@@ -435,15 +435,25 @@ pub fn expand(
     }
     let resolved_exprs = resolved.exprs;
 
+    // An all-window query whose inner aggregate lives at a non-root grain is
+    // answered by anchoring `__sv_agg` there instead of at the base table
+    // (TECH-DEBT #36). Decided BEFORE the fence, because the two checks the
+    // anchor supersedes are the ones that would otherwise reject this shape —
+    // the same reason `grain_plan` is decided before it.
+    let window_anchor = super::per_grain::window_cte_anchor(def, &resolved_dims, &resolved_mets);
+
     // Phase 31: Check for fan traps before generating SQL. In per-grain mode the
     // fence keeps only the metric × dimension check — the other two guard the
-    // base-anchored topology the per-grain plan replaces.
+    // base-anchored topology the per-grain plan replaces. An anchored window CTE
+    // replaces that topology in exactly the same way, so it uses the same mode;
+    // the retained metric × dimension check is what still reports a dimension
+    // below the metric's own grain.
     check_fan_traps(
         view_name,
         def,
         &resolved_dims,
         &resolved_mets,
-        grain_plan.is_some(),
+        grain_plan.is_some() || window_anchor.is_some(),
     )?;
     if let Some(rw) = &resolved_where {
         super::fan_trap::check_where_clause_fan_traps(view_name, def, &rw.members, &resolved_mets)?;
@@ -527,6 +537,7 @@ pub fn expand(
             &resolved_mets,
             &resolved_exprs,
             resolved_where.as_ref(),
+            window_anchor.as_deref(),
         );
     }
 

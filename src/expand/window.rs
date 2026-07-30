@@ -15,7 +15,8 @@ use crate::model::{Metric, NullsOrder, SemanticViewDefinition, SortOrder};
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::{quote_ident, quote_stored_ident};
 use super::select_spec::{
-    push_from_base, push_group_by_ordinals, FromSource, GroupBy, SelectItem, SelectSpec,
+    push_from_anchor, push_from_base, push_group_by_ordinals, FromSource, GroupBy, SelectItem,
+    SelectSpec,
 };
 use super::types::{ExpandError, ResolvedDim};
 
@@ -51,6 +52,14 @@ fn window_dim_column(def: &SemanticViewDefinition, reference: &str) -> String {
 /// 2. **Outer SELECT**: Applies each window function over the CTE results with
 ///    computed PARTITION BY (all queried dims minus EXCLUDING dims) and ORDER BY.
 ///    No GROUP BY in the outer query -- window functions are row-level operations.
+///
+/// # Grain
+///
+/// `grain_anchor` re-anchors the CTE in step 1 at a declared table other than the
+/// base table — see [`super::per_grain::window_cte_anchor`], which decides it and
+/// documents when it declines. Step 2 is unaffected: the window function runs over
+/// the already-grouped CTE, so only the inner aggregate is grain-sensitive.
+/// `None` keeps the base-anchored shape, byte-identical to before.
 #[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
 pub(super) fn expand_window_metrics(
     view_name: &str,
@@ -59,6 +68,7 @@ pub(super) fn expand_window_metrics(
     resolved_mets: &[&Metric],
     resolved_exprs: &HashMap<String, String>,
     where_clause: Option<&super::where_clause::ResolvedWhere>,
+    grain_anchor: Option<&str>,
 ) -> Result<String, ExpandError> {
     // 1. Validate required dimensions for each window metric.
     //
@@ -188,17 +198,25 @@ pub(super) fn expand_window_metrics(
 
     sql.push_str(&cte_select_items.join(",\n"));
 
-    // CTE FROM clause
-    push_from_base(&mut sql, def, "\n    ");
-
-    // CTE JOINs
+    // CTE FROM clause + JOINs.
     let dims: Vec<&crate::model::Dimension> = resolved_dims.iter().map(|rd| rd.dim).collect();
     // Tables named only by the predicate must be joined inside the CTE, where
     // the filter is applied.
     let where_tables: Vec<String> = where_clause
         .map(|w| w.source_tables.clone())
         .unwrap_or_default();
-    let resolved_joins = resolve_joins_pkfk(def, &dims, resolved_mets, &where_tables);
+    // Anchored at the inner aggregate's own grain when the base-anchored FROM
+    // would fan it (TECH-DEBT #36): the joins then reach out from THAT table to
+    // the queried dimensions, rather than from the base table inward. Only the
+    // CTE moves — the outer window SELECT still runs over `__sv_agg` unchanged,
+    // because the window function is not grain-sensitive.
+    let resolved_joins = if let Some(anchor) = grain_anchor {
+        push_from_anchor(&mut sql, def, anchor, "\n    ");
+        super::per_grain::anchor_joins(def, anchor, &dims, &where_tables)
+    } else {
+        push_from_base(&mut sql, def, "\n    ");
+        resolve_joins_pkfk(def, &dims, resolved_mets, &where_tables)
+    };
     push_join_clauses(&mut sql, &resolved_joins, def, "\n    LEFT JOIN ");
 
     // Inside the CTE and before its GROUP BY, so the inner aggregates the

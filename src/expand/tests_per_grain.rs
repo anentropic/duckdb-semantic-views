@@ -534,11 +534,25 @@ fn multi_grain_with_active_semi_additive_metric_still_errors() {
     );
 }
 
-/// The same boundary for window metrics.
+/// A window metric whose inner aggregate lives at a NON-ROOT grain is answered
+/// by anchoring `__sv_agg` at that grain (TECH-DEBT #36, first sub-item).
+///
+/// `total_balance` is `SUM(c.balance)` on the parent `customers`; `segment` is
+/// also on `customers`. Base-anchoring the CTE at `orders` would join each
+/// customer once per order and sum the balance that many times — the inflation
+/// the v0.11.0 fence turned into `RootGrainFanTrap`. Anchored at `c` the inner
+/// aggregate sees one row per customer, and the window function then runs over
+/// the CTE exactly as before: only the inner aggregate is grain-sensitive.
+///
+/// The window metric is declared QUALIFIED (`o.running_balance`), the shape real
+/// DDL always produces — `metric_grain_tables` unions that alias with the
+/// inner's, so an anchor derived from it would see two grains and decline for
+/// every DDL-declared window metric. Using `source_table: None` here would have
+/// passed while the feature did nothing through actual DDL.
 #[test]
-fn multi_grain_with_window_metric_still_errors() {
+fn multi_grain_window_metric_anchors_the_cte_at_its_own_grain() {
     let def = orders_with_parent_customers()
-        .with_metric("running_balance", "SUM(total_balance)", None)
+        .with_metric("running_balance", "SUM(total_balance)", Some("o"))
         .with_window_spec(
             "running_balance",
             WindowSpec {
@@ -551,11 +565,144 @@ fn multi_grain_with_window_metric_still_errors() {
                 frame_clause: None,
             },
         );
-    let err = expand("sales", &def, &req(&["segment"], &["running_balance"]))
-        .expect_err("a window metric is not per-grain eligible");
+    let sql = expand("sales", &def, &req(&["segment"], &["running_balance"]))
+        .expect("a window metric at its own grain is answerable");
+
+    // The CTE is anchored at `customers`, NOT at the base table `orders`.
     assert!(
-        matches!(err, ExpandError::RootGrainFanTrap { .. }),
-        "expected the v0.11.0 fan-trap error, got: {err}"
+        sql.contains("FROM \"customers\" AS \"c\""),
+        "__sv_agg must anchor at the inner metric's own grain: {sql}"
+    );
+    assert!(
+        !sql.contains("\"orders\""),
+        "the base table must not appear — joining it is what inflated the sum: {sql}"
+    );
+    // The window function still runs over the CTE, unchanged.
+    assert!(
+        sql.contains("__sv_agg"),
+        "the window CTE shape is retained: {sql}"
+    );
+    assert!(
+        sql.contains("OVER (PARTITION BY"),
+        "the OVER clause still partitions: {sql}"
+    );
+}
+
+/// A window metric already at the ROOT grain is left exactly as it was — the
+/// base-anchored CTE is already correct there, so the anchor decision declines
+/// and the emitted SQL is unchanged. Guards against re-anchoring queries that
+/// never needed it.
+#[test]
+fn root_grain_window_metric_stays_base_anchored() {
+    let def = orders_with_parent_customers()
+        .with_metric("running_orders", "SUM(order_count)", Some("o"))
+        .with_window_spec(
+            "running_orders",
+            WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "order_count".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec![],
+                partition_dims: vec!["order_status".to_string()],
+                order_by: vec![],
+                frame_clause: None,
+            },
+        );
+    let sql = expand("sales", &def, &req(&["order_status"], &["running_orders"]))
+        .expect("a root-grain window metric was always answerable");
+    assert!(
+        sql.contains(r#"FROM "orders" AS "o""#),
+        "must stay anchored at the base table: {sql}"
+    );
+}
+
+/// A window metric whose inner aggregate is on a CHILD of the base table stays
+/// base-anchored — re-anchoring there would be a correctness REGRESSION, not an
+/// optimisation.
+///
+/// `FROM orders LEFT JOIN line_items` already yields each line-item row once, so
+/// nothing is inflated, and that LEFT JOIN deliberately keeps an order with no
+/// line items as a NULL-extended row whose `COUNT` is 0. Flipping to
+/// `FROM line_items LEFT JOIN orders` would DROP that order from the result
+/// entirely. Per-grain's own planner may re-anchor either way because it FULL
+/// OUTER JOINs the grain CTEs; this single-CTE path has no such reassembly, so it
+/// only re-anchors toward the "one" side, where base-anchoring genuinely fans.
+///
+/// Caught by `cr20260718_quoted_metric_window.test`, whose childless EU order
+/// disappeared when the direction was not checked.
+#[test]
+fn window_metric_on_a_child_table_stays_base_anchored() {
+    let def = orders_with_child_line_items()
+        .with_metric("rolling_items", "SUM(item_count)", Some("li"))
+        .with_window_spec(
+            "rolling_items",
+            WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "item_count".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec![],
+                partition_dims: vec!["order_status".to_string()],
+                order_by: vec![],
+                frame_clause: None,
+            },
+        );
+    let sql = expand("sales", &def, &req(&["order_status"], &["rolling_items"]))
+        .expect("a child-grain window metric was always answerable");
+    assert!(
+        sql.contains(r#"FROM "orders" AS "o""#),
+        "must stay anchored at the base table so childless parents survive: {sql}"
+    );
+    assert!(
+        sql.contains("LEFT JOIN"),
+        "the outer-join that preserves childless parents must remain: {sql}"
+    );
+}
+
+/// The boundary this increment keeps: window metrics whose inner aggregates sit
+/// at DIFFERENT grains would need those grains joined before the window runs,
+/// which the single-anchor CTE cannot express. Declined, so the fence still
+/// reports it rather than emitting a silently wrong shape.
+#[test]
+fn window_metrics_at_two_different_grains_still_error() {
+    let def = orders_with_parent_customers()
+        .with_metric("running_balance", "SUM(total_balance)", Some("o"))
+        .with_window_spec(
+            "running_balance",
+            WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "total_balance".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec![],
+                partition_dims: vec!["segment".to_string()],
+                order_by: vec![],
+                frame_clause: None,
+            },
+        )
+        .with_metric("running_orders", "SUM(order_count)", Some("o"))
+        .with_window_spec(
+            "running_orders",
+            WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "order_count".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec![],
+                partition_dims: vec!["segment".to_string()],
+                order_by: vec![],
+                frame_clause: None,
+            },
+        );
+    let err = expand(
+        "sales",
+        &def,
+        &req(&["segment"], &["running_balance", "running_orders"]),
+    )
+    .expect_err("inner aggregates at two grains are not answerable by one anchored CTE");
+    assert!(
+        matches!(
+            err,
+            ExpandError::RootGrainFanTrap { .. } | ExpandError::MetricFanTrap { .. }
+        ),
+        "expected a fan-trap error, got: {err}"
     );
 }
 

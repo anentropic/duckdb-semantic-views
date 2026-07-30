@@ -1,0 +1,181 @@
+# Window metrics at their own grain (TECH-DEBT #36, first sub-item).
+#
+# A window metric wraps an inner aggregate: `SUM(total_balance) OVER (…)`. The
+# window function itself runs over the already-grouped `__sv_agg` CTE, so it is
+# not grain-sensitive — the INNER aggregate is. When that inner aggregate lives
+# on a table other than the base table, anchoring the CTE at the base table
+# joins the two and counts the inner metric's rows once per base-table row.
+#
+# v0.11.0 turned that inflation into `RootGrainFanTrap` rather than answering it.
+# The CTE now anchors at the inner aggregate's own table, which is the whole fix.
+#
+# This file asserts the RESULTING NUMBERS, not just the SQL shape: the inflated
+# values are spelled out in comments so a regression is recognisable on sight.
+
+require semantic_views
+
+statement ok
+CREATE TABLE wog_customers (id INTEGER, segment VARCHAR, balance INTEGER);
+
+statement ok
+CREATE TABLE wog_orders (id INTEGER, customer_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO wog_customers VALUES (1, 'ENT', 100), (2, 'ENT', 200), (3, 'SMB', 50);
+
+# Deliberately uneven order counts per customer — 3, 1, 2 — so an inflated sum
+# is a different number per segment rather than a uniform multiple.
+statement ok
+INSERT INTO wog_orders VALUES
+  (10, 1, 5), (11, 1, 6), (12, 1, 7),
+  (20, 2, 8),
+  (30, 3, 9), (31, 3, 10);
+
+statement ok
+CREATE SEMANTIC VIEW wog_sv AS
+  TABLES (
+    o AS wog_orders PRIMARY KEY (id),
+    c AS wog_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    order_customer AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.segment AS c.segment,
+    o.order_id AS o.id
+  )
+  METRICS (
+    c.total_balance AS sum(c.balance),
+    o.order_count AS count(*),
+    o.seg_balance AS SUM(total_balance) OVER (PARTITION BY segment),
+    o.running_orders AS SUM(order_count) OVER (PARTITION BY segment)
+  );
+
+# ============================================================
+# Test 1: ground truth. The plain parent-grain metric already worked via the
+# per-grain path (TECH-DEBT #35) — ENT = 100 + 200, SMB = 50.
+# ============================================================
+
+query TT rowsort
+SELECT * FROM semantic_view('wog_sv', metrics := ['total_balance'], dimensions := ['segment']);
+----
+ENT	300
+SMB	50
+
+# ============================================================
+# Test 2: the new capability. The window metric wrapping that same inner
+# aggregate must produce the SAME per-segment totals.
+#
+# Each segment is one partition of one row, so the window SUM equals that
+# segment's own total_balance. Base-anchoring the CTE would have given
+# ENT = 100*3 + 200*1 = 500 and SMB = 50*2 = 100 — the inflation this fixes.
+# Before this change the query raised `fan trap detected` instead.
+# ============================================================
+
+query TT rowsort
+SELECT * FROM semantic_view('wog_sv', metrics := ['seg_balance'], dimensions := ['segment']);
+----
+ENT	300
+SMB	50
+
+# ============================================================
+# Test 3: the CTE is anchored at the inner aggregate's own table, and the base
+# table is absent — joining it is precisely what inflated the sum.
+# ============================================================
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('wog_sv', metrics := ['seg_balance'], dimensions := ['segment'])
+  WHERE explain_output LIKE '%"wog_customers" AS "c"%';
+----
+true
+
+query I
+SELECT count(*) FROM explain_semantic_view('wog_sv', metrics := ['seg_balance'], dimensions := ['segment'])
+  WHERE explain_output LIKE '%wog_orders%';
+----
+0
+
+# The window CTE shape is retained — only its anchor moved. Asserted as two
+# separate matches: `explain_semantic_view` yields one row per LINE, so an
+# `AND` over patterns on different lines could never match.
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('wog_sv', metrics := ['seg_balance'], dimensions := ['segment'])
+  WHERE explain_output LIKE '%__sv_agg%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('wog_sv', metrics := ['seg_balance'], dimensions := ['segment'])
+  WHERE explain_output LIKE '%OVER (PARTITION BY%';
+----
+true
+
+# ============================================================
+# Test 4: a window metric whose inner aggregate is already at the ROOT grain is
+# left exactly as it was — base-anchoring is correct there, so the anchor
+# decision declines. `order_count` is `count(*)` on the base table: 6 orders,
+# 4 for ENT customers (3 + 1) and 2 for SMB.
+# ============================================================
+
+query TT rowsort
+SELECT * FROM semantic_view('wog_sv', metrics := ['running_orders'], dimensions := ['segment']);
+----
+ENT	4
+SMB	2
+
+query I
+SELECT count(*) > 0 FROM explain_semantic_view('wog_sv', metrics := ['running_orders'], dimensions := ['segment'])
+  WHERE explain_output LIKE '%"wog_orders" AS "o"%';
+----
+true
+
+# ============================================================
+# Test 5: `where_clause` still filters INSIDE the anchored CTE, before the inner
+# aggregate — so the windowed number is recomputed over the matching rows rather
+# than the window's output being filtered afterwards.
+# ============================================================
+
+query TT rowsort
+SELECT * FROM semantic_view('wog_sv', metrics := ['seg_balance'], dimensions := ['segment'], where_clause := 'segment = ''ENT''');
+----
+ENT	300
+
+# Dropping one ENT customer recomputes that segment's total (300 -> 200), which
+# an outer WHERE on the result could not do.
+query TT rowsort
+SELECT * FROM semantic_view('wog_sv', metrics := ['seg_balance'], dimensions := ['segment'], where_clause := 'balance > 150');
+----
+ENT	200
+
+# ============================================================
+# Test 6: the boundary this increment keeps. Two window metrics whose inner
+# aggregates sit at DIFFERENT grains would need those grains joined before the
+# window runs, which one anchored CTE cannot express — so it is declined and the
+# fence still reports it, rather than emitting a silently wrong shape.
+# ============================================================
+
+statement error
+SELECT * FROM semantic_view('wog_sv', metrics := ['seg_balance', 'running_orders'], dimensions := ['segment']);
+----
+fan trap detected
+
+# ============================================================
+# Test 7: a dimension BELOW the inner aggregate's grain is still an error. An
+# order-grain dimension against a customer-grain aggregate has no single value
+# per group in either engine; the retained metric x dimension check reports it.
+# ============================================================
+
+statement error
+SELECT * FROM semantic_view('wog_sv', metrics := ['seg_balance'], dimensions := ['order_id']);
+----
+fan trap detected
+
+# Cleanup
+statement ok
+DROP SEMANTIC VIEW wog_sv;
+
+statement ok
+DROP TABLE wog_orders;
+
+statement ok
+DROP TABLE wog_customers;
