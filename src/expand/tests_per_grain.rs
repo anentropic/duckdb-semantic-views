@@ -1259,3 +1259,49 @@ fn using_naming_a_non_role_played_relationship_still_declines() {
         "expected the v0.11.0 fan-trap error, got: {err}"
     );
 }
+
+/// root `f` (flights) --carrier_id--> `c` (carriers) --dep/arr--> `a` (airports).
+///
+/// `c` is a PARENT of the base table, so a metric on it needs per-grain
+/// treatment; `a` is a parent of `c`, so a dimension on it is ABOVE the metric's
+/// grain and the fan-trap fence permits it. That combination is what reaches
+/// `render_single_grain` — one grain group — with a role resolved.
+fn carriers_via_role_played_airports() -> SemanticViewDefinition {
+    base_table(minimal_def("f", "d", "d", "m", "count(*)"), "flights", "id")
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("a", "airports", &["code"])
+        .with_table("c", "carriers", &["id"])
+        .with_dimension("dep_city", "a.city", Some("a"))
+        .with_metric("fleet_size", "SUM(c.fleet)", Some("c"))
+        .with_pkfk_join("dep", "c", "a", &["dep_code"], &["code"])
+        .with_pkfk_join("arr", "c", "a", &["arr_code"], &["code"])
+        .with_pkfk_join("f_to_c", "f", "c", &["carrier_id"], &["id"])
+        .with_using_relationship("fleet_size", &["dep"])
+}
+
+/// A SINGLE per-grain CTE must scope its dimension too.
+///
+/// One grain group takes `render_single_grain` rather than the multi-grain
+/// renderer, but it emits its joins through the same `anchor_joins` — so it
+/// receives the scoped `a__dep` JOIN and must rewrite the dimension to match.
+/// Emitting the bare `a.city` there references an alias its own FROM never
+/// binds, which DuckDB rejects at bind time.
+#[test]
+fn using_scopes_a_role_played_dimension_in_a_single_grain_cte() {
+    let def = carriers_via_role_played_airports();
+    let sql = expand("sv", &def, &req(&["dep_city"], &["fleet_size"]))
+        .expect("a parent-grain metric with USING is per-grain eligible");
+    assert!(
+        sql.contains(r#"AS "a__dep" ON"#),
+        "the scoped role is joined, got:\n{sql}"
+    );
+    assert!(
+        sql.contains("a__dep.city"),
+        "the dimension must bind to the scoped alias the JOIN emitted, got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("a.city AS"),
+        "the bare alias is never bound by this FROM, so selecting it is invalid SQL:\n{sql}"
+    );
+}

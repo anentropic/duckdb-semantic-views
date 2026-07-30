@@ -119,6 +119,63 @@ SELECT * FROM semantic_view('rpu_sv', metrics := ['flight_count'], dimensions :=
 London	2
 New York	1
 
+# ============================================================
+# Test 4: the SINGLE-grain CTE must scope its dimension too.
+#
+# One grain group takes a different renderer from the multi-grain case, but it
+# emits its joins through the same code — so it receives the scoped `a__dep`
+# JOIN and must rewrite the dimension to match. Emitting the bare `a.city`
+# against `FROM carriers ... LEFT JOIN airports AS "a__dep"` references an alias
+# the FROM never binds, which DuckDB rejects at bind time. Only an end-to-end
+# test catches that; a string assertion on the generated SQL cannot.
+#
+# `c` is a parent of the base table (so a metric on it needs per-grain
+# treatment) and `a` is a parent of `c` (so the dimension is above the metric's
+# grain and is permitted).
+# ============================================================
+
+statement ok
+CREATE TABLE rpu_carriers (id INTEGER, fleet INTEGER, dep_code VARCHAR, arr_code VARCHAR);
+
+statement ok
+INSERT INTO rpu_carriers VALUES (1, 50, 'LHR', 'JFK'), (2, 30, 'JFK', 'LHR');
+
+statement ok
+ALTER TABLE rpu_flights ADD COLUMN carrier_id INTEGER;
+
+statement ok
+CREATE SEMANTIC VIEW rpu_sg AS
+  TABLES (
+    f AS rpu_flights PRIMARY KEY (id),
+    c AS rpu_carriers PRIMARY KEY (id),
+    a AS rpu_airports PRIMARY KEY (code)
+  )
+  RELATIONSHIPS (
+    dep AS c(dep_code) REFERENCES a(code),
+    arr AS c(arr_code) REFERENCES a(code),
+    f_to_c AS f(carrier_id) REFERENCES c(id)
+  )
+  DIMENSIONS (
+    a.hub_city AS a.city
+  )
+  METRICS (
+    c.fleet_size USING (dep) AS sum(c.fleet)
+  );
+
+# Carrier 1 hubs at LHR (London) with 50; carrier 2 at JFK (New York) with 30.
+# Binding `arr` instead would swap the two cities.
+query TI rowsort
+SELECT * FROM semantic_view('rpu_sg', metrics := ['fleet_size'], dimensions := ['hub_city']);
+----
+London	50
+New York	30
+
+statement ok
+DROP SEMANTIC VIEW rpu_sg;
+
+statement ok
+DROP TABLE rpu_carriers;
+
 # Cleanup
 statement ok
 DROP SEMANTIC VIEW rpu_sv;

@@ -735,7 +735,7 @@ fn render_single_grain(
         .iter()
         .map(|dim| {
             SelectItem::new(
-                dim.expr.clone(),
+                dim_expr(dim, roles),
                 dim.output_type.clone(),
                 quote_stored_ident(&dim.name),
             )
