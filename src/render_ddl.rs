@@ -1494,7 +1494,7 @@ mod tests {
         );
     }
 
-    /// A labelled fact alongside an UNlabelled one: only the flagged member
+    /// A labelled fact alongside an unlabelled one: only the flagged member
     /// gets the clause.
     #[test]
     fn test_labels_renders_only_on_the_flagged_fact() {
