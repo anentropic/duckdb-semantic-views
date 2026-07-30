@@ -299,9 +299,14 @@ Two boundaries are worth knowing:
   metric"; our ``fan trap detected`` error enforces the same condition. Per-grain
   aggregation does not make these answerable — the metric's rows genuinely fan
   across the dimension's values, so there is no single correct value per group.
-- Multi-grain queries involving **window metrics**, **active semi-additive
-  metrics**, or **role-playing (**``USING``**) resolution** are not yet computed
-  per-grain here and keep raising the fan-trap error. Snowflake computes them.
+- A **window metric** whose inner aggregate lives on a non-base table is computed
+  at its own grain — the ``__sv_agg`` CTE anchors there, so the inner aggregate is
+  not inflated by the base-table join. Window metrics whose inner aggregates sit
+  at *different* grains still error, as those grains would need joining before the
+  window runs.
+- Multi-grain queries involving **active semi-additive metrics** or
+  **role-playing (**``USING``**) resolution** are not yet computed per-grain here
+  and keep raising the fan-trap error. Snowflake computes them.
 
 
 USING RELATIONSHIPS

@@ -43,8 +43,14 @@
 //!
 //! - a dimension **below** a metric's grain (the metric's rows genuinely fan
 //!   across the dimension's values) — `FanTrap`, raised by the fence;
-//! - window metrics, *active* semi-additive metrics, and role-playing (`USING`)
-//!   resolution, whose own CTE strategies are base-anchored (see `docs/`).
+//! - *active* semi-additive metrics and role-playing (`USING`) resolution, whose
+//!   own CTE strategies are base-anchored (see `docs/`).
+//!
+//! Window metrics are no longer in that list. [`window_cte_anchor`] picks the
+//! grain for an all-window query and `expand_window_metrics` anchors its
+//! `__sv_agg` CTE there — the window function is not grain-sensitive, so moving
+//! the CTE is the whole fix. That path does not build [`Plan`] groups; it reuses
+//! only [`anchor_joins`] and the fence's per-grain mode.
 
 use std::collections::{HashMap, HashSet};
 
@@ -344,6 +350,137 @@ fn rebuild_expr(
     resolve(def, met, replacements, 0)
 }
 
+/// Whether any table is reached from the same source through more than one
+/// named relationship — role-playing.
+///
+/// Which role an anchored CTE should join is exactly the question `USING`
+/// answers on the base-anchored path, and neither the per-grain grain CTEs nor
+/// the anchored window CTE carries that context, so both decline the shape.
+fn has_role_playing(def: &SemanticViewDefinition) -> bool {
+    let mut edges: HashSet<(String, String)> = HashSet::new();
+    for join in def.joins.iter().filter(|j| !j.fk_columns.is_empty()) {
+        let edge = (
+            join.from_alias.to_ascii_lowercase(),
+            join.table.to_ascii_lowercase(),
+        );
+        if !edges.insert(edge) {
+            return true; // A second relationship between the same pair.
+        }
+    }
+    false
+}
+
+/// The declared table a window query's `__sv_agg` CTE should anchor at, or
+/// `None` to leave it anchored at the base table.
+///
+/// A window metric's inner aggregate is the grain-sensitive part: the window
+/// function itself runs over the already-grouped CTE, so anchoring the CTE at
+/// the inner metric's own table is the whole fix (TECH-DEBT #36). With
+/// `total_balance = SUM(c.balance)` on the parent `customers`, a base-anchored
+/// CTE joins `orders` and sums each customer's balance once per order — the
+/// inflation the v0.11.0 fence turned into `RootGrainFanTrap`. Anchored at `c`
+/// the inner aggregate sees one row per customer.
+///
+/// Returns `None` — leaving the query base-anchored with the full fence — when:
+/// - the anchor would be the root anyway (base-anchoring is already correct);
+/// - the window metrics' inner aggregates span **several** grains, which would
+///   need those grains joined before the window runs. That is the next
+///   increment, not this one;
+/// - a queried dimension is unqualified (its binding would move with the
+///   anchor), or the view role-plays, matching [`is_eligible`]'s conservatism;
+/// - a queried dimension is unreachable from the anchor.
+///
+/// A dimension *below* the anchor's grain is deliberately NOT screened here: it
+/// has no single value per group in either engine, and the fan-trap fence's
+/// metric × dimension check — which per-grain mode keeps — is what reports it.
+pub(super) fn window_cte_anchor(
+    def: &SemanticViewDefinition,
+    resolved_dims: &[&Dimension],
+    resolved_mets: &[&Metric],
+) -> Option<String> {
+    if def.joins.is_empty() || resolved_mets.is_empty() {
+        return None;
+    }
+    // Only an all-window query reaches the window emitter — mixing window and
+    // aggregate metrics is rejected upstream — and only then is `__sv_agg` the
+    // shape being anchored.
+    if !resolved_mets.iter().all(|m| m.is_window()) {
+        return None;
+    }
+    if resolved_dims.iter().any(|d| d.source_table.is_none()) || has_role_playing(def) {
+        return None;
+    }
+    if resolved_mets
+        .iter()
+        .any(|m| !m.using_relationships.is_empty())
+    {
+        return None;
+    }
+
+    let graph = GrainGraph::build(def)?;
+    let root = graph.root().to_string();
+
+    // Every window metric's INNER aggregate must sit at the same single table.
+    //
+    // The inner metric is deliberately what is measured, not the window metric
+    // itself: DDL qualifies a window metric with a source alias
+    // (`o.running_balance AS SUM(total_balance) OVER (…)`), and
+    // `metric_grain_tables` unions that alias with the inner's for its own
+    // conservative fan-trap purpose. Here that union would report two grains for
+    // every DDL-declared window metric and decline unconditionally. The alias on
+    // a window metric is declarative — emission never references it, because the
+    // window function runs over `__sv_agg`'s columns — so the inner aggregate's
+    // grain is the one the CTE must anchor at.
+    let mut anchor: Option<String> = None;
+    for met in resolved_mets {
+        let ws = met.window_spec.as_ref()?;
+        if ws.inner_metric.eq_ignore_ascii_case(&met.name) {
+            return None; // Self-referential; not a shape to re-anchor.
+        }
+        let inner = def
+            .metrics
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(&ws.inner_metric))?;
+        let grains = metric_grain_tables(inner, def);
+        let [only] = grains.as_slice() else {
+            return None; // No grain, or an inner spanning several — decline.
+        };
+        match &anchor {
+            None => anchor = Some(only.clone()),
+            Some(existing) if existing == only => {}
+            Some(_) => return None, // Two inner aggregates at different grains.
+        }
+    }
+    let anchor = anchor?;
+    if anchor == root {
+        return None; // Already correct as-is.
+    }
+    // Only re-anchor in the direction where base-anchoring actually inflates —
+    // when the anchor is on the "one" side of the path from the root, so joining
+    // it to the base table replicates each of its rows once per base row.
+    //
+    // The other direction must be left alone, and not merely as an optimisation:
+    // for a metric on a CHILD of the base table, `FROM base LEFT JOIN child`
+    // already yields each child row once, and its LEFT JOIN deliberately keeps
+    // childless parents as NULL-extended rows (a `COUNT` of 0 for them). Flipping
+    // to `FROM child LEFT JOIN base` would silently DROP those groups — an order
+    // with no line items would vanish from the result rather than counting 0.
+    // Per-grain's own planner can re-anchor either way because it FULL OUTER
+    // JOINs the grain CTEs, which restores such groups; this single-CTE path has
+    // no such reassembly, so it restricts itself to the safe direction.
+    //
+    // `?` discards the relationship NAME deliberately — only its presence matters
+    // here, and `None` (no fanning edge, so no inflation to fix) declines.
+    graph.fanning_relationship(&anchor, &root)?;
+    // Each queried dimension must be joinable from the anchor, or the CTE's
+    // FROM could not reach the column its SELECT names.
+    for dim in resolved_dims {
+        let table = dim.source_table.as_ref()?.to_ascii_lowercase();
+        graph.path(&anchor, &table)?;
+    }
+    Some(anchor)
+}
+
 /// Whether the query's shape is one the per-grain emitter can express.
 ///
 /// Deliberately conservative: anything outside the plain-aggregate,
@@ -361,19 +498,8 @@ fn is_eligible(
     if resolved_dims.iter().any(|d| d.source_table.is_none()) {
         return false;
     }
-    // Role-playing: one table reached from the same source through several
-    // named relationships. Which role a grain CTE should join is exactly the
-    // question `USING` answers on the base-anchored path; per-grain does not
-    // carry that context, so it declines the whole shape.
-    let mut edges: HashSet<(String, String)> = HashSet::new();
-    for join in def.joins.iter().filter(|j| !j.fk_columns.is_empty()) {
-        let edge = (
-            join.from_alias.to_ascii_lowercase(),
-            join.table.to_ascii_lowercase(),
-        );
-        if !edges.insert(edge) {
-            return false; // A second relationship between the same pair.
-        }
+    if has_role_playing(def) {
+        return false;
     }
 
     let queried_dim_keys: HashSet<String> = resolved_dims
@@ -607,7 +733,7 @@ fn coalesced_key(groups: usize, d: usize) -> String {
 /// introduces and one already in scope. The planner has already established
 /// that none of these paths fans the anchor, so the anchor's row count — and
 /// therefore its aggregate — is unaffected by them.
-fn anchor_joins<'a>(
+pub(super) fn anchor_joins<'a>(
     def: &'a SemanticViewDefinition,
     anchor: &str,
     resolved_dims: &[&Dimension],

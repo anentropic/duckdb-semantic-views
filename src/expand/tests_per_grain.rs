@@ -534,11 +534,25 @@ fn multi_grain_with_active_semi_additive_metric_still_errors() {
     );
 }
 
-/// The same boundary for window metrics.
+/// A window metric whose inner aggregate lives at a NON-ROOT grain is answered
+/// by anchoring `__sv_agg` at that grain (TECH-DEBT #36, first sub-item).
+///
+/// `total_balance` is `SUM(c.balance)` on the parent `customers`; `segment` is
+/// also on `customers`. Base-anchoring the CTE at `orders` would join each
+/// customer once per order and sum the balance that many times — the inflation
+/// the v0.11.0 fence turned into `RootGrainFanTrap`. Anchored at `c` the inner
+/// aggregate sees one row per customer, and the window function then runs over
+/// the CTE exactly as before: only the inner aggregate is grain-sensitive.
+///
+/// The window metric is declared QUALIFIED (`o.running_balance`), the shape real
+/// DDL always produces — `metric_grain_tables` unions that alias with the
+/// inner's, so an anchor derived from it would see two grains and decline for
+/// every DDL-declared window metric. Using `source_table: None` here would have
+/// passed while the feature did nothing through actual DDL.
 #[test]
-fn multi_grain_with_window_metric_still_errors() {
+fn multi_grain_window_metric_anchors_the_cte_at_its_own_grain() {
     let def = orders_with_parent_customers()
-        .with_metric("running_balance", "SUM(total_balance)", None)
+        .with_metric("running_balance", "SUM(total_balance)", Some("o"))
         .with_window_spec(
             "running_balance",
             WindowSpec {
@@ -551,11 +565,144 @@ fn multi_grain_with_window_metric_still_errors() {
                 frame_clause: None,
             },
         );
-    let err = expand("sales", &def, &req(&["segment"], &["running_balance"]))
-        .expect_err("a window metric is not per-grain eligible");
+    let sql = expand("sales", &def, &req(&["segment"], &["running_balance"]))
+        .expect("a window metric at its own grain is answerable");
+
+    // The CTE is anchored at `customers`, NOT at the base table `orders`.
     assert!(
-        matches!(err, ExpandError::RootGrainFanTrap { .. }),
-        "expected the v0.11.0 fan-trap error, got: {err}"
+        sql.contains("FROM \"customers\" AS \"c\""),
+        "__sv_agg must anchor at the inner metric's own grain: {sql}"
+    );
+    assert!(
+        !sql.contains("\"orders\""),
+        "the base table must not appear — joining it is what inflated the sum: {sql}"
+    );
+    // The window function still runs over the CTE, unchanged.
+    assert!(
+        sql.contains("__sv_agg"),
+        "the window CTE shape is retained: {sql}"
+    );
+    assert!(
+        sql.contains("OVER (PARTITION BY"),
+        "the OVER clause still partitions: {sql}"
+    );
+}
+
+/// A window metric already at the ROOT grain is left exactly as it was — the
+/// base-anchored CTE is already correct there, so the anchor decision declines
+/// and the emitted SQL is unchanged. Guards against re-anchoring queries that
+/// never needed it.
+#[test]
+fn root_grain_window_metric_stays_base_anchored() {
+    let def = orders_with_parent_customers()
+        .with_metric("running_orders", "SUM(order_count)", Some("o"))
+        .with_window_spec(
+            "running_orders",
+            WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "order_count".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec![],
+                partition_dims: vec!["order_status".to_string()],
+                order_by: vec![],
+                frame_clause: None,
+            },
+        );
+    let sql = expand("sales", &def, &req(&["order_status"], &["running_orders"]))
+        .expect("a root-grain window metric was always answerable");
+    assert!(
+        sql.contains(r#"FROM "orders" AS "o""#),
+        "must stay anchored at the base table: {sql}"
+    );
+}
+
+/// A window metric whose inner aggregate is on a CHILD of the base table stays
+/// base-anchored — re-anchoring there would be a correctness REGRESSION, not an
+/// optimisation.
+///
+/// `FROM orders LEFT JOIN line_items` already yields each line-item row once, so
+/// nothing is inflated, and that LEFT JOIN deliberately keeps an order with no
+/// line items as a NULL-extended row whose `COUNT` is 0. Flipping to
+/// `FROM line_items LEFT JOIN orders` would DROP that order from the result
+/// entirely. Per-grain's own planner may re-anchor either way because it FULL
+/// OUTER JOINs the grain CTEs; this single-CTE path has no such reassembly, so it
+/// only re-anchors toward the "one" side, where base-anchoring genuinely fans.
+///
+/// Caught by `cr20260718_quoted_metric_window.test`, whose childless EU order
+/// disappeared when the direction was not checked.
+#[test]
+fn window_metric_on_a_child_table_stays_base_anchored() {
+    let def = orders_with_child_line_items()
+        .with_metric("rolling_items", "SUM(item_count)", Some("li"))
+        .with_window_spec(
+            "rolling_items",
+            WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "item_count".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec![],
+                partition_dims: vec!["order_status".to_string()],
+                order_by: vec![],
+                frame_clause: None,
+            },
+        );
+    let sql = expand("sales", &def, &req(&["order_status"], &["rolling_items"]))
+        .expect("a child-grain window metric was always answerable");
+    assert!(
+        sql.contains(r#"FROM "orders" AS "o""#),
+        "must stay anchored at the base table so childless parents survive: {sql}"
+    );
+    assert!(
+        sql.contains("LEFT JOIN"),
+        "the outer-join that preserves childless parents must remain: {sql}"
+    );
+}
+
+/// The boundary this increment keeps: window metrics whose inner aggregates sit
+/// at DIFFERENT grains would need those grains joined before the window runs,
+/// which the single-anchor CTE cannot express. Declined, so the fence still
+/// reports it rather than emitting a silently wrong shape.
+#[test]
+fn window_metrics_at_two_different_grains_still_error() {
+    let def = orders_with_parent_customers()
+        .with_metric("running_balance", "SUM(total_balance)", Some("o"))
+        .with_window_spec(
+            "running_balance",
+            WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "total_balance".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec![],
+                partition_dims: vec!["segment".to_string()],
+                order_by: vec![],
+                frame_clause: None,
+            },
+        )
+        .with_metric("running_orders", "SUM(order_count)", Some("o"))
+        .with_window_spec(
+            "running_orders",
+            WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "order_count".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec![],
+                partition_dims: vec!["segment".to_string()],
+                order_by: vec![],
+                frame_clause: None,
+            },
+        );
+    let err = expand(
+        "sales",
+        &def,
+        &req(&["segment"], &["running_balance", "running_orders"]),
+    )
+    .expect_err("inner aggregates at two grains are not answerable by one anchored CTE");
+    assert!(
+        matches!(
+            err,
+            ExpandError::RootGrainFanTrap { .. } | ExpandError::MetricFanTrap { .. }
+        ),
+        "expected a fan-trap error, got: {err}"
     );
 }
 
@@ -681,4 +828,136 @@ fn where_clause_on_a_single_grain_plan_filters_before_aggregation() {
     if let Some(group_at) = sql.find("GROUP BY") {
         assert!(where_at < Some(group_at), "WHERE before GROUP BY: {sql}");
     }
+}
+
+/// A PARENT of the base table whose metric is a bare `COUNT(*)` and which
+/// declares `UNIQUE (id)` rather than `PRIMARY KEY (id)` — the SG-8 shape, one
+/// grain UP instead of one grain down.
+///
+/// The `UNIQUE`-not-`PRIMARY KEY` detail is what makes this shape reachable
+/// through real DDL, and it is load-bearing. D-06 rejects a table that an FK
+/// references unless it declares a PRIMARY KEY **or** a UNIQUE, so a parent with
+/// neither cannot be created at all (`65_pk_error.test`). `UNIQUE` satisfies
+/// D-06, and it also makes `c` the "one" side that [`window_cte_anchor`]
+/// re-anchors toward — while leaving `pk_columns` empty, so the
+/// `COUNT(*)` → `COUNT(<pk>)` rewrite is impossible and SG-8 records the metric.
+///
+/// Declaring `c` with neither constraint would be a fixture DDL cannot produce —
+/// the same trap that made the first cut of this feature a no-op through actual
+/// DDL, so it is spelled out rather than left implicit.
+fn orders_with_unique_only_parent() -> SemanticViewDefinition {
+    let mut def = base_table(minimal_def("o", "d", "d", "m", "count(*)"), "orders", "id")
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("c", "customers", &[])
+        .with_dimension("segment", "c.segment", Some("c"))
+        .with_dimension("order_status", "o.status", Some("o"))
+        .with_metric("customer_count", "COUNT(*)", Some("c"))
+        .with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"]);
+    let c = def
+        .tables
+        .iter_mut()
+        .find(|t| t.alias == "c")
+        .expect("the fixture declares `c`");
+    c.unique_constraints = vec![vec!["id".to_string()]];
+    def
+}
+
+/// A `SUM(<inner>) OVER (PARTITION BY <dim>)` window spec.
+fn sum_over(inner: &str, partition_dim: &str) -> WindowSpec {
+    WindowSpec {
+        window_function: "SUM".to_string(),
+        inner_metric: inner.to_string(),
+        extra_args: vec![],
+        excluding_dims: vec![],
+        partition_dims: vec![partition_dim.to_string()],
+        order_by: vec![],
+        frame_clause: None,
+    }
+}
+
+/// SG-8 must not reject a query the anchor makes safe (PR #175 review).
+///
+/// `customer_count` is a bare `COUNT(*)` on the PK-less parent `customers`.
+/// Base-anchored, `FROM orders LEFT JOIN customers` would count NULL-extended
+/// rows, which is exactly what `CountStarRequiresPrimaryKey` exists to prevent —
+/// but the anchored CTE is `FROM customers`, where `COUNT(*)` counts customer
+/// rows exactly and needs no PRIMARY KEY, the same reasoning that already
+/// exempts the per-grain path.
+///
+/// This regressed on nothing — it was never answerable — but the guard ran
+/// before `window_anchor` was computed, so a subset of the shape this change set
+/// out to support still errored. Verified red before the fix, with
+/// `CountStarRequiresPrimaryKey`.
+#[test]
+fn anchored_window_count_star_needs_no_primary_key() {
+    let def = orders_with_unique_only_parent()
+        .with_metric("running_customers", "SUM(customer_count)", Some("o"))
+        .with_window_spec("running_customers", sum_over("customer_count", "segment"));
+    let sql = expand("sales", &def, &req(&["segment"], &["running_customers"]))
+        .expect("COUNT(*) at the anchored grain needs no PRIMARY KEY");
+    assert!(
+        sql.contains("FROM \"customers\" AS \"c\""),
+        "the CTE must anchor at the counted table: {sql}"
+    );
+    assert!(
+        sql.contains("COUNT(*)"),
+        "the count stays a plain COUNT(*) at its own grain: {sql}"
+    );
+    assert!(
+        !sql.contains("\"orders\""),
+        "joining the base table is what would have inflated the count: {sql}"
+    );
+}
+
+/// The invariant that makes the SG-8 bypass above sound, and the reason it is a
+/// bypass rather than a deletion.
+///
+/// A dimension BELOW the anchor's grain pulls a "many"-side join back into the
+/// anchored CTE (`FROM customers JOIN orders`), where `COUNT(*)` would count
+/// orders rather than customers. The retained metric × dimension fan-trap check
+/// rejects that shape before emission, so skipping SG-8 cannot turn a loud error
+/// into a silently inflated number — it only changes WHICH error is reported
+/// (`CountStarRequiresPrimaryKey` before, `FanTrap` now). Were that check ever
+/// dropped, this test emits inflated SQL and fails.
+#[test]
+fn anchored_window_count_star_below_its_grain_still_errors() {
+    let def = orders_with_unique_only_parent()
+        .with_metric("running_customers", "SUM(customer_count)", Some("o"))
+        .with_window_spec(
+            "running_customers",
+            sum_over("customer_count", "order_status"),
+        );
+    let err = expand(
+        "sales",
+        &def,
+        &req(&["order_status"], &["running_customers"]),
+    )
+    .expect_err("a dimension below the anchor grain re-fans the CTE");
+    assert!(
+        matches!(
+            err,
+            ExpandError::FanTrap { .. } | ExpandError::MetricFanTrap { .. }
+        ),
+        "expected a fan-trap error, got: {err}"
+    );
+}
+
+/// The same invariant for an inner `SUM` on a PK-ful parent, independent of
+/// SG-8: a dimension below the anchor's grain must error rather than emit a CTE
+/// whose fanning join re-inflates the very aggregate this change set out to fix.
+#[test]
+fn anchored_window_sum_below_its_grain_still_errors() {
+    let def = orders_with_parent_customers()
+        .with_metric("running_balance", "SUM(total_balance)", Some("o"))
+        .with_window_spec("running_balance", sum_over("total_balance", "order_status"));
+    let err = expand("sales", &def, &req(&["order_status"], &["running_balance"]))
+        .expect_err("a dimension below the anchor grain re-fans the inner SUM");
+    assert!(
+        matches!(
+            err,
+            ExpandError::FanTrap { .. } | ExpandError::MetricFanTrap { .. }
+        ),
+        "expected a fan-trap error, got: {err}"
+    );
 }

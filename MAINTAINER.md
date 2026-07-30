@@ -86,7 +86,8 @@ src/
 ├── expand/                    # Query expansion: definition + QueryRequest → SQL (pure, always compiled)
 │   ├── mod.rs resolution.rs join_resolver.rs sql_gen.rs select_spec.rs types.rs
 │   ├── facts.rs fan_trap.rs semi_additive.rs window.rs wildcard.rs role_playing.rs materialization.rs
-│   ├── per_grain.rs           #   multi-grain queries: one CTE per metric grain, joined (Snowflake parity)
+│   ├── per_grain.rs           #   multi-grain queries: one CTE per metric grain, joined (Snowflake parity);
+│   │                          #   also `window_cte_anchor`, which picks the grain window.rs anchors __sv_agg at
 │   └── tests_*.rs             #   behaviour-named extracted test modules
 ├── catalog/                   # Reads/writes of semantic_layer._definitions
 │   ├── mod.rs                 #   CatalogReader (fresh-per-call connection) + RAII PreparedStmt/QueryResult guards

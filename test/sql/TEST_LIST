@@ -82,3 +82,4 @@ test/sql/readonly_load.test
 test/sql/rt_weird_names.test
 test/sql/v080_transactional_ddl.test
 test/sql/where_clause.test
+test/sql/window_own_grain.test

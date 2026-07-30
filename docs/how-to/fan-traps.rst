@@ -200,11 +200,19 @@ base-anchored join does not.
    The per-grain path is entered only where the query would otherwise have been
    rejected.
 
-Multi-grain queries involving **window metrics**, **active semi-additive
-metrics** (``NON ADDITIVE BY`` with a snapshot dimension outside the query), or
-**role-playing** (``USING``) resolution are not computed per-grain and keep
-raising the fan-trap error. Their own strategies are anchored at the base table;
-query those metrics at a single grain.
+A **window metric** whose inner aggregate lives on a non-base table *is*
+computed at its own grain: the ``__sv_agg`` CTE is anchored at that table, so the
+inner aggregate sees one row per record there instead of one per base-table row.
+The window function itself is unaffected — it runs over the already-grouped CTE.
+Two window metrics whose inner aggregates sit at **different** grains still raise
+the fan-trap error, because those grains would have to be joined before the
+window runs.
+
+Multi-grain queries involving **active semi-additive metrics** (``NON ADDITIVE
+BY`` with a snapshot dimension outside the query) or **role-playing** (``USING``)
+resolution are not computed per-grain and keep raising the fan-trap error. Their
+own strategies are anchored at the base table; query those metrics at a single
+grain.
 
 
 .. _howto-fan-other-shapes:
