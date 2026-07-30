@@ -1457,15 +1457,64 @@ mod tests {
         assert_eq!(ddl1, ddl2, "Round-trip DDL should be identical");
     }
 
+    /// Covers BOTH member kinds, and locates each clause rather than just
+    /// asserting the string appears somewhere: the previous version of this test
+    /// flagged only `dimensions[0]` despite its name, so fact rendering was
+    /// never actually exercised here (PR #174 review).
     #[test]
     fn test_labels_filter_renders_on_dimension_and_fact() {
         let mut def = minimal_def();
+        def.facts.push(crate::model::Fact {
+            name: "is_large".to_string(),
+            expr: "o.amount > 100".to_string(),
+            source_table: Some("o".to_string()),
+            is_filter: true,
+            ..Default::default()
+        });
         def.dimensions[0].is_filter = true;
         let ddl = render_create_ddl("sv", &def).unwrap();
-        assert!(
-            ddl.contains("LABELS = (FILTER)"),
-            "dimension filter must render: {ddl}"
+
+        assert_eq!(
+            ddl.matches("LABELS = (FILTER)").count(),
+            2,
+            "one per labelled member, dimension AND fact: {ddl}"
         );
+        // Anchor each occurrence to its own member so a regression that renders
+        // both on one entry (or drops the fact wiring) cannot pass.
+        assert!(
+            ddl.contains(&format!(
+                "{} LABELS = (FILTER)",
+                def.dimensions[0].expr.clone()
+            )),
+            "dimension filter must render on the dimension entry: {ddl}"
+        );
+        assert!(
+            ddl.contains("o.amount > 100 LABELS = (FILTER)"),
+            "fact filter must render on the fact entry: {ddl}"
+        );
+    }
+
+    /// A labelled fact alongside an UNlabelled one: only the flagged member
+    /// gets the clause.
+    #[test]
+    fn test_labels_renders_only_on_the_flagged_fact() {
+        let mut def = minimal_def();
+        def.facts.push(crate::model::Fact {
+            name: "plain".to_string(),
+            expr: "o.amount".to_string(),
+            source_table: Some("o".to_string()),
+            ..Default::default()
+        });
+        def.facts.push(crate::model::Fact {
+            name: "flagged".to_string(),
+            expr: "o.amount > 100".to_string(),
+            source_table: Some("o".to_string()),
+            is_filter: true,
+            ..Default::default()
+        });
+        let ddl = render_create_ddl("sv", &def).unwrap();
+        assert_eq!(ddl.matches("LABELS = (FILTER)").count(), 1, "{ddl}");
+        assert!(ddl.contains("o.amount > 100 LABELS = (FILTER)"), "{ddl}");
     }
 
     #[test]

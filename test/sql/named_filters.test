@@ -311,6 +311,37 @@ CREATE SEMANTIC VIEW nf_bad AS
 Unsupported label 'TAG'
 
 # ============================================================
+# Test 8b: LABELS only means something on a FACT or DIMENSION. The annotation
+# tail is parsed by one shared routine that TABLES, METRICS and the view-level
+# trailing COMMENT also use, so without an explicit guard `LABELS = (FILTER)`
+# would be ACCEPTED there and then dropped on the floor — the definition would
+# round-trip having silently lost it, which is exactly what rejecting an
+# unsupported label is meant to prevent. Each context rejects it instead.
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW nf_bad AS
+  TABLES (o AS nf_orders PRIMARY KEY (id))
+  METRICS (o.revenue AS sum(o.amount) LABELS = (FILTER));
+----
+LABELS is not valid on a metric
+
+statement error
+CREATE SEMANTIC VIEW nf_bad AS
+  TABLES (o AS nf_orders PRIMARY KEY (id) LABELS = (FILTER))
+  METRICS (o.revenue AS sum(o.amount));
+----
+LABELS is not valid on a table
+
+statement error
+CREATE SEMANTIC VIEW nf_bad AS
+  TABLES (o AS nf_orders PRIMARY KEY (id))
+  METRICS (o.revenue AS sum(o.amount))
+  COMMENT = 'v' LABELS = (FILTER);
+----
+LABELS is not valid at the view level
+
+# ============================================================
 # Test 9: a filter whose expression is not BOOLEAN is not rejected at define
 # time — we cannot type an expression without a binder, so DuckDB's own type
 # error surfaces at query time rather than a guess at CREATE.

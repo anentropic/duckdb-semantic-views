@@ -206,6 +206,16 @@ fn parse_single_table_entry(entry: &str, entry_offset: usize) -> Result<TableRef
             position: Some(entry_offset),
         });
     }
+    // The shared annotation parser also understands `LABELS`, which only means
+    // something on a fact or dimension. `TableRef` carries no `is_filter`, so
+    // accepting it here would silently discard it on the way to the model.
+    if annotations.is_filter {
+        return Err(ParseError {
+            message: "LABELS is not valid on a table; it applies to facts and dimensions."
+                .to_string(),
+            position: Some(entry_offset),
+        });
+    }
 
     Ok(TableRef {
         alias: alias.to_string(),

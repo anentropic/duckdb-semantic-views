@@ -106,6 +106,11 @@ Syntax
    clauses separated by whitespace. Trailing junk or a repeated clause is a
    parse error rather than being silently ignored.
 
+   ``LABELS`` is accepted only on a ``FACTS`` or ``DIMENSIONS`` entry -- those
+   are the entries that carry the flag. On a ``TABLES`` or ``METRICS`` entry, or
+   in the trailing view-level annotation position, it is rejected rather than
+   parsed and discarded.
+
 **YAML body (FROM YAML):**
 
 .. versionadded:: 0.7.0

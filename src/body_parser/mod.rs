@@ -463,6 +463,13 @@ fn split_trailing_view_comment(
             position: Some(base_offset + comment_tok.start),
         });
     }
+    if ann.is_filter {
+        return Err(ParseError {
+            message: "LABELS is not valid at the view level; it applies to facts and dimensions."
+                .to_string(),
+            position: Some(base_offset + comment_tok.start),
+        });
+    }
     Ok((&after_as[..comment_tok.start], ann.comment))
 }
 

@@ -186,6 +186,8 @@ The label is **declarative metadata**, not an access restriction or a resolution
 
 ``FILTER`` is the only supported label. Any other value (Snowflake's tags, for instance) is rejected at ``CREATE`` rather than silently dropped, so a definition cannot round-trip having quietly lost a label you wrote.
 
+``LABELS`` is likewise valid **only on a fact or a dimension**. Writing it on a table, on a metric, or as a view-level annotation is rejected for the same reason: those entries carry no filter flag, so accepting it there would mean discarding it on the way to storage.
+
 
 .. _howto-annotations-inspect:
 
@@ -251,6 +253,9 @@ Troubleshooting
 
 **Unsupported label**
    ``FILTER`` is the only value accepted in ``LABELS = (...)``. Snowflake's tags and other label values are rejected at ``CREATE`` -- deliberately, so a definition cannot round-trip having quietly lost a label. Remove the unsupported value to create the view.
+
+**LABELS rejected on a table, metric, or the view itself**
+   ``LABELS`` applies only to facts and dimensions -- they are the entries that carry the filter flag. On a ``TABLES`` or ``METRICS`` entry, or in the trailing view-level annotation position, it raises *LABELS is not valid on a ...*. Move the annotation to the fact or dimension you meant to mark.
 
 **A named filter still shows up in query output**
    Expected. ``LABELS = (FILTER)`` declares intent and drives introspection; it does not hide the member. Use ``PRIVATE`` (facts and metrics only) to make an item unqueryable.
