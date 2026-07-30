@@ -170,6 +170,48 @@ SELECT * FROM semantic_view('wog_sv', metrics := ['seg_balance'], dimensions := 
 ----
 fan trap detected
 
+# ============================================================
+# Test 8 (PR #175 review): the SG-8 interaction. `c` declares UNIQUE (id)
+# instead of PRIMARY KEY (id) — enough to satisfy D-06 as an FK target and
+# enough to make it the "one" side the CTE re-anchors toward, but it leaves
+# `pk_columns` empty so `COUNT(*)` cannot be rewritten to `COUNT(<pk>)`.
+#
+# Base-anchored, that COUNT(*) would count NULL-extended join rows, which is
+# exactly what `CountStarRequiresPrimaryKey` (SG-8) exists to prevent. Anchored
+# at the customer grain there are no such rows: it counts customers exactly, so
+# the guard must not fire. It ran before the anchor was decided, so this shape
+# still errored.
+#
+# ENT has 2 customers and SMB 1. Base-anchoring would have counted ORDERS per
+# segment instead — ENT 4, SMB 2 — the inflation the anchor removes.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW wog_uniq AS
+  TABLES (
+    o AS wog_orders PRIMARY KEY (id),
+    c AS wog_customers UNIQUE (id)
+  )
+  RELATIONSHIPS (
+    order_customer AS o(customer_id) REFERENCES c(id)
+  )
+  DIMENSIONS (
+    c.segment AS c.segment
+  )
+  METRICS (
+    c.cust_count AS count(*),
+    o.seg_custs AS SUM(cust_count) OVER (PARTITION BY segment)
+  );
+
+query TI rowsort
+SELECT * FROM semantic_view('wog_uniq', metrics := ['seg_custs'], dimensions := ['segment']);
+----
+ENT	2
+SMB	1
+
+statement ok
+DROP SEMANTIC VIEW wog_uniq;
+
 # Cleanup
 statement ok
 DROP SEMANTIC VIEW wog_sv;

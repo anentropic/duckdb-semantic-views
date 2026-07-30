@@ -406,6 +406,13 @@ pub fn expand(
     // them exist only to guard the base-anchored topology.
     let grain_plan = super::per_grain::plan(def, &resolved_dims, &resolved_mets, &resolved.exprs);
 
+    // An all-window query whose inner aggregate lives at a non-root grain is
+    // answered by anchoring `__sv_agg` there instead of at the base table
+    // (TECH-DEBT #36). Decided BEFORE the checks below, because the checks the
+    // anchor supersedes are the ones that would otherwise reject this shape —
+    // the same reason `grain_plan` is decided before them.
+    let window_anchor = super::per_grain::window_cte_anchor(def, &resolved_dims, &resolved_mets);
+
     // SG-8: fail loudly when a REQUESTED metric (directly, via a derived
     // metric, or as a window metric's inner aggregate) depends on a COUNT(*)
     // that could not be rewritten to COUNT(<pk>) — a non-base source table
@@ -415,7 +422,17 @@ pub fn expand(
     // On the per-grain path there is no such row: the metric's table anchors
     // its own CTE instead of being LEFT JOINed to the base table, so a bare
     // COUNT(*) counts exactly that table's rows and needs no PRIMARY KEY.
-    if grain_plan.is_none() && !resolved.count_star_no_pk.is_empty() {
+    //
+    // An anchored window CTE removes the row for the same reason: `__sv_agg`
+    // anchors at the inner aggregate's own table, so a bare COUNT(*) there
+    // counts exactly that table's rows. The one shape that would re-fan it is a
+    // dimension BELOW the anchor's grain, which pulls a "many"-side join back
+    // into the CTE — and the retained metric × dimension fan-trap check below
+    // rejects that before emission (`anchored_window_count_star_...` pair in
+    // `tests_per_grain`). PR #175 review: without this the guard rejected
+    // eligible anchored-window queries, because it ran while `window_anchor`
+    // was still computed further down.
+    if grain_plan.is_none() && window_anchor.is_none() && !resolved.count_star_no_pk.is_empty() {
         for met in &resolved_mets {
             for name in collect_transitive_metric_names(met, &def.metrics) {
                 if let Some(table_alias) = resolved.count_star_no_pk.get(&name) {
@@ -434,13 +451,6 @@ pub fn expand(
         }
     }
     let resolved_exprs = resolved.exprs;
-
-    // An all-window query whose inner aggregate lives at a non-root grain is
-    // answered by anchoring `__sv_agg` there instead of at the base table
-    // (TECH-DEBT #36). Decided BEFORE the fence, because the two checks the
-    // anchor supersedes are the ones that would otherwise reject this shape —
-    // the same reason `grain_plan` is decided before it.
-    let window_anchor = super::per_grain::window_cte_anchor(def, &resolved_dims, &resolved_mets);
 
     // Phase 31: Check for fan traps before generating SQL. In per-grain mode the
     // fence keeps only the metric × dimension check — the other two guard the
