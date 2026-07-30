@@ -37,12 +37,14 @@ Syntax
        [ PRIVATE ] <alias>.<fact_name> AS <row_level_expression>
            [ COMMENT = '<text>' ]
            [ WITH SYNONYMS = ( '<synonym>' [, '<synonym>' ...] ) ]
+           [ LABELS = ( FILTER ) ]
        [, ... ]
    ) ]
    [ DIMENSIONS (
        <alias>.<dim_name> AS <expression>
            [ COMMENT = '<text>' ]
            [ WITH SYNONYMS = ( '<synonym>' [, '<synonym>' ...] ) ]
+           [ LABELS = ( FILTER ) ]
        [, ... ]
    ) ]
    [ METRICS (
@@ -92,6 +94,22 @@ Syntax
      public is the default). ``PRIVATE`` on a dimension is still rejected rather
      than silently downgraded.
    - ``WITH SYNONYMS (...)`` is accepted **without** the ``=``.
+   - ``LABELS (...)`` is likewise accepted **without** the ``=``.
+
+.. note::
+
+   **Annotation order.** ``COMMENT``, ``WITH SYNONYMS`` and ``LABELS`` may
+   appear in any order on a single entry; the grammar above shows one
+   canonical spelling, not a required sequence. What *is* required is that the
+   annotations be contiguous and complete: once the first annotation keyword is
+   seen, the remainder of the entry must consist only of valid annotation
+   clauses separated by whitespace. Trailing junk or a repeated clause is a
+   parse error rather than being silently ignored.
+
+   ``LABELS`` is accepted only on a ``FACTS`` or ``DIMENSIONS`` entry -- those
+   are the entries that carry the flag. On a ``TABLES`` or ``METRICS`` entry, or
+   in the trailing view-level annotation position, it is rejected rather than
+   parsed and discarded.
 
 **YAML body (FROM YAML):**
 
@@ -171,7 +189,7 @@ Declares the physical tables available to the semantic view. Each entry assigns 
 - ``<table_name>``, the physical table name. Supports catalog-qualified names (``catalog.schema.table``).
 - ``PRIMARY KEY (<column>, ...)``, optional. One or more columns forming the table's primary key. Used for JOIN synthesis and cardinality inference. This is semantic metadata, not a DuckDB constraint. Omit for fact tables that do not need to be join targets.
 - ``COMMENT = '<text>'``, optional. A human-readable description of the table.
-- ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability. Must come after COMMENT if both are present.
+- ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability. May be written before or after ``COMMENT`` when both are present.
 
 **Optional: UNIQUE constraints:**
 
@@ -249,6 +267,7 @@ Declares named row-level expressions. Facts are inlined into metric expressions 
 - ``<row_level_expression>``, the SQL expression **after** ``AS``: any expression that operates on individual rows. Must not contain aggregate functions. A fact may be named after its own backing column (``s.unit_price AS s.unit_price``), giving a passthrough fact.
 - ``COMMENT = '<text>'``, optional. A human-readable description.
 - ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability.
+- ``LABELS = (FILTER)``, optional. Declares the fact a :ref:`named filter <howto-annotations-filters>` — a boolean-valued member meant for reuse in a query's ``where_clause``. Metadata only: it does not restrict querying, and the ``BOOLEAN`` requirement is enforced by DuckDB's binder at query time. ``FILTER`` is the only accepted label.
 
 **Fact chaining:**
 
@@ -282,6 +301,7 @@ Declares named grouping expressions available for queries.
 - ``<expression>``, any SQL expression. Can be a simple column reference (``o.region``) or a computed expression (``date_trunc('month', o.ordered_at)``).
 - ``COMMENT = '<text>'``, optional. A human-readable description.
 - ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability.
+- ``LABELS = (FILTER)``, optional. Declares the dimension a :ref:`named filter <howto-annotations-filters>` — a boolean-valued member meant for reuse in a query's ``where_clause``. Metadata only: it does not hide the dimension from output, and the ``BOOLEAN`` requirement is enforced by DuckDB's binder at query time. ``FILTER`` is the only accepted label.
 
 .. note::
 

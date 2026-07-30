@@ -2383,7 +2383,7 @@ mod tests {
         let outer = &sql[cte_end..];
 
         assert!(
-            cte.contains("WHERE report_date >= DATE '2024-01-01'"),
+            cte.contains("WHERE (report_date) >= DATE '2024-01-01'"),
             "predicate must be inside the snapshot CTE: {sql}"
         );
         assert!(

@@ -17,9 +17,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The predicate is applied before aggregation on **every** emission path: before the `GROUP BY` on the base-anchored and fact paths, inside *each* grain CTE for a multi-grain query, inside the `__sv_snapshot` CTE *before* the `RANK` for a semi-additive metric (so filtering changes which row wins the snapshot, which is what "before the metrics are computed" has to mean there), and inside `__sv_agg` before a window function runs. Tables named only by the predicate are joined into whichever CTE evaluates it.
 
+  Each member's expression is substituted **parenthesized**, so a member that binds looser than its surrounding context keeps its grouping: a filter defined as `o.country = 'US' OR o.country = 'EU'` used as `where_clause := 'us_or_eu AND is_large'` means `(US OR EU) AND large`, not the `US OR (EU AND large)` that a bare textual splice would have produced. The visible consequence is a redundant but harmless `WHERE (o.region) = 'EU'` when a member's expression is a plain column.
+
+- **Named filters — `LABELS = (FILTER)` on a fact or dimension**, matching Snowflake. A named filter is a boolean-valued member that exists to be reused in a query's pre-aggregation predicate rather than selected as output: declare `o.is_domestic AS o.country = 'US' LABELS = (FILTER)` once, then query `where_clause := 'is_domestic AND is_large'`. The annotation sits alongside `COMMENT` and `WITH SYNONYMS` in any order, accepts the `=`-less `LABELS (FILTER)` spelling like `WITH SYNONYMS`, and survives a full round-trip through `GET_DDL`, YAML export, and `DESCRIBE SEMANTIC VIEW` — which reports it as a `LABELS` property row valued `["FILTER"]`, emitted only on labelled members. `SHOW SEMANTIC DIMENSIONS` / `FACTS` keep their existing eight columns; as with `ACCESS_MODIFIER`, the per-member flag is reported through `DESCRIBE`.
+
+  `LABELS` is accepted only on a fact or dimension entry. The annotation tail is parsed by one shared routine that `TABLES`, `METRICS` and the view-level trailing `COMMENT` also use, so each of those rejects `LABELS` explicitly rather than parsing it and discarding it — the same reasoning that rejects an unrecognised label.
+
+  The label declares *intent* and drives introspection — it does not change resolution or restrict access. `where_clause` already substituted any declared fact or dimension name, and a labelled member remains selectable as an ordinary dimension or fact (use `PRIVATE` to make something unqueryable). The `BOOLEAN` requirement is enforced by DuckDB's binder when the filter is first used, not at `CREATE`: typing an arbitrary SQL expression needs a binder, so a non-boolean filter raises DuckDB's own type error at query time rather than a guess at define time. Labels other than `FILTER` — Snowflake's tags, for instance — are **rejected** rather than ignored, so a definition cannot round-trip having quietly lost a label you wrote.
+
 ### Changed
 
 - DuckDB version pin bumped to `v1.5.5`.
+
+### Fixed
+
+- Corrected the documented annotation order: `COMMENT`, `WITH SYNONYMS` and `LABELS` may appear in **any** order on an entry. The DDL reference and the metadata-annotations how-to previously stated that `COMMENT` must precede `WITH SYNONYMS` and that the reverse was a parse error; the parser has always accepted either order, requiring only that the annotation region be tiled by recognized clauses with no leftover text.
 
 ## [0.12.0] - 2026-07-28
 

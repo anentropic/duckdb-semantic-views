@@ -251,7 +251,10 @@ fn collect_relationship_rows(
 
 /// Collect FACT property rows from the definition.
 ///
-/// Each fact emits: `TABLE`, `EXPRESSION`, `DATA_TYPE`.
+/// Each fact emits: `TABLE`, `EXPRESSION`, `DATA_TYPE`, `ACCESS_MODIFIER`, plus
+/// `COMMENT` / `SYNONYMS` / `LABELS` when set. `LABELS` is `["FILTER"]` for a
+/// named filter — like `ACCESS_MODIFIER`, it is surfaced here rather than as a
+/// `SHOW SEMANTIC FACTS` column, which stays at its 8 Snowflake-aligned columns.
 fn collect_fact_rows(
     def: &SemanticViewDefinition,
     base_table: &str,
@@ -304,6 +307,15 @@ fn collect_fact_rows(
                 property_value: format_json_array(&fact.synonyms),
             });
         }
+        if fact.is_filter {
+            rows.push(DescribeRow {
+                object_kind: "FACT".to_string(),
+                object_name: fact.name.clone(),
+                parent_entity: parent.clone(),
+                property: "LABELS".to_string(),
+                property_value: format_json_array(&["FILTER".to_string()]),
+            });
+        }
         rows.push(DescribeRow {
             object_kind: "FACT".to_string(),
             object_name: fact.name.clone(),
@@ -319,7 +331,8 @@ fn collect_fact_rows(
 
 /// Collect DIMENSION property rows from the definition.
 ///
-/// Each dimension emits: `TABLE`, `EXPRESSION`, `DATA_TYPE`.
+/// Each dimension emits: `TABLE`, `EXPRESSION`, `DATA_TYPE`, plus `COMMENT` /
+/// `SYNONYMS` / `LABELS` when set. `LABELS` is `["FILTER"]` for a named filter.
 fn collect_dimension_rows(
     def: &SemanticViewDefinition,
     base_table: &str,
@@ -367,9 +380,18 @@ fn collect_dimension_rows(
             rows.push(DescribeRow {
                 object_kind: "DIMENSION".to_string(),
                 object_name: dim.name.clone(),
-                parent_entity: parent,
+                parent_entity: parent.clone(),
                 property: "SYNONYMS".to_string(),
                 property_value: format_json_array(&dim.synonyms),
+            });
+        }
+        if dim.is_filter {
+            rows.push(DescribeRow {
+                object_kind: "DIMENSION".to_string(),
+                object_name: dim.name.clone(),
+                parent_entity: parent,
+                property: "LABELS".to_string(),
+                property_value: format_json_array(&["FILTER".to_string()]),
             });
         }
     }
@@ -722,6 +744,117 @@ mod tests {
         assert_eq!(
             na_row.property_value, "snap_date DESC NULLS LAST",
             "NULLS LAST must be explicit (previously omitted)"
+        );
+    }
+
+    /// Build a one-table def with one dimension and one fact, each flagged as a
+    /// named filter per the arguments.
+    fn filter_def(dim_is_filter: bool, fact_is_filter: bool) -> SemanticViewDefinition {
+        use crate::model::{Dimension, Fact, TableRef};
+        SemanticViewDefinition {
+            tables: vec![TableRef {
+                alias: "o".to_string(),
+                table: "orders".to_string(),
+                pk_columns: vec!["id".to_string()],
+                ..Default::default()
+            }],
+            dimensions: vec![Dimension {
+                name: "is_domestic".to_string(),
+                expr: "o.country = 'US'".to_string(),
+                source_table: Some("o".to_string()),
+                is_filter: dim_is_filter,
+                ..Default::default()
+            }],
+            facts: vec![Fact {
+                name: "is_large".to_string(),
+                expr: "o.amount > 100".to_string(),
+                source_table: Some("o".to_string()),
+                is_filter: fact_is_filter,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A named filter surfaces as a `LABELS` property row valued `["FILTER"]`.
+    /// Like `ACCESS_MODIFIER`, this is a DESCRIBE property row rather than a new
+    /// `SHOW` column — `SHOW SEMANTIC {DIMENSIONS,FACTS}` stays at its 8
+    /// Snowflake-aligned columns.
+    #[test]
+    fn labels_property_row_emitted_for_filter_dimension_and_fact() {
+        let def = filter_def(true, true);
+        let alias_map = def.alias_to_table_map();
+        let mut rows = Vec::new();
+        collect_dimension_rows(&def, "orders", &alias_map, &mut rows);
+        collect_fact_rows(&def, "orders", &alias_map, &mut rows);
+
+        let dim_row = rows
+            .iter()
+            .find(|r| r.object_kind == "DIMENSION" && r.property == "LABELS")
+            .expect("dimension should have a LABELS row");
+        assert_eq!(dim_row.object_name, "is_domestic");
+        assert_eq!(dim_row.property_value, r#"["FILTER"]"#);
+        assert_eq!(dim_row.parent_entity, "orders");
+
+        let fact_row = rows
+            .iter()
+            .find(|r| r.object_kind == "FACT" && r.property == "LABELS")
+            .expect("fact should have a LABELS row");
+        assert_eq!(fact_row.object_name, "is_large");
+        assert_eq!(fact_row.property_value, r#"["FILTER"]"#);
+        assert_eq!(fact_row.parent_entity, "orders");
+    }
+
+    /// A non-filter member emits no `LABELS` row at all, matching how `COMMENT`
+    /// and `SYNONYMS` are omitted when unset rather than emitted empty.
+    #[test]
+    fn no_labels_row_when_member_is_not_a_filter() {
+        let def = filter_def(false, false);
+        let alias_map = def.alias_to_table_map();
+        let mut rows = Vec::new();
+        collect_dimension_rows(&def, "orders", &alias_map, &mut rows);
+        collect_fact_rows(&def, "orders", &alias_map, &mut rows);
+        assert!(
+            !rows.iter().any(|r| r.property == "LABELS"),
+            "no spurious LABELS row for a plain member"
+        );
+    }
+
+    /// The flag is per-member: flagging the dimension must not label the fact.
+    #[test]
+    fn labels_row_is_per_member() {
+        let def = filter_def(true, false);
+        let alias_map = def.alias_to_table_map();
+        let mut rows = Vec::new();
+        collect_dimension_rows(&def, "orders", &alias_map, &mut rows);
+        collect_fact_rows(&def, "orders", &alias_map, &mut rows);
+        let labelled: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.property == "LABELS")
+            .map(|r| r.object_kind.as_str())
+            .collect();
+        assert_eq!(labelled, vec!["DIMENSION"]);
+    }
+
+    /// The fact `ACCESS_MODIFIER` row is emitted last and consumes the parent
+    /// entity; inserting `LABELS` ahead of it must not disturb either row.
+    #[test]
+    fn labels_row_precedes_access_modifier_and_both_keep_their_parent() {
+        let def = filter_def(false, true);
+        let alias_map = def.alias_to_table_map();
+        let mut rows = Vec::new();
+        collect_fact_rows(&def, "orders", &alias_map, &mut rows);
+        let props: Vec<&str> = rows.iter().map(|r| r.property.as_str()).collect();
+        let labels_at = props.iter().position(|p| *p == "LABELS").expect("LABELS");
+        let access_at = props
+            .iter()
+            .position(|p| *p == "ACCESS_MODIFIER")
+            .expect("ACCESS_MODIFIER");
+        assert!(labels_at < access_at, "LABELS before ACCESS_MODIFIER");
+        assert_eq!(rows[access_at].property_value, "PUBLIC");
+        assert!(
+            rows.iter().all(|r| r.parent_entity == "orders"),
+            "every fact row keeps its parent entity"
         );
     }
 }

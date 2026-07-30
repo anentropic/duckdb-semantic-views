@@ -102,6 +102,7 @@ fn inline_derived_with_facts() {
         output_type: None,
         comment: None,
         synonyms: vec![],
+        is_filter: false,
         access: AccessModifier::Public,
     }];
     let topo_order = toposort_facts(&facts).unwrap();
@@ -387,6 +388,7 @@ fn expand_derived_metric_with_facts_chain() {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         }],
         materializations: vec![],

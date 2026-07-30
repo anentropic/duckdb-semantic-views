@@ -144,6 +144,8 @@ Rows appear in definition order: ``SEMANTIC_VIEW`` (when comment is set), then `
         - The fact comment text. Only emitted when a comment is set.
       * - ``SYNONYMS``
         - JSON array of synonym strings. Only emitted when synonyms are set.
+      * - ``LABELS``
+        - ``["FILTER"]`` when the fact is declared a :ref:`named filter <howto-annotations-filters>` with ``LABELS = (FILTER)``. Only emitted when labelled.
       * - ``ACCESS_MODIFIER``
         - ``PUBLIC`` or ``PRIVATE``. Always emitted.
 
@@ -166,6 +168,8 @@ Rows appear in definition order: ``SEMANTIC_VIEW`` (when comment is set), then `
         - The dimension comment text. Only emitted when a comment is set.
       * - ``SYNONYMS``
         - JSON array of synonym strings. Only emitted when synonyms are set.
+      * - ``LABELS``
+        - ``["FILTER"]`` when the dimension is declared a :ref:`named filter <howto-annotations-filters>` with ``LABELS = (FILTER)``. Only emitted when labelled.
 
 **METRIC**
    One block per base metric (those scoped to a table) declared in the ``METRICS`` clause:

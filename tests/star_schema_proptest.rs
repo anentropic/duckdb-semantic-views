@@ -138,6 +138,7 @@ fn build_def() -> SemanticViewDefinition {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
         },
         Dimension {
             name: "ucat".to_string(),
@@ -146,6 +147,7 @@ fn build_def() -> SemanticViewDefinition {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
         },
     ];
     let base_metric = |name: &str, expr: &str, source: Option<&str>| Metric {

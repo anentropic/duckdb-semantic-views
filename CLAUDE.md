@@ -40,6 +40,15 @@ exercises the defect — a `#[cfg(test)]`/`tests_*.rs` unit test for logic, a
 sqllogictest for anything on the extension-load → DDL → query path (added to
 `test/sql/TEST_LIST`). A "fix" landed without a failing-first test is incomplete.
 
+**Confirm the red for *each* case, not just the run.** The sqllogictest runner stops a file at
+its first failing statement, so N new cases in one `.test` file yield exactly one observed red —
+the other N-1 are unproven, and any that would have passed anyway (a vacuous test) look
+identical. The same halt masks regressions later: a break in the second case stays hidden until
+the first is repaired. When one fix needs several cases, either give each its own unit test so
+they report independently, or verify the set by reverting the fix and checking every case goes
+red. Claiming "confirmed red" for cases you did not individually watch fail is the same false
+green as the exit-code trap under "Build/test command rules" below.
+
 **Refactor coverage-forward.** A refactor must never silently reduce test
 coverage. Be alert for changes that quietly remove coverage — deleting or
 weakening an assertion, gating a test behind a feature/flag that CI doesn't
@@ -134,6 +143,12 @@ tail -100 /tmp/claude/x.log
 
 This applies to ANY command above and any cargo/just/sqllogictest invocation that runs longer
 than a few seconds.
+
+The `RC=$?` line is not decoration. In a pipeline `$?` is the **last** command's status, so
+`cmd | tail -N; echo $?` reports `tail`'s success and hides a failing gate — `cargo clippy`
+exiting 101 and `cargo fmt --check` exiting 1 both read as green that way. A hang is at least
+obvious; this failure mode silently produces a false pass you may then report as fact. Capture
+the status from the command itself, before anything else runs.
 
 **Rule 2 — Use `dangerouslyDisableSandbox: true` for the listed build/test commands when
 needed.** The project's Makefile invokes `mktemp` which writes to `/var/folders/.../T/`

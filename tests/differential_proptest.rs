@@ -154,6 +154,7 @@ fn build_def(s: &Schema) -> SemanticViewDefinition {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
         })
         .collect();
     let metrics = s

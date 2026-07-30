@@ -159,6 +159,19 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
     // Phase 43: Parse trailing annotations from expression
     let (expr, annotations) = parse_trailing_annotations(raw_expr, cur.abs_of(raw_expr))?;
 
+    // `parse_trailing_annotations` is shared with FACTS / DIMENSIONS, which is
+    // where `LABELS` means something. `Metric` carries no `is_filter`, so
+    // accepting it here would parse the label and then drop it — the definition
+    // would round-trip having silently lost what the user wrote, the exact
+    // failure rejecting an unsupported label exists to prevent.
+    if annotations.is_filter {
+        return Err(ParseError {
+            message: "LABELS is not valid on a metric; it applies to facts and dimensions."
+                .to_string(),
+            position: Some(cur.abs_of(raw_expr)),
+        });
+    }
+
     // Phase 48: Detect and parse OVER clause from the expression text.
     //   AVG(total_qty) OVER (PARTITION BY EXCLUDING d1, d2 ORDER BY d1)
     // Base the reported positions at the expression's own offset within the

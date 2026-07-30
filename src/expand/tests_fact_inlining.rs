@@ -25,6 +25,7 @@ fn toposort_facts_independent() {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         },
         Fact {
@@ -34,6 +35,7 @@ fn toposort_facts_independent() {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         },
     ];
@@ -53,6 +55,7 @@ fn toposort_facts_chain() {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         },
         Fact {
@@ -62,6 +65,7 @@ fn toposort_facts_chain() {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         },
     ];
@@ -82,6 +86,7 @@ fn toposort_facts_three_level_chain() {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         },
         Fact {
@@ -91,6 +96,7 @@ fn toposort_facts_three_level_chain() {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         },
         Fact {
@@ -100,6 +106,7 @@ fn toposort_facts_three_level_chain() {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         },
     ];
@@ -127,6 +134,7 @@ fn inline_facts_single_fact() {
         output_type: None,
         comment: None,
         synonyms: vec![],
+        is_filter: false,
         access: AccessModifier::Public,
     }];
     let order = toposort_facts(&facts).unwrap();
@@ -144,6 +152,7 @@ fn inline_facts_multi_level() {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         },
         Fact {
@@ -153,6 +162,7 @@ fn inline_facts_multi_level() {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
             access: AccessModifier::Public,
         },
     ];
@@ -170,6 +180,7 @@ fn inline_facts_preserves_parenthesization() {
         output_type: None,
         comment: None,
         synonyms: vec![],
+        is_filter: false,
         access: AccessModifier::Public,
     }];
     let order = toposort_facts(&facts).unwrap();
@@ -186,6 +197,7 @@ fn inline_facts_word_boundary_prevents_collision() {
         output_type: None,
         comment: None,
         synonyms: vec![],
+        is_filter: false,
         access: AccessModifier::Public,
     }];
     let order = toposort_facts(&facts).unwrap();
@@ -205,6 +217,7 @@ fn inline_facts_with_qualified_name_in_metric() {
         output_type: None,
         comment: None,
         synonyms: vec![],
+        is_filter: false,
         access: AccessModifier::Public,
     }];
     let order = toposort_facts(&facts).unwrap();

@@ -98,15 +98,22 @@ fn arb_dimension() -> impl Strategy<Value = Dimension> {
         proptest::option::of(arb_name()),
         proptest::option::of(arb_payload()),
         proptest::collection::vec(arb_payload(), 0..=2),
+        // VARIED, not defaulted: a generator that left `is_filter` false would
+        // make any assertion on it vacuous (CLAUDE.md), so the YAML round-trip
+        // would silently stop covering LABELS = (FILTER).
+        proptest::bool::ANY,
     )
-        .prop_map(|(name, expr, source_table, comment, synonyms)| Dimension {
-            name,
-            expr,
-            source_table,
-            output_type: None,
-            comment,
-            synonyms,
-        })
+        .prop_map(
+            |(name, expr, source_table, comment, synonyms, is_filter)| Dimension {
+                name,
+                expr,
+                source_table,
+                output_type: None,
+                comment,
+                synonyms,
+                is_filter,
+            },
+        )
 }
 
 fn arb_non_additive_dim() -> impl Strategy<Value = NonAdditiveDim> {
@@ -201,15 +208,18 @@ fn arb_fact() -> impl Strategy<Value = Fact> {
         arb_access(),
         proptest::option::of(arb_payload()),
         proptest::collection::vec(arb_payload(), 0..=2),
+        // Varied independently of `access` — see `arb_dimension`.
+        proptest::bool::ANY,
     )
         .prop_map(
-            |(name, expr, source_table, access, comment, synonyms)| Fact {
+            |(name, expr, source_table, access, comment, synonyms, is_filter)| Fact {
                 name,
                 expr,
                 source_table,
                 output_type: None,
                 comment,
                 synonyms,
+                is_filter,
                 access,
             },
         )

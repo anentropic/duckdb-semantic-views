@@ -46,6 +46,8 @@ pub(super) struct ParsedQualifiedEntry {
     pub(super) expr: String,
     pub(super) comment: Option<String>,
     pub(super) synonyms: Vec<String>,
+    /// `LABELS = (FILTER)` — the member is a named filter.
+    pub(super) is_filter: bool,
     pub(super) access: AccessModifier,
 }
 
@@ -169,6 +171,7 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
             output_type: None,
             comment: e.comment,
             synonyms: e.synonyms,
+            is_filter: e.is_filter,
             access: e.access,
         })
         .collect();
@@ -184,6 +187,7 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
             output_type: None,
             comment: e.comment,
             synonyms: e.synonyms,
+            is_filter: e.is_filter,
         })
         .collect();
 
@@ -459,6 +463,13 @@ fn split_trailing_view_comment(
             position: Some(base_offset + comment_tok.start),
         });
     }
+    if ann.is_filter {
+        return Err(ParseError {
+            message: "LABELS is not valid at the view level; it applies to facts and dimensions."
+                .to_string(),
+            position: Some(base_offset + comment_tok.start),
+        });
+    }
     Ok((&after_as[..comment_tok.start], ann.comment))
 }
 
@@ -598,6 +609,73 @@ mod tests {
             "expected a precise dollar-quote error, got: {}",
             err.message
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // LABELS is valid ONLY on a fact or dimension (PR #174 review).
+    //
+    // `parse_trailing_annotations` is shared by four call sites. Adding
+    // `is_filter` to `ParsedAnnotations` made the three that cannot store it
+    // parse `LABELS = (FILTER)` and then silently drop it — a definition would
+    // round-trip having lost what the user wrote, the exact failure that
+    // rejecting an unrecognised label exists to prevent. Each case below was
+    // confirmed to CREATE successfully (with LABELS absent from the resulting
+    // GET_DDL) before the guards landed.
+    //
+    // One test per site: the sqllogictest equivalents live in one file and the
+    // runner stops at the first failure, so a regression in the second or third
+    // guard would be masked until the first is repaired. These report
+    // independently under `cargo test`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn labels_is_rejected_on_a_metric() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    METRICS (o.revenue AS sum(o.amount) LABELS = (FILTER))";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message.contains("LABELS is not valid on a metric"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn labels_is_rejected_on_a_table() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id) LABELS = (FILTER)) \
+                    METRICS (o.revenue AS sum(o.amount))";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message.contains("LABELS is not valid on a table"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn labels_is_rejected_at_the_view_level() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    METRICS (o.revenue AS sum(o.amount)) COMMENT = 'v' LABELS = (FILTER)";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message
+                .contains("LABELS is not valid at the view level"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    /// The guards must not cost FACTS / DIMENSIONS their label — the one place
+    /// it is meant to work. Guards this pair against an over-broad rejection.
+    #[test]
+    fn labels_is_still_accepted_on_a_fact_and_a_dimension() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    FACTS (o.is_large AS o.amount > 100 LABELS = (FILTER)) \
+                    DIMENSIONS (o.is_domestic AS o.country = 'US' LABELS = (FILTER)) \
+                    METRICS (o.revenue AS sum(o.amount))";
+        let parsed = parse_keyword_body(body, 0).expect("should parse");
+        assert!(parsed.facts[0].is_filter, "fact filter flag lost");
+        assert!(parsed.dimensions[0].is_filter, "dimension filter flag lost");
     }
 
     #[test]

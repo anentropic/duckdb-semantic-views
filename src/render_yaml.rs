@@ -206,6 +206,7 @@ mod tests {
                 source_table: Some("o".to_string()),
                 comment: Some("Geographic region".to_string()),
                 synonyms: vec!["area".to_string(), "territory".to_string()],
+                is_filter: false,
                 ..Default::default()
             }],
             metrics: vec![Metric {
@@ -224,6 +225,7 @@ mod tests {
                 access: AccessModifier::Private,
                 comment: Some("Price per unit".to_string()),
                 synonyms: vec!["price_per_item".to_string()],
+                is_filter: false,
                 ..Default::default()
             }],
             comment: Some("Revenue analytics view".to_string()),
@@ -330,5 +332,69 @@ mod tests {
         let ws = reimported.metrics[1].window_spec.as_ref().unwrap();
         assert_eq!(ws.window_function, "AVG");
         assert_eq!(ws.inner_metric, "total_qty");
+    }
+
+    /// `is_filter` survives the YAML round-trip on both a dimension and a fact.
+    ///
+    /// The export is `def.clone()` through serde, so the `#[serde]` derive
+    /// already carries the field — this guards the derive rather than adding
+    /// behaviour. It would fail if the attribute were dropped or renamed, or if
+    /// `render_yaml_export` grew a strip step that reset the flag.
+    #[test]
+    fn is_filter_survives_yaml_round_trip() {
+        let def = SemanticViewDefinition {
+            tables: vec![TableRef {
+                alias: "o".to_string(),
+                table: "orders".to_string(),
+                pk_columns: vec!["id".to_string()],
+                ..Default::default()
+            }],
+            dimensions: vec![
+                Dimension {
+                    name: "is_domestic".to_string(),
+                    expr: "o.country = 'US'".to_string(),
+                    source_table: Some("o".to_string()),
+                    is_filter: true,
+                    ..Default::default()
+                },
+                Dimension {
+                    name: "region".to_string(),
+                    expr: "o.region".to_string(),
+                    source_table: Some("o".to_string()),
+                    ..Default::default()
+                },
+            ],
+            facts: vec![Fact {
+                name: "is_large".to_string(),
+                expr: "o.amount > 100".to_string(),
+                source_table: Some("o".to_string()),
+                is_filter: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let yaml = render_yaml_export(&def).unwrap();
+        assert!(yaml.contains("is_filter"), "is_filter missing: {yaml}");
+
+        let rt = SemanticViewDefinition::from_yaml("filters_roundtrip", &yaml).unwrap();
+        assert!(rt.dimensions[0].is_filter, "filter dimension lost its flag");
+        assert!(
+            !rt.dimensions[1].is_filter,
+            "plain dimension must not gain the flag"
+        );
+        assert!(rt.facts[0].is_filter, "filter fact lost its flag");
+    }
+
+    /// A definition with no filters must not emit `is_filter` at all, so YAML
+    /// exported from pre-existing views stays byte-identical
+    /// (`skip_serializing_if` on the `false` default).
+    #[test]
+    fn no_filters_emits_no_is_filter_key() {
+        let yaml = render_yaml_export(&def_with_internals()).unwrap();
+        assert!(
+            !yaml.contains("is_filter"),
+            "is_filter must be omitted when false: {yaml}"
+        );
     }
 }

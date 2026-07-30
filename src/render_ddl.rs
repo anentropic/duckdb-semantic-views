@@ -31,6 +31,17 @@ fn emit_comment(out: &mut String, comment: Option<&str>) {
     }
 }
 
+/// Append ` LABELS = (FILTER)` to `out` when the member is a named filter.
+///
+/// Emitted after COMMENT / WITH SYNONYMS so the annotation region renders in a
+/// stable order; the parser accepts the clauses in any order, so the round-trip
+/// does not depend on this choice.
+fn emit_labels(out: &mut String, is_filter: bool) {
+    if is_filter {
+        out.push_str(" LABELS = (FILTER)");
+    }
+}
+
 /// Append ` WITH SYNONYMS = ('<escaped1>', '<escaped2>')` to `out` if non-empty.
 fn emit_synonyms(out: &mut String, synonyms: &[String]) {
     if !synonyms.is_empty() {
@@ -218,6 +229,7 @@ fn emit_facts(out: &mut String, def: &SemanticViewDefinition) {
         out.push_str(&fact.expr);
         emit_comment(out, fact.comment.as_deref());
         emit_synonyms(out, &fact.synonyms);
+        emit_labels(out, fact.is_filter);
         if i + 1 < def.facts.len() {
             out.push(',');
         }
@@ -240,6 +252,7 @@ fn emit_dimensions(out: &mut String, def: &SemanticViewDefinition) {
         out.push_str(&dim.expr);
         emit_comment(out, dim.comment.as_deref());
         emit_synonyms(out, &dim.synonyms);
+        emit_labels(out, dim.is_filter);
         if i + 1 < def.dimensions.len() {
             out.push(',');
         }
@@ -1442,5 +1455,81 @@ mod tests {
         };
         let ddl2 = render_create_ddl("rt", &def2).unwrap();
         assert_eq!(ddl1, ddl2, "Round-trip DDL should be identical");
+    }
+
+    /// Covers BOTH member kinds, and locates each clause rather than just
+    /// asserting the string appears somewhere: the previous version of this test
+    /// flagged only `dimensions[0]` despite its name, so fact rendering was
+    /// never actually exercised here (PR #174 review).
+    #[test]
+    fn test_labels_filter_renders_on_dimension_and_fact() {
+        let mut def = minimal_def();
+        def.facts.push(crate::model::Fact {
+            name: "is_large".to_string(),
+            expr: "o.amount > 100".to_string(),
+            source_table: Some("o".to_string()),
+            is_filter: true,
+            ..Default::default()
+        });
+        def.dimensions[0].is_filter = true;
+        let ddl = render_create_ddl("sv", &def).unwrap();
+
+        assert_eq!(
+            ddl.matches("LABELS = (FILTER)").count(),
+            2,
+            "one per labelled member, dimension AND fact: {ddl}"
+        );
+        // Anchor each occurrence to its own member so a regression that renders
+        // both on one entry (or drops the fact wiring) cannot pass.
+        assert!(
+            ddl.contains(&format!(
+                "{} LABELS = (FILTER)",
+                def.dimensions[0].expr.clone()
+            )),
+            "dimension filter must render on the dimension entry: {ddl}"
+        );
+        assert!(
+            ddl.contains("o.amount > 100 LABELS = (FILTER)"),
+            "fact filter must render on the fact entry: {ddl}"
+        );
+    }
+
+    /// A labelled fact alongside an unlabelled one: only the flagged member
+    /// gets the clause.
+    #[test]
+    fn test_labels_renders_only_on_the_flagged_fact() {
+        let mut def = minimal_def();
+        def.facts.push(crate::model::Fact {
+            name: "plain".to_string(),
+            expr: "o.amount".to_string(),
+            source_table: Some("o".to_string()),
+            ..Default::default()
+        });
+        def.facts.push(crate::model::Fact {
+            name: "flagged".to_string(),
+            expr: "o.amount > 100".to_string(),
+            source_table: Some("o".to_string()),
+            is_filter: true,
+            ..Default::default()
+        });
+        let ddl = render_create_ddl("sv", &def).unwrap();
+        assert_eq!(ddl.matches("LABELS = (FILTER)").count(), 1, "{ddl}");
+        assert!(ddl.contains("o.amount > 100 LABELS = (FILTER)"), "{ddl}");
+    }
+
+    #[test]
+    fn test_labels_absent_renders_nothing() {
+        let def = minimal_def();
+        let ddl = render_create_ddl("sv", &def).unwrap();
+        assert!(!ddl.contains("LABELS"), "no spurious LABELS: {ddl}");
+    }
+
+    #[test]
+    fn test_emit_labels_helper() {
+        let mut out = String::new();
+        emit_labels(&mut out, false);
+        assert!(out.is_empty());
+        emit_labels(&mut out, true);
+        assert_eq!(out, " LABELS = (FILTER)");
     }
 }

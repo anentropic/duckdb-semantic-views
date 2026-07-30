@@ -124,6 +124,7 @@ fn build_def(order: SortOrder) -> SemanticViewDefinition {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
         },
         Dimension {
             name: "ts".to_string(),
@@ -132,6 +133,7 @@ fn build_def(order: SortOrder) -> SemanticViewDefinition {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
         },
     ];
     let metrics = vec![Metric {

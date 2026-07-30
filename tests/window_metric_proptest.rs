@@ -184,6 +184,7 @@ fn build_def(func: WFunc, mode: &PartMode) -> SemanticViewDefinition {
             output_type: None,
             comment: None,
             synonyms: vec![],
+            is_filter: false,
         })
         .collect();
     let (excluding_dims, partition_dims) = match mode {

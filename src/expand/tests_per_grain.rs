@@ -622,7 +622,7 @@ fn where_clause_is_injected_into_every_grain_cte() {
     let bodies = grain_cte_bodies(&sql);
     assert_eq!(bodies.len(), 2, "expected two grain CTEs: {sql}");
     for (i, body) in bodies.iter().enumerate() {
-        let where_at = body.find("WHERE c.segment = 'ENTERPRISE'");
+        let where_at = body.find("WHERE (c.segment) = 'ENTERPRISE'");
         let group_at = body.find("GROUP BY");
         assert!(
             where_at.is_some(),
@@ -676,7 +676,7 @@ fn where_clause_on_a_single_grain_plan_filters_before_aggregation() {
         where_clause: Some("segment <> 'CHURNED'".to_string()),
     };
     let sql = expand("test_view", &def, &req).unwrap();
-    let where_at = sql.find("WHERE c.segment <> 'CHURNED'");
+    let where_at = sql.find("WHERE (c.segment) <> 'CHURNED'");
     assert!(where_at.is_some(), "predicate must be emitted: {sql}");
     if let Some(group_at) = sql.find("GROUP BY") {
         assert!(where_at < Some(group_at), "WHERE before GROUP BY: {sql}");
