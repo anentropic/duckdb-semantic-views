@@ -1,0 +1,133 @@
+# USING names which role a grain CTE joins
+# (TECH-DEBT #36, role-playing sub-item, second half).
+#
+# `rpu_flights` reaches `rpu_airports` through TWO named relationships, dep and
+# arr. A dimension on `rpu_airports` is therefore ambiguous on its own — which
+# of the two does `a.city` mean? — and per-grain declined the whole query.
+#
+# A co-queried metric's `USING (dep)` answers exactly that, and the base-anchored
+# path has always honoured it (emitting `a__dep.city` and joining
+# `"airports" AS "a__dep" ON "f"."dep_code" = "a__dep"."code"`). The grain CTEs
+# now reproduce that shape, choosing the NAMED edge rather than whichever the
+# relationship list happens to declare first.
+#
+# The data is built so that dep and arr give DIFFERENT answers: a regression that
+# silently bound the other role would change the numbers, not just the alias.
+
+require semantic_views
+
+statement ok
+CREATE TABLE rpu_airports (code VARCHAR, city VARCHAR);
+
+statement ok
+CREATE TABLE rpu_flights (id INTEGER, dep_code VARCHAR, arr_code VARCHAR);
+
+statement ok
+CREATE TABLE rpu_legs (id INTEGER, flight_id INTEGER);
+
+statement ok
+INSERT INTO rpu_airports VALUES ('LHR', 'London'), ('JFK', 'New York'), ('CDG', 'Paris');
+
+# f10 LHR->JFK, f11 LHR->CDG, f12 JFK->LHR.
+#
+# By DEPARTURE city:  London 2 flights, New York 1.
+# By ARRIVAL city:    New York 1, Paris 1, London 1.
+#
+# So London = 2 is only reachable by binding `dep`; binding `arr` would give
+# London = 1 and add a Paris row.
+statement ok
+INSERT INTO rpu_flights VALUES (10, 'LHR', 'JFK'), (11, 'LHR', 'CDG'), (12, 'JFK', 'LHR');
+
+# Legs hang off flights, so `l` is a CHILD grain and `a` sits ABOVE both.
+statement ok
+INSERT INTO rpu_legs VALUES (1, 10), (2, 10), (3, 11), (4, 12);
+
+statement ok
+CREATE SEMANTIC VIEW rpu_sv AS
+  TABLES (
+    f AS rpu_flights PRIMARY KEY (id),
+    a AS rpu_airports PRIMARY KEY (code),
+    l AS rpu_legs PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    dep AS f(dep_code) REFERENCES a(code),
+    arr AS f(arr_code) REFERENCES a(code),
+    l_to_f AS l(flight_id) REFERENCES f(id)
+  )
+  DIMENSIONS (
+    a.dep_city AS a.city
+  )
+  METRICS (
+    f.flight_count USING (dep) AS count(*),
+    l.leg_count AS count(l.id)
+  );
+
+# ============================================================
+# Test 1: the new capability. Two grains — `flight_count` at the flight grain,
+# `leg_count` at the leg grain — grouped by a dimension on the role-played
+# table, with `USING (dep)` naming the role.
+#
+# This whole query used to error with `fan trap detected`.
+#
+# London departs 2 flights carrying 3 legs; New York departs 1 flight carrying
+# 1 leg. Binding `arr` instead would have produced London 1 and a Paris row.
+# ============================================================
+
+query TII rowsort
+SELECT * FROM semantic_view('rpu_sv', metrics := ['flight_count', 'leg_count'], dimensions := ['dep_city']);
+----
+London	2	3
+New York	1	1
+
+# ============================================================
+# Test 2: the scoped alias reaches the emitted SQL, in BOTH grain CTEs — the
+# join is on dep_code, and arr_code appears nowhere.
+# ============================================================
+
+query I
+SELECT count(*) FROM (
+  SELECT unnest(string_split(explain_output, chr(10))) AS plan
+  FROM (SELECT * FROM explain_semantic_view('rpu_sv', metrics := ['flight_count', 'leg_count'], dimensions := ['dep_city']))
+    AS t(explain_output)
+) WHERE plan LIKE '%arr_code%';
+----
+0
+
+# ...and the scoped alias IS joined, once per grain CTE.
+query I
+SELECT count(*) FROM (
+  SELECT unnest(string_split(explain_output, chr(10))) AS plan
+  FROM (SELECT * FROM explain_semantic_view('rpu_sv', metrics := ['flight_count', 'leg_count'], dimensions := ['dep_city']))
+    AS t(explain_output)
+) WHERE plan LIKE '%AS "a__dep" ON%';
+----
+2
+
+# ============================================================
+# Test 3: a REGRESSION GUARD, not a new capability. `flight_count` alone sits at
+# the base grain, so per-grain never engages and the base-anchored path answers
+# it exactly as it always did. It is here to pin that the widened routing does
+# not hijack such a query and change its numbers — confirmed by reverting the
+# eligibility relaxation and watching it still pass. Its independently-reporting
+# twin is the unit test
+# `single_grain_role_played_dimension_stays_on_the_base_anchored_path`.
+# ============================================================
+
+query TI rowsort
+SELECT * FROM semantic_view('rpu_sv', metrics := ['flight_count'], dimensions := ['dep_city']);
+----
+London	2
+New York	1
+
+# Cleanup
+statement ok
+DROP SEMANTIC VIEW rpu_sv;
+
+statement ok
+DROP TABLE rpu_legs;
+
+statement ok
+DROP TABLE rpu_flights;
+
+statement ok
+DROP TABLE rpu_airports;
