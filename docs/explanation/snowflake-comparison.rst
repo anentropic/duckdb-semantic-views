@@ -304,9 +304,16 @@ Two boundaries are worth knowing:
   not inflated by the base-table join. Window metrics whose inner aggregates sit
   at *different* grains still error, as those grains would need joining before the
   window runs.
-- Multi-grain queries involving **active semi-additive metrics** or
-  **role-playing (**``USING``**) resolution** are not yet computed per-grain here
-  and keep raising the fan-trap error. Snowflake computes them.
+- Multi-grain queries involving **active semi-additive metrics** are not yet
+  computed per-grain here and keep raising the fan-trap error. Snowflake
+  computes them.
+- Multi-grain queries that **reach a role-played table** — one the query's
+  dimensions or metric grains sit on, or can reach only through — likewise keep
+  the fan-trap error, because a grain CTE would have to choose between that
+  table's several relationship instances and does not yet carry the ``USING``
+  context that answers it. A definition that merely *declares* role-playing does
+  not lose per-grain emission: the test is what the query reaches, so unrelated
+  grains in the same view are computed normally.
 
 
 USING RELATIONSHIPS

@@ -43,8 +43,15 @@
 //!
 //! - a dimension **below** a metric's grain (the metric's rows genuinely fan
 //!   across the dimension's values) — `FanTrap`, raised by the fence;
-//! - *active* semi-additive metrics and role-playing (`USING`) resolution, whose
-//!   own CTE strategies are base-anchored (see `docs/`).
+//! - *active* semi-additive metrics, whose own CTE strategy is base-anchored
+//!   (see `docs/`);
+//! - a query that reaches a **role-played** table — one this query's dimensions
+//!   or metric grains sit on, or can reach only through. Which of its several
+//!   relationship instances a grain CTE should join is exactly what `USING`
+//!   answers on the base-anchored path, and the grain CTEs do not carry that
+//!   context yet. Note the scope: this is asked of the QUERY, not the
+//!   definition, so a definition that declares role-playing somewhere does not
+//!   lose per-grain emission for queries that never reach it.
 //!
 //! Window metrics are no longer in that list. [`window_cte_anchor`] picks the
 //! grain for an all-window query and `expand_window_metrics` anchors its
@@ -350,24 +357,50 @@ fn rebuild_expr(
     resolve(def, met, replacements, 0)
 }
 
-/// Whether any table is reached from the same source through more than one
-/// named relationship — role-playing.
+/// Whether role-playing is relevant to **this query** — not merely present
+/// somewhere in the definition.
 ///
 /// Which role an anchored CTE should join is exactly the question `USING`
 /// answers on the base-anchored path, and neither the per-grain grain CTEs nor
-/// the anchored window CTE carries that context, so both decline the shape.
-fn has_role_playing(def: &SemanticViewDefinition) -> bool {
-    let mut edges: HashSet<(String, String)> = HashSet::new();
-    for join in def.joins.iter().filter(|j| !j.fk_columns.is_empty()) {
-        let edge = (
-            join.from_alias.to_ascii_lowercase(),
-            join.table.to_ascii_lowercase(),
-        );
-        if !edges.insert(edge) {
-            return true; // A second relationship between the same pair.
-        }
+/// the anchored window CTE carries that context, so both still decline a query
+/// that would have to answer it.
+///
+/// The question is asked per query rather than per definition. A definition-wide
+/// test costs *every* query against a definition that declares role-playing
+/// anywhere — including queries that never reach the role-played table, whose
+/// grain CTEs join nothing ambiguous and need no role context at all. Two
+/// unrelated grains lost per-grain emission because some third table happened to
+/// be reachable by two relationships.
+///
+/// A table is ambiguous here if it *is* a role-playing target or is reachable
+/// only *through* one, which is what [`role_playing_on_path`] walks. Checking
+/// the tables the query touches also covers the joins between them: the
+/// relationship graph is a tree apart from the sanctioned role-playing
+/// multi-edge, so any node on the path between two touched tables is an ancestor
+/// of one of them, and the walk from that endpoint to the root passes through it.
+///
+/// [`role_playing_on_path`]: super::role_playing::role_playing_on_path
+fn role_playing_affects_query(
+    def: &SemanticViewDefinition,
+    resolved_dims: &[&Dimension],
+    resolved_mets: &[&Metric],
+) -> bool {
+    let mut tables: Vec<String> = resolved_dims
+        .iter()
+        .filter_map(|d| d.source_table.as_ref().map(|s| s.to_ascii_lowercase()))
+        .collect();
+    for met in resolved_mets {
+        tables.extend(metric_grain_tables(met, def));
     }
-    false
+    tables.iter().any(|table| {
+        // The view name only decorates an error that is discarded here: a
+        // definition too malformed to walk declines per-grain, and the
+        // base-anchored path this falls back to reports the real diagnostic.
+        !matches!(
+            super::role_playing::role_playing_on_path("", def, table),
+            Ok(None)
+        )
+    })
 }
 
 /// The declared table a window query's `__sv_agg` CTE should anchor at, or
@@ -407,7 +440,9 @@ pub(super) fn window_cte_anchor(
     if !resolved_mets.iter().all(|m| m.is_window()) {
         return None;
     }
-    if resolved_dims.iter().any(|d| d.source_table.is_none()) || has_role_playing(def) {
+    if resolved_dims.iter().any(|d| d.source_table.is_none())
+        || role_playing_affects_query(def, resolved_dims, resolved_mets)
+    {
         return None;
     }
     if resolved_mets
@@ -498,7 +533,7 @@ fn is_eligible(
     if resolved_dims.iter().any(|d| d.source_table.is_none()) {
         return false;
     }
-    if has_role_playing(def) {
+    if role_playing_affects_query(def, resolved_dims, resolved_mets) {
         return false;
     }
 

@@ -961,3 +961,102 @@ fn anchored_window_sum_below_its_grain_still_errors() {
         "expected a fan-trap error, got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// GRAIN-09: role-playing is a per-QUERY question, not a per-definition one
+// ---------------------------------------------------------------------------
+
+/// Base `f` (flights) reaches `a` (airports) through TWO named relationships —
+/// the role-playing shape — and separately reaches an unrelated parent `c`
+/// (carriers) through one.
+fn flights_with_role_playing_airports() -> SemanticViewDefinition {
+    base_table(minimal_def("f", "d", "d", "m", "count(*)"), "flights", "id")
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("a", "airports", &["code"])
+        .with_table("c", "carriers", &["id"])
+        .with_dimension("dep_city", "a.city", Some("a"))
+        .with_dimension("carrier_name", "c.name", Some("c"))
+        .with_metric("flight_count", "COUNT(*)", Some("f"))
+        .with_metric("fleet_size", "SUM(c.fleet)", Some("c"))
+        .with_pkfk_join("dep", "f", "a", &["dep_code"], &["code"])
+        .with_pkfk_join("arr", "f", "a", &["arr_code"], &["code"])
+        .with_pkfk_join("f_to_c", "f", "c", &["carrier_id"], &["id"])
+}
+
+/// GRAIN-09: role-playing that the query never reaches must not cost it
+/// per-grain emission.
+///
+/// Two grains (`f` and `c`) and a dimension on `c`: nothing here touches the
+/// role-played `airports`, so no grain CTE joins anything ambiguous and no role
+/// context is needed. The eligibility test used to ask a definition-level
+/// question — "does any table have two inbound relationships from one source?" —
+/// so every query against this definition lost per-grain emission and got the
+/// v0.11.0 fan-trap error, however unrelated its grains were.
+#[test]
+fn role_playing_elsewhere_in_the_definition_does_not_block_per_grain() {
+    let def = flights_with_role_playing_airports();
+    let sql = expand(
+        "flights_sv",
+        &def,
+        &req(&["carrier_name"], &["flight_count", "fleet_size"]),
+    )
+    .expect("role-playing the query never reaches must not block per-grain");
+    assert!(
+        sql.contains("__sv_grain_0") && sql.contains("__sv_grain_1"),
+        "expected one CTE per grain, got:\n{sql}"
+    );
+    assert!(
+        sql.contains(r#"FROM "carriers" AS "c""#),
+        "the carrier-grain metric must anchor at its own table, got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("airports"),
+        "the role-played table is not part of this query and must not be joined:\n{sql}"
+    );
+}
+
+/// The single-grain half of the same fix, reported independently so the
+/// sqllogictest file's halt-at-first-failure cannot leave it unproven: the
+/// carrier-grain metric queried ALONE with its own dimension is a one-CTE
+/// per-grain query, and it was declined by the definition-level test too.
+#[test]
+fn role_playing_elsewhere_does_not_block_a_single_grain_query() {
+    let def = flights_with_role_playing_airports();
+    let sql = expand("flights_sv", &def, &req(&["carrier_name"], &["fleet_size"]))
+        .expect("a single-grain parent metric must be answerable here too");
+    assert!(
+        sql.contains(r#"FROM "carriers" AS "c""#),
+        "anchored at the metric's own table, got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("flights") && !sql.contains("airports"),
+        "neither the base table nor the role-played table belongs in this CTE:\n{sql}"
+    );
+}
+
+/// The boundary the narrowed test keeps: when the query DOES reach the
+/// role-played table, per-grain still declines.
+///
+/// `dep_city` is on `airports`, reachable by both `dep` and `arr`, and no
+/// co-queried metric carries `USING` to say which. A grain CTE would have to
+/// pick an edge, and picking one silently is the declaration-order-dependent
+/// mis-binding the fence exists to prevent — so the query keeps its error until
+/// `USING` context is threaded into `anchor_joins`.
+#[test]
+fn dimension_on_a_role_playing_target_still_declines_per_grain() {
+    let def = flights_with_role_playing_airports();
+    let err = expand(
+        "flights_sv",
+        &def,
+        &req(&["dep_city"], &["flight_count", "fleet_size"]),
+    )
+    .expect_err("an unscoped dimension on a role-playing target is still declined");
+    assert!(
+        matches!(
+            err,
+            ExpandError::FanTrap { .. } | ExpandError::MetricFanTrap { .. }
+        ),
+        "expected the v0.11.0 fan-trap error, got: {err}"
+    );
+}
