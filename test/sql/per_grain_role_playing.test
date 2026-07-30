@@ -1,0 +1,123 @@
+# Role-playing is a per-QUERY question, not a per-definition one
+# (TECH-DEBT #36, role-playing sub-item, first half).
+#
+# `rp_flights` reaches `rp_airports` through TWO named relationships (dep/arr) —
+# the role-playing shape — and separately reaches `rp_carriers` through one.
+#
+# Per-grain eligibility used to ask a DEFINITION-level question: does any table
+# have two inbound relationships from one source? If so, every query against the
+# definition lost per-grain emission and got the v0.11.0 fan-trap error, however
+# unrelated its grains were to the role-played table. It now asks the query-level
+# question instead, so a query that never reaches `a` is computed.
+#
+# This file asserts the RESULTING NUMBERS, with the inflated values spelled out
+# in comments so a regression is recognisable on sight.
+
+require semantic_views
+
+statement ok
+CREATE TABLE rp_airports (code VARCHAR, city VARCHAR);
+
+statement ok
+CREATE TABLE rp_carriers (id INTEGER, name VARCHAR, fleet INTEGER);
+
+statement ok
+CREATE TABLE rp_flights (id INTEGER, dep_code VARCHAR, arr_code VARCHAR, carrier_id INTEGER);
+
+statement ok
+INSERT INTO rp_airports VALUES ('LHR', 'London'), ('JFK', 'New York'), ('CDG', 'Paris');
+
+statement ok
+INSERT INTO rp_carriers VALUES (1, 'AA', 100), (2, 'BB', 50);
+
+# Deliberately uneven flight counts per carrier — 3 and 1 — so an inflated fleet
+# sum is a different number per carrier rather than a uniform multiple.
+statement ok
+INSERT INTO rp_flights VALUES
+  (10, 'LHR', 'JFK', 1),
+  (11, 'JFK', 'LHR', 1),
+  (12, 'LHR', 'CDG', 1),
+  (20, 'CDG', 'JFK', 2);
+
+statement ok
+CREATE SEMANTIC VIEW rp_sv AS
+  TABLES (
+    f AS rp_flights PRIMARY KEY (id),
+    a AS rp_airports PRIMARY KEY (code),
+    c AS rp_carriers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    dep AS f(dep_code) REFERENCES a(code),
+    arr AS f(arr_code) REFERENCES a(code),
+    f_to_c AS f(carrier_id) REFERENCES c(id)
+  )
+  DIMENSIONS (
+    a.dep_city AS a.city,
+    c.carrier_name AS c.name
+  )
+  METRICS (
+    f.flight_count AS count(*),
+    c.fleet_size AS sum(c.fleet)
+  );
+
+# ============================================================
+# Test 1: the new capability. Two grains — `flight_count` at the flight grain,
+# `fleet_size` at the carrier grain — with a carrier-grain dimension. Nothing
+# here reaches the role-played `a`, so no grain CTE joins anything ambiguous.
+#
+# This whole query used to error with `fan trap detected`, purely because the
+# DEFINITION declared dep/arr to a table the query never mentions.
+#
+# AA flies 3 of the 4 flights and has a fleet of 100; BB flies 1 with a fleet of
+# 50. Base-anchoring would have counted the fleet once per flight — AA 300 — the
+# inflation per-grain removes.
+# ============================================================
+
+query TII rowsort
+SELECT * FROM semantic_view('rp_sv', metrics := ['flight_count', 'fleet_size'], dimensions := ['carrier_name']);
+----
+AA	3	100
+BB	1	50
+
+# ============================================================
+# Test 2: each metric alone is unchanged by the narrowed test — the carrier-grain
+# metric is computed at its own grain, the flight-grain one at the base.
+# ============================================================
+
+query TI rowsort
+SELECT * FROM semantic_view('rp_sv', metrics := ['fleet_size'], dimensions := ['carrier_name']);
+----
+AA	100
+BB	50
+
+query TI rowsort
+SELECT * FROM semantic_view('rp_sv', metrics := ['flight_count'], dimensions := ['carrier_name']);
+----
+AA	3
+BB	1
+
+# ============================================================
+# Test 3: the boundary the narrowed test keeps. `dep_city` is on the role-played
+# `a`, reachable by both `dep` and `arr`, and no co-queried metric carries USING
+# to say which. A grain CTE would have to pick an edge; picking one silently is
+# the declaration-order-dependent mis-binding the fence exists to prevent, so
+# this still errors until USING context is threaded into the grain CTEs.
+# ============================================================
+
+statement error
+SELECT * FROM semantic_view('rp_sv', metrics := ['flight_count', 'fleet_size'], dimensions := ['dep_city']);
+----
+fan trap detected
+
+# Cleanup
+statement ok
+DROP SEMANTIC VIEW rp_sv;
+
+statement ok
+DROP TABLE rp_flights;
+
+statement ok
+DROP TABLE rp_carriers;
+
+statement ok
+DROP TABLE rp_airports;

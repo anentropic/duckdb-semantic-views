@@ -404,14 +404,28 @@ pub fn expand(
     // unchanged) and for multi-grain shapes it cannot express (so those keep
     // their fan-trap error). Decided before the checks below because both of
     // them exist only to guard the base-anchored topology.
-    let grain_plan = super::per_grain::plan(def, &resolved_dims, &resolved_mets, &resolved.exprs);
+    // A `where_clause` member's tables are joined into whichever CTE evaluates
+    // the predicate, so both decisions below have to account for them alongside
+    // the dimension and metric tables.
+    let where_tables: Vec<String> = resolved_where
+        .as_ref()
+        .map(|w| w.source_tables.clone())
+        .unwrap_or_default();
+    let grain_plan = super::per_grain::plan(
+        def,
+        &resolved_dims,
+        &resolved_mets,
+        &resolved.exprs,
+        &where_tables,
+    );
 
     // An all-window query whose inner aggregate lives at a non-root grain is
     // answered by anchoring `__sv_agg` there instead of at the base table
     // (TECH-DEBT #36). Decided BEFORE the checks below, because the checks the
     // anchor supersedes are the ones that would otherwise reject this shape —
     // the same reason `grain_plan` is decided before them.
-    let window_anchor = super::per_grain::window_cte_anchor(def, &resolved_dims, &resolved_mets);
+    let window_anchor =
+        super::per_grain::window_cte_anchor(def, &resolved_dims, &resolved_mets, &where_tables);
 
     // SG-8: fail loudly when a REQUESTED metric (directly, via a derived
     // metric, or as a window metric's inner aggregate) depends on a COUNT(*)
