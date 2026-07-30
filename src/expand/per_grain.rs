@@ -45,13 +45,22 @@
 //!   across the dimension's values) — `FanTrap`, raised by the fence;
 //! - *active* semi-additive metrics, whose own CTE strategy is base-anchored
 //!   (see `docs/`);
-//! - a query that reaches a **role-played** table — one this query's dimensions,
-//!   metric grains, or `where_clause` members sit on, or can reach only through. Which of its several
-//!   relationship instances a grain CTE should join is exactly what `USING`
-//!   answers on the base-anchored path, and the grain CTEs do not carry that
-//!   context yet. Note the scope: this is asked of the QUERY, not the
-//!   definition, so a definition that declares role-playing somewhere does not
-//!   lose per-grain emission for queries that never reach it.
+//! - a query that reaches a **role-played** table without saying which role it
+//!   means. Which of the several relationship instances a grain CTE should join
+//!   is what `USING` answers, and a co-queried metric's `USING` is now honoured:
+//!   the grain CTEs join the NAMED edge under its scoped alias (`a__dep`) and
+//!   emit the dimension against it, matching the base-anchored path.
+//!
+//!   Without that context the query is still declined, and the rescue is
+//!   deliberately narrow — it covers a queried DIMENSION's own table only. A
+//!   `where_clause` member on a role-played table, a metric's own grain table, or
+//!   a table reachable only *through* a role-played one are all still declined:
+//!   only a dimension's expression is rewritten to the scoped alias, so nothing
+//!   else can say which role it means without guessing.
+//!
+//!   Note the scope: this is asked of the QUERY, not the definition, so a
+//!   definition that declares role-playing somewhere does not lose per-grain
+//!   emission for queries that never reach it.
 //!
 //! Window metrics are no longer in that list. [`window_cte_anchor`] picks the
 //! grain for an all-window query and `expand_window_metrics` anchors its
@@ -381,34 +390,110 @@ fn rebuild_expr(
 /// of one of them, and the walk from that endpoint to the root passes through it.
 ///
 /// [`role_playing_on_path`]: super::role_playing::role_playing_on_path
+/// The role each role-played table plays in **this** query: lowercased table
+/// alias -> the lowercased relationship name a co-queried metric's `USING`
+/// named for it.
+///
+/// [`find_using_context`] is the base-anchored path's answer to the same
+/// question, and reusing it is what keeps the two paths agreeing on which role a
+/// dimension means — it returns the scoped alias (`a__dep`), from which the
+/// relationship name is the suffix after `__`. Rather than re-split that string,
+/// this asks the definition directly: the relationship whose target is the
+/// dimension's table and whose scoped alias matches.
+///
+/// Only a queried DIMENSION's table is resolved. A role-played table reached
+/// only as a metric's grain, or named only by a `where_clause` member, has no
+/// dimension for `USING` to scope and stays ineligible — see
+/// [`role_playing_affects_query`].
+fn scoped_roles(
+    def: &SemanticViewDefinition,
+    resolved_dims: &[&Dimension],
+    resolved_mets: &[&Metric],
+) -> HashMap<String, String> {
+    let mut roles: HashMap<String, String> = HashMap::new();
+    for dim in resolved_dims {
+        let Some(table) = dim.source_table.as_ref().map(|t| t.to_ascii_lowercase()) else {
+            continue;
+        };
+        // The view name only decorates an error discarded here: an ambiguous
+        // dimension yields no role, so the query stays ineligible and the
+        // base-anchored path reports the real diagnostic.
+        if let Ok(Some(scoped)) =
+            super::role_playing::find_using_context("", def, dim, resolved_mets)
+        {
+            if let Some(rel) = def.joins.iter().find_map(|j| {
+                let name = j.name.as_ref()?.to_ascii_lowercase();
+                (j.table.to_ascii_lowercase() == table
+                    && super::join_resolver::scoped_join_alias(&table, &name) == scoped)
+                    .then_some(name)
+            }) {
+                roles.insert(table, rel);
+            }
+        }
+    }
+    roles
+}
+
 fn role_playing_affects_query(
     def: &SemanticViewDefinition,
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
     where_tables: &[String],
+    allow_using_scoped: bool,
 ) -> bool {
-    let mut tables: HashSet<String> = resolved_dims
+    // The view name passed to `role_playing_on_path` below only decorates an
+    // error discarded here: a definition too malformed to walk declines
+    // per-grain, and the base-anchored path it falls back to reports the real
+    // diagnostic.
+    let ambiguity = |table: &String| match super::role_playing::role_playing_on_path("", def, table)
+    {
+        Ok(v) => v,
+        Err(_) => Some(table.clone()), // Unwalkable: treat as ambiguous, decline.
+    };
+
+    // Tables that CANNOT be rescued by `USING`, so any role-playing on their
+    // path declines outright. Deduplicated: several metrics commonly share a
+    // grain, and each walk can rebuild the relationship graph.
+    //
+    // A `where_clause` member's table is joined into every grain CTE exactly
+    // like a dimension's — `anchor_joins` chains both into the sources it walks
+    // — but only a DIMENSION's expression is rewritten to a scoped alias, so a
+    // predicate naming a role-played member has no way to say which role it
+    // means and stays ineligible. A metric's grain table is likewise strict:
+    // `USING` scopes the dimension a metric is grouped BY, not the table a
+    // metric is aggregated AT.
+    let mut strict: HashSet<String> = where_tables
+        .iter()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    for met in resolved_mets {
+        strict.extend(metric_grain_tables(met, def));
+    }
+    if strict.iter().any(|t| ambiguity(t).is_some()) {
+        return true;
+    }
+
+    // A queried dimension's table may be rescued, but only when the ambiguous
+    // table is the dimension's OWN table and a co-queried metric's `USING`
+    // named its role. A table reached only THROUGH a role-played ancestor is
+    // never rescued: `find_using_context` rejects that case outright, because a
+    // descendant cannot be scoped by a co-queried metric's `USING`, so it
+    // yields no role here either.
+    let roles = if allow_using_scoped {
+        scoped_roles(def, resolved_dims, resolved_mets)
+    } else {
+        // The window path emits its own `__sv_agg` SELECT list and does not
+        // rewrite dimension expressions to scoped aliases, so it cannot honour a
+        // role even when `USING` names one. It stays strict.
+        HashMap::new()
+    };
+    let dim_tables: HashSet<String> = resolved_dims
         .iter()
         .filter_map(|d| d.source_table.as_ref().map(|s| s.to_ascii_lowercase()))
         .collect();
-    for met in resolved_mets {
-        tables.extend(metric_grain_tables(met, def));
-    }
-    // A `where_clause` member's table is joined into every grain CTE exactly
-    // like a dimension's — `anchor_joins` chains both into the sources it walks
-    // — so it is every bit as "touched" and must be tested the same way.
-    tables.extend(where_tables.iter().map(|t| t.to_ascii_lowercase()));
-    // Deduplicated: several dimensions commonly share a source table, and
-    // several metrics a grain, while each walk can rebuild the relationship
-    // graph.
-    tables.iter().any(|table| {
-        // The view name only decorates an error that is discarded here: a
-        // definition too malformed to walk declines per-grain, and the
-        // base-anchored path this falls back to reports the real diagnostic.
-        !matches!(
-            super::role_playing::role_playing_on_path("", def, table),
-            Ok(None)
-        )
+    dim_tables.iter().any(|table| match ambiguity(table) {
+        None => false,
+        Some(ambiguous) => !(ambiguous == *table && roles.contains_key(table)),
     })
 }
 
@@ -451,7 +536,7 @@ pub(super) fn window_cte_anchor(
         return None;
     }
     if resolved_dims.iter().any(|d| d.source_table.is_none())
-        || role_playing_affects_query(def, resolved_dims, resolved_mets, where_tables)
+        || role_playing_affects_query(def, resolved_dims, resolved_mets, where_tables, false)
     {
         return None;
     }
@@ -544,7 +629,7 @@ fn is_eligible(
     if resolved_dims.iter().any(|d| d.source_table.is_none()) {
         return false;
     }
-    if role_playing_affects_query(def, resolved_dims, resolved_mets, where_tables) {
+    if role_playing_affects_query(def, resolved_dims, resolved_mets, where_tables, true) {
         return false;
     }
 
@@ -552,6 +637,24 @@ fn is_eligible(
         .iter()
         .map(|d| crate::ident::normalize_ident_part(&d.name))
         .collect();
+    // A metric's `USING` is honoured only in the one shape this emitter threads:
+    // every relationship it names targets a role-played table whose role was
+    // resolved into `roles` and is therefore emitted as a scoped join. `USING`
+    // naming anything else — a relationship to a table reached only one way,
+    // where the base-anchored path still scopes the alias — is left on that
+    // path, unchanged, rather than guessed at here.
+    let roles = scoped_roles(def, resolved_dims, resolved_mets);
+    let using_is_threaded = |m: &Metric| {
+        m.using_relationships.iter().all(|rel| {
+            let rel = rel.to_ascii_lowercase();
+            def.joins.iter().any(|j| {
+                j.name
+                    .as_ref()
+                    .is_some_and(|n| n.to_ascii_lowercase() == rel)
+                    && roles.get(&j.table.to_ascii_lowercase()) == Some(&rel)
+            })
+        })
+    };
     resolved_mets.iter().all(|met| {
         super::facts::collect_transitive_metric_names(met, &def.metrics)
             .iter()
@@ -562,7 +665,7 @@ fn is_eligible(
             })
             .all(|m| {
                 !m.is_window()
-                    && m.using_relationships.is_empty()
+                    && using_is_threaded(m)
                     && !super::semi_additive::is_active_semi_additive(def, m, &queried_dim_keys)
             })
     })
@@ -582,6 +685,9 @@ pub(super) fn expand_per_grain(
     plan: &Plan,
     where_clause: Option<&ResolvedWhere>,
 ) -> String {
+    // Resolved once here and threaded into both renderers, so the join and the
+    // dimension expression cannot disagree about which role a table plays.
+    let roles = scoped_roles(def, resolved_dims, resolved_mets);
     // A cross-grain assembly always spans at least two groups, so a single-group
     // plan holds only `Direct` outputs — but check rather than assert: falling
     // through to the general emitter is correct for any plan, and a wrong
@@ -592,9 +698,23 @@ pub(super) fn expand_per_grain(
             .iter()
             .all(|o| matches!(o, Output::Direct { .. }))
     {
-        return render_single_grain(def, resolved_dims, resolved_mets, plan, where_clause);
+        return render_single_grain(
+            def,
+            resolved_dims,
+            resolved_mets,
+            plan,
+            where_clause,
+            &roles,
+        );
     }
-    render_multi_grain(def, resolved_dims, resolved_mets, plan, where_clause)
+    render_multi_grain(
+        def,
+        resolved_dims,
+        resolved_mets,
+        plan,
+        where_clause,
+        &roles,
+    )
 }
 
 /// The one-grain case: the ordinary aggregation shape, anchored at the metrics'
@@ -605,6 +725,7 @@ fn render_single_grain(
     resolved_mets: &[&Metric],
     plan: &Plan,
     where_clause: Option<&ResolvedWhere>,
+    roles: &HashMap<String, String>,
 ) -> String {
     let group = &plan.groups[0];
     let where_tables = where_clause
@@ -614,7 +735,7 @@ fn render_single_grain(
         .iter()
         .map(|dim| {
             SelectItem::new(
-                dim.expr.clone(),
+                dim_expr(dim, roles),
                 dim.output_type.clone(),
                 quote_stored_ident(&dim.name),
             )
@@ -644,7 +765,7 @@ fn render_single_grain(
         from: FromSource::AnchorTable {
             def,
             anchor: group.anchor.clone(),
-            joins: anchor_joins(def, &group.anchor, resolved_dims, &where_tables),
+            joins: anchor_joins(def, &group.anchor, resolved_dims, &where_tables, roles),
         },
         group_by,
     }
@@ -658,6 +779,7 @@ fn render_multi_grain(
     resolved_mets: &[&Metric],
     plan: &Plan,
     where_clause: Option<&ResolvedWhere>,
+    roles: &HashMap<String, String>,
 ) -> String {
     let mut sql = String::with_capacity(512);
     let where_tables = where_clause
@@ -670,7 +792,7 @@ fn render_multi_grain(
         let mut items: Vec<String> = Vec::new();
         for (d, dim) in resolved_dims.iter().enumerate() {
             let item = SelectItem::new(
-                dim.expr.clone(),
+                dim_expr(dim, roles),
                 dim.output_type.clone(),
                 quote_ident(&dim_column(d)),
             );
@@ -687,7 +809,7 @@ fn render_multi_grain(
         push_from_anchor(&mut sql, def, &group.anchor, "\n    ");
         push_join_clauses(
             &mut sql,
-            &anchor_joins(def, &group.anchor, resolved_dims, &where_tables),
+            &anchor_joins(def, &group.anchor, resolved_dims, &where_tables, roles),
             def,
             "\n    LEFT JOIN ",
         );
@@ -784,6 +906,7 @@ pub(super) fn anchor_joins<'a>(
     anchor: &str,
     resolved_dims: &[&Dimension],
     where_tables: &[String],
+    roles: &HashMap<String, String>,
 ) -> Vec<ResolvedJoin<'a>> {
     let Some(graph) = GrainGraph::build(def) else {
         return Vec::new();
@@ -803,6 +926,30 @@ pub(super) fn anchor_joins<'a>(
         };
         for pair in path.windows(2) {
             let (from, to) = (&pair[0], &pair[1]);
+            // A role-played hop is emitted under its scoped alias, joined on the
+            // relationship `USING` NAMED. `edge_between` cannot be used here: it
+            // returns whichever of the several edges is declared first, which is
+            // the declaration-order mis-binding the eligibility gate exists to
+            // keep out of this emitter.
+            if let Some(rel) = roles.get(to) {
+                let scoped = super::join_resolver::scoped_join_alias(to, rel);
+                if !emitted.insert(scoped.clone()) {
+                    continue;
+                }
+                if let Some(join) = def.joins.iter().find(|j| {
+                    j.name
+                        .as_ref()
+                        .is_some_and(|n| n.to_ascii_lowercase() == *rel)
+                }) {
+                    joins.push(ResolvedJoin {
+                        emit_alias: scoped,
+                        bare_alias: to.clone(),
+                        join,
+                        scoped: true,
+                    });
+                }
+                continue;
+            }
             if !emitted.insert(to.clone()) {
                 continue;
             }
@@ -817,6 +964,25 @@ pub(super) fn anchor_joins<'a>(
         }
     }
     joins
+}
+
+/// A queried dimension's expression as the grain CTEs must emit it: qualified by
+/// its role's scoped alias when `USING` named one, and unchanged otherwise.
+///
+/// Mirrors what the base-anchored path does with [`ResolvedDim::scoped_alias`],
+/// so both paths emit `a__dep.city` for the same query.
+fn dim_expr(dim: &Dimension, roles: &HashMap<String, String>) -> String {
+    let Some(table) = dim.source_table.as_ref().map(|t| t.to_ascii_lowercase()) else {
+        return dim.expr.clone();
+    };
+    match roles.get(&table) {
+        Some(rel) => crate::expr_tokens::rewrite_qualifier(
+            &dim.expr,
+            &table,
+            &super::join_resolver::scoped_join_alias(&table, rel),
+        ),
+        None => dim.expr.clone(),
+    }
 }
 
 /// The relationship edge connecting two adjacent tables, in either direction.

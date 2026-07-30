@@ -307,13 +307,17 @@ Two boundaries are worth knowing:
 - Multi-grain queries involving **active semi-additive metrics** are not yet
   computed per-grain here and keep raising the fan-trap error. Snowflake
   computes them.
-- Multi-grain queries that **reach a role-played table** — one the query's
-  dimensions or metric grains sit on, or can reach only through — likewise keep
-  the fan-trap error, because a grain CTE would have to choose between that
-  table's several relationship instances and does not yet carry the ``USING``
-  context that answers it. A definition that merely *declares* role-playing does
-  not lose per-grain emission: the test is what the query reaches, so unrelated
-  grains in the same view are computed normally.
+- Multi-grain queries **reaching a role-played table** are computed when a
+  co-queried metric's ``USING`` names the role: each grain CTE joins that
+  relationship under its scoped alias and groups by the dimension bound to it,
+  as the single-grain path already did. Without ``USING`` the query keeps the
+  fan-trap error, since a grain CTE would otherwise choose among the
+  relationship instances by declaration order. The rescue covers a queried
+  dimension's own table — a ``where_clause`` member on a role-played table, a
+  metric aggregated at one, or a table reachable only *through* one still error.
+  A definition that merely *declares* role-playing does not lose per-grain
+  emission: the test is what the query reaches, so unrelated grains in the same
+  view are computed normally.
 
 
 USING RELATIONSHIPS

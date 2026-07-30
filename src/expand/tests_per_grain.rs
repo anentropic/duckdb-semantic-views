@@ -1121,3 +1121,187 @@ fn where_clause_reaching_a_role_played_table_declines_per_grain() {
         "expected the base-anchored fence's error, got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// GRAIN-10: USING names which role a grain CTE joins
+// ---------------------------------------------------------------------------
+
+/// `f` (flights) base; `a` (airports) role-played via dep/arr and ABOVE both
+/// metric grains; `l` (legs) a child of `f`.
+fn flights_using_fixture() -> SemanticViewDefinition {
+    base_table(minimal_def("f", "d", "d", "m", "count(*)"), "flights", "id")
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("a", "airports", &["code"])
+        .with_table("l", "legs", &["id"])
+        .with_dimension("dep_city", "a.city", Some("a"))
+        .with_dimension("flight_status", "f.status", Some("f"))
+        .with_metric("flight_count", "COUNT(*)", Some("f"))
+        .with_metric("leg_count", "COUNT(l.id)", Some("l"))
+        .with_pkfk_join("dep", "f", "a", &["dep_code"], &["code"])
+        .with_pkfk_join("arr", "f", "a", &["arr_code"], &["code"])
+        .with_pkfk_join("l_to_f", "l", "f", &["flight_id"], &["id"])
+        .with_using_relationship("flight_count", &["dep"])
+}
+
+/// GRAIN-10: a dimension on a role-played table is answerable per-grain when a
+/// co-queried metric's `USING` names which role it means.
+///
+/// The base-anchored path already does this (see `probe`-free equivalent in the
+/// single-grain case): it emits `a__dep.city` and joins
+/// `"airports" AS "a__dep" ON "f"."dep_code" = "a__dep"."code"`. Each grain CTE
+/// has to reproduce that shape, choosing the NAMED edge rather than whichever
+/// `edge_between` happens to return first.
+#[test]
+fn using_scopes_a_role_played_dimension_in_every_grain_cte() {
+    let def = flights_using_fixture();
+    let sql = expand(
+        "flights_sv",
+        &def,
+        &req(&["dep_city"], &["flight_count", "leg_count"]),
+    )
+    .expect("USING names the role, so the grain CTEs can join it unambiguously");
+    assert!(
+        sql.contains("__sv_grain_0") && sql.contains("__sv_grain_1"),
+        "expected one CTE per grain, got:\n{sql}"
+    );
+    assert_eq!(
+        sql.matches(r#"AS "a__dep""#).count(),
+        2,
+        "each grain CTE joins the scoped role exactly once, got:\n{sql}"
+    );
+    assert!(
+        sql.contains("a__dep.city"),
+        "the dimension must be emitted against its scoped alias, got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("arr_code"),
+        "the arrival role was not named by USING and must not be joined:\n{sql}"
+    );
+}
+
+/// NOT a new capability — a guard that the widened routing does not hijack a
+/// query the base-anchored path already answered correctly.
+///
+/// `flight_count` alone sits at the BASE grain, so no per-grain treatment is
+/// needed and `plan` returns `None`; the base-anchored path emits `a__dep.city`
+/// as it always has. Verified by reverting the eligibility relaxation and
+/// watching this still pass, which is exactly why it carries no "was declined
+/// before" claim: it never was.
+#[test]
+fn single_grain_role_played_dimension_stays_on_the_base_anchored_path() {
+    let def = flights_using_fixture();
+    let sql = expand("flights_sv", &def, &req(&["dep_city"], &["flight_count"]))
+        .expect("USING names the role for a one-grain query too");
+    assert!(
+        sql.contains("a__dep.city"),
+        "the dimension binds to the named role, got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("arr_code"),
+        "the arrival role was not named and must not be joined:\n{sql}"
+    );
+}
+
+/// Guard: `USING` rescues a DIMENSION on a role-played table, not a
+/// `where_clause` member on one.
+///
+/// Only a dimension's expression is rewritten to the scoped alias; the
+/// predicate's is not. Answering this would bind the filter by declaration
+/// order, which is the regression PR #176 shipped and then fixed — this pins
+/// that the role-threading increment does not re-open it in a new shape.
+#[test]
+fn using_does_not_rescue_a_where_clause_on_the_role_played_table() {
+    let def = flights_using_fixture();
+    let req = QueryRequest {
+        dimensions: vec![DimensionName::new("dep_city")],
+        metrics: vec![
+            MetricName::new("flight_count"),
+            MetricName::new("leg_count"),
+        ],
+        facts: vec![],
+        where_clause: Some("dep_city = 'London'".to_string()),
+    };
+    let err = expand("flights_sv", &def, &req)
+        .expect_err("a predicate on a role-played table is not scoped by USING");
+    assert!(
+        matches!(
+            err,
+            ExpandError::MetricFanTrap { .. }
+                | ExpandError::FanTrap { .. }
+                | ExpandError::RootGrainFanTrap { .. }
+                | ExpandError::WhereClauseFanTrap { .. }
+        ),
+        "expected the base-anchored fence's error, got: {err}"
+    );
+}
+
+/// Guard: the relaxation is narrow. A metric whose `USING` names a relationship
+/// to a table reached only ONE way is not what this increment threads — the
+/// base-anchored path scopes that alias itself — so it keeps declining rather
+/// than being guessed at here.
+#[test]
+fn using_naming_a_non_role_played_relationship_still_declines() {
+    let def = flights_using_fixture().with_using_relationship("leg_count", &["l_to_f"]);
+    let err = expand(
+        "flights_sv",
+        &def,
+        &req(&["dep_city"], &["flight_count", "leg_count"]),
+    )
+    .expect_err("USING on a single-edge relationship is not threaded by this path");
+    assert!(
+        matches!(
+            err,
+            ExpandError::MetricFanTrap { .. }
+                | ExpandError::FanTrap { .. }
+                | ExpandError::RootGrainFanTrap { .. }
+        ),
+        "expected the v0.11.0 fan-trap error, got: {err}"
+    );
+}
+
+/// root `f` (flights) --carrier_id--> `c` (carriers) --dep/arr--> `a` (airports).
+///
+/// `c` is a PARENT of the base table, so a metric on it needs per-grain
+/// treatment; `a` is a parent of `c`, so a dimension on it is ABOVE the metric's
+/// grain and the fan-trap fence permits it. That combination is what reaches
+/// `render_single_grain` — one grain group — with a role resolved.
+fn carriers_via_role_played_airports() -> SemanticViewDefinition {
+    base_table(minimal_def("f", "d", "d", "m", "count(*)"), "flights", "id")
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("a", "airports", &["code"])
+        .with_table("c", "carriers", &["id"])
+        .with_dimension("dep_city", "a.city", Some("a"))
+        .with_metric("fleet_size", "SUM(c.fleet)", Some("c"))
+        .with_pkfk_join("dep", "c", "a", &["dep_code"], &["code"])
+        .with_pkfk_join("arr", "c", "a", &["arr_code"], &["code"])
+        .with_pkfk_join("f_to_c", "f", "c", &["carrier_id"], &["id"])
+        .with_using_relationship("fleet_size", &["dep"])
+}
+
+/// A SINGLE per-grain CTE must scope its dimension too.
+///
+/// One grain group takes `render_single_grain` rather than the multi-grain
+/// renderer, but it emits its joins through the same `anchor_joins` — so it
+/// receives the scoped `a__dep` JOIN and must rewrite the dimension to match.
+/// Emitting the bare `a.city` there references an alias its own FROM never
+/// binds, which DuckDB rejects at bind time.
+#[test]
+fn using_scopes_a_role_played_dimension_in_a_single_grain_cte() {
+    let def = carriers_via_role_played_airports();
+    let sql = expand("sv", &def, &req(&["dep_city"], &["fleet_size"]))
+        .expect("a parent-grain metric with USING is per-grain eligible");
+    assert!(
+        sql.contains(r#"AS "a__dep" ON"#),
+        "the scoped role is joined, got:\n{sql}"
+    );
+    assert!(
+        sql.contains("a__dep.city"),
+        "the dimension must bind to the scoped alias the JOIN emitted, got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("a.city AS"),
+        "the bare alias is never bound by this FROM, so selecting it is invalid SQL:\n{sql}"
+    );
+}

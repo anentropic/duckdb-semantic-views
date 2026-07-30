@@ -212,7 +212,17 @@ pub(super) fn expand_window_metrics(
     // because the window function is not grain-sensitive.
     let resolved_joins = if let Some(anchor) = grain_anchor {
         push_from_anchor(&mut sql, def, anchor, "\n    ");
-        super::per_grain::anchor_joins(def, anchor, &dims, &where_tables)
+        // The window path declines every role-played query (`window_cte_anchor`
+        // is strict), so it never has a role to honour and passes none. Were
+        // that to change, `__sv_agg`'s SELECT list would need the same
+        // scoped-alias rewrite the grain CTEs do.
+        super::per_grain::anchor_joins(
+            def,
+            anchor,
+            &dims,
+            &where_tables,
+            &std::collections::HashMap::new(),
+        )
     } else {
         push_from_base(&mut sql, def, "\n    ");
         resolve_joins_pkfk(def, &dims, resolved_mets, &where_tables)
