@@ -45,8 +45,8 @@
 //!   across the dimension's values) — `FanTrap`, raised by the fence;
 //! - *active* semi-additive metrics, whose own CTE strategy is base-anchored
 //!   (see `docs/`);
-//! - a query that reaches a **role-played** table — one this query's dimensions
-//!   or metric grains sit on, or can reach only through. Which of its several
+//! - a query that reaches a **role-played** table — one this query's dimensions,
+//!   metric grains, or `where_clause` members sit on, or can reach only through. Which of its several
 //!   relationship instances a grain CTE should join is exactly what `USING`
 //!   answers on the base-anchored path, and the grain CTEs do not carry that
 //!   context yet. Note the scope: this is asked of the QUERY, not the
@@ -173,11 +173,12 @@ pub(super) fn plan(
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
     resolved_exprs: &HashMap<String, String>,
+    where_tables: &[String],
 ) -> Option<Plan> {
     if def.joins.is_empty() || resolved_mets.is_empty() {
         return None; // Single-table view, or a dimensions-only query.
     }
-    if !is_eligible(def, resolved_dims, resolved_mets) {
+    if !is_eligible(def, resolved_dims, resolved_mets, where_tables) {
         return None;
     }
     let graph = GrainGraph::build(def)?;
@@ -384,14 +385,22 @@ fn role_playing_affects_query(
     def: &SemanticViewDefinition,
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
+    where_tables: &[String],
 ) -> bool {
-    let mut tables: Vec<String> = resolved_dims
+    let mut tables: HashSet<String> = resolved_dims
         .iter()
         .filter_map(|d| d.source_table.as_ref().map(|s| s.to_ascii_lowercase()))
         .collect();
     for met in resolved_mets {
         tables.extend(metric_grain_tables(met, def));
     }
+    // A `where_clause` member's table is joined into every grain CTE exactly
+    // like a dimension's — `anchor_joins` chains both into the sources it walks
+    // — so it is every bit as "touched" and must be tested the same way.
+    tables.extend(where_tables.iter().map(|t| t.to_ascii_lowercase()));
+    // Deduplicated: several dimensions commonly share a source table, and
+    // several metrics a grain, while each walk can rebuild the relationship
+    // graph.
     tables.iter().any(|table| {
         // The view name only decorates an error that is discarded here: a
         // definition too malformed to walk declines per-grain, and the
@@ -430,6 +439,7 @@ pub(super) fn window_cte_anchor(
     def: &SemanticViewDefinition,
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
+    where_tables: &[String],
 ) -> Option<String> {
     if def.joins.is_empty() || resolved_mets.is_empty() {
         return None;
@@ -441,7 +451,7 @@ pub(super) fn window_cte_anchor(
         return None;
     }
     if resolved_dims.iter().any(|d| d.source_table.is_none())
-        || role_playing_affects_query(def, resolved_dims, resolved_mets)
+        || role_playing_affects_query(def, resolved_dims, resolved_mets, where_tables)
     {
         return None;
     }
@@ -525,6 +535,7 @@ fn is_eligible(
     def: &SemanticViewDefinition,
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
+    where_tables: &[String],
 ) -> bool {
     // A dimension with no source table is an unqualified expression, resolved
     // against whatever the FROM happens to expose. That is well defined only
@@ -533,7 +544,7 @@ fn is_eligible(
     if resolved_dims.iter().any(|d| d.source_table.is_none()) {
         return false;
     }
-    if role_playing_affects_query(def, resolved_dims, resolved_mets) {
+    if role_playing_affects_query(def, resolved_dims, resolved_mets, where_tables) {
         return false;
     }
 

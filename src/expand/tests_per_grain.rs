@@ -1060,3 +1060,64 @@ fn dimension_on_a_role_playing_target_still_declines_per_grain() {
         "expected the v0.11.0 fan-trap error, got: {err}"
     );
 }
+
+/// A role-playing definition that also has a CHILD of the base table, so a
+/// query can have two grains while the role-played parent `a` sits ABOVE both —
+/// the shape where the where-clause fan-trap check does not fire.
+fn flights_with_role_playing_and_child_legs() -> SemanticViewDefinition {
+    base_table(minimal_def("f", "d", "d", "m", "count(*)"), "flights", "id")
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("a", "airports", &["code"])
+        .with_table("l", "legs", &["id"])
+        .with_dimension("dep_city", "a.city", Some("a"))
+        .with_dimension("flight_status", "f.status", Some("f"))
+        .with_metric("flight_count", "COUNT(*)", Some("f"))
+        .with_metric("leg_count", "COUNT(l.id)", Some("l"))
+        .with_pkfk_join("dep", "f", "a", &["dep_code"], &["code"])
+        .with_pkfk_join("arr", "f", "a", &["arr_code"], &["code"])
+        .with_pkfk_join("l_to_f", "l", "f", &["flight_id"], &["id"])
+}
+
+/// A `where_clause` predicate is joined into every grain CTE, so its tables are
+/// as "touched" by the query as a dimension's — and must be tested for
+/// role-playing the same way.
+///
+/// Two grains (`f`, `l`) with the role-played `a` ABOVE both, so the
+/// where-clause fan-trap check does not fire and nothing else stands in the way.
+/// The gate's first cut looked only at dimension source tables and metric grain
+/// tables, so this query was ruled eligible, and `anchor_joins` then walked
+/// `f -> a` through `edge_between`, which returns the FIRST declared edge of the
+/// two. Both grain CTEs silently joined `dep` and filtered on departure city.
+///
+/// The name `dep_city` makes that look intentional; it is not. The dimension is
+/// `a.city`, and which role it bound to was decided by declaration order — swap
+/// `dep` and `arr` in the DDL and the same query filters on arrival city. That
+/// is the declaration-order-dependent mis-binding this gate exists to prevent,
+/// and answering it silently is strictly worse than the `MetricFanTrap` this
+/// shape raised before per-grain ever looked at it.
+#[test]
+fn where_clause_reaching_a_role_played_table_declines_per_grain() {
+    let def = flights_with_role_playing_and_child_legs();
+    let req = QueryRequest {
+        dimensions: vec![DimensionName::new("flight_status")],
+        metrics: vec![
+            MetricName::new("flight_count"),
+            MetricName::new("leg_count"),
+        ],
+        facts: vec![],
+        where_clause: Some("dep_city = 'London'".to_string()),
+    };
+    let err = expand("flights_sv", &def, &req)
+        .expect_err("a predicate on a role-played table must not be answered by guesswork");
+    assert!(
+        matches!(
+            err,
+            ExpandError::MetricFanTrap { .. }
+                | ExpandError::FanTrap { .. }
+                | ExpandError::RootGrainFanTrap { .. }
+                | ExpandError::WhereClauseFanTrap { .. }
+        ),
+        "expected the base-anchored fence's error, got: {err}"
+    );
+}
