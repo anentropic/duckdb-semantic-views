@@ -304,9 +304,14 @@ Two boundaries are worth knowing:
   not inflated by the base-table join. Window metrics whose inner aggregates sit
   at *different* grains still error, as those grains would need joining before the
   window runs.
-- Multi-grain queries involving **active semi-additive metrics** are not yet
-  computed per-grain here and keep raising the fan-trap error. Snowflake
-  computes them: probed directly, it returns each metric at its own grain, with
+- An **active semi-additive metric** at a single non-base grain snapshots at its
+  own grain: the ``RANK()`` CTE anchors at the metric's table rather than the
+  base table, so the winning snapshot row is not added once per base row. A
+  ``NON ADDITIVE BY`` dimension declared on another logical table is joined into
+  that CTE so its ordering still binds. Queries spanning **more than one** grain
+  with such a metric keep the fan-trap error, since a single snapshot CTE has
+  only one anchor to take. Snowflake computes those too: probed directly, it
+  returns each metric at its own grain, with
   the snapshot selection happening inside the semi-additive metric's own-grain
   aggregation rather than over the joined row set. Snowflake also accepts a
   ``NON ADDITIVE BY`` dimension declared on *another* logical table, provided the

@@ -43,8 +43,12 @@
 //!
 //! - a dimension **below** a metric's grain (the metric's rows genuinely fan
 //!   across the dimension's values) — `FanTrap`, raised by the fence;
-//! - *active* semi-additive metrics, whose own CTE strategy is base-anchored
-//!   (see `docs/`);
+//! - *active* semi-additive metrics **spanning more than one grain**. A single
+//!   grain is now answered: [`snapshot_cte_anchor`] re-points `__sv_snapshot` at
+//!   the metric's own table, the same move [`window_cte_anchor`] makes for
+//!   `__sv_agg`. Two grains give that single CTE no one anchor, so they keep the
+//!   error until the `RANK` shape can be emitted as one group's CTE inside a
+//!   multi-grain plan (TECH-DEBT #36);
 //! - a query that reaches a **role-played** table without saying which role it
 //!   means. Which of the several relationship instances a grain CTE should join
 //!   is what `USING` answers, and a co-queried metric's `USING` is now honoured:
@@ -520,6 +524,90 @@ fn role_playing_affects_query(
 /// A dimension *below* the anchor's grain is deliberately NOT screened here: it
 /// has no single value per group in either engine, and the fan-trap fence's
 /// metric × dimension check — which per-grain mode keeps — is what reports it.
+/// The table an active semi-additive metric's `__sv_snapshot` CTE should anchor
+/// at, or `None` to leave it base-anchored.
+///
+/// The sibling of [`window_cte_anchor`], and deliberately the same shape: both
+/// re-anchor a single base-anchored CTE, so both carry the same restrictions.
+/// Probed against Snowflake (TECH-DEBT #36): it computes the snapshot inside the
+/// metric's own-grain aggregation and joins pre-aggregated results, rather than
+/// ranking rows a base-anchored join has already multiplied.
+///
+/// `extra_tables` carries the NA dimensions' source tables and any
+/// `where_clause` members'. The NA dims matter especially: an *active*
+/// semi-additive metric is by definition one whose NA dim is NOT queried, so its
+/// table never appears in `resolved_dims`, yet the snapshot's `ORDER BY` names
+/// it. Snowflake accepts an NA dimension declared on another logical table when
+/// the reference is qualified (probed), so this must be checked for
+/// reachability rather than assumed to be the metric's own table.
+pub(super) fn snapshot_cte_anchor(
+    def: &SemanticViewDefinition,
+    resolved_dims: &[&Dimension],
+    resolved_mets: &[&Metric],
+    extra_tables: &[String],
+) -> Option<String> {
+    if def.joins.is_empty() || resolved_mets.is_empty() {
+        return None;
+    }
+    if resolved_dims.iter().any(|d| d.source_table.is_none())
+        || role_playing_affects_query(def, resolved_dims, resolved_mets, extra_tables, false)
+    {
+        return None;
+    }
+    // A metric's `USING` scopes its joins on the base-anchored path; the
+    // snapshot emitter does not thread that context, so decline rather than
+    // silently re-anchor onto a different relationship instance.
+    if resolved_mets
+        .iter()
+        .any(|m| !m.using_relationships.is_empty())
+    {
+        return None;
+    }
+
+    let graph = GrainGraph::build(def)?;
+    let root = graph.root().to_string();
+
+    // Every metric in the query must sit at one shared grain — the snapshot is a
+    // SINGLE CTE, so there is only one anchor to give it. A query mixing grains
+    // is the multi-grain case, which belongs to the per-grain planner.
+    let mut anchor: Option<String> = None;
+    for met in resolved_mets {
+        let grains = metric_grain_tables(met, def);
+        let [only] = grains.as_slice() else {
+            return None; // No grain, or one metric spanning several.
+        };
+        match &anchor {
+            None => anchor = Some(only.clone()),
+            Some(existing) if existing == only => {}
+            Some(_) => return None,
+        }
+    }
+    let anchor = anchor?;
+    if anchor == root {
+        return None; // Already correct as-is.
+    }
+    // Only re-anchor where base-anchoring actually inflates — the anchor on the
+    // "one" side of the path from the root. The other direction must be left
+    // alone: for a metric on a CHILD of the base table, `FROM base LEFT JOIN
+    // child` already yields each child row once, and that LEFT JOIN keeps
+    // childless parents as NULL-extended rows. Flipping to `FROM child` would
+    // silently DROP those groups, and this single-CTE path has no FULL OUTER
+    // JOIN reassembly to restore them. Identical reasoning to
+    // [`window_cte_anchor`]; see its note for the worked example.
+    graph.fanning_relationship(&anchor, &root)?;
+    // Everything the CTE must reference has to be reachable from the anchor, or
+    // its FROM could not bind the column: the queried dimensions...
+    for dim in resolved_dims {
+        let table = dim.source_table.as_ref()?.to_ascii_lowercase();
+        graph.path(&anchor, &table)?;
+    }
+    // ...and the NA dimensions / `where_clause` members.
+    for table in extra_tables {
+        graph.path(&anchor, &table.to_ascii_lowercase())?;
+    }
+    Some(anchor)
+}
+
 pub(super) fn window_cte_anchor(
     def: &SemanticViewDefinition,
     resolved_dims: &[&Dimension],
