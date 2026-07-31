@@ -513,10 +513,22 @@ fn metric_grouped_by_sibling_dimension_errors() {
 // GRAIN-07: the documented residual boundary (TECH-DEBT #36)
 // ---------------------------------------------------------------------------
 
-/// A multi-grain query carrying an ACTIVE semi-additive metric keeps the
-/// fan-trap error: the snapshot CTE that metric needs is anchored at the base
-/// table, and routing it through per-grain emission without designing that
-/// interaction would risk the silent-inflation class the fence exists to stop.
+/// A GENUINELY multi-grain query carrying an ACTIVE semi-additive metric keeps
+/// the fan-trap error.
+///
+/// The boundary moved but did not disappear. `snapshot_cte_anchor` re-anchors a
+/// single `__sv_snapshot`, so it needs ONE grain to anchor at; a semi-additive
+/// metric alongside a metric at a different grain has two, and the per-grain
+/// planner that could reassemble them still declines active semi-additive
+/// metrics. Emitting the `RANK` shape as one group's CTE inside a multi-grain
+/// plan is the second increment (TECH-DEBT #36).
+///
+/// This test previously queried `total_balance` ALONE — a single grain, which
+/// is exactly the shape the first increment now answers, so the assertion was
+/// superseded rather than broken. It is re-pointed at the residual boundary
+/// (which its name always described) instead of being deleted, so the retired
+/// case keeps a guard; the answered case is pinned by
+/// `active_semi_additive_snapshot_anchors_at_its_own_grain`.
 #[test]
 fn multi_grain_with_active_semi_additive_metric_still_errors() {
     let def = orders_with_parent_customers()
@@ -525,11 +537,15 @@ fn multi_grain_with_active_semi_additive_metric_still_errors() {
             "total_balance",
             &[("snapshot_day", SortOrder::Asc, NullsOrder::Last)],
         );
-    // `snapshot_day` is NOT queried, so the metric is *active* semi-additive.
-    let err = expand("sales", &def, &req(&[], &["total_balance"]))
-        .expect_err("an active semi-additive metric is not per-grain eligible");
+    // `snapshot_day` is NOT queried, so the metric is *active* semi-additive;
+    // `order_count` sits at the base grain, so the query spans two.
+    let err = expand("sales", &def, &req(&[], &["order_count", "total_balance"]))
+        .expect_err("two grains give the single snapshot CTE no one anchor");
     assert!(
-        matches!(err, ExpandError::RootGrainFanTrap { .. }),
+        matches!(
+            err,
+            ExpandError::RootGrainFanTrap { .. } | ExpandError::MetricFanTrap { .. }
+        ),
         "expected the v0.11.0 fan-trap error, got: {err}"
     );
 }
@@ -1303,5 +1319,125 @@ fn using_scopes_a_role_played_dimension_in_a_single_grain_cte() {
     assert!(
         !sql.contains("a.city AS"),
         "the bare alias is never bound by this FROM, so selecting it is invalid SQL:\n{sql}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GRAIN-11: an active semi-additive metric snapshots at its OWN grain
+// ---------------------------------------------------------------------------
+
+/// root `o` (orders) --account_id--> `a` (accounts).
+///
+/// `a` is a PARENT of the base table, so `FROM orders LEFT JOIN accounts`
+/// repeats each account row once per order and inflates a metric on `a`. The
+/// metric is semi-additive on `report_date`, which the query does NOT ask for —
+/// so it is ACTIVE and `__sv_snapshot` is the shape being emitted.
+fn accounts_snapshot_fixture() -> SemanticViewDefinition {
+    base_table(minimal_def("o", "d", "d", "m", "count(*)"), "orders", "id")
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("a", "accounts", &["id"])
+        .with_dimension("account_type", "a.account_type", Some("a"))
+        .with_dimension("report_date", "a.report_date", Some("a"))
+        .with_metric("total_balance", "SUM(a.balance)", Some("a"))
+        .with_non_additive_by(
+            "total_balance",
+            &[("report_date", SortOrder::Asc, NullsOrder::Last)],
+        )
+        .with_pkfk_join("o_to_a", "o", "a", &["account_id"], &["id"])
+}
+
+/// GRAIN-11: the snapshot CTE anchors at the metric's own table instead of the
+/// base table. Probed against Snowflake (TECH-DEBT #36): it computes the
+/// snapshot inside the metric's own-grain aggregation. Was `RootGrainFanTrap`.
+#[test]
+fn active_semi_additive_snapshot_anchors_at_its_own_grain() {
+    let def = accounts_snapshot_fixture();
+    let sql = expand("sv", &def, &req(&["account_type"], &["total_balance"]))
+        .expect("a parent-grain semi-additive metric must snapshot at its own grain");
+    assert!(
+        sql.contains(r#"FROM "accounts" AS "a""#),
+        "the snapshot must anchor at the metric's own table, got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("orders"),
+        "joining the base table is exactly what repeated each account row:\n{sql}"
+    );
+    assert!(
+        sql.contains("RANK()"),
+        "still the snapshot shape, just re-anchored:\n{sql}"
+    );
+}
+
+/// GRAIN-11 guard — DIRECTION. A metric at a CHILD grain must NOT be
+/// re-anchored, and not merely as an optimisation: `FROM base LEFT JOIN child`
+/// already yields each child row once, and the LEFT JOIN deliberately keeps
+/// childless parents as NULL-extended rows. Flipping to `FROM child` would
+/// silently DROP those groups. This single-CTE path has no FULL OUTER JOIN
+/// reassembly to restore them, so it must stay base-anchored — the same
+/// restriction `window_cte_anchor` documents.
+#[test]
+fn child_grain_semi_additive_is_not_re_anchored() {
+    let def = base_table(minimal_def("o", "d", "d", "m", "count(*)"), "orders", "id")
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("li", "line_items", &["id"])
+        .with_dimension("order_status", "o.status", Some("o"))
+        .with_dimension("ship_date", "li.ship_date", Some("li"))
+        .with_metric("item_total", "SUM(li.amount)", Some("li"))
+        .with_non_additive_by(
+            "item_total",
+            &[("ship_date", SortOrder::Asc, NullsOrder::Last)],
+        )
+        .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"]);
+    let sql = expand("sv", &def, &req(&["order_status"], &["item_total"]))
+        .expect("a child-grain semi-additive metric is already correct base-anchored");
+    assert!(
+        sql.contains(r#"FROM "orders" AS "o""#),
+        "must stay anchored at the base table so childless groups survive:\n{sql}"
+    );
+}
+
+/// root `o` (orders) --account_id--> `a` (accounts) --snapshot_id--> `s`.
+///
+/// The NA dimension lives on `s`, NOT on the metric's own table. Snowflake
+/// accepts this when the reference is qualified (probed, TECH-DEBT #36), so the
+/// re-anchored CTE has to join `s` for the `RANK`'s ORDER BY to bind.
+fn offtable_na_dim_fixture() -> SemanticViewDefinition {
+    base_table(minimal_def("o", "d", "d", "m", "count(*)"), "orders", "id")
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("a", "accounts", &["id"])
+        .with_table("s", "snapshots", &["id"])
+        .with_dimension("account_type", "a.account_type", Some("a"))
+        .with_dimension("report_date", "s.report_date", Some("s"))
+        .with_metric("total_balance", "SUM(a.balance)", Some("a"))
+        .with_non_additive_by(
+            "total_balance",
+            &[("report_date", SortOrder::Asc, NullsOrder::Last)],
+        )
+        .with_pkfk_join("o_to_a", "o", "a", &["account_id"], &["id"])
+        .with_pkfk_join("a_to_s", "a", "s", &["snapshot_id"], &["id"])
+}
+
+/// GRAIN-11 guard — the NA dimension's table must be JOINED into the
+/// re-anchored CTE.
+///
+/// An active semi-additive metric's NA dim is by definition not queried, so its
+/// table never appears in `resolved_dims` and the ordinary dimension-join walk
+/// would not reach it. Emitting `ORDER BY s.report_date` over a FROM that never
+/// binds `s` is the unbound-alias class that shipped in #177.
+#[test]
+fn re_anchored_snapshot_joins_an_offtable_na_dimension() {
+    let def = offtable_na_dim_fixture();
+    let sql = expand("sv", &def, &req(&["account_type"], &["total_balance"]))
+        .expect("an off-table NA dimension is legal (Snowflake accepts the qualified form)");
+    assert!(
+        sql.contains(r#"FROM "accounts" AS "a""#),
+        "anchored at the metric's own grain, got:\n{sql}"
+    );
+    assert!(
+        sql.contains(r#""snapshots" AS "s""#),
+        "the NA dimension's table must be joined or its ORDER BY cannot bind:\n{sql}"
     );
 }

@@ -36,6 +36,18 @@
 //!
 //! When multiple semi-additive metrics have different NON ADDITIVE BY dimensions,
 //! each gets its own `__sv_rn_N` column in the CTE.
+//!
+//! **Where the CTE is anchored.** By default `FROM <base table>`, outward. When
+//! every queried metric sits at one NON-base grain that the base-anchored join
+//! would fan, [`super::per_grain::snapshot_cte_anchor`] returns that table and
+//! the CTE anchors there instead — otherwise `RANK()` would rank rows the join
+//! has already multiplied, tying every copy at rank 1 so the outer `SUM` adds
+//! the winning value once per base row. Probed against Snowflake (TECH-DEBT
+//! #36): it computes the snapshot inside the metric's own-grain aggregation.
+//! The NA dims' source tables ride the same extra-sources channel either way,
+//! which matters most when re-anchored — an *active* NA dim is never in the
+//! queried dimensions, so nothing else would join the table its ORDER BY
+//! names.
 
 use std::collections::{HashMap, HashSet};
 
@@ -43,7 +55,9 @@ use crate::model::{Metric, NonAdditiveDim, NullsOrder, SemanticViewDefinition, S
 
 use super::join_resolver::{push_join_clauses, resolve_joins_pkfk};
 use super::resolution::{quote_ident, quote_stored_ident};
-use super::select_spec::{push_from_base, FromSource, GroupBy, SelectItem, SelectSpec};
+use super::select_spec::{
+    push_from_anchor, push_from_base, FromSource, GroupBy, SelectItem, SelectSpec,
+};
 use super::types::{ExpandError, ResolvedDim};
 
 /// Resolve a NON ADDITIVE BY dim reference — bare (`report_date`), dotted
@@ -140,6 +154,7 @@ pub(super) fn expand_semi_additive(
     resolved_mets: &[&Metric],
     resolved_exprs: &HashMap<String, String>,
     where_clause: Option<&super::where_clause::ResolvedWhere>,
+    anchor: Option<&str>,
 ) -> Result<String, ExpandError> {
     let mut sql = String::with_capacity(512);
 
@@ -210,8 +225,13 @@ pub(super) fn expand_semi_additive(
 
     sql.push_str(&cte_select_items.join(",\n"));
 
-    // CTE FROM clause (same logic as expand())
-    push_from_base(&mut sql, def, "\n    ");
+    // CTE FROM clause. `anchor` re-points it at the metric's own grain when
+    // `per_grain::snapshot_cte_anchor` found a safe one; otherwise the base
+    // table, as before.
+    match anchor {
+        Some(a) => push_from_anchor(&mut sql, def, a, "\n    "),
+        None => push_from_base(&mut sql, def, "\n    "),
+    }
 
     // CTE JOINs. SG-9: the snapshot ORDER BY references each active NA dim's
     // raw expression even when that dim is not queried, so the NA dims'
@@ -225,7 +245,20 @@ pub(super) fn expand_semi_additive(
         na_dim_sources.extend(w.source_tables.iter().cloned());
     }
     let dims: Vec<&crate::model::Dimension> = resolved_dims.iter().map(|rd| rd.dim).collect();
-    let resolved_joins = resolve_joins_pkfk(def, &dims, resolved_mets, &na_dim_sources);
+    let resolved_joins = match anchor {
+        // Re-anchored: walk out from the metric's own table. The NA-dim and
+        // `where_clause` tables ride the same extra-sources channel they do on
+        // the base-anchored path, so the snapshot ORDER BY still binds.
+        // Role-playing is declined by `snapshot_cte_anchor`, hence no roles.
+        Some(a) => super::per_grain::anchor_joins(
+            def,
+            a,
+            &dims,
+            &na_dim_sources,
+            &std::collections::HashMap::new(),
+        ),
+        None => resolve_joins_pkfk(def, &dims, resolved_mets, &na_dim_sources),
+    };
     push_join_clauses(&mut sql, &resolved_joins, def, "\n    LEFT JOIN ");
 
     // The predicate goes INSIDE the snapshot CTE, which puts it before the
@@ -692,6 +725,27 @@ fn collect_na_dim_source_tables(
         }
     }
     sources
+}
+
+/// The source tables of a query's active NA dimensions, for the anchor decision
+/// in `sql_gen` — which has to be made BEFORE the fan-trap fence runs, and so
+/// cannot wait for [`expand_semi_additive`] to build its groups.
+///
+/// A malformed NA reference yields an empty list rather than an error. That does
+/// **not** decline the re-anchor — `snapshot_cte_anchor` cannot tell "no NA
+/// tables" from "could not resolve them", and may still return an anchor. It
+/// cannot mislead, though: [`expand_semi_additive`] rebuilds the same groups and
+/// propagates the real error before the anchor is ever used for emission, so the
+/// query fails on the NA reference itself rather than on anything decided here.
+pub(super) fn na_dim_source_tables(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    resolved_mets: &[&Metric],
+    queried_dim_keys: &HashSet<String>,
+) -> Vec<String> {
+    collect_na_groups(view_name, def, resolved_mets, queried_dim_keys)
+        .map(|groups| collect_na_dim_source_tables(def, &groups))
+        .unwrap_or_default()
 }
 
 /// Aggregate functions the snapshot CTE knows how to decompose into an

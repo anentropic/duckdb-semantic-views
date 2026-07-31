@@ -427,6 +427,34 @@ pub fn expand(
     let window_anchor =
         super::per_grain::window_cte_anchor(def, &resolved_dims, &resolved_mets, &where_tables);
 
+    // An ACTIVE semi-additive metric at a non-root grain is answered by
+    // anchoring `__sv_snapshot` there instead of at the base table (TECH-DEBT
+    // #36). Decided here for the same reason as `window_anchor`: the checks
+    // below are the ones this supersedes, so it cannot be decided after them.
+    //
+    // `queried_dim_keys` are canonical (quote-stripped + folded) so a dotted or
+    // quoted NA reference resolves against the queried dims (#30); the same set
+    // is reused by the semi-additive dispatch further down.
+    let queried_dim_keys: std::collections::HashSet<String> = resolved_dims
+        .iter()
+        .map(|d| crate::ident::normalize_ident_part(&d.name))
+        .collect();
+    let has_active_semi_additive = resolved_mets
+        .iter()
+        .any(|m| super::semi_additive::is_active_semi_additive(def, m, &queried_dim_keys));
+    let snapshot_anchor = if has_active_semi_additive {
+        let mut extra = super::semi_additive::na_dim_source_tables(
+            view_name,
+            def,
+            &resolved_mets,
+            &queried_dim_keys,
+        );
+        extra.extend(where_tables.iter().cloned());
+        super::per_grain::snapshot_cte_anchor(def, &resolved_dims, &resolved_mets, &extra)
+    } else {
+        None
+    };
+
     // SG-8: fail loudly when a REQUESTED metric (directly, via a derived
     // metric, or as a window metric's inner aggregate) depends on a COUNT(*)
     // that could not be rewritten to COUNT(<pk>) — a non-base source table
@@ -477,7 +505,7 @@ pub fn expand(
         def,
         &resolved_dims,
         &resolved_mets,
-        grain_plan.is_some() || window_anchor.is_some(),
+        grain_plan.is_some() || window_anchor.is_some() || snapshot_anchor.is_some(),
     )?;
     if let Some(rw) = &resolved_where {
         super::fan_trap::check_where_clause_fan_traps(view_name, def, &rw.members, &resolved_mets)?;
@@ -507,21 +535,10 @@ pub fn expand(
         resolved.push(ResolvedDim { dim, scoped_alias });
     }
 
-    // Phase 47: Check if any resolved metric ACTUALLY needs semi-additive expansion.
-    // A semi-additive metric only needs CTE treatment when at least one of its
-    // NA dims is NOT in the queried dimension set. When ALL NA dims are in the
-    // query, the metric acts as regular (Snowflake semantics). The predicate
-    // is shared with expand_semi_additive and the fan-trap check (SG-6).
-    // Canonical keys (quote-stripped + folded) so a dotted/quoted NA reference
-    // resolves against the queried dims (#30, shared with the CTE path).
-    let queried_dim_keys: std::collections::HashSet<String> = resolved_dims
-        .iter()
-        .map(|d| crate::ident::normalize_ident_part(&d.name))
-        .collect();
-    let has_active_semi_additive = resolved_mets
-        .iter()
-        .any(|m| super::semi_additive::is_active_semi_additive(def, m, &queried_dim_keys));
-
+    // Phase 47: a semi-additive metric only needs CTE treatment when at least
+    // one of its NA dims is NOT in the queried dimension set. When ALL are in
+    // the query it acts as regular (Snowflake semantics). Decided above, with
+    // the snapshot anchor that depends on it.
     if has_active_semi_additive {
         return super::semi_additive::expand_semi_additive(
             view_name,
@@ -530,6 +547,7 @@ pub fn expand(
             &resolved_mets,
             &resolved_exprs,
             resolved_where.as_ref(),
+            snapshot_anchor.as_deref(),
         );
     }
 

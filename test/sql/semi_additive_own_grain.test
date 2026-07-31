@@ -1,0 +1,177 @@
+# An active semi-additive metric snapshots at its OWN grain
+# (TECH-DEBT #36, semi-additive sub-item, increment 1).
+#
+# `sa_snapshots` is a PARENT of the base table `sa_orders`, so the old
+# base-anchored `FROM sa_orders LEFT JOIN sa_snapshots` repeated each snapshot
+# row once per order. `RANK()` over that multiplied row set ties ALL the copies
+# at rank 1, so the outer SUM added the winning balance once per order.
+#
+# Snowflake was probed directly on this question (see TECH-DEBT #36): it
+# computes the snapshot inside the metric's own-grain aggregation and joins
+# pre-aggregated results. `__sv_snapshot` now anchors there too.
+#
+# The data makes the difference a NUMBER, not just a plan shape: the correct
+# answer is 100/200 and the inflated one is 300/400. Both were computed in
+# DuckDB before this test was written, so the two cannot be confused.
+
+require semantic_views
+
+statement ok
+CREATE TABLE sa_snapshots (id INTEGER, account_type VARCHAR, report_date DATE, balance INTEGER);
+
+statement ok
+CREATE TABLE sa_orders (id INTEGER, snapshot_id INTEGER);
+
+# Two account types, each with an old and a current snapshot.
+statement ok
+INSERT INTO sa_snapshots VALUES
+  (1, 'CHECKING', '2026-01-01',  10),
+  (2, 'CHECKING', '2026-02-01', 100),
+  (3, 'SAVINGS',  '2026-01-01',  20),
+  (4, 'SAVINGS',  '2026-02-01', 200);
+
+# The fan: snapshot 2 carries THREE orders and snapshot 4 carries TWO, so a
+# base-anchored plan multiplies exactly the rows that win the snapshot.
+statement ok
+INSERT INTO sa_orders VALUES (10,1), (11,2), (12,2), (13,2), (14,3), (15,4), (16,4);
+
+statement ok
+CREATE SEMANTIC VIEW sa_sv AS
+  TABLES (
+    o AS sa_orders    PRIMARY KEY (id),
+    s AS sa_snapshots PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    o_to_s AS o(snapshot_id) REFERENCES s(id)
+  )
+  DIMENSIONS (
+    s.account_type AS s.account_type,
+    s.report_date AS s.report_date
+  )
+  METRICS (
+    s.total_balance NON ADDITIVE BY (report_date) AS sum(s.balance)
+  );
+
+# ============================================================
+# Test 1: the capability. `report_date` is NOT queried, so the metric is
+# ACTIVE semi-additive and the snapshot CTE is emitted.
+#
+# Latest snapshot per account type: CHECKING 100, SAVINGS 200.
+# The base-anchored answer would be 300/400 — the winning balance added once
+# per order. This query used to error with `fan trap detected`.
+# ============================================================
+
+query TI rowsort
+SELECT * FROM semantic_view('sa_sv', metrics := ['total_balance'], dimensions := ['account_type']);
+----
+CHECKING	100
+SAVINGS	200
+
+# ============================================================
+# Test 2: the snapshot CTE anchors at the metric's own table, and the base
+# table is not joined into it at all.
+# ============================================================
+
+query I
+SELECT count(*) FROM (
+  SELECT unnest(string_split(explain_output, chr(10))) AS plan
+  FROM (SELECT * FROM explain_semantic_view('sa_sv', metrics := ['total_balance'], dimensions := ['account_type']))
+    AS t(explain_output)
+) WHERE plan LIKE '%sa_orders%';
+----
+0
+
+# ============================================================
+# Test 3: when the NA dimension IS queried the metric is effectively regular —
+# no snapshot, no re-anchoring, and every snapshot row is its own group. This
+# pins that the re-anchor did not leak into the path it does not own.
+#
+# Reported independently by the unit test
+# `child_grain_semi_additive_is_not_re_anchored` for the direction guard; this
+# asserts the end-to-end numbers for the effectively-regular case.
+# ============================================================
+
+query TTI rowsort
+SELECT * FROM semantic_view('sa_sv', metrics := ['total_balance'], dimensions := ['account_type', 'report_date']);
+----
+CHECKING	2026-01-01	10
+CHECKING	2026-02-01	100
+SAVINGS	2026-01-01	20
+SAVINGS	2026-02-01	200
+
+# ============================================================
+# Test 4: the NA dimension on ANOTHER logical table.
+#
+# Snowflake accepts this when the reference is qualified (probed, TECH-DEBT
+# #36). An ACTIVE semi-additive metric's NA dim is by definition not queried,
+# so its table never reaches the dimension-join walk — the re-anchored CTE has
+# to join it explicitly or `ORDER BY d.report_date` references an alias the
+# FROM never binds. That is a bind-time failure only an end-to-end test sees.
+# ============================================================
+
+statement ok
+CREATE TABLE sa_dates (id INTEGER, report_date DATE);
+
+statement ok
+INSERT INTO sa_dates VALUES (1, '2026-01-01'), (2, '2026-02-01');
+
+statement ok
+CREATE TABLE sa_bal (id INTEGER, date_id INTEGER, account_type VARCHAR, balance INTEGER);
+
+statement ok
+INSERT INTO sa_bal VALUES
+  (1, 1, 'CHECKING',  10), (2, 2, 'CHECKING', 100),
+  (3, 1, 'SAVINGS',   20), (4, 2, 'SAVINGS',  200);
+
+statement ok
+CREATE TABLE sa_ord2 (id INTEGER, bal_id INTEGER);
+
+statement ok
+INSERT INTO sa_ord2 VALUES (10,1), (11,2), (12,2), (13,2), (14,3), (15,4), (16,4);
+
+statement ok
+CREATE SEMANTIC VIEW sa_off AS
+  TABLES (
+    o AS sa_ord2  PRIMARY KEY (id),
+    b AS sa_bal   PRIMARY KEY (id),
+    d AS sa_dates PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    o_to_b AS o(bal_id) REFERENCES b(id),
+    b_to_d AS b(date_id) REFERENCES d(id)
+  )
+  DIMENSIONS (
+    b.account_type AS b.account_type,
+    d.report_date AS d.report_date
+  )
+  METRICS (
+    b.total_balance NON ADDITIVE BY (report_date) AS sum(b.balance)
+  );
+
+query TI rowsort
+SELECT * FROM semantic_view('sa_off', metrics := ['total_balance'], dimensions := ['account_type']);
+----
+CHECKING	100
+SAVINGS	200
+
+# Cleanup
+statement ok
+DROP SEMANTIC VIEW sa_off;
+
+statement ok
+DROP SEMANTIC VIEW sa_sv;
+
+statement ok
+DROP TABLE sa_ord2;
+
+statement ok
+DROP TABLE sa_bal;
+
+statement ok
+DROP TABLE sa_dates;
+
+statement ok
+DROP TABLE sa_orders;
+
+statement ok
+DROP TABLE sa_snapshots;
