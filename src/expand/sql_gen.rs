@@ -516,13 +516,15 @@ pub fn expand(
         // over only the matching rows. On the outer query it would instead
         // filter the already-combined result — a post-aggregation filter
         // wearing a pre-aggregation name.
-        return Ok(super::per_grain::expand_per_grain(
+        return super::per_grain::expand_per_grain(
+            view_name,
             def,
             &resolved_dims,
             &resolved_mets,
+            &resolved_exprs,
             &plan,
             resolved_where.as_ref(),
-        ));
+        );
     }
 
     // Phase 32: pair each resolved dimension with its role-playing scoped alias

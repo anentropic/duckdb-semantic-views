@@ -77,6 +77,7 @@ test/sql/phase67_quoted_source_tables.test
 test/sql/phase68_quoted_idents_non_additive.test
 test/sql/phase68_quoted_idents_window.test
 test/sql/per_grain_role_playing.test
+test/sql/semi_additive_multi_grain.test
 test/sql/semi_additive_own_grain.test
 test/sql/per_grain_role_playing_using.test
 test/sql/phase69_per_grain.test

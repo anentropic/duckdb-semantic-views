@@ -43,12 +43,6 @@
 //!
 //! - a dimension **below** a metric's grain (the metric's rows genuinely fan
 //!   across the dimension's values) — `FanTrap`, raised by the fence;
-//! - *active* semi-additive metrics **spanning more than one grain**. A single
-//!   grain is now answered: [`snapshot_cte_anchor`] re-points `__sv_snapshot` at
-//!   the metric's own table, the same move [`window_cte_anchor`] makes for
-//!   `__sv_agg`. Two grains give that single CTE no one anchor, so they keep the
-//!   error until the `RANK` shape can be emitted as one group's CTE inside a
-//!   multi-grain plan (TECH-DEBT #36);
 //! - a query that reaches a **role-played** table without saying which role it
 //!   means. Which of the several relationship instances a grain CTE should join
 //!   is what `USING` answers, and a co-queried metric's `USING` is now honoured:
@@ -71,6 +65,14 @@
 //! `__sv_agg` CTE there — the window function is not grain-sensitive, so moving
 //! the CTE is the whole fix. That path does not build [`Plan`] groups; it reuses
 //! only [`anchor_joins`] and the fence's per-grain mode.
+//!
+//! *Active* semi-additive metrics are no longer in that list either. A single
+//! grain re-points `__sv_snapshot` at the metric's own table via
+//! [`snapshot_cte_anchor`] — the move [`window_cte_anchor`] makes for `__sv_agg`
+//! — and is left to the base-anchored emitter. A query spanning several grains
+//! emits the snapshot as ONE GROUP's CTE, nested as `SELECT <outer> FROM
+//! (<inner>)` so its rows are ranked before that grain aggregates them, while
+//! sibling groups aggregate normally (see [`render_snapshot_group`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -115,6 +117,12 @@ struct Group {
     /// Aggregate expressions, in emission order. The `i`th is aliased
     /// [`metric_column(i)`](metric_column).
     exprs: Vec<String>,
+    /// Canonical names of the metrics contributing each expression, parallel to
+    /// `exprs`. A snapshot group needs the metrics themselves — `USING`,
+    /// `NON ADDITIVE BY`, and the aggregate to decompose — not the already-built
+    /// expression, and storing names rather than `&Metric` keeps [`Plan`] free
+    /// of a lifetime.
+    metric_names: Vec<String>,
 }
 
 /// How one requested metric's output column is produced from the grain CTEs.
@@ -161,15 +169,17 @@ impl Partition {
 
     /// Add `expr` to `anchor`'s group (creating it on first use) and return the
     /// (group, column) coordinates of the added column.
-    fn push(&mut self, anchor: &str, expr: String) -> (usize, usize) {
+    fn push(&mut self, anchor: &str, expr: String, metric_name: String) -> (usize, usize) {
         let group = *self.index.entry(anchor.to_string()).or_insert_with(|| {
             self.groups.push(Group {
                 anchor: anchor.to_string(),
                 exprs: Vec::new(),
+                metric_names: Vec::new(),
             });
             self.groups.len() - 1
         });
         self.groups[group].exprs.push(expr);
+        self.groups[group].metric_names.push(metric_name);
         (group, self.groups[group].exprs.len() - 1)
     }
 }
@@ -218,7 +228,11 @@ pub(super) fn plan(
                 .get(&crate::ident::normalize_ident_part(&met.name))
                 .cloned()
                 .unwrap_or_else(|| met.expr.clone());
-            let (group, column) = partition.push(&grains[0], expr);
+            let (group, column) = partition.push(
+                &grains[0],
+                expr,
+                crate::ident::normalize_ident_part(&met.name),
+            );
             outputs.push(Output::Direct { group, column });
         } else {
             outputs.push(decompose(def, met, resolved_exprs, &mut partition)?);
@@ -256,9 +270,41 @@ pub(super) fn plan(
         }
     }
 
+    // A query whose ONLY group is a snapshot group belongs to the base-anchored
+    // semi-additive emitter, which `snapshot_cte_anchor` already re-points at the
+    // metric's own grain (TECH-DEBT #36 increment 1). Declining here keeps that
+    // verified single-CTE shape instead of re-routing it through a one-group
+    // plan that would emit the same thing with an extra wrapper.
+    let queried_dim_keys: HashSet<String> = resolved_dims
+        .iter()
+        .map(|d| crate::ident::normalize_ident_part(&d.name))
+        .collect();
+    if partition.groups.len() == 1
+        && is_snapshot_group(def, &partition.groups[0], &queried_dim_keys)
+    {
+        return None;
+    }
+
     Some(Plan {
         groups: partition.groups,
         outputs,
+    })
+}
+
+/// Whether `group`'s metrics include an ACTIVE semi-additive one, in which case
+/// its CTE is the nested snapshot shape rather than a flat aggregate.
+fn is_snapshot_group(
+    def: &SemanticViewDefinition,
+    group: &Group,
+    queried_dim_keys: &HashSet<String>,
+) -> bool {
+    group.metric_names.iter().any(|name| {
+        def.metrics
+            .iter()
+            .find(|m| crate::ident::normalize_ident_part(&m.name) == *name)
+            .is_some_and(|m| {
+                super::semi_additive::is_active_semi_additive(def, m, queried_dim_keys)
+            })
     })
 }
 
@@ -297,7 +343,9 @@ fn decompose(
             return None; // Component strategies that are base-anchored — not eligible.
         }
         let expr = resolved_exprs.get(&name).cloned()?;
-        let (group, column) = partition.push(&source.to_ascii_lowercase(), expr);
+        // A component always has an empty `non_additive_by` (rejected above), so a
+        // decomposed derived metric never lands in a snapshot group.
+        let (group, column) = partition.push(&source.to_ascii_lowercase(), expr, name.clone());
         let reference = column_ref(group, &metric_column(column));
         // A base metric may be referenced bare (`revenue`) or qualified by its
         // own source table (`o.revenue`) — the same two spellings
@@ -717,14 +765,30 @@ fn is_eligible(
     if resolved_dims.iter().any(|d| d.source_table.is_none()) {
         return false;
     }
-    if role_playing_affects_query(def, resolved_dims, resolved_mets, where_tables, true) {
-        return false;
-    }
-
+    // A snapshot group cannot honour a role: `render_snapshot_group` builds its
+    // `ResolvedDim`s with no scoped alias and gives `anchor_joins` an empty role
+    // map, so it would join whichever instance is declared first while a sibling
+    // PLAIN group in the same query joins the one `USING` named. The two grain
+    // CTEs would then group by different instances of the same dimension and the
+    // outer join would compare them — a silent wrong answer, not an error. So
+    // the scoped-alias rescue is available only when no metric needs a snapshot.
     let queried_dim_keys: HashSet<String> = resolved_dims
         .iter()
         .map(|d| crate::ident::normalize_ident_part(&d.name))
         .collect();
+    let any_active_semi_additive = resolved_mets
+        .iter()
+        .any(|m| super::semi_additive::is_active_semi_additive(def, m, &queried_dim_keys));
+    if role_playing_affects_query(
+        def,
+        resolved_dims,
+        resolved_mets,
+        where_tables,
+        !any_active_semi_additive,
+    ) {
+        return false;
+    }
+
     // A metric's `USING` is honoured only in the one shape this emitter threads:
     // every relationship it names targets a role-played table whose role was
     // resolved into `roles` and is therefore emitted as a scoped join. `USING`
@@ -751,11 +815,7 @@ fn is_eligible(
                     .iter()
                     .find(|m| crate::ident::normalize_ident_part(&m.name) == *name)
             })
-            .all(|m| {
-                !m.is_window()
-                    && using_is_threaded(m)
-                    && !super::semi_additive::is_active_semi_additive(def, m, &queried_dim_keys)
-            })
+            .all(|m| !m.is_window() && using_is_threaded(m))
     })
 }
 
@@ -766,13 +826,16 @@ fn is_eligible(
 /// `FULL OUTER JOIN` on the queried dimensions — NULL-safe, so a group present
 /// at one grain and absent at another survives with a NULL metric — or
 /// `CROSS JOIN` when the query has no dimensions and each grain yields one row.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn expand_per_grain(
+    view_name: &str,
     def: &SemanticViewDefinition,
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
+    resolved_exprs: &HashMap<String, String>,
     plan: &Plan,
     where_clause: Option<&ResolvedWhere>,
-) -> String {
+) -> Result<String, super::types::ExpandError> {
     // Resolved once here and threaded into both renderers, so the join and the
     // dimension expression cannot disagree about which role a table plays.
     let roles = scoped_roles(def, resolved_dims, resolved_mets);
@@ -786,23 +849,154 @@ pub(super) fn expand_per_grain(
             .iter()
             .all(|o| matches!(o, Output::Direct { .. }))
     {
-        return render_single_grain(
+        return Ok(render_single_grain(
             def,
             resolved_dims,
             resolved_mets,
             plan,
             where_clause,
             &roles,
-        );
+        ));
     }
     render_multi_grain(
+        view_name,
         def,
         resolved_dims,
         resolved_mets,
+        resolved_exprs,
         plan,
         where_clause,
         &roles,
     )
+}
+
+/// Render one grain group's CTE body: the ordinary aggregation shape, anchored
+/// at this grain's own table. The sibling of [`render_snapshot_group`], which
+/// handles the group that must rank its rows first.
+fn render_plain_group(
+    def: &SemanticViewDefinition,
+    resolved_dims: &[&Dimension],
+    group: &Group,
+    where_clause: Option<&ResolvedWhere>,
+    where_tables: &[String],
+    roles: &HashMap<String, String>,
+) -> String {
+    let mut sql = String::with_capacity(256);
+    sql.push_str("    SELECT\n");
+    let mut items: Vec<String> = Vec::new();
+    for (d, dim) in resolved_dims.iter().enumerate() {
+        let item = SelectItem::new(
+            dim_expr(dim, roles),
+            dim.output_type.clone(),
+            quote_ident(&dim_column(d)),
+        );
+        items.push(format!("        {}", item.render()));
+    }
+    for (m, expr) in group.exprs.iter().enumerate() {
+        items.push(format!(
+            "        {} AS {}",
+            expr,
+            quote_ident(&metric_column(m))
+        ));
+    }
+    sql.push_str(&items.join(",\n"));
+    push_from_anchor(&mut sql, def, &group.anchor, "\n    ");
+    push_join_clauses(
+        &mut sql,
+        &anchor_joins(def, &group.anchor, resolved_dims, where_tables, roles),
+        def,
+        "\n    LEFT JOIN ",
+    );
+    // Inside the CTE, before its GROUP BY: each grain must aggregate over only
+    // the matching rows. On the outer query this would instead filter the
+    // already-combined result — a post-aggregation filter.
+    if let Some(w) = where_clause {
+        sql.push_str("\n    WHERE ");
+        sql.push_str(&w.sql);
+    }
+    push_group_by_ordinals(&mut sql, resolved_dims.len(), "\n    ", "        ");
+    sql
+}
+
+/// Render one grain group's CTE body when that group carries an ACTIVE
+/// semi-additive metric.
+///
+/// The rows must be ranked BEFORE this grain aggregates them, so the body is
+/// `SELECT <outer> FROM (<inner>)` — the same two halves
+/// [`super::semi_additive::build_snapshot_block`] gives the base-anchored
+/// emitter, nested instead of split across a `WITH`. Sharing that builder is
+/// what keeps the `RANK` tie semantics (SG-4), the decomposition rejection
+/// (SG-5) and the NA-dimension joins identical on both paths.
+///
+/// `build_snapshot_block` indexes its `__sv_semi_{i}` / `__sv_reg_{i}` capture
+/// columns by position within the metrics it is GIVEN, so passing only this
+/// group's metrics gives each group its own column namespace — two snapshot
+/// groups in one query cannot collide.
+fn render_snapshot_group(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    resolved_dims: &[&Dimension],
+    group: &Group,
+    resolved_exprs: &HashMap<String, String>,
+    where_clause: Option<&ResolvedWhere>,
+) -> Result<String, super::types::ExpandError> {
+    // No dimension here carries a scoped alias, and none can: `is_eligible`
+    // withholds the scoped-alias rescue from any query with an active
+    // semi-additive metric, precisely BECAUSE this renderer cannot honour a role
+    // while a sibling plain group can — see the guard test
+    // `role_played_dimension_with_a_semi_additive_metric_stays_ineligible`.
+    let rdims: Vec<super::types::ResolvedDim> = resolved_dims
+        .iter()
+        .map(|dim| super::types::ResolvedDim {
+            dim,
+            scoped_alias: None,
+        })
+        .collect();
+    let dim_aliases: Vec<String> = (0..resolved_dims.len())
+        .map(|d| quote_ident(&dim_column(d)))
+        .collect();
+    let mets: Vec<&Metric> = group
+        .metric_names
+        .iter()
+        .filter_map(|name| {
+            def.metrics
+                .iter()
+                .find(|m| crate::ident::normalize_ident_part(&m.name) == *name)
+        })
+        .collect();
+
+    let block = super::semi_additive::build_snapshot_block(
+        view_name,
+        def,
+        &rdims,
+        &dim_aliases,
+        &mets,
+        resolved_exprs,
+        where_clause,
+        Some(&group.anchor),
+    )?;
+
+    let mut sql = String::with_capacity(256);
+    sql.push_str("    SELECT\n");
+    let mut items: Vec<String> = Vec::new();
+    // The inner SELECT already aliased each dimension to its `__sv_d{i}`
+    // column, so the outer one groups by that alias and re-exposes it.
+    for d in 0..resolved_dims.len() {
+        items.push(format!("        {}", quote_ident(&dim_column(d))));
+    }
+    for (m, expr) in block.outer_exprs.iter().enumerate() {
+        items.push(format!(
+            "        {} AS {}",
+            expr,
+            quote_ident(&metric_column(m))
+        ));
+    }
+    sql.push_str(&items.join(",\n"));
+    sql.push_str("\n    FROM (\n");
+    sql.push_str(&block.inner_sql);
+    sql.push_str("\n    )");
+    push_group_by_ordinals(&mut sql, resolved_dims.len(), "\n    ", "        ");
+    Ok(sql)
 }
 
 /// The one-grain case: the ordinary aggregation shape, anchored at the metrics'
@@ -861,54 +1055,49 @@ fn render_single_grain(
 }
 
 /// The general case: one CTE per grain, joined on the queried dimensions.
+#[allow(clippy::too_many_arguments)]
 fn render_multi_grain(
+    view_name: &str,
     def: &SemanticViewDefinition,
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
+    resolved_exprs: &HashMap<String, String>,
     plan: &Plan,
     where_clause: Option<&ResolvedWhere>,
     roles: &HashMap<String, String>,
-) -> String {
+) -> Result<String, super::types::ExpandError> {
     let mut sql = String::with_capacity(512);
     let where_tables = where_clause
         .map(|w| w.source_tables.clone())
         .unwrap_or_default();
+    let queried_dim_keys: HashSet<String> = resolved_dims
+        .iter()
+        .map(|d| crate::ident::normalize_ident_part(&d.name))
+        .collect();
     for (i, group) in plan.groups.iter().enumerate() {
         sql.push_str(if i == 0 { "WITH " } else { ",\n" });
         sql.push_str(&grain_cte(i));
-        sql.push_str(" AS (\n    SELECT\n");
-        let mut items: Vec<String> = Vec::new();
-        for (d, dim) in resolved_dims.iter().enumerate() {
-            let item = SelectItem::new(
-                dim_expr(dim, roles),
-                dim.output_type.clone(),
-                quote_ident(&dim_column(d)),
-            );
-            items.push(format!("        {}", item.render()));
+        sql.push_str(" AS (\n");
+        if is_snapshot_group(def, group, &queried_dim_keys) {
+            sql.push_str(&render_snapshot_group(
+                view_name,
+                def,
+                resolved_dims,
+                group,
+                resolved_exprs,
+                where_clause,
+            )?);
+            sql.push_str("\n)");
+            continue;
         }
-        for (m, expr) in group.exprs.iter().enumerate() {
-            items.push(format!(
-                "        {} AS {}",
-                expr,
-                quote_ident(&metric_column(m))
-            ));
-        }
-        sql.push_str(&items.join(",\n"));
-        push_from_anchor(&mut sql, def, &group.anchor, "\n    ");
-        push_join_clauses(
-            &mut sql,
-            &anchor_joins(def, &group.anchor, resolved_dims, &where_tables, roles),
+        sql.push_str(&render_plain_group(
             def,
-            "\n    LEFT JOIN ",
-        );
-        // Inside the CTE, before its GROUP BY: each grain must aggregate over
-        // only the matching rows. On the outer query this would instead filter
-        // the already-combined result — a post-aggregation filter.
-        if let Some(w) = where_clause {
-            sql.push_str("\n    WHERE ");
-            sql.push_str(&w.sql);
-        }
-        push_group_by_ordinals(&mut sql, resolved_dims.len(), "\n    ", "        ");
+            resolved_dims,
+            group,
+            where_clause,
+            &where_tables,
+            roles,
+        ));
         sql.push_str("\n)");
     }
     sql.push('\n');
@@ -963,7 +1152,7 @@ fn render_multi_grain(
             sql.push_str(&conditions.join("\n    AND "));
         }
     }
-    sql
+    Ok(sql)
 }
 
 /// The join key for dimension `d` over the first `groups` grain CTEs: a plain

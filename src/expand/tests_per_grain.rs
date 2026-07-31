@@ -513,24 +513,20 @@ fn metric_grouped_by_sibling_dimension_errors() {
 // GRAIN-07: the documented residual boundary (TECH-DEBT #36)
 // ---------------------------------------------------------------------------
 
-/// A GENUINELY multi-grain query carrying an ACTIVE semi-additive metric keeps
-/// the fan-trap error.
+/// GRAIN-12: a multi-grain query carrying an ACTIVE semi-additive metric is
+/// computed — the snapshot becomes one grain group's CTE.
 ///
-/// The boundary moved but did not disappear. `snapshot_cte_anchor` re-anchors a
-/// single `__sv_snapshot`, so it needs ONE grain to anchor at; a semi-additive
-/// metric alongside a metric at a different grain has two, and the per-grain
-/// planner that could reassemble them still declines active semi-additive
-/// metrics. Emitting the `RANK` shape as one group's CTE inside a multi-grain
-/// plan is the second increment (TECH-DEBT #36).
+/// This is the shape TECH-DEBT #36 tracked to the end. Increment 1 re-anchored a
+/// SINGLE snapshot CTE; here the snapshot is one group among several, nested
+/// inside its grain CTE as `SELECT <outer> FROM (<inner>)` while the sibling
+/// group aggregates normally and the two are joined. Probed against Snowflake:
+/// it computes each metric at its own grain, snapshot included.
 ///
-/// This test previously queried `total_balance` ALONE — a single grain, which
-/// is exactly the shape the first increment now answers, so the assertion was
-/// superseded rather than broken. It is re-pointed at the residual boundary
-/// (which its name always described) instead of being deleted, so the retired
-/// case keeps a guard; the answered case is pinned by
-/// `active_semi_additive_snapshot_anchors_at_its_own_grain`.
+/// Supersedes `multi_grain_with_active_semi_additive_metric_still_errors`, which
+/// asserted the fan-trap error for exactly this query. The boundary is gone
+/// rather than moved this time, so the test is converted rather than re-pointed.
 #[test]
-fn multi_grain_with_active_semi_additive_metric_still_errors() {
+fn multi_grain_with_active_semi_additive_metric_is_computed() {
     let def = orders_with_parent_customers()
         .with_dimension("snapshot_day", "c.as_of", Some("c"))
         .with_non_additive_by(
@@ -539,14 +535,48 @@ fn multi_grain_with_active_semi_additive_metric_still_errors() {
         );
     // `snapshot_day` is NOT queried, so the metric is *active* semi-additive;
     // `order_count` sits at the base grain, so the query spans two.
-    let err = expand("sales", &def, &req(&[], &["order_count", "total_balance"]))
-        .expect_err("two grains give the single snapshot CTE no one anchor");
+    let sql = expand("sales", &def, &req(&[], &["order_count", "total_balance"]))
+        .expect("a snapshot group and a plain group must be computable together");
     assert!(
-        matches!(
-            err,
-            ExpandError::RootGrainFanTrap { .. } | ExpandError::MetricFanTrap { .. }
-        ),
-        "expected the v0.11.0 fan-trap error, got: {err}"
+        sql.contains("__sv_grain_0") && sql.contains("__sv_grain_1"),
+        "expected one CTE per grain, got:\n{sql}"
+    );
+    assert!(
+        sql.contains("RANK()"),
+        "the semi-additive group keeps its snapshot shape, got:\n{sql}"
+    );
+    assert!(sql.contains("__sv_rn"), "and its rank column, got:\n{sql}");
+    // The snapshot group anchors at customers; the base table must not be
+    // joined into it, which is what inflated the balance before.
+    assert!(
+        sql.contains(r#"FROM "customers" AS "c""#),
+        "snapshot group anchored at its own grain, got:\n{sql}"
+    );
+}
+
+/// GRAIN-12, grouped: the same shape with a dimension both grains can reach.
+#[test]
+fn multi_grain_semi_additive_with_a_shared_dimension() {
+    let def = orders_with_parent_customers()
+        .with_dimension("snapshot_day", "c.as_of", Some("c"))
+        .with_non_additive_by(
+            "total_balance",
+            &[("snapshot_day", SortOrder::Asc, NullsOrder::Last)],
+        );
+    let sql = expand(
+        "sales",
+        &def,
+        &req(&["segment"], &["order_count", "total_balance"]),
+    )
+    .expect("a dimension above both grains must group the snapshot too");
+    assert!(
+        sql.contains("RANK()") && sql.contains("__sv_grain_1"),
+        "snapshot inside a grain CTE, got:\n{sql}"
+    );
+    // The dimension must reach the outer coalesce, so the two grains join on it.
+    assert!(
+        sql.contains("COALESCE") || sql.contains("FULL OUTER JOIN"),
+        "grains must be joined on the shared dimension, got:\n{sql}"
     );
 }
 
@@ -1439,5 +1469,108 @@ fn re_anchored_snapshot_joins_an_offtable_na_dimension() {
     assert!(
         sql.contains(r#""snapshots" AS "s""#),
         "the NA dimension's table must be joined or its ORDER BY cannot bind:\n{sql}"
+    );
+}
+
+/// GRAIN-12: TWO snapshot groups in one query.
+///
+/// `build_snapshot_block` numbers its capture columns by position within the
+/// metrics it is given, so both groups independently produce `__sv_semi_0` and
+/// `__sv_rn`. That is safe only because each lives inside its own grain CTE —
+/// this pins that the per-group namespaces really are separate, which a single
+/// shared snapshot CTE could not have provided.
+#[test]
+fn two_snapshot_groups_get_independent_column_namespaces() {
+    let def = base_table(minimal_def("o", "d", "d", "m", "count(*)"), "orders", "id")
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("c", "customers", &["id"])
+        .with_table("w", "warehouses", &["id"])
+        .with_dimension("c_day", "c.as_of", Some("c"))
+        .with_dimension("w_day", "w.as_of", Some("w"))
+        .with_metric("total_balance", "SUM(c.balance)", Some("c"))
+        .with_metric("stock_level", "SUM(w.stock)", Some("w"))
+        .with_non_additive_by(
+            "total_balance",
+            &[("c_day", SortOrder::Asc, NullsOrder::Last)],
+        )
+        .with_non_additive_by(
+            "stock_level",
+            &[("w_day", SortOrder::Asc, NullsOrder::Last)],
+        )
+        .with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"])
+        .with_pkfk_join("o_to_w", "o", "w", &["warehouse_id"], &["id"]);
+    let sql = expand("sales", &def, &req(&[], &["total_balance", "stock_level"]))
+        .expect("two snapshot groups at two grains must be computable");
+    assert_eq!(
+        sql.matches("RANK()").count(),
+        2,
+        "one rank per snapshot group, got:\n{sql}"
+    );
+    assert!(
+        sql.contains(r#"FROM "customers" AS "c""#) && sql.contains(r#"FROM "warehouses" AS "w""#),
+        "each snapshot anchors at its own grain, got:\n{sql}"
+    );
+    // Each grain CTE orders by its OWN metric's NA dimension.
+    assert!(
+        sql.contains("c.as_of") && sql.contains("w.as_of"),
+        "each snapshot ranks by its own NA dimension, got:\n{sql}"
+    );
+}
+
+/// GRAIN-12 guard — a role-played dimension makes a snapshot query INELIGIBLE.
+///
+/// Copilot review catch on #180, and a real silent-wrong-answer hole.
+/// `render_snapshot_group` builds its `ResolvedDim`s with `scoped_alias: None`
+/// and passes an empty roles map to `anchor_joins`, so a snapshot group cannot
+/// honour a role — while a sibling PLAIN group in the same query can. The two
+/// CTEs then disagree about which instance the dimension means:
+///
+/// ```text
+/// __sv_grain_0 (plain)    a__dep.city   ON "c"."dep_code"   <- named role
+/// __sv_grain_1 (snapshot) a.city        ON "c"."arr_code"   <- declaration order
+/// ```
+///
+/// and the outer FULL OUTER JOIN compares departure city against arrival city.
+/// No error, plausible output, wrong numbers. Role-playing therefore stays
+/// STRICT whenever an active semi-additive metric is present, which is what
+/// `render_snapshot_group`'s doc comment always claimed.
+///
+/// The fixture declares `arr` FIRST so the bare-alias edge is demonstrably the
+/// wrong one: with `dep` first the mis-binding would coincide with the right
+/// answer and the test would pass for the wrong reason.
+#[test]
+fn role_played_dimension_with_a_semi_additive_metric_stays_ineligible() {
+    let def = base_table(minimal_def("f", "d", "d", "m", "count(*)"), "flights", "id")
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("c", "carriers", &["id"])
+        .with_table("a", "airports", &["code"])
+        .with_dimension("hub_city", "a.city", Some("a"))
+        .with_dimension("as_of", "c.as_of", Some("c"))
+        .with_metric("flight_count", "COUNT(*)", Some("f"))
+        .with_metric("fleet_balance", "SUM(c.fleet)", Some("c"))
+        .with_using_relationship("flight_count", &["dep"])
+        .with_non_additive_by(
+            "fleet_balance",
+            &[("as_of", SortOrder::Asc, NullsOrder::Last)],
+        )
+        .with_pkfk_join("f_to_c", "f", "c", &["carrier_id"], &["id"])
+        .with_pkfk_join("arr", "c", "a", &["arr_code"], &["code"])
+        .with_pkfk_join("dep", "c", "a", &["dep_code"], &["code"]);
+    let err = expand(
+        "sv",
+        &def,
+        &req(&["hub_city"], &["flight_count", "fleet_balance"]),
+    )
+    .expect_err("a snapshot group cannot honour a role, so the query must decline");
+    assert!(
+        matches!(
+            err,
+            ExpandError::RootGrainFanTrap { .. }
+                | ExpandError::MetricFanTrap { .. }
+                | ExpandError::FanTrap { .. }
+        ),
+        "expected the base-anchored fence's error, got: {err}"
     );
 }
