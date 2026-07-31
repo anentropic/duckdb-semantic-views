@@ -147,26 +147,58 @@ pub(super) fn is_active_semi_additive(
 ///
 /// Called from `expand()` when `has_active_semi_additive` is true.
 /// Receives already-resolved dims, metrics, expressions, and scoped aliases.
-pub(super) fn expand_semi_additive(
+/// The two halves of a snapshot computation, ready for either caller.
+///
+/// [`expand_semi_additive`] assembles them as
+/// `WITH __sv_snapshot AS (<inner_sql>) SELECT <outer_exprs> FROM __sv_snapshot`.
+/// The per-grain planner nests the same pair inside one grain CTE, as
+/// `SELECT <outer_exprs> FROM (<inner_sql>)`. One builder for both is what stops
+/// the paths drifting on the parts that carry the correctness — the `RANK` tie
+/// semantics (SG-4), the decomposition rejection (SG-5), dotted NA resolution
+/// (#30) and the role-playing ORDER BY scoping (T-15).
+pub(super) struct SnapshotBlock {
+    /// The inner SELECT: dimension columns, each metric's captured raw value,
+    /// the rank column(s), and the FROM / JOIN / WHERE that feed them. Indented
+    /// for a one-level nesting; SQL is whitespace-insensitive, so a caller that
+    /// nests it deeper does not need to re-indent.
+    pub(super) inner_sql: String,
+    /// One outer re-aggregation per metric, in `resolved_mets` order, unaliased.
+    pub(super) outer_exprs: Vec<String>,
+}
+
+/// Build both halves of the snapshot for `resolved_mets`.
+///
+/// `dim_aliases[i]` is the already-quoted alias the `i`th dimension takes in the
+/// inner SELECT — the stored name for the base-anchored path, `__sv_d{i}` for a
+/// grain CTE. `anchor` re-points the FROM at a metric's own grain when
+/// [`super::per_grain::snapshot_cte_anchor`] found a safe one.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_snapshot_block(
     view_name: &str,
     def: &SemanticViewDefinition,
     resolved_dims: &[ResolvedDim],
+    dim_aliases: &[String],
     resolved_mets: &[&Metric],
     resolved_exprs: &HashMap<String, String>,
     where_clause: Option<&super::where_clause::ResolvedWhere>,
     anchor: Option<&str>,
-) -> Result<String, ExpandError> {
-    let mut sql = String::with_capacity(512);
+) -> Result<SnapshotBlock, ExpandError> {
+    // `dim_aliases` is positionally parallel to `resolved_dims`; state it here so
+    // a caller that builds the two separately fails on this line rather than on
+    // an opaque index panic inside the column emitter.
+    debug_assert_eq!(
+        resolved_dims.len(),
+        dim_aliases.len(),
+        "dim_aliases must be parallel to resolved_dims"
+    );
 
-    // Build set of queried dimension keys for classification. Canonical keys
-    // (quote-stripped + folded) so a quoted stored dim name matches, and so a
-    // dotted/quoted NA reference resolves against it (#30).
+    // Canonical keys (quote-stripped + folded) so a quoted stored dim name
+    // matches, and so a dotted/quoted NA reference resolves against it (#30).
     let queried_dim_keys: HashSet<String> = resolved_dims
         .iter()
         .map(|rd| crate::ident::normalize_ident_part(&rd.dim.name))
         .collect();
 
-    // Classify each metric as active semi-additive (shared routing predicate)
     let is_active_semi =
         |met: &Metric| -> bool { is_active_semi_additive(def, met, &queried_dim_keys) };
 
@@ -174,25 +206,25 @@ pub(super) fn expand_semi_additive(
     let na_groups = collect_na_groups(view_name, def, resolved_mets, &queried_dim_keys)?;
 
     // 2. SG-5: validate and decompose every metric expression BEFORE emitting
-    //    any SQL. The snapshot CTE decomposes each metric into an
-    //    inner-expression capture (CTE column) plus an outer re-aggregation,
-    //    which is only sound for a single bare aggregate call. Anything else
-    //    was previously mangled silently (dropped arithmetic, star/DISTINCT
-    //    arguments emitted as broken CTE columns) -- reject it with a clear
-    //    error instead.
+    //    any SQL. The snapshot decomposes each metric into an inner-expression
+    //    capture plus an outer re-aggregation, which is only sound for a single
+    //    bare aggregate call. Anything else was previously mangled silently
+    //    (dropped arithmetic, star/DISTINCT arguments emitted as broken columns)
+    //    -- reject it with a clear error instead.
     let decomposed = decompose_metrics(view_name, resolved_mets, resolved_exprs, &is_active_semi)?;
 
-    // === CTE ===
-    sql.push_str("WITH __sv_snapshot AS (\n    SELECT\n");
+    let mut sql = String::with_capacity(512);
+    sql.push_str("    SELECT\n");
 
     let mut cte_select_items: Vec<String> = Vec::new();
 
-    // Dimension columns in CTE (returns the rendered dimension EXPRESSIONS the
-    // RANK() window clauses must repeat, never the CTE aliases — E-1).
-    let dim_cte_exprs = push_cte_dimension_columns(resolved_dims, &mut cte_select_items);
+    // Dimension columns (returns the rendered dimension EXPRESSIONS the RANK()
+    // window clauses must repeat, never the aliases — E-1).
+    let dim_cte_exprs =
+        push_cte_dimension_columns(resolved_dims, dim_aliases, &mut cte_select_items);
 
-    // Metric raw columns in CTE -- the validated inner expression of each
-    // metric's aggregate call (decomposed above).
+    // Metric raw columns -- the validated inner expression of each metric's
+    // aggregate call (decomposed above).
     for (met_idx, met) in resolved_mets.iter().enumerate() {
         let inner = &decomposed[met_idx].1;
         if is_active_semi(met) {
@@ -204,8 +236,8 @@ pub(super) fn expand_semi_additive(
         }
     }
 
-    // Snapshot rank columns (one per active NA group). RANK() so that rows
-    // tied on all NA ordering keys share rank 1 and ALL aggregate (SG-4);
+    // Snapshot rank columns (one per active NA group). RANK() so that rows tied
+    // on all NA ordering keys share rank 1 and ALL aggregate (SG-4);
     // ROW_NUMBER() would keep one arbitrary tied row per partition.
     for (group_idx, group) in na_groups.iter().enumerate() {
         let rn_alias = if na_groups.len() == 1 {
@@ -213,7 +245,6 @@ pub(super) fn expand_semi_additive(
         } else {
             format!("__sv_rn_{}", group_idx + 1)
         };
-
         cte_select_items.push(snapshot_rank_column(
             def,
             resolved_dims,
@@ -225,22 +256,18 @@ pub(super) fn expand_semi_additive(
 
     sql.push_str(&cte_select_items.join(",\n"));
 
-    // CTE FROM clause. `anchor` re-points it at the metric's own grain when
-    // `per_grain::snapshot_cte_anchor` found a safe one; otherwise the base
-    // table, as before.
     match anchor {
         Some(a) => push_from_anchor(&mut sql, def, a, "\n    "),
         None => push_from_base(&mut sql, def, "\n    "),
     }
 
-    // CTE JOINs. SG-9: the snapshot ORDER BY references each active NA dim's
-    // raw expression even when that dim is not queried, so the NA dims'
-    // source tables must be joined too. They are passed through the
-    // resolver's extra-alias parameter, which appends each with its path
-    // intermediaries (aliases already joined for dims/metrics are skipped).
+    // SG-9: the snapshot ORDER BY references each active NA dim's raw expression
+    // even when that dim is not queried, so the NA dims' source tables must be
+    // joined too. They ride the resolver's extra-alias parameter, which appends
+    // each with its path intermediaries (aliases already joined are skipped).
     let mut na_dim_sources = collect_na_dim_source_tables(def, &na_groups);
-    // A `where_clause` member's table must be joined inside the CTE too — the
-    // predicate is applied here, so its aliases have to be in the CTE's FROM.
+    // A `where_clause` member's table must be joined here too — the predicate is
+    // applied inside this SELECT, so its aliases have to be in this FROM.
     if let Some(w) = where_clause {
         na_dim_sources.extend(w.source_tables.iter().cloned());
     }
@@ -261,24 +288,72 @@ pub(super) fn expand_semi_additive(
     };
     push_join_clauses(&mut sql, &resolved_joins, def, "\n    LEFT JOIN ");
 
-    // The predicate goes INSIDE the snapshot CTE, which puts it before the
-    // `RANK()` in the select list is evaluated. That ordering is the whole
-    // point: filtering changes which row wins the snapshot, and "applied before
-    // the metrics are computed" has to mean before the snapshot is picked. On
-    // the outer query it would pick the snapshot from unfiltered rows and then
-    // discard some of them — a different, wrong answer.
+    // The predicate goes INSIDE this SELECT, which puts it before the `RANK()`
+    // in the select list is evaluated. That ordering is the whole point:
+    // filtering changes which row wins the snapshot, and "applied before the
+    // metrics are computed" has to mean before the snapshot is picked. Outside,
+    // it would pick the snapshot from unfiltered rows and then discard some of
+    // them — a different, wrong answer.
     if let Some(w) = where_clause {
         sql.push_str("\n    WHERE ");
         sql.push_str(&w.sql);
     }
 
+    let outer_exprs = resolved_mets
+        .iter()
+        .enumerate()
+        .map(|(met_idx, met)| {
+            outer_metric_expr(
+                met_idx,
+                &decomposed[met_idx].0,
+                is_active_semi(met),
+                &na_groups,
+            )
+        })
+        .collect();
+
+    Ok(SnapshotBlock {
+        inner_sql: sql,
+        outer_exprs,
+    })
+}
+
+pub(super) fn expand_semi_additive(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    resolved_dims: &[ResolvedDim],
+    resolved_mets: &[&Metric],
+    resolved_exprs: &HashMap<String, String>,
+    where_clause: Option<&super::where_clause::ResolvedWhere>,
+    anchor: Option<&str>,
+) -> Result<String, ExpandError> {
+    // The base-anchored path names each dimension column by its stored name, so
+    // the outer SELECT can reference the alias directly.
+    let dim_aliases: Vec<String> = resolved_dims
+        .iter()
+        .map(|rd| quote_stored_ident(&rd.dim.name))
+        .collect();
+    let block = build_snapshot_block(
+        view_name,
+        def,
+        resolved_dims,
+        &dim_aliases,
+        resolved_mets,
+        resolved_exprs,
+        where_clause,
+        anchor,
+    )?;
+
+    let mut sql = String::with_capacity(512);
+    sql.push_str("WITH __sv_snapshot AS (\n");
+    sql.push_str(&block.inner_sql);
     sql.push_str("\n)\n");
 
     // === Outer SELECT over the snapshot CTE ===
     let mut outer_items: Vec<SelectItem> = Vec::new();
 
-    // Dimension columns: reference CTE aliases (outer query over the CTE, so
-    // referencing the alias is safe — no physical column shadows it here).
+    // Dimension columns: reference the CTE aliases (an outer query over the CTE,
+    // so referencing the alias is safe — no physical column shadows it here).
     for rd in resolved_dims {
         outer_items.push(SelectItem::new(
             quote_stored_ident(&rd.dim.name),
@@ -287,14 +362,11 @@ pub(super) fn expand_semi_additive(
         ));
     }
 
-    // Metric columns
-    for (met_idx, met) in resolved_mets.iter().enumerate() {
-        outer_items.push(outer_metric_column(
-            met_idx,
-            met,
-            &decomposed[met_idx].0,
-            is_active_semi(met),
-            &na_groups,
+    for (met, expr) in resolved_mets.iter().zip(block.outer_exprs) {
+        outer_items.push(SelectItem::new(
+            expr,
+            met.output_type.clone(),
+            quote_stored_ident(&met.name),
         ));
     }
 
@@ -386,12 +458,17 @@ fn decompose_metrics(
 /// column and produced wrong snapshot sums (E-1, code-review 2026-07-11). The
 /// standard path defends against the same shadowing with GROUP BY ordinals;
 /// this is the CTE-path equivalent.
+/// `dim_aliases[i]` is the already-quoted alias for the `i`th dimension. The
+/// base-anchored caller passes the stored dimension name; the per-grain planner
+/// passes its positional `__sv_d{i}` column, which is why this is a parameter
+/// rather than derived from the dimension.
 fn push_cte_dimension_columns(
     resolved_dims: &[ResolvedDim],
+    dim_aliases: &[String],
     cte_select_items: &mut Vec<String>,
 ) -> Vec<String> {
     let mut dim_cte_exprs: Vec<String> = Vec::with_capacity(resolved_dims.len());
-    for rd in resolved_dims {
+    for (idx, rd) in resolved_dims.iter().enumerate() {
         let dim = rd.dim;
         let mut base_expr = dim.expr.clone();
         if let Some(ref scoped) = rd.scoped_alias {
@@ -399,11 +476,7 @@ fn push_cte_dimension_columns(
                 base_expr = crate::expr_tokens::rewrite_qualifier(&base_expr, st, scoped);
             }
         }
-        let item = SelectItem::new(
-            base_expr,
-            dim.output_type.clone(),
-            quote_stored_ident(&dim.name),
-        );
+        let item = SelectItem::new(base_expr, dim.output_type.clone(), dim_aliases[idx].clone());
         cte_select_items.push(format!("        {}", item.render()));
         // The window PARTITION/ORDER clauses must repeat this EXPRESSION, never
         // the select alias (E-1) -- see the doc comment.
@@ -575,24 +648,21 @@ fn na_order_item(
 /// `FUNC(CASE WHEN "<rn_col>" = 1 THEN "__sv_semi_<idx>" END)` -- where every
 /// row tied at rank 1 contributes (RANK semantics, SG-4). A regular or
 /// effectively-regular metric aggregates over all rows: `FUNC("__sv_reg_<idx>")`.
-fn outer_metric_column(
+/// The outer re-aggregation for one metric, without an alias — the part both
+/// snapshot callers share. An active semi-additive metric re-aggregates only its
+/// rank-1 rows; everything else re-aggregates every captured row.
+fn outer_metric_expr(
     met_idx: usize,
-    met: &Metric,
     agg_func: &str,
     is_active_semi: bool,
     na_groups: &[NaGroup],
-) -> SelectItem {
-    let inner = if is_active_semi {
+) -> String {
+    if is_active_semi {
         let rn_col = get_rn_column_for_metric(met_idx, na_groups);
         format!("{agg_func}(CASE WHEN \"{rn_col}\" = 1 THEN \"__sv_semi_{met_idx}\" END)")
     } else {
         format!("{agg_func}(\"__sv_reg_{met_idx}\")")
-    };
-    SelectItem::new(
-        inner,
-        met.output_type.clone(),
-        quote_stored_ident(&met.name),
-    )
+    }
 }
 
 /// A group of metrics sharing the same NON ADDITIVE BY dimension set.
