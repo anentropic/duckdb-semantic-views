@@ -702,9 +702,12 @@ fn collect_na_groups(
 /// in `sql_gen` — which has to be made BEFORE the fan-trap fence runs, and so
 /// cannot wait for [`expand_semi_additive`] to build its groups.
 ///
-/// A malformed NA reference yields an empty list rather than an error: the real
-/// diagnostic is raised by [`expand_semi_additive`], and an empty list simply
-/// declines the re-anchor, leaving the base-anchored path to report it.
+/// A malformed NA reference yields an empty list rather than an error. That does
+/// **not** decline the re-anchor — `snapshot_cte_anchor` cannot tell "no NA
+/// tables" from "could not resolve them", and may still return an anchor. It
+/// cannot mislead, though: [`expand_semi_additive`] rebuilds the same groups and
+/// propagates the real error before the anchor is ever used for emission, so the
+/// query fails on the NA reference itself rather than on anything decided here.
 pub(super) fn na_dim_source_tables(
     view_name: &str,
     def: &SemanticViewDefinition,
