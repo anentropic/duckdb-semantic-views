@@ -1517,3 +1517,60 @@ fn two_snapshot_groups_get_independent_column_namespaces() {
         "each snapshot ranks by its own NA dimension, got:\n{sql}"
     );
 }
+
+/// GRAIN-12 guard — a role-played dimension makes a snapshot query INELIGIBLE.
+///
+/// Copilot review catch on #180, and a real silent-wrong-answer hole.
+/// `render_snapshot_group` builds its `ResolvedDim`s with `scoped_alias: None`
+/// and passes an empty roles map to `anchor_joins`, so a snapshot group cannot
+/// honour a role — while a sibling PLAIN group in the same query can. The two
+/// CTEs then disagree about which instance the dimension means:
+///
+/// ```text
+/// __sv_grain_0 (plain)    a__dep.city   ON "c"."dep_code"   <- named role
+/// __sv_grain_1 (snapshot) a.city        ON "c"."arr_code"   <- declaration order
+/// ```
+///
+/// and the outer FULL OUTER JOIN compares departure city against arrival city.
+/// No error, plausible output, wrong numbers. Role-playing therefore stays
+/// STRICT whenever an active semi-additive metric is present, which is what
+/// `render_snapshot_group`'s doc comment always claimed.
+///
+/// The fixture declares `arr` FIRST so the bare-alias edge is demonstrably the
+/// wrong one: with `dep` first the mis-binding would coincide with the right
+/// answer and the test would pass for the wrong reason.
+#[test]
+fn role_played_dimension_with_a_semi_additive_metric_stays_ineligible() {
+    let def = base_table(minimal_def("f", "d", "d", "m", "count(*)"), "flights", "id")
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("c", "carriers", &["id"])
+        .with_table("a", "airports", &["code"])
+        .with_dimension("hub_city", "a.city", Some("a"))
+        .with_dimension("as_of", "c.as_of", Some("c"))
+        .with_metric("flight_count", "COUNT(*)", Some("f"))
+        .with_metric("fleet_balance", "SUM(c.fleet)", Some("c"))
+        .with_using_relationship("flight_count", &["dep"])
+        .with_non_additive_by(
+            "fleet_balance",
+            &[("as_of", SortOrder::Asc, NullsOrder::Last)],
+        )
+        .with_pkfk_join("f_to_c", "f", "c", &["carrier_id"], &["id"])
+        .with_pkfk_join("arr", "c", "a", &["arr_code"], &["code"])
+        .with_pkfk_join("dep", "c", "a", &["dep_code"], &["code"]);
+    let err = expand(
+        "sv",
+        &def,
+        &req(&["hub_city"], &["flight_count", "fleet_balance"]),
+    )
+    .expect_err("a snapshot group cannot honour a role, so the query must decline");
+    assert!(
+        matches!(
+            err,
+            ExpandError::RootGrainFanTrap { .. }
+                | ExpandError::MetricFanTrap { .. }
+                | ExpandError::FanTrap { .. }
+        ),
+        "expected the base-anchored fence's error, got: {err}"
+    );
+}

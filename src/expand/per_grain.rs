@@ -765,7 +765,27 @@ fn is_eligible(
     if resolved_dims.iter().any(|d| d.source_table.is_none()) {
         return false;
     }
-    if role_playing_affects_query(def, resolved_dims, resolved_mets, where_tables, true) {
+    // A snapshot group cannot honour a role: `render_snapshot_group` builds its
+    // `ResolvedDim`s with no scoped alias and gives `anchor_joins` an empty role
+    // map, so it would join whichever instance is declared first while a sibling
+    // PLAIN group in the same query joins the one `USING` named. The two grain
+    // CTEs would then group by different instances of the same dimension and the
+    // outer join would compare them — a silent wrong answer, not an error. So
+    // the scoped-alias rescue is available only when no metric needs a snapshot.
+    let queried_dim_keys: HashSet<String> = resolved_dims
+        .iter()
+        .map(|d| crate::ident::normalize_ident_part(&d.name))
+        .collect();
+    let any_active_semi_additive = resolved_mets
+        .iter()
+        .any(|m| super::semi_additive::is_active_semi_additive(def, m, &queried_dim_keys));
+    if role_playing_affects_query(
+        def,
+        resolved_dims,
+        resolved_mets,
+        where_tables,
+        !any_active_semi_additive,
+    ) {
         return false;
     }
 
@@ -920,9 +940,11 @@ fn render_snapshot_group(
     resolved_exprs: &HashMap<String, String>,
     where_clause: Option<&ResolvedWhere>,
 ) -> Result<String, super::types::ExpandError> {
-    // Role-playing is declined for a query carrying an active semi-additive
-    // metric (`role_playing_affects_query` is consulted with the scoped-alias
-    // rescue disabled for this shape), so no dimension here carries one.
+    // No dimension here carries a scoped alias, and none can: `is_eligible`
+    // withholds the scoped-alias rescue from any query with an active
+    // semi-additive metric, precisely BECAUSE this renderer cannot honour a role
+    // while a sibling plain group can — see the guard test
+    // `role_played_dimension_with_a_semi_additive_metric_stays_ineligible`.
     let rdims: Vec<super::types::ResolvedDim> = resolved_dims
         .iter()
         .map(|dim| super::types::ResolvedDim {
