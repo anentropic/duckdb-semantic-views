@@ -1,0 +1,137 @@
+# A semi-additive metric alongside a metric at ANOTHER grain
+# (TECH-DEBT #36, semi-additive sub-item, increment 2 — the last of the entry).
+#
+# Increment 1 re-anchored a SINGLE snapshot CTE at the metric's own grain. This
+# is the harder half: the snapshot becomes ONE GROUP among several. Its grain
+# CTE is `SELECT <outer> FROM (<inner>)` — rows ranked before that grain
+# aggregates them — while the sibling group aggregates normally, and the two are
+# joined on the shared dimension.
+#
+# Snowflake was probed directly (see TECH-DEBT #36): it computes each metric at
+# its own grain, snapshot included. This query used to raise `fan trap detected`.
+#
+# The data makes every wrong answer a DIFFERENT NUMBER, all computed in DuckDB
+# before this file was written:
+#   total_balance  correct 100/200   base-anchored 300/400
+#   order_count    correct 4/3
+# So a regression that collapsed the two grains back together changes the
+# numbers rather than only the plan.
+
+require semantic_views
+
+statement ok
+CREATE TABLE sam_cust (id INTEGER, segment VARCHAR, as_of DATE, balance INTEGER);
+
+statement ok
+CREATE TABLE sam_orders (id INTEGER, cust_id INTEGER);
+
+# One row per customer-snapshot: each segment has an old and a current balance.
+statement ok
+INSERT INTO sam_cust VALUES
+  (1, 'EAST', '2026-01-01',  10),
+  (2, 'EAST', '2026-02-01', 100),
+  (3, 'WEST', '2026-01-01',  20),
+  (4, 'WEST', '2026-02-01', 200);
+
+# The fan: snapshot 2 carries THREE orders and snapshot 4 carries TWO, so a
+# base-anchored plan multiplies exactly the rows that win the snapshot.
+statement ok
+INSERT INTO sam_orders VALUES (10,1), (11,2), (12,2), (13,2), (14,3), (15,4), (16,4);
+
+statement ok
+CREATE SEMANTIC VIEW sam_sv AS
+  TABLES (
+    o AS sam_orders PRIMARY KEY (id),
+    c AS sam_cust   PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    o_to_c AS o(cust_id) REFERENCES c(id)
+  )
+  DIMENSIONS (
+    c.segment AS c.segment,
+    c.as_of AS c.as_of
+  )
+  METRICS (
+    o.order_count AS count(*),
+    c.total_balance NON ADDITIVE BY (as_of) AS sum(c.balance)
+  );
+
+# ============================================================
+# Test 1: THE capability. `order_count` sits at the order grain and
+# `total_balance` at the customer grain, and `as_of` is not queried so the
+# latter is ACTIVE semi-additive. Two grains, one of them a snapshot.
+#
+# EAST has 4 orders and a latest balance of 100; WEST 3 orders and 200.
+# A base-anchored plan would report the balances as 300/400.
+# ============================================================
+
+query TII rowsort
+SELECT * FROM semantic_view('sam_sv', metrics := ['order_count', 'total_balance'], dimensions := ['segment']);
+----
+EAST	4	100
+WEST	3	200
+
+# ============================================================
+# Test 2: the plan really is per-grain — the snapshot ranks inside its own
+# grain CTE.
+#
+# Matched on `AS "__sv_rn"` rather than on `RANK() OVER`: this table function
+# returns the GENERATED SQL *and* DuckDB's physical plan, and the plan's WINDOW
+# node prints the rank expression too, so a `RANK() OVER` match counts both. The
+# emitted alias appears only in the SQL.
+# ============================================================
+
+query I
+SELECT count(*) FROM (
+  SELECT unnest(string_split(explain_output, chr(10))) AS plan
+  FROM (SELECT * FROM explain_semantic_view('sam_sv', metrics := ['order_count', 'total_balance'], dimensions := ['segment']))
+    AS t(explain_output)
+) WHERE plan LIKE '%AS "__sv_rn"%';
+----
+1
+
+# ...and both grain CTEs are emitted, the snapshot one nesting its ranked rows.
+query I
+SELECT count(*) FROM (
+  SELECT unnest(string_split(explain_output, chr(10))) AS plan
+  FROM (SELECT * FROM explain_semantic_view('sam_sv', metrics := ['order_count', 'total_balance'], dimensions := ['segment']))
+    AS t(explain_output)
+) WHERE plan LIKE '%__sv_grain_1 AS (%';
+----
+1
+
+# ============================================================
+# Test 3: dimensionless. The two grains combine with a CROSS JOIN and the
+# snapshot still collapses to the latest row per grain.
+#
+# Latest balances across all segments: 100 + 200 = 300. Seven orders.
+# ============================================================
+
+query II
+SELECT * FROM semantic_view('sam_sv', metrics := ['order_count', 'total_balance']);
+----
+7	300
+
+# ============================================================
+# Test 4: with the NA dimension QUERIED the metric is effectively regular, so
+# no snapshot is emitted and every customer-snapshot row is its own group.
+# A guard that the new routing does not capture the case it does not own.
+# ============================================================
+
+query TTII rowsort
+SELECT * FROM semantic_view('sam_sv', metrics := ['order_count', 'total_balance'], dimensions := ['segment', 'as_of']);
+----
+EAST	2026-01-01	1	10
+EAST	2026-02-01	3	100
+WEST	2026-01-01	1	20
+WEST	2026-02-01	2	200
+
+# Cleanup
+statement ok
+DROP SEMANTIC VIEW sam_sv;
+
+statement ok
+DROP TABLE sam_orders;
+
+statement ok
+DROP TABLE sam_cust;
