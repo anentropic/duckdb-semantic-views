@@ -306,7 +306,12 @@ Two boundaries are worth knowing:
   window runs.
 - Multi-grain queries involving **active semi-additive metrics** are not yet
   computed per-grain here and keep raising the fan-trap error. Snowflake
-  computes them.
+  computes them: probed directly, it returns each metric at its own grain, with
+  the snapshot selection happening inside the semi-additive metric's own-grain
+  aggregation rather than over the joined row set. Snowflake also accepts a
+  ``NON ADDITIVE BY`` dimension declared on *another* logical table, provided the
+  reference is qualified (``NON ADDITIVE BY (s.report_date)``); the bare form
+  resolves only within the metric's own table. Both forms are accepted here too.
 - Multi-grain queries **reaching a role-played table** are computed when a
   co-queried metric's ``USING`` names the role: each grain CTE joins that
   relationship under its scoped alias and groups by the dimension bound to it,
