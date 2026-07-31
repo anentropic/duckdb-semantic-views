@@ -698,27 +698,6 @@ fn collect_na_groups(
 /// already joins. Adding the bare table alias here would emit a redundant
 /// second join to the same table on whichever edge the resolver picks first —
 /// exactly the wrong-role instance the T-15 fix routes the ORDER BY away from.
-/// The source tables of a query's active NA dimensions, for the anchor decision
-/// in `sql_gen` — which has to be made BEFORE the fan-trap fence runs, and so
-/// cannot wait for [`expand_semi_additive`] to build its groups.
-///
-/// A malformed NA reference yields an empty list rather than an error. That does
-/// **not** decline the re-anchor — `snapshot_cte_anchor` cannot tell "no NA
-/// tables" from "could not resolve them", and may still return an anchor. It
-/// cannot mislead, though: [`expand_semi_additive`] rebuilds the same groups and
-/// propagates the real error before the anchor is ever used for emission, so the
-/// query fails on the NA reference itself rather than on anything decided here.
-pub(super) fn na_dim_source_tables(
-    view_name: &str,
-    def: &SemanticViewDefinition,
-    resolved_mets: &[&Metric],
-    queried_dim_keys: &HashSet<String>,
-) -> Vec<String> {
-    collect_na_groups(view_name, def, resolved_mets, queried_dim_keys)
-        .map(|groups| collect_na_dim_source_tables(def, &groups))
-        .unwrap_or_default()
-}
-
 fn collect_na_dim_source_tables(
     def: &SemanticViewDefinition,
     na_groups: &[NaGroup],
@@ -746,6 +725,27 @@ fn collect_na_dim_source_tables(
         }
     }
     sources
+}
+
+/// The source tables of a query's active NA dimensions, for the anchor decision
+/// in `sql_gen` — which has to be made BEFORE the fan-trap fence runs, and so
+/// cannot wait for [`expand_semi_additive`] to build its groups.
+///
+/// A malformed NA reference yields an empty list rather than an error. That does
+/// **not** decline the re-anchor — `snapshot_cte_anchor` cannot tell "no NA
+/// tables" from "could not resolve them", and may still return an anchor. It
+/// cannot mislead, though: [`expand_semi_additive`] rebuilds the same groups and
+/// propagates the real error before the anchor is ever used for emission, so the
+/// query fails on the NA reference itself rather than on anything decided here.
+pub(super) fn na_dim_source_tables(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    resolved_mets: &[&Metric],
+    queried_dim_keys: &HashSet<String>,
+) -> Vec<String> {
+    collect_na_groups(view_name, def, resolved_mets, queried_dim_keys)
+        .map(|groups| collect_na_dim_source_tables(def, &groups))
+        .unwrap_or_default()
 }
 
 /// Aggregate functions the snapshot CTE knows how to decompose into an
