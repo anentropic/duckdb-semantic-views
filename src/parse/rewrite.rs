@@ -397,8 +397,8 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, ParseError> {
                 clauses.like_pattern.as_deref(),
                 clauses.starts_with.as_deref(),
                 clauses.limit,
-                clauses.in_schema,
-                clauses.in_database,
+                clauses.in_schema.as_deref(),
+                clauses.in_database.as_deref(),
             );
             Ok(RewriteAction::Passthrough(format!("{base}{suffix}")))
         }
@@ -3490,6 +3490,198 @@ $$"#;
         fn create_mixed_quoting_captures_bare_name() {
             let q = format!("CREATE SEMANTIC VIEW a.\"b\".c {MINIMAL_BODY}");
             assert_eq!(create_name(&q), "c");
+        }
+    }
+
+    /// TECH-DEBT #25 residual — the SHOW name slots.
+    ///
+    /// `IN SCHEMA` / `IN DATABASE`, `IN <view>`, and `FOR METRIC` each peeled
+    /// their identifier at the first whitespace, the last members of the
+    /// whitespace-tokeniser family #24 and #25 fixed elsewhere. Two distinct
+    /// failures came out of that, and the tests below separate them because a
+    /// fix for one does not imply the other:
+    ///
+    /// 1. a quoted name containing whitespace was truncated mid-quote, so the
+    ///    tail became "Unexpected tokens" — a loud but wrong error;
+    /// 2. a quoted name *without* whitespace was captured with its quote
+    ///    characters intact. For the schema/database slots that is the worse
+    ///    half: the value goes straight into `schema_name = '<literal>'`, so
+    ///    `IN SCHEMA "main"` silently matched nothing.
+    ///
+    /// The view and metric slots keep the FF-4 convention — emit the RAW name
+    /// and let the read table function fold it once at the catalog boundary —
+    /// so only their capture is asserted here.
+    mod show_name_slot_quoted_ident_tests {
+        use super::*;
+
+        // ----- 1. quoted names containing whitespace survive the capture -----
+
+        #[test]
+        fn in_schema_accepts_a_quoted_name_containing_whitespace() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"my schema\""),
+                "SELECT * FROM list_semantic_views() WHERE schema_name = 'my schema'"
+            );
+        }
+
+        #[test]
+        fn in_database_accepts_a_quoted_name_containing_whitespace() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN DATABASE \"my db\""),
+                "SELECT * FROM list_semantic_views() WHERE database_name = 'my db'"
+            );
+        }
+
+        #[test]
+        fn in_view_accepts_a_quoted_name_containing_whitespace() {
+            // FF-4: the raw (still-quoted) name is embedded; the TF normalizes.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC DIMENSIONS IN \"my view\""),
+                "SELECT * FROM show_semantic_dimensions('\"my view\"')"
+            );
+        }
+
+        #[test]
+        fn for_metric_accepts_a_quoted_name_containing_whitespace() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC DIMENSIONS IN v FOR METRIC \"my metric\""),
+                "SELECT * FROM show_semantic_dimensions_for_metric('v', '\"my metric\"')"
+            );
+        }
+
+        // ----- 1b. ...and the view slot must NOT strip them -----
+
+        #[test]
+        fn a_quoted_view_name_containing_a_dot_keeps_its_quotes() {
+            // The counterpart to the stripping tests below: this slot defers to
+            // the read TF's `normalize_view_name`, so the quotes have to still
+            // be there when it arrives.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC DIMENSIONS IN \"a.b\""),
+                "SELECT * FROM show_semantic_dimensions('\"a.b\"')"
+            );
+        }
+
+        #[test]
+        fn an_unquoted_dot_is_a_qualifier_but_a_quoted_one_is_not() {
+            // Why the deferral above is load-bearing rather than merely tidy.
+            // `normalize_view_name` reads an UNQUOTED dot as a qualifier
+            // separator and keeps only the last part, so a parser-side strip
+            // would hand the TF `a.b` and resolve the view named `b` — a
+            // different view that may well exist. That failure mode is a silent
+            // WRONG HIT, not a miss, which is why it gets its own pin.
+            assert_eq!(normalize_view_name("\"a.b\"").unwrap(), "a.b");
+            assert_eq!(normalize_view_name("a.b").unwrap(), "b");
+        }
+
+        // ----- 2. the schema/database slots must also STRIP the quotes -----
+
+        #[test]
+        fn in_schema_strips_quotes_before_emitting_the_literal() {
+            // Nothing downstream unquotes this one — it is compared as a plain
+            // string literal — so a surviving quote character is a silent
+            // no-match rather than an error.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"main\""),
+                "SELECT * FROM list_semantic_views() WHERE schema_name = 'main'"
+            );
+        }
+
+        #[test]
+        fn in_database_strips_quotes_before_emitting_the_literal() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN DATABASE \"memory\""),
+                "SELECT * FROM list_semantic_views() WHERE database_name = 'memory'"
+            );
+        }
+
+        #[test]
+        fn a_doubled_quote_inside_a_quoted_schema_name_unescapes() {
+            // `""` is the SQL escape for a literal `"`, so the stored name is
+            // `a"b`. Asserted separately from plain stripping: a naive
+            // trim_matches('"') would produce `a""b` and pass the test above.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"a\"\"b\""),
+                "SELECT * FROM list_semantic_views() WHERE schema_name = 'a\"b'"
+            );
+        }
+
+        #[test]
+        fn a_quoted_schema_name_may_contain_a_semicolon() {
+            // `;` terminates a bare identifier but is inert inside quotes.
+            // Pinned because the scan's delimiter set is wider than whitespace.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"a;b\""),
+                "SELECT * FROM list_semantic_views() WHERE schema_name = 'a;b'"
+            );
+        }
+
+        #[test]
+        fn a_quoted_schema_name_survives_a_single_quote_escape() {
+            // Quote-stripping happens BEFORE `SqlLit::escape`, so the literal
+            // is still well-formed. A fix that stripped after escaping would
+            // emit `'"O''Brien"'` and fail here.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"O'Brien\""),
+                "SELECT * FROM list_semantic_views() WHERE schema_name = 'O''Brien'"
+            );
+        }
+
+        #[test]
+        fn a_quoted_schema_name_cannot_break_out_of_its_literal() {
+            // The capture is deliberately WIDER than it was — bytes that used
+            // to terminate the name are now accepted inside quotes — so pin
+            // the escape boundary explicitly rather than trusting that the
+            // stripping step left `SqlLit` in charge. The `'` doubles, which
+            // keeps the payload inside the literal.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"a'; DROP TABLE t; --\""),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE schema_name = 'a''; DROP TABLE t; --'"
+            );
+        }
+
+        // ----- controls: over-rejection / over-stripping would fail here -----
+
+        #[test]
+        fn an_unquoted_schema_name_is_unchanged() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA main"),
+                "SELECT * FROM list_semantic_views() WHERE schema_name = 'main'"
+            );
+        }
+
+        #[test]
+        fn an_unquoted_view_and_metric_are_unchanged() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC DIMENSIONS IN v FOR METRIC revenue"),
+                "SELECT * FROM show_semantic_dimensions_for_metric('v', 'revenue')"
+            );
+        }
+
+        #[test]
+        fn a_quoted_name_still_composes_with_the_other_clauses() {
+            // The capture returns the right remainder, so LIKE before and
+            // LIMIT after still parse. A scan that over-consumed would eat
+            // them and surface as "Unexpected tokens".
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS LIKE '%x%' IN SCHEMA \"my schema\" LIMIT 3"),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE name ILIKE '%x%' AND schema_name = 'my schema' LIMIT 3"
+            );
+        }
+
+        #[test]
+        fn an_unterminated_quote_in_a_schema_name_still_errors() {
+            // `find_identifier_end` saturates at end-of-input for an
+            // unterminated quote, so the whole tail is captured. It must not
+            // be silently accepted as a name.
+            let err = plan_ddl("SHOW SEMANTIC VIEWS IN SCHEMA \"oops").unwrap_err();
+            assert!(
+                err.message.contains("Invalid schema name"),
+                "expected an invalid-schema-name error, got: {}",
+                err.message
+            );
         }
     }
 }

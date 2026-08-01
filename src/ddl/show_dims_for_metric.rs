@@ -95,11 +95,17 @@ unsafe fn show_dims_for_metric(
     };
     let def = SemanticViewDefinition::from_json(&view_name, &json)?;
 
-    let metric_lower = metric_name.to_ascii_lowercase();
+    // `ident_matches`, not a bare case fold. The parser embeds the RAW metric
+    // name (FF-4) and a metric declared `t."total amount"` is STORED with its
+    // quotes, so the same-spelling case did match under the old fold — what it
+    // could not do is match ACROSS spellings: a metric declared `plain_total`
+    // referenced as `FOR METRIC "plain_total"` compared `plain_total` against
+    // `"plain_total"` and reported the metric as not found. This is the #28
+    // name-field-matcher class — fold case AND strip quotes.
     let Some(met) = def
         .metrics
         .iter()
-        .find(|m| m.name.to_ascii_lowercase() == metric_lower)
+        .find(|m| crate::ident::ident_matches(&m.name, &metric_name))
     else {
         let available: Vec<String> = def.metrics.iter().map(|m| m.name.clone()).collect();
         return Err(match suggest_closest(&metric_name, &available) {
