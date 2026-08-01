@@ -180,11 +180,65 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
     let expr_abs = entry_offset + byte_offset_within(entry, raw_expr);
     let (expr, window_spec) = parse_window_over_clause(&expr, expr_abs)?;
 
+    // Reported BEFORE the misplaced-clause scan below: a missing name is the
+    // more basic defect, and letting the scan pre-empt it would answer a
+    // question the user did not ask (Copilot review, #181).
     if before_as.is_empty() {
         return Err(ParseError {
             message: format!("Missing metric name before 'AS' in entry '{entry}'."),
             position: Some(entry_offset),
         });
+    }
+
+    // TECH-DEBT #38: `USING` and `NON ADDITIVE BY` are parsed from the prefix
+    // BEFORE `AS`, so writing either after it made the clause part of the
+    // expression: the metric was stored as ordinary and additive with its
+    // declared semantics silently discarded, `GET_DDL` round-tripped the
+    // malformed text, and the only complaint arrived at query time as a parser
+    // error pointing inside generated SQL. Reject it here, naming the clause and
+    // the position it belongs in.
+    //
+    // Scanning at DEPTH 0 is what makes this safe: an aggregate call's contents
+    // sit at depth >= 1, so a depth-0 keyword can only be OUTSIDE the call —
+    // exactly the misplaced-clause position. The scan is also quote-aware, so
+    // the same words inside a string literal or quoted identifier are data, not
+    // syntax. `OVER` is simply not one of the scanned keywords — note that
+    // `parse_window_over_clause` returns the expression text UNCHANGED, so an
+    // `OVER (...)` is still present here; it is left alone because it is the one
+    // clause that legitimately follows `AS`.
+    // Strip redundant outer parens first: `AS (sum(v) USING (r))` wraps the
+    // whole expression, which would push the keywords to depth 1 and hide them
+    // from the scan — the same bug through another door (Copilot review, #181).
+    // Only a WHOLLY-parenthesised expression is unwrapped, so a structural
+    // `(...)` — a subquery, an argument list — keeps its contents nested and a
+    // genuinely nested `USING` inside a JOIN stays legal.
+    let mut scan_src = expr.trim();
+    let mut scan_abs = expr_abs + byte_offset_within(&expr, scan_src);
+    loop {
+        let probe = Cursor::new(scan_src, scan_abs);
+        if !probe.is_wholly_parenthesised() {
+            break;
+        }
+        let inner = scan_src[1..scan_src.len() - 1].trim();
+        scan_abs += byte_offset_within(scan_src, inner);
+        scan_src = inner;
+    }
+    let expr_cur = Cursor::new(scan_src, scan_abs);
+    if let Some((tok, _)) = expr_cur.find_kw_seq_depth0(&["NON", "ADDITIVE", "BY"]) {
+        return Err(expr_cur.err(
+            tok.start,
+            "'NON ADDITIVE BY (...)' must come BEFORE 'AS' in a metric entry. \
+             Form: 'alias.name [USING (...)] [NON ADDITIVE BY (...)] AS expr'."
+                .to_string(),
+        ));
+    }
+    if let Some(tok) = expr_cur.find_kw_depth0("USING") {
+        return Err(expr_cur.err(
+            tok.start,
+            "'USING (...)' must come BEFORE 'AS' in a metric entry. \
+             Form: 'alias.name [USING (...)] [NON ADDITIVE BY (...)] AS expr'."
+                .to_string(),
+        ));
     }
 
     // Parse `before_as` = `name [USING (...)] [NON ADDITIVE BY (...)]` on a

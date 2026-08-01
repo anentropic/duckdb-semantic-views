@@ -628,6 +628,133 @@ mod tests {
     // independently under `cargo test`.
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // TECH-DEBT #38: a pre-`AS` clause written AFTER `AS` is swallowed into the
+    // metric expression, so its semantics are silently discarded and the view
+    // only fails much later at query time.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn non_additive_by_after_as_is_rejected() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    DIMENSIONS (o.d AS o.d) \
+                    METRICS (o.m AS sum(o.v) NON ADDITIVE BY (d))";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message.contains("NON ADDITIVE BY"),
+            "the error must name the misplaced clause, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn using_after_as_is_rejected() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id), c AS customers PRIMARY KEY (id)) \
+                    RELATIONSHIPS (r AS o(cid) REFERENCES c(id)) \
+                    METRICS (o.m AS sum(o.v) USING (r))";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message.contains("USING"),
+            "the error must name the misplaced clause, got: {}",
+            err.message
+        );
+    }
+
+    /// Copilot review catch on #181: wrapping the whole expression in parens
+    /// keeps the keywords at depth 1, so the depth-0 scan missed them and the
+    /// SAME bug survived through another door — `CREATE` succeeded silently and
+    /// the view failed only at query time. Redundant outer parens are stripped
+    /// before scanning.
+    #[test]
+    fn a_parenthesised_expression_does_not_hide_a_misplaced_clause() {
+        for metrics in [
+            "o.m AS (sum(o.v) USING (r))",
+            "o.m AS (sum(o.v) NON ADDITIVE BY (d))",
+            "o.m AS ((sum(o.v) USING (r)))",
+        ] {
+            let body = format!(
+                "AS TABLES (o AS orders PRIMARY KEY (id), c AS customers PRIMARY KEY (id)) \
+                 RELATIONSHIPS (r AS o(cid) REFERENCES c(id)) \
+                 DIMENSIONS (o.d AS o.d) \
+                 METRICS ({metrics})"
+            );
+            let err = parse_keyword_body(&body, 0).unwrap_err();
+            assert!(
+                err.message.contains("must come BEFORE 'AS'"),
+                "parenthesising must not hide the misplaced clause in {metrics:?}, got: {}",
+                err.message
+            );
+        }
+    }
+
+    /// Guard for the stripping above: a `USING` that is genuinely nested — here
+    /// inside a subquery's JOIN, which is valid SQL in a metric expression —
+    /// must NOT be rejected. The parens around it are structural, not a
+    /// redundant wrapper, so stripping leaves it at depth >= 1.
+    #[test]
+    fn a_genuinely_nested_using_is_not_a_misplaced_clause() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    DIMENSIONS (o.d AS o.d) \
+                    METRICS (o.m AS sum(CASE WHEN o.id IN \
+                             (SELECT a.id FROM x a JOIN y b USING (id)) THEN o.v ELSE 0 END))";
+        let res = parse_keyword_body(body, 0);
+        assert!(
+            res.is_ok(),
+            "a nested USING inside a subquery is not a misplaced clause, got: {:?}",
+            res.err()
+        );
+    }
+
+    /// Copilot review catch on #181: the misplaced-clause scan must not
+    /// pre-empt the more basic "you forgot the metric name" diagnostic.
+    #[test]
+    fn a_missing_metric_name_is_reported_before_a_misplaced_clause() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    DIMENSIONS (o.d AS o.d) \
+                    METRICS (AS sum(o.v) NON ADDITIVE BY (d))";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message.contains("Missing metric name"),
+            "the primary defect is the missing name, got: {}",
+            err.message
+        );
+    }
+
+    /// Control: `OVER (...)` legitimately follows `AS` — `parse_window_over_clause`
+    /// runs on the post-`AS` text. The new scan must not reject it.
+    #[test]
+    fn over_after_as_is_still_accepted() {
+        // A window metric's inner must be a declared METRIC, not a raw column.
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    DIMENSIONS (o.d AS o.d) \
+                    METRICS (o.total AS sum(o.v), \
+                             o.m AS SUM(total) \
+                             OVER (PARTITION BY EXCLUDING d ORDER BY d ASC NULLS LAST))";
+        let res = parse_keyword_body(body, 0);
+        assert!(
+            res.is_ok(),
+            "a window clause after AS must still parse, got: {:?}",
+            res.err()
+        );
+    }
+
+    /// Guard against over-rejection: the keywords appear inside a STRING
+    /// LITERAL, where they are data rather than clause syntax. The scan is
+    /// quote-aware, so this must still parse — rejecting it would break valid
+    /// DDL, a worse outcome than the bug being fixed.
+    #[test]
+    fn clause_keywords_inside_a_string_literal_are_not_clauses() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    METRICS (o.m AS sum(CASE WHEN o.note = 'USING (x) NON ADDITIVE BY (y)' \
+                             THEN o.v ELSE 0 END))";
+        let res = parse_keyword_body(body, 0);
+        assert!(
+            res.is_ok(),
+            "clause keywords inside a string are data, not syntax, got: {:?}",
+            res.err()
+        );
+    }
+
     #[test]
     fn labels_is_rejected_on_a_metric() {
         let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
