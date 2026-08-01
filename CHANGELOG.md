@@ -61,15 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The schema and database slots had a second, quieter failure: their value goes into a `schema_name = '…'` comparison with nothing downstream to unquote it, so `SHOW SEMANTIC VIEWS IN SCHEMA "main"` compared against `"main"` **including the quote characters** and returned no rows at all — no error, no warning, just an empty result. Those two now strip the quotes (and unescape a doubled `""`), while an unterminated quote is reported as an invalid name instead of being swallowed. The view and metric slots keep their raw text, as their lookups already normalise it.
 
+  Relatedly, `SHOW SEMANTIC DIMENSIONS … FOR METRIC "revenue"` now finds a metric declared unquoted as `revenue`. Metric names were compared case-insensitively but without stripping quotes, so a quoted reference to an unquoted declaration reported `metric '"revenue"' not found` — while helpfully suggesting `revenue`.
+
+  Unquoted names, which is what every example uses, are unaffected.
+
 - **`SHOW SEMANTIC … IN SCHEMA` / `IN DATABASE` now match case-insensitively**, like every other name in the language and like DuckDB's own identifier resolution (TECH-DEBT #25). `IN SCHEMA MYSCHEMA` previously matched nothing against a schema created as `MySchema`.
 
   This mattered more than a spelling nicety, because the schema and database recorded against a view are captured from `current_schema()` / `current_database()` when it is created, and DuckDB reports those as the spelling you last wrote in `USE` rather than the catalog's own. Two views created in the *same* schema — one after `USE MySchema`, one after `USE myschema` — were therefore recorded differently, and an exact-match filter could return at most one of them. No spelling returned both, including the one the catalog itself holds. Both spellings are now folded, so quoting still makes no difference (`"MySchema"` and `MySchema` behave identically) and the filter is an equality rather than a pattern, so a `%` or `_` in a schema name stays a literal character.
 
   Not changed: the recorded value itself, so `SHOW SEMANTIC VIEWS` may still *display* two spellings of one schema across rows created under different `USE` statements.
-
-  Relatedly, `SHOW SEMANTIC DIMENSIONS … FOR METRIC "revenue"` now finds a metric declared unquoted as `revenue`. Metric names were compared case-insensitively but without stripping quotes, so a quoted reference to an unquoted declaration reported `metric '"revenue"' not found` — while helpfully suggesting `revenue`.
-
-  Unquoted names, which is what every example uses, are unaffected. Schema and database names are still matched case-sensitively, exactly as before: `IN SCHEMA Main` does not match a schema stored as `main`, quoted or not.
 
 - Corrected the documented annotation order: `COMMENT`, `WITH SYNONYMS` and `LABELS` may appear in **any** order on an entry. The DDL reference and the metadata-annotations how-to previously stated that `COMMENT` must precede `WITH SYNONYMS` and that the reverse was a parse error; the parser has always accepted either order, requiring only that the annotation region be tiled by recognized clauses with no leftover text.
 
