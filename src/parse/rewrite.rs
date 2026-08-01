@@ -2066,7 +2066,7 @@ mod tests {
         fn test_build_filter_suffix_in_schema() {
             assert_eq!(
                 build_filter_suffix(None, None, None, Some("main"), None),
-                " WHERE schema_name = 'main'"
+                " WHERE lower(schema_name) = lower('main')"
             );
         }
 
@@ -2074,7 +2074,7 @@ mod tests {
         fn test_build_filter_suffix_in_database() {
             assert_eq!(
                 build_filter_suffix(None, None, None, None, Some("memory")),
-                " WHERE database_name = 'memory'"
+                " WHERE lower(database_name) = lower('memory')"
             );
         }
 
@@ -2082,7 +2082,7 @@ mod tests {
         fn test_build_filter_suffix_like_and_schema() {
             assert_eq!(
                 build_filter_suffix(Some("%x%"), None, None, Some("main"), None),
-                " WHERE name ILIKE '%x%' AND schema_name = 'main'"
+                " WHERE name ILIKE '%x%' AND lower(schema_name) = lower('main')"
             );
         }
 
@@ -2244,7 +2244,7 @@ mod tests {
             let sql = passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA main");
             assert_eq!(
                 sql,
-                "SELECT * FROM list_semantic_views() WHERE schema_name = 'main'"
+                "SELECT * FROM list_semantic_views() WHERE lower(schema_name) = lower('main')"
             );
         }
 
@@ -2253,7 +2253,7 @@ mod tests {
             let sql = passthrough_sql("SHOW SEMANTIC VIEWS IN DATABASE memory");
             assert_eq!(
                 sql,
-                "SELECT * FROM list_semantic_views() WHERE database_name = 'memory'"
+                "SELECT * FROM list_semantic_views() WHERE lower(database_name) = lower('memory')"
             );
         }
 
@@ -2277,7 +2277,7 @@ mod tests {
             let sql = passthrough_sql("SHOW TERSE SEMANTIC VIEWS IN SCHEMA main");
             assert_eq!(
                 sql,
-                "SELECT * FROM list_terse_semantic_views() WHERE schema_name = 'main'"
+                "SELECT * FROM list_terse_semantic_views() WHERE lower(schema_name) = lower('main')"
             );
         }
 
@@ -2286,7 +2286,7 @@ mod tests {
             let sql = passthrough_sql("SHOW SEMANTIC VIEWS LIKE '%x%' IN SCHEMA main");
             assert_eq!(
                 sql,
-                "SELECT * FROM list_semantic_views() WHERE name ILIKE '%x%' AND schema_name = 'main'"
+                "SELECT * FROM list_semantic_views() WHERE name ILIKE '%x%' AND lower(schema_name) = lower('main')"
             );
         }
 
@@ -3520,7 +3520,7 @@ $$"#;
         fn in_schema_accepts_a_quoted_name_containing_whitespace() {
             assert_eq!(
                 passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"my schema\""),
-                "SELECT * FROM list_semantic_views() WHERE schema_name = 'my schema'"
+                "SELECT * FROM list_semantic_views() WHERE lower(schema_name) = lower('my schema')"
             );
         }
 
@@ -3528,7 +3528,7 @@ $$"#;
         fn in_database_accepts_a_quoted_name_containing_whitespace() {
             assert_eq!(
                 passthrough_sql("SHOW SEMANTIC VIEWS IN DATABASE \"my db\""),
-                "SELECT * FROM list_semantic_views() WHERE database_name = 'my db'"
+                "SELECT * FROM list_semantic_views() WHERE lower(database_name) = lower('my db')"
             );
         }
 
@@ -3583,7 +3583,7 @@ $$"#;
             // no-match rather than an error.
             assert_eq!(
                 passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"main\""),
-                "SELECT * FROM list_semantic_views() WHERE schema_name = 'main'"
+                "SELECT * FROM list_semantic_views() WHERE lower(schema_name) = lower('main')"
             );
         }
 
@@ -3591,7 +3591,7 @@ $$"#;
         fn in_database_strips_quotes_before_emitting_the_literal() {
             assert_eq!(
                 passthrough_sql("SHOW SEMANTIC VIEWS IN DATABASE \"memory\""),
-                "SELECT * FROM list_semantic_views() WHERE database_name = 'memory'"
+                "SELECT * FROM list_semantic_views() WHERE lower(database_name) = lower('memory')"
             );
         }
 
@@ -3602,7 +3602,7 @@ $$"#;
             // trim_matches('"') would produce `a""b` and pass the test above.
             assert_eq!(
                 passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"a\"\"b\""),
-                "SELECT * FROM list_semantic_views() WHERE schema_name = 'a\"b'"
+                "SELECT * FROM list_semantic_views() WHERE lower(schema_name) = lower('a\"b')"
             );
         }
 
@@ -3612,7 +3612,7 @@ $$"#;
             // Pinned because the scan's delimiter set is wider than whitespace.
             assert_eq!(
                 passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"a;b\""),
-                "SELECT * FROM list_semantic_views() WHERE schema_name = 'a;b'"
+                "SELECT * FROM list_semantic_views() WHERE lower(schema_name) = lower('a;b')"
             );
         }
 
@@ -3623,7 +3623,7 @@ $$"#;
             // emit `'"O''Brien"'` and fail here.
             assert_eq!(
                 passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"O'Brien\""),
-                "SELECT * FROM list_semantic_views() WHERE schema_name = 'O''Brien'"
+                "SELECT * FROM list_semantic_views() WHERE lower(schema_name) = lower('O''Brien')"
             );
         }
 
@@ -3637,7 +3637,7 @@ $$"#;
             assert_eq!(
                 passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"a'; DROP TABLE t; --\""),
                 "SELECT * FROM list_semantic_views() \
-                 WHERE schema_name = 'a''; DROP TABLE t; --'"
+                 WHERE lower(schema_name) = lower('a''; DROP TABLE t; --')"
             );
         }
 
@@ -3647,7 +3647,7 @@ $$"#;
         fn an_unquoted_schema_name_is_unchanged() {
             assert_eq!(
                 passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA main"),
-                "SELECT * FROM list_semantic_views() WHERE schema_name = 'main'"
+                "SELECT * FROM list_semantic_views() WHERE lower(schema_name) = lower('main')"
             );
         }
 
@@ -3667,7 +3667,7 @@ $$"#;
             assert_eq!(
                 passthrough_sql("SHOW SEMANTIC VIEWS LIKE '%x%' IN SCHEMA \"my schema\" LIMIT 3"),
                 "SELECT * FROM list_semantic_views() \
-                 WHERE name ILIKE '%x%' AND schema_name = 'my schema' LIMIT 3"
+                 WHERE name ILIKE '%x%' AND lower(schema_name) = lower('my schema') LIMIT 3"
             );
         }
 
@@ -3681,6 +3681,83 @@ $$"#;
                 err.message.contains("Invalid schema name"),
                 "expected an invalid-schema-name error, got: {}",
                 err.message
+            );
+        }
+    }
+
+    /// TECH-DEBT #25 — case folding for the `IN SCHEMA` / `IN DATABASE` slots.
+    ///
+    /// These two are the last name sites comparing with raw `=` rather than
+    /// `DuckDB`'s case-insensitive identifier rule (the rule `ident_matches`
+    /// states and every other site follows). Left open by the quoting fix on
+    /// the reasoning that an unquoted name is passed through as written, so
+    /// folding only the quoted spelling would make quoting mean something
+    /// extra.
+    ///
+    /// That reasoning assumed the stored side is canonical. It is not: it is
+    /// stamped from `current_schema()` at CREATE time, which `DuckDB` returns
+    /// as the spelling the caller typed in their last `USE` — not the
+    /// catalog's. So two views in ONE schema can be stamped `MySchema` and
+    /// `myschema`, and no single spelling of the filter returns both. Folding
+    /// BOTH sides is what makes the filter answerable at all; it also keeps
+    /// quoting meaning nothing extra, which is the invariant the original
+    /// reasoning wanted.
+    ///
+    /// The row-level end-to-end proof is
+    /// `test/integration/test_show_scope_case_insensitive.py` — it needs to
+    /// compare returned rows, and `list_semantic_views` leads with a live
+    /// `created_on` that cannot be written into a `.test` file.
+    mod show_scope_case_folding_tests {
+        use super::*;
+
+        #[test]
+        fn in_schema_folds_case_on_both_sides() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA MySchema"),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE lower(schema_name) = lower('MySchema')"
+            );
+        }
+
+        #[test]
+        fn in_database_folds_case_on_both_sides() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN DATABASE MyDb"),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE lower(database_name) = lower('MyDb')"
+            );
+        }
+
+        #[test]
+        fn a_quoted_scope_name_folds_exactly_like_an_unquoted_one() {
+            // A CONTROL, green before this fix as well as after — the quoting
+            // fix had already made the two spellings identical. It is not
+            // evidence the fold works; it guards the invariant the original
+            // deferral was protecting, and would fail on the specific wrong fix
+            // that deferral feared: folding the quoted spelling only.
+            //
+            // Asserted as an equality between the two spellings rather than
+            // against a literal, so it keeps holding if the emitted form is
+            // ever rewritten.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"MySchema\""),
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA MySchema")
+            );
+        }
+
+        #[test]
+        fn the_fold_is_left_to_sql_rather_than_applied_in_rust() {
+            // Why `lower(x) = lower(y)` and not a Rust-side fold of the
+            // requested name: the stored side is folded by DuckDB's `lower()`,
+            // which is Unicode-aware, while Rust's `to_ascii_lowercase` (what
+            // `ident::normalize_ident_part` uses) is not. Folding here would
+            // emit `'myschÉma'` against a stored `'myschéma'` and STOP matching
+            // a non-ASCII name that matches exactly today — a regression, not
+            // merely a gap. Pin that the literal reaches SQL verbatim.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"MYSCHÉMA\""),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE lower(schema_name) = lower('MYSCHÉMA')"
             );
         }
     }
