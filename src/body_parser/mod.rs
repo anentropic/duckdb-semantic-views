@@ -628,6 +628,73 @@ mod tests {
     // independently under `cargo test`.
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // TECH-DEBT #38: a pre-`AS` clause written AFTER `AS` is swallowed into the
+    // metric expression, so its semantics are silently discarded and the view
+    // only fails much later at query time.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn non_additive_by_after_as_is_rejected() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    DIMENSIONS (o.d AS o.d) \
+                    METRICS (o.m AS sum(o.v) NON ADDITIVE BY (d))";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message.contains("NON ADDITIVE BY"),
+            "the error must name the misplaced clause, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn using_after_as_is_rejected() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id), c AS customers PRIMARY KEY (id)) \
+                    RELATIONSHIPS (r AS o(cid) REFERENCES c(id)) \
+                    METRICS (o.m AS sum(o.v) USING (r))";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message.contains("USING"),
+            "the error must name the misplaced clause, got: {}",
+            err.message
+        );
+    }
+
+    /// Control: `OVER (...)` legitimately follows `AS` — `parse_window_over_clause`
+    /// runs on the post-`AS` text. The new scan must not reject it.
+    #[test]
+    fn over_after_as_is_still_accepted() {
+        // A window metric's inner must be a declared METRIC, not a raw column.
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    DIMENSIONS (o.d AS o.d) \
+                    METRICS (o.total AS sum(o.v), \
+                             o.m AS SUM(total) \
+                             OVER (PARTITION BY EXCLUDING d ORDER BY d ASC NULLS LAST))";
+        let res = parse_keyword_body(body, 0);
+        assert!(
+            res.is_ok(),
+            "a window clause after AS must still parse, got: {:?}",
+            res.err()
+        );
+    }
+
+    /// Guard against over-rejection: the keywords appear inside a STRING
+    /// LITERAL, where they are data rather than clause syntax. The scan is
+    /// quote-aware, so this must still parse — rejecting it would break valid
+    /// DDL, a worse outcome than the bug being fixed.
+    #[test]
+    fn clause_keywords_inside_a_string_literal_are_not_clauses() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    METRICS (o.m AS sum(CASE WHEN o.note = 'USING (x) NON ADDITIVE BY (y)' \
+                             THEN o.v ELSE 0 END))";
+        let res = parse_keyword_body(body, 0);
+        assert!(
+            res.is_ok(),
+            "clause keywords inside a string are data, not syntax, got: {:?}",
+            res.err()
+        );
+    }
+
     #[test]
     fn labels_is_rejected_on_a_metric() {
         let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \

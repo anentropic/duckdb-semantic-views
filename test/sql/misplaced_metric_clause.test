@@ -1,0 +1,84 @@
+# `USING` / `NON ADDITIVE BY` written AFTER `AS` are rejected at CREATE
+# (TECH-DEBT #38).
+#
+# Both clauses are parsed from the metric entry's prefix, BEFORE `AS`. Writing
+# either after it made the clause part of the EXPRESSION, so:
+#
+#   - the metric was stored as ordinary and additive, its declared semantics
+#     silently discarded — `DESCRIBE` showed
+#     `EXPRESSION = 'sum(o.v) NON ADDITIVE BY (d)'` and no NON_ADDITIVE_BY row;
+#   - `GET_DDL` round-tripped that text, so the malformed definition survived a
+#     dump/reload;
+#   - the only complaint arrived at QUERY time, as a parser error pointing
+#     inside generated SQL rather than at the user's DDL.
+#
+# The silent-at-the-point-of-the-mistake part is why this was worth fixing: a
+# typo'd clause position produced a view that created cleanly and reported
+# itself as a plain metric.
+
+require semantic_views
+
+statement ok
+CREATE TABLE mmc_orders (id INTEGER, cid INTEGER, d DATE, v INTEGER);
+
+statement ok
+CREATE TABLE mmc_cust (id INTEGER);
+
+# ============================================================
+# NON ADDITIVE BY after AS — was accepted, now named and refused.
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW mmc_a AS
+TABLES (o AS mmc_orders PRIMARY KEY (id))
+DIMENSIONS (o.d AS o.d)
+METRICS (o.m AS sum(o.v) NON ADDITIVE BY (d))
+----
+'NON ADDITIVE BY (...)' must come BEFORE 'AS' in a metric entry.
+
+# ============================================================
+# USING after AS — the same hole, the other clause.
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW mmc_b AS
+TABLES (o AS mmc_orders PRIMARY KEY (id), c AS mmc_cust PRIMARY KEY (id))
+RELATIONSHIPS (r AS o(cid) REFERENCES c(id))
+METRICS (o.m AS sum(o.v) USING (r))
+----
+'USING (...)' must come BEFORE 'AS' in a metric entry.
+
+# ============================================================
+# The correct spelling still works — the clause belongs before `AS`.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW mmc_ok AS
+TABLES (o AS mmc_orders PRIMARY KEY (id))
+DIMENSIONS (o.d AS o.d)
+METRICS (o.m NON ADDITIVE BY (d) AS sum(o.v));
+
+statement ok
+DROP SEMANTIC VIEW mmc_ok;
+
+# ============================================================
+# Guard against over-rejection: the same words inside a STRING LITERAL are
+# data, not clause syntax. The scan is quote-aware, so this must still create —
+# rejecting valid DDL would be a worse outcome than the bug being fixed.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW mmc_str AS
+TABLES (o AS mmc_orders PRIMARY KEY (id))
+DIMENSIONS (o.d AS o.d)
+METRICS (o.m AS sum(CASE WHEN o.d = 'USING (x) NON ADDITIVE BY (y)' THEN o.v ELSE 0 END));
+
+statement ok
+DROP SEMANTIC VIEW mmc_str;
+
+# Cleanup
+statement ok
+DROP TABLE mmc_cust;
+
+statement ok
+DROP TABLE mmc_orders;

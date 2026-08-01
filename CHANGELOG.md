@@ -55,6 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A misplaced `USING` or `NON ADDITIVE BY` is now rejected at `CREATE`** instead of being absorbed into the metric's expression (TECH-DEBT #38). Both clauses belong before the `AS` — `o.balance NON ADDITIVE BY (as_of) AS sum(o.v)`. Written after it, the clause became part of the expression text: the metric was stored as an ordinary additive metric with its declared semantics silently dropped, `DESCRIBE` reported no non-additive dimensions, `GET_DDL` round-tripped the malformed text so the definition survived a dump and reload, and the only complaint came at query time as a confusing parser error pointing inside generated SQL. The error now names the clause and the position it belongs in, at the point the mistake is made. The same words inside a string literal or quoted identifier are still data, not syntax, and an `OVER (...)` clause after `AS` is unaffected — that one legitimately belongs there.
+
 - Corrected the documented annotation order: `COMMENT`, `WITH SYNONYMS` and `LABELS` may appear in **any** order on an entry. The DDL reference and the metadata-annotations how-to previously stated that `COMMENT` must precede `WITH SYNONYMS` and that the reverse was a parse error; the parser has always accepted either order, requiring only that the annotation region be tiled by recognized clauses with no leftover text.
 
 ## [0.12.0] - 2026-07-28

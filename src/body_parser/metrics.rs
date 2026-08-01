@@ -180,6 +180,38 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
     let expr_abs = entry_offset + byte_offset_within(entry, raw_expr);
     let (expr, window_spec) = parse_window_over_clause(&expr, expr_abs)?;
 
+    // TECH-DEBT #38: `USING` and `NON ADDITIVE BY` are parsed from the prefix
+    // BEFORE `AS`, so writing either after it made the clause part of the
+    // expression: the metric was stored as ordinary and additive with its
+    // declared semantics silently discarded, `GET_DDL` round-tripped the
+    // malformed text, and the only complaint arrived at query time as a parser
+    // error pointing inside generated SQL. Reject it here, naming the clause and
+    // the position it belongs in.
+    //
+    // Scanning at DEPTH 0 is what makes this safe: an aggregate call's contents
+    // sit at depth >= 1, so a depth-0 keyword can only be OUTSIDE the call —
+    // exactly the misplaced-clause position. The scan is also quote-aware, so
+    // the same words inside a string literal or quoted identifier are data, not
+    // syntax. `OVER (...)` is unaffected: `parse_window_over_clause` above has
+    // already consumed it.
+    let expr_cur = Cursor::new(&expr, expr_abs);
+    if let Some((tok, _)) = expr_cur.find_kw_seq_depth0(&["NON", "ADDITIVE", "BY"]) {
+        return Err(expr_cur.err(
+            tok.start,
+            "'NON ADDITIVE BY (...)' must come BEFORE 'AS' in a metric entry. \
+             Form: 'alias.name [USING (...)] [NON ADDITIVE BY (...)] AS expr'."
+                .to_string(),
+        ));
+    }
+    if let Some(tok) = expr_cur.find_kw_depth0("USING") {
+        return Err(expr_cur.err(
+            tok.start,
+            "'USING (...)' must come BEFORE 'AS' in a metric entry. \
+             Form: 'alias.name [USING (...)] [NON ADDITIVE BY (...)] AS expr'."
+                .to_string(),
+        ));
+    }
+
     if before_as.is_empty() {
         return Err(ParseError {
             message: format!("Missing metric name before 'AS' in entry '{entry}'."),
