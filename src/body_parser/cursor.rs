@@ -169,6 +169,41 @@ impl<'a> Cursor<'a> {
     /// for `OVER`, which must be outside the window-function call's own
     /// parentheses. All three bracket kinds count as nesting, matching
     /// [`super::split_at_depth0_commas`] and the retired `find_depth0_keyword`.
+    /// Whether the remaining text is ONE redundant `(...)` wrapper — the first
+    /// token is an opening bracket whose match is the last token.
+    ///
+    /// Used to unwrap an expression before a depth-0 clause scan: parenthesising
+    /// the whole thing would otherwise push every keyword to depth 1 and hide it
+    /// (Copilot review, #181). Deliberately narrow — `(a) + (b)` is NOT wholly
+    /// parenthesised, and a `(...)` that is structural rather than a wrapper
+    /// (a subquery, an argument list) keeps its contents nested, which is what
+    /// lets a genuinely nested `USING` inside a JOIN stay legal.
+    pub(super) fn is_wholly_parenthesised(&self) -> bool {
+        let toks = &self.toks[self.idx..];
+        let (Some(first), Some(last)) = (toks.first(), toks.last()) else {
+            return false;
+        };
+        if !matches!(first.kind, TokenKind::Symbol(b'(' | b'[' | b'{')) {
+            return false;
+        }
+        // Walk from the opening bracket; the depth returns to 0 exactly once,
+        // and that must be at the final token for the wrapper to be redundant.
+        let mut depth = 0i32;
+        for (i, &t) in toks.iter().enumerate() {
+            match t.kind {
+                TokenKind::Symbol(b'(' | b'[' | b'{') => depth += 1,
+                TokenKind::Symbol(b')' | b']' | b'}') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i == toks.len() - 1 && t.start == last.start;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     pub(super) fn find_kw_depth0(&self, kw: &str) -> Option<Token> {
         let mut depth = 0i32;
         for &t in &self.toks[self.idx..] {

@@ -49,6 +49,38 @@ METRICS (o.m AS sum(o.v) USING (r))
 'USING (...)' must come BEFORE 'AS' in a metric entry.
 
 # ============================================================
+# Parenthesising the whole expression must not hide the clause.
+#
+# Copilot review catch on #181: the scan looks at bracket-depth 0, so wrapping
+# the expression pushed the keywords to depth 1 and the SAME bug survived —
+# `CREATE` succeeded silently and the view failed only at query time. Redundant
+# outer parens are stripped before scanning.
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW mmc_p AS
+TABLES (o AS mmc_orders PRIMARY KEY (id), c AS mmc_cust PRIMARY KEY (id))
+RELATIONSHIPS (r AS o(cid) REFERENCES c(id))
+METRICS (o.m AS (sum(o.v) USING (r)))
+----
+'USING (...)' must come BEFORE 'AS' in a metric entry.
+
+# ============================================================
+# ...but only a REDUNDANT wrapper is stripped. A `USING` nested inside a
+# subquery's JOIN is valid SQL in a metric expression and must still parse —
+# its parens are structural, so stripping never reaches it.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW mmc_nested AS
+TABLES (o AS mmc_orders PRIMARY KEY (id))
+DIMENSIONS (o.d AS o.d)
+METRICS (o.m AS sum(CASE WHEN o.id IN (SELECT a.id FROM mmc_cust a JOIN mmc_cust b USING (id)) THEN o.v ELSE 0 END));
+
+statement ok
+DROP SEMANTIC VIEW mmc_nested;
+
+# ============================================================
 # The correct spelling still works — the clause belongs before `AS`.
 # ============================================================
 
