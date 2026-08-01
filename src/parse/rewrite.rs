@@ -3549,6 +3549,31 @@ $$"#;
             );
         }
 
+        // ----- 1b. ...and the view slot must NOT strip them -----
+
+        #[test]
+        fn a_quoted_view_name_containing_a_dot_keeps_its_quotes() {
+            // The counterpart to the stripping tests below: this slot defers to
+            // the read TF's `normalize_view_name`, so the quotes have to still
+            // be there when it arrives.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC DIMENSIONS IN \"a.b\""),
+                "SELECT * FROM show_semantic_dimensions('\"a.b\"')"
+            );
+        }
+
+        #[test]
+        fn an_unquoted_dot_is_a_qualifier_but_a_quoted_one_is_not() {
+            // Why the deferral above is load-bearing rather than merely tidy.
+            // `normalize_view_name` reads an UNQUOTED dot as a qualifier
+            // separator and keeps only the last part, so a parser-side strip
+            // would hand the TF `a.b` and resolve the view named `b` — a
+            // different view that may well exist. That failure mode is a silent
+            // WRONG HIT, not a miss, which is why it gets its own pin.
+            assert_eq!(normalize_view_name("\"a.b\"").unwrap(), "a.b");
+            assert_eq!(normalize_view_name("a.b").unwrap(), "b");
+        }
+
         // ----- 2. the schema/database slots must also STRIP the quotes -----
 
         #[test]

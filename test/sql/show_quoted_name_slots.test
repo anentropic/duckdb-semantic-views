@@ -164,7 +164,53 @@ SHOW SEMANTIC VIEWS IN SCHEMA "oops
 ----
 Invalid schema name
 
+# ============================================================
+# Test 9: the view slot must NOT strip its quotes — a quoted DOT.
+#
+# The other slots strip; this one deliberately does not, because
+# `normalize_view_name` at the read TF reads an unquoted dot as a qualifier
+# separator and keeps only the last part. So a parser-side strip would turn
+# `IN "sns_a.sns_b"` into a lookup for `sns_b` — which exists here, with a
+# DIFFERENT dimension. The wrong view answering is silent: no error, a full
+# result set, just not the one that was asked for.
+#
+# The two views are distinguishable in two columns at once (the view-name
+# column and the dimension name), so a wrong hit cannot be mistaken for a
+# formatting difference.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW "sns_a.sns_b" AS
+  TABLES (t AS sns_sales PRIMARY KEY (id))
+  DIMENSIONS (t.region AS t.region)
+  METRICS (t.total AS sum(t.amt));
+
+statement ok
+CREATE SEMANTIC VIEW sns_b AS
+  TABLES (t AS sns_sales PRIMARY KEY (id))
+  DIMENSIONS (t.id AS t.id)
+  METRICS (t.total AS sum(t.amt));
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN "sns_a.sns_b"
+----
+memory	main	sns_a.sns_b	sns_sales	region	(empty)	[]	(empty)
+
+# The control: the tail-named view is reachable on its own spelling, so the
+# case above is proved to have resolved the quoted name rather than merely
+# having found the only view in the catalog.
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN sns_b
+----
+memory	main	sns_b	sns_sales	id	(empty)	[]	(empty)
+
 # Cleanup
+statement ok
+DROP SEMANTIC VIEW "sns_a.sns_b";
+
+statement ok
+DROP SEMANTIC VIEW sns_b;
+
 statement ok
 DROP SEMANTIC VIEW sns_plain;
 
