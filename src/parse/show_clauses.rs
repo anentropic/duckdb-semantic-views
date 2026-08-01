@@ -16,8 +16,61 @@
 use super::extract_quoted_string;
 use super::DdlKind;
 use crate::errors::ParseError;
+use crate::ident::{find_identifier_end, parse_qualified_identifier_with_quoting};
 use crate::sql_lit::SqlLit;
 use crate::util::{byte_offset_within, is_ident_byte, starts_with_keyword_ci};
+
+/// Peel a (possibly double-quoted) identifier off the front of `rest`,
+/// returning `(name, remaining)` with `remaining` already left-trimmed.
+///
+/// The scan is [`find_identifier_end`], the same quote-aware helper the
+/// CREATE / DROP / DESCRIBE name slots use, so whitespace and `;` inside
+/// `"..."` are part of the name rather than terminators. These slots
+/// previously split on the first whitespace, which truncated a quoted name
+/// mid-quote and left its tail to surface as "Unexpected tokens"
+/// (TECH-DEBT #25 residual, the last of the whitespace-tokeniser family).
+///
+/// `allow_paren` is false, matching `extract_name_only`: no SHOW name slot is
+/// followed by a parenthesised list, so `(` is an ordinary name byte here.
+fn take_identifier(rest: &str) -> (&str, &str) {
+    let end = find_identifier_end(rest, false);
+    (&rest[..end], rest[end..].trim_start())
+}
+
+/// Strip the surrounding double quotes from a captured identifier, honouring
+/// the `""` escape.
+///
+/// Only the schema / database slots need this. Their value is emitted into a
+/// plain `schema_name = '<literal>'` comparison and nothing downstream
+/// unquotes it, so a surviving quote character is a **silent no-match** rather
+/// than an error — `IN SCHEMA "main"` matched nothing at all. The view and
+/// metric slots deliberately keep their raw text instead: their read table
+/// function normalizes once at the catalog-read boundary (FF-4), and stripping
+/// here as well would double-fold.
+///
+/// Case is deliberately **not** folded. An unquoted `IN SCHEMA Main` is passed
+/// through as written today, so folding only the quoted spelling would make
+/// quoting mean something extra; keeping both verbatim leaves them identical.
+/// Whether these two slots should match case-insensitively at all is a
+/// separate question from quoting — see TECH-DEBT #25.
+fn unquote_show_name(
+    raw: &str,
+    label: &str,
+    position: Option<usize>,
+) -> Result<String, ParseError> {
+    parse_qualified_identifier_with_quoting(raw)
+        .map(|parts| {
+            parts
+                .into_iter()
+                .map(|(part, _quoted)| part)
+                .collect::<Vec<_>>()
+                .join(".")
+        })
+        .map_err(|e| ParseError {
+            message: format!("Invalid {label} name '{raw}': {e}"),
+            position,
+        })
+}
 
 /// Build optional WHERE and LIMIT suffix for a SHOW rewrite.
 ///
@@ -66,8 +119,12 @@ pub(crate) fn build_filter_suffix(
 pub(crate) struct ShowClauses<'a> {
     pub(crate) like_pattern: Option<String>,
     pub(crate) in_view: Option<&'a str>,
-    pub(crate) in_schema: Option<&'a str>,
-    pub(crate) in_database: Option<&'a str>,
+    /// Owned, unlike the other name slots: these two are the only ones whose
+    /// value reaches SQL as a plain string literal with no downstream
+    /// normalization, so their quotes are stripped here (see
+    /// [`unquote_show_name`]) and the result no longer borrows the query.
+    pub(crate) in_schema: Option<String>,
+    pub(crate) in_database: Option<String>,
     pub(crate) for_metric: Option<&'a str>,
     pub(crate) starts_with: Option<String>,
     pub(crate) limit: Option<u64>,
@@ -82,7 +139,7 @@ pub(crate) struct ShowClauses<'a> {
 fn parse_in_scope(
     rest: &str,
     base: usize,
-) -> Result<(&str, Option<&str>, Option<&str>), ParseError> {
+) -> Result<(&str, Option<String>, Option<String>), ParseError> {
     let after_in = rest[2..].trim_start();
 
     // Try to match a keyword (SCHEMA or DATABASE) followed by an identifier.
@@ -109,11 +166,12 @@ fn parse_in_scope(
             position: Some(base + byte_offset_within(rest, after_kw)),
         });
     }
-    let name_end = after_kw
-        .find(|c: char| c.is_whitespace())
-        .unwrap_or(after_kw.len());
-    let name = &after_kw[..name_end];
-    let remaining = after_kw[name_end..].trim_start();
+    let (raw_name, remaining) = take_identifier(after_kw);
+    let name = unquote_show_name(
+        raw_name,
+        label,
+        Some(base + byte_offset_within(rest, after_kw)),
+    )?;
 
     if keyword == "SCHEMA" {
         Ok((remaining, Some(name), None))
@@ -148,13 +206,8 @@ fn parse_for_metric(rest: &str, base: usize) -> Result<(&str, &str), ParseError>
             position: Some(base + byte_offset_within(rest, after_metric)),
         });
     }
-    let name_end = after_metric
-        .find(|c: char| c.is_whitespace())
-        .unwrap_or(after_metric.len());
-    Ok((
-        after_metric[name_end..].trim_start(),
-        &after_metric[..name_end],
-    ))
+    let (metric_name, remaining) = take_identifier(after_metric);
+    Ok((remaining, metric_name))
 }
 
 /// Parse optional SHOW SEMANTIC filter clauses from text after the prefix.
@@ -176,8 +229,8 @@ pub(crate) fn parse_show_filter_clauses<'a>(
     let mut rest = after_prefix.trim();
     let mut like_pattern: Option<String> = None;
     let mut in_view: Option<&'a str> = None;
-    let mut in_schema: Option<&'a str> = None;
-    let mut in_database: Option<&'a str> = None;
+    let mut in_schema: Option<String> = None;
+    let mut in_database: Option<String> = None;
     let mut for_metric: Option<&'a str> = None;
     let mut starts_with: Option<String> = None;
     let mut limit: Option<u64> = None;
@@ -223,9 +276,9 @@ pub(crate) fn parse_show_filter_clauses<'a>(
                     position: Some(abs(rest)),
                 });
             }
-            let name_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-            in_view = Some(&rest[..name_end]);
-            rest = rest[name_end..].trim_start();
+            let (view_name, remaining) = take_identifier(rest);
+            in_view = Some(view_name);
+            rest = remaining;
         }
     }
 

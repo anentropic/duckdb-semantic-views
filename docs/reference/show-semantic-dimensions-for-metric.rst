@@ -40,7 +40,7 @@ Parameters
    The name of the semantic view. Returns an error if the view does not exist.
 
 ``<metric_name>``
-   The name of a metric defined in the semantic view. Returns an error if the metric does not exist. Matching is case-insensitive.
+   The name of a metric defined in the semantic view. Returns an error if the metric does not exist. Matching is case-insensitive, and quoting does not affect it: ``revenue``, ``REVENUE`` and ``"Revenue"`` all resolve to the same metric. Write the name quoted when it contains whitespace or other characters that would otherwise end it — ``FOR METRIC "total amount"``.
 
 .. tip::
 

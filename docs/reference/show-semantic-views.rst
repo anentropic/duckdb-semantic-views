@@ -56,6 +56,8 @@ Optional Filtering Clauses
 ``IN DATABASE <database_name>``
    Filters views to those in the specified database.
 
+   Both names may be written double-quoted, which is what lets a name containing whitespace be given at all: ``IN SCHEMA "my schema"``. The quotes are stripped before matching, so ``"main"`` and ``main`` select the same schema. Matching is otherwise exact — unlike view, dimension and metric names, these two are **case-sensitive**, so ``IN SCHEMA Main`` does not match a schema stored as ``main`` whether it is quoted or not.
+
 ``STARTS WITH '<prefix>'``
    Filters views to those whose name begins with the prefix. Matching is **case-sensitive**. The prefix must be enclosed in single quotes.
 

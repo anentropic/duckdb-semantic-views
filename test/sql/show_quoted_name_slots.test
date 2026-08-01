@@ -1,0 +1,175 @@
+# Quoted names in the SHOW filter-clause name slots
+# (TECH-DEBT #25 residual — the last of the whitespace-tokeniser family).
+#
+# `IN SCHEMA` / `IN DATABASE`, `IN <view>`, and `FOR METRIC` each peeled their
+# identifier at the first whitespace and never stripped quotes. Two failures
+# came out of that:
+#
+#   - a quoted name containing whitespace was truncated mid-quote, so its tail
+#     surfaced as `Unexpected tokens: 'view"'` — a loud but wrong error;
+#   - a quoted name captured with its quotes intact went into
+#     `schema_name = '"main"'`, which matched nothing SILENTLY.
+#
+# What only this layer can prove is the CONSUMER half: the emitted name has to
+# survive the read table function's own lookup. The parser half — the exact
+# text of the emitted SQL — is pinned by the independently-reporting unit tests
+# in `parse::rewrite::tests::show_name_slot_quoted_ident_tests`.
+
+require semantic_views
+
+statement ok
+CREATE TABLE sns_sales (id INTEGER, region VARCHAR, amt INTEGER);
+
+# A view whose NAME carries whitespace, with a metric whose name does too.
+statement ok
+CREATE SEMANTIC VIEW "sns weird view" AS
+  TABLES (t AS sns_sales PRIMARY KEY (id))
+  DIMENSIONS (t.region AS t.region)
+  METRICS (t."total amount" AS sum(t.amt));
+
+# A companion whose names are ordinary — the cross-spelling case below needs a
+# metric that is DECLARED unquoted so a quoted reference has to be normalised
+# rather than compared verbatim.
+statement ok
+CREATE SEMANTIC VIEW sns_plain AS
+  TABLES (t AS sns_sales PRIMARY KEY (id))
+  DIMENSIONS (t.region AS t.region)
+  METRICS (t.plain_total AS sum(t.amt));
+
+# ============================================================
+# Test 1: `IN <view>` with a quoted, whitespace-bearing name.
+#
+# The capture used to stop at the space, so the view name became `"sns` and
+# `weird view"` was reported as unexpected trailing tokens.
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN "sns weird view"
+----
+memory	main	sns weird view	sns_sales	region	(empty)	[]	(empty)
+
+# ...and the same slot on a different SHOW entity.
+query TTTTTTTT rowsort
+SHOW SEMANTIC METRICS IN "sns weird view"
+----
+memory	main	sns weird view	sns_sales	"total amount"	(empty)	[]	(empty)
+
+# ============================================================
+# Test 2: `FOR METRIC` with a quoted, whitespace-bearing name.
+#
+# Both name slots are quoted here, so this pins that the two captures compose
+# rather than one eating the other's text.
+# ============================================================
+
+query TTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN "sns weird view" FOR METRIC "total amount"
+----
+sns_sales	region	(empty)	false
+
+# ============================================================
+# Test 3: the CONSUMER half — a quoted reference to an UNQUOTED declaration.
+#
+# `plain_total` is stored exactly as written, unquoted. The dispatcher compared
+# metric names with a bare `to_ascii_lowercase()` fold, so the quoted reference
+# `"plain_total"` was compared against `plain_total` WITH its quote characters
+# and reported `metric 'plain_total' not found`. It now matches through
+# `ident::ident_matches`, which strips quotes as well as folding case.
+#
+# This case is the reason the fix is not purely a parser change, and it has no
+# unit-testable seam: the dispatcher is `#![cfg(feature = "extension")]` and
+# takes raw pointers, so this file is its only coverage.
+# ============================================================
+
+query TTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN sns_plain FOR METRIC "plain_total"
+----
+sns_sales	region	(empty)	false
+
+# ...and the reverse spelling, to pin that the normalisation is symmetric.
+query TTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN "sns weird view" FOR METRIC "TOTAL AMOUNT"
+----
+sns_sales	region	(empty)	false
+
+# ============================================================
+# Test 4: `IN SCHEMA` with a quoted, whitespace-bearing name.
+#
+# No such schema exists, so an EMPTY result is the correct answer — and it is a
+# real assertion rather than a vacuous one, because before the fix this did not
+# reach the filter at all: the capture stopped at the space and the statement
+# failed with `Unexpected tokens: 'schema"'`.
+# ============================================================
+
+query TTTTTT
+SHOW SEMANTIC VIEWS IN SCHEMA "no such schema"
+----
+
+# ============================================================
+# Test 5: `IN SCHEMA` / `IN DATABASE` with a quoted name that DOES exist.
+#
+# Asserted as `statement ok` rather than by row, because `list_semantic_views`
+# leads with `created_on` — a live timestamp that cannot be written down here.
+# The row-level proof is the unit test
+# `in_schema_strips_quotes_before_emitting_the_literal`, which pins the emitted
+# text as `schema_name = 'main'` exactly; this asserts that text then binds and
+# runs end-to-end. Before the fix the statement also "succeeded" — returning
+# nothing, because the literal was `'"main"'` — which is precisely why the
+# existing `statement ok` coverage in `phase44_show_terse_scope.test` never
+# caught this and why the row-level assertion belongs at the unit layer.
+# ============================================================
+
+statement ok
+SHOW SEMANTIC VIEWS IN SCHEMA "main"
+
+statement ok
+SHOW SEMANTIC VIEWS IN DATABASE "memory"
+
+statement ok
+SHOW TERSE SEMANTIC VIEWS IN SCHEMA "main"
+
+# ============================================================
+# Test 6: a quoted name still composes with the clauses around it.
+#
+# LIKE runs before IN and LIMIT after, so a capture that over-consumed would
+# swallow one of them and surface as `Unexpected tokens`.
+# ============================================================
+
+statement ok
+SHOW SEMANTIC VIEWS LIKE 'sns%' IN SCHEMA "main" LIMIT 5
+
+# ============================================================
+# Test 7: over-rejection controls. The unquoted spellings are what every
+# example and doc shows, and they must be untouched by the new scan.
+# ============================================================
+
+query TTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN sns_plain FOR METRIC plain_total
+----
+sns_sales	region	(empty)	false
+
+statement ok
+SHOW SEMANTIC VIEWS IN SCHEMA main
+
+statement ok
+SHOW SEMANTIC VIEWS IN DATABASE memory
+
+# ============================================================
+# Test 8: an unterminated quote is still an error, not a silently-accepted
+# name. `find_identifier_end` saturates at end-of-input inside an open quote,
+# so without an explicit check the whole tail would have become the schema.
+# ============================================================
+
+statement error
+SHOW SEMANTIC VIEWS IN SCHEMA "oops
+----
+Invalid schema name
+
+# Cleanup
+statement ok
+DROP SEMANTIC VIEW sns_plain;
+
+statement ok
+DROP SEMANTIC VIEW "sns weird view";
+
+statement ok
+DROP TABLE sns_sales;
