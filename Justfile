@@ -239,11 +239,19 @@ test-differential: build
 test-show-scope-case: build
     uv run test/integration/test_show_scope_case_insensitive.py
 
+# SHOW ... IN SCHEMA <db>.<schema> — Snowflake's qualified scope form. It parsed
+# and was then rejoined with a dot into `schema_name = 'db.schema'`, matching
+# nothing with no error. Needs a second ATTACHed database to prove the database
+# half is really applied (a last-part-only fix passes every single-DB test), so
+# it cannot live in sqllogictest.
+test-show-scope-qualified: build
+    uv run test/integration/test_show_scope_qualified_name.py
+
 # All Python integration suites against the built extension. This is the
 # exact set the `python-integration` CI job runs (IntegrationChecks.yml) —
 # keep the two in sync by editing THIS recipe, not the workflow.
 # (test-ducklake-ci is excluded: it has its own dedicated CI job.)
-test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-attach-migration test-readonly-fresh-drop test-chunk-boundary test-differential test-show-scope-case
+test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-attach-migration test-readonly-fresh-drop test-chunk-boundary test-differential test-show-scope-case test-show-scope-qualified
 
 # Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + all Python integration suites
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.

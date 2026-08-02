@@ -71,6 +71,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Not changed: the recorded value itself, so `SHOW SEMANTIC VIEWS` may still *display* two spellings of one schema across rows created under different `USE` statements.
 
+- **`SHOW SEMANTIC VIEWS IN SCHEMA <database>.<schema>` now works** instead of silently returning nothing (TECH-DEBT #25). Naming a schema together with its database is how Snowflake writes this filter, and it was accepted here without complaint — but the two halves were rejoined with a dot and compared against the recorded schema, which holds a bare name. Nothing ever matched `mydb.analytics`, and because an empty result is a legitimate answer there was no error to notice.
+
+  Both halves are now applied, so a schema of the same name in a *different* database is correctly excluded rather than folded in. A dot inside quotes stays part of the name: a schema actually called `"a.b"` is still found, and is not read as database `a`, schema `b`.
+
+  Two spellings that previously produced the same silent empty result are now errors that say what was expected: a three-part schema name (`a.b.c`), and a qualified database name (`IN DATABASE a.b` — a database has nothing to qualify it with).
+
 - Corrected the documented annotation order: `COMMENT`, `WITH SYNONYMS` and `LABELS` may appear in **any** order on an entry. The DDL reference and the metadata-annotations how-to previously stated that `COMMENT` must precede `WITH SYNONYMS` and that the reverse was a parse error; the parser has always accepted either order, requiring only that the annotation region be tiled by recognized clauses with no leftover text.
 
 ## [0.12.0] - 2026-07-28
