@@ -37,8 +37,7 @@ fn take_identifier(rest: &str) -> (&str, &str) {
     (&rest[..end], rest[end..].trim_start())
 }
 
-/// Strip the surrounding double quotes from a captured identifier, honouring
-/// the `""` escape.
+/// Split a captured scope name into its unquoted identifier parts.
 ///
 /// Only the schema / database slots need this. Their value is emitted into a
 /// `lower(schema_name) = lower('<literal>')` comparison and nothing downstream
@@ -48,22 +47,24 @@ fn take_identifier(rest: &str) -> (&str, &str) {
 /// function normalizes once at the catalog-read boundary (FF-4), and stripping
 /// here as well would double-fold.
 ///
+/// The parts are returned rather than rejoined because a dot is **significant**
+/// here: `IN SCHEMA <db>.<schema>` is Snowflake's qualified form and has to
+/// become two predicates. Rejoining produced `schema_name = 'memory.main'`
+/// against a column holding a bare schema name — matching nothing, silently.
+/// A quoted dot (`"a.b"`) is a single part and stays one, which is why this
+/// goes through `parse_qualified_identifier_with_quoting` rather than
+/// `split('.')`.
+///
 /// Case is **not** folded here. It is folded in the emitted SQL instead, on
 /// both sides (see [`build_filter_suffix`]), so quoting still means nothing
 /// extra — `"Main"` and `Main` produce identical predicates.
-fn unquote_show_name(
+fn scope_name_parts(
     raw: &str,
     label: &str,
     position: Option<usize>,
-) -> Result<String, ParseError> {
+) -> Result<Vec<String>, ParseError> {
     parse_qualified_identifier_with_quoting(raw)
-        .map(|parts| {
-            parts
-                .into_iter()
-                .map(|(part, _quoted)| part)
-                .collect::<Vec<_>>()
-                .join(".")
-        })
+        .map(|parts| parts.into_iter().map(|(part, _quoted)| part).collect())
         .map_err(|e| ParseError {
             message: format!("Invalid {label} name '{raw}': {e}"),
             position,
@@ -139,7 +140,10 @@ pub(crate) struct ShowClauses<'a> {
     /// Owned, unlike the other name slots: these two are the only ones whose
     /// value reaches SQL as a plain string literal with no downstream
     /// normalization, so their quotes are stripped here (see
-    /// [`unquote_show_name`]) and the result no longer borrows the query.
+    /// [`scope_name_parts`]) and the result no longer borrows the query.
+    ///
+    /// A qualified `IN SCHEMA <db>.<schema>` populates **both**, which is how
+    /// the database half of Snowflake's qualified form gets applied.
     pub(crate) in_schema: Option<String>,
     pub(crate) in_database: Option<String>,
     pub(crate) for_metric: Option<&'a str>,
@@ -184,16 +188,36 @@ fn parse_in_scope(
         });
     }
     let (raw_name, remaining) = take_identifier(after_kw);
-    let name = unquote_show_name(
-        raw_name,
-        label,
-        Some(base + byte_offset_within(rest, after_kw)),
-    )?;
+    let position = Some(base + byte_offset_within(rest, after_kw));
+    let mut parts = scope_name_parts(raw_name, label, position)?;
+
+    // Arity is what distinguishes the two slots. `IN SCHEMA` takes Snowflake's
+    // `<schema>` or `<db>.<schema>`; `IN DATABASE` takes one part, because a
+    // database has nothing to qualify it with. Anything longer used to be
+    // rejoined into a literal that could never match, so it is an error now
+    // rather than an empty result set.
+    let too_many = |expected: &str| ParseError {
+        message: format!("Invalid {label} name '{raw_name}': expected {expected}"),
+        position,
+    };
 
     if keyword == "SCHEMA" {
-        Ok((remaining, Some(name), None))
+        match parts.len() {
+            1 => Ok((remaining, parts.pop(), None)),
+            // Pop schema first — it is the LAST part; the database qualifier
+            // precedes it. Both predicates are emitted, so a same-named schema
+            // in another database does not match.
+            2 => {
+                let schema = parts.pop();
+                let database = parts.pop();
+                Ok((remaining, schema, database))
+            }
+            _ => Err(too_many("<schema> or <database>.<schema>")),
+        }
+    } else if parts.len() == 1 {
+        Ok((remaining, None, parts.pop()))
     } else {
-        Ok((remaining, None, Some(name)))
+        Err(too_many("a single <database>"))
     }
 }
 

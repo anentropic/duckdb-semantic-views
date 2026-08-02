@@ -3761,4 +3761,99 @@ $$"#;
             );
         }
     }
+
+    /// `IN SCHEMA <db_name>.<schema_name>` — Snowflake's qualified scope form.
+    ///
+    /// Snowflake's grammar for the SHOW scope clause is
+    /// `IN { <name> | ACCOUNT | DATABASE [<db>] | SCHEMA [<db>.<schema>] }`, so
+    /// the two-part spelling is the documented way to name a schema in another
+    /// database. It parsed here — `parse_qualified_identifier_with_quoting`
+    /// accepts it — and then the parts were rejoined with `.` and compared
+    /// against `schema_name`, which stores a BARE schema name. The result was
+    /// `schema_name = 'memory.main'`: no match, no error, empty result.
+    ///
+    /// The same silent-no-match shape as TECH-DEBT #25's quoting half, and the
+    /// case-fold fix could not help — folding does not make two different
+    /// strings equal.
+    ///
+    /// A qualified schema now populates BOTH slots, which is what makes the
+    /// answer correct rather than merely non-empty: matching only the schema
+    /// half would return same-named schemas in OTHER databases.
+    mod show_scope_qualified_name_tests {
+        use super::*;
+
+        #[test]
+        fn a_qualified_schema_name_filters_on_database_and_schema() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA memory.main"),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE lower(schema_name) = lower('main') \
+                 AND lower(database_name) = lower('memory')"
+            );
+        }
+
+        #[test]
+        fn a_quoted_qualified_schema_name_splits_on_the_unquoted_dot() {
+            // The split has to happen on the dot BETWEEN the quoted parts, not
+            // inside either of them, so this fails both a naive `split('.')`
+            // and any fix that gives up on quoting once a dot is present.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"my db\".\"my schema\""),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE lower(schema_name) = lower('my schema') \
+                 AND lower(database_name) = lower('my db')"
+            );
+        }
+
+        #[test]
+        fn a_three_part_schema_name_is_rejected() {
+            // Snowflake allows at most `<db>.<schema>` here. Three parts had no
+            // sensible reading and previously became the silent no-match
+            // `schema_name = 'a.b.c'`.
+            let err = plan_ddl("SHOW SEMANTIC VIEWS IN SCHEMA a.b.c").unwrap_err();
+            assert!(
+                err.message.contains("Invalid schema name"),
+                "expected an invalid-schema-name error, got: {}",
+                err.message
+            );
+        }
+
+        #[test]
+        fn a_qualified_database_name_is_rejected() {
+            // `IN DATABASE` takes ONE part in Snowflake — a database has nothing
+            // to qualify it with. Silently no-matched before.
+            let err = plan_ddl("SHOW SEMANTIC VIEWS IN DATABASE a.b").unwrap_err();
+            assert!(
+                err.message.contains("Invalid database name"),
+                "expected an invalid-database-name error, got: {}",
+                err.message
+            );
+        }
+
+        // ----- controls: green before this change as well as after -----
+
+        #[test]
+        fn an_unqualified_schema_name_emits_no_database_predicate() {
+            // Over-reach guard: the qualified path must not start inventing a
+            // database predicate for the common single-part spelling.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA main"),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE lower(schema_name) = lower('main')"
+            );
+        }
+
+        #[test]
+        fn a_quoted_dot_is_not_a_qualifier() {
+            // A CONTROL, and the reason the fix cannot be `split('.')`: a schema
+            // literally named `a.b` is ONE part, and must stay one part with no
+            // database predicate. Green before this change, and the single most
+            // likely thing a careless fix breaks.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"a.b\""),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE lower(schema_name) = lower('a.b')"
+            );
+        }
+    }
 }

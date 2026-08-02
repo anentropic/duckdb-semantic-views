@@ -19,7 +19,7 @@ Syntax
 
    SHOW [ TERSE ] SEMANTIC VIEWS
        [ LIKE '<pattern>' ]
-       [ IN SCHEMA <schema_name> | IN DATABASE <database_name> ]
+       [ IN SCHEMA [<database_name>.]<schema_name> | IN DATABASE <database_name> ]
        [ STARTS WITH '<prefix>' ]
        [ LIMIT <rows> ]
 
@@ -50,11 +50,11 @@ Optional Filtering Clauses
 ``LIKE '<pattern>'``
    Filters views to those whose name matches the pattern. Uses SQL ``LIKE`` pattern syntax: ``%`` matches any sequence of characters, ``_`` matches a single character. Matching is **case-insensitive** (the extension maps ``LIKE`` to DuckDB's ``ILIKE``). The pattern must be enclosed in single quotes.
 
-``IN SCHEMA <schema_name>``
-   Filters views to those in the specified schema.
+``IN SCHEMA [<database_name>.]<schema_name>``
+   Filters views to those in the specified schema. The schema may be qualified with a database — ``IN SCHEMA mydb.analytics`` — in which case both halves must match, so a same-named schema in another database is not included. Unqualified, the schema is matched in any database.
 
 ``IN DATABASE <database_name>``
-   Filters views to those in the specified database.
+   Filters views to those in the specified database. Unlike the schema, a database name takes no qualifier; ``IN DATABASE a.b`` is an error rather than a name.
 
    Both names may be written double-quoted, which is what lets a name containing whitespace be given at all: ``IN SCHEMA "my schema"``. Matching follows DuckDB's identifier rule, the same rule view, dimension and metric names use: quotes are stripped and case is ignored, so ``"main"``, ``main`` and ``MAIN`` all select the same schema.
 
