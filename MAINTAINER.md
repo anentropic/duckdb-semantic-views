@@ -178,7 +178,9 @@ The `ddl/` and `query/` modules are gated behind `#[cfg(feature = "extension")]`
 
 ### Catalog Persistence
 
-Definitions live in `semantic_layer._definitions` (a regular DuckDB table that participates in normal transactional semantics). Two separate connections coexist per extension load:
+Definitions live in `semantic_layer._definitions` (a regular DuckDB table that participates in normal transactional semantics), keyed by `(schema_name, name)` — semantic views are scoped to a schema, so two schemas may each hold a view of the same name. `schema_name` is a column rather than a field inside the JSON `definition` so the key can enforce that; the JSON keeps a matching copy for the SHOW / DESCRIBE listings, written from the same expression and kept in lockstep (see `catalog::writes::create_target_schema_expr`). A catalog in the pre-scoping single-column shape is rebuilt in place on the next `LOAD` by `migrate_definitions_to_schema_scoped` — a rebuild rather than an `ALTER`, because DuckDB cannot retrofit a primary key.
+
+Two separate connections coexist per extension load:
 
 - **Caller's connection.** Where DDL writes execute. `parser_override` produces `INSERT / UPDATE / DELETE ... RETURNING ...` SQL, DuckDB plans it on this connection, and the writes participate in whatever transaction the caller has open.
 - **Catalog connection (`catalog_conn`).** Created at extension load time and held for read-side table functions (`describe_*`, `show_*`, `list_*`, `read_yaml_*`, `get_ddl`) and CREATE-time enrichment (PK lookup, type inference). Reads see committed state — never the caller's in-flight transaction.

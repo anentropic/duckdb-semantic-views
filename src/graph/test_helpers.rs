@@ -65,6 +65,7 @@ pub(super) fn make_def(
         created_on: None,
         database_name: None,
         schema_name: None,
+        resolution_schema_name: None,
         comment: None,
     }
 }
@@ -107,6 +108,7 @@ pub(super) fn make_def_with_facts(
         created_on: None,
         database_name: None,
         schema_name: None,
+        resolution_schema_name: None,
         comment: None,
     }
 }
@@ -163,6 +165,7 @@ pub(super) fn make_def_with_derived_metrics(
         created_on: None,
         database_name: None,
         schema_name: None,
+        resolution_schema_name: None,
         comment: None,
     }
 }
@@ -217,6 +220,7 @@ pub(super) fn make_def_with_named_joins(
         created_on: None,
         database_name: None,
         schema_name: None,
+        resolution_schema_name: None,
         comment: None,
     }
 }

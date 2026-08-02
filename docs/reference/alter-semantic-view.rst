@@ -49,6 +49,10 @@ Statement Variants
 
 .. note::
 
+   **Schema qualifiers.** ``<name>`` may carry a ``<schema>.`` qualifier and it decides which view is altered; an unqualified name resolves to the one view of that name, and is an error when several schemas hold one (see :ref:`ref-create-semantic-view`). A qualifier on ``<new_name>`` **moves** the view: ``ALTER SEMANTIC VIEW analytics.sales RENAME TO staging.sales`` relocates it to ``staging``. An unqualified ``<new_name>`` leaves the view in its current schema, so the ordinary rename never moves anything. The "already exists" check applies to the destination schema.
+
+.. note::
+
    ``ALTER`` participates in your surrounding transaction (``BEGIN ... ROLLBACK`` restores the previous name and comment). The non-``IF EXISTS`` forms raise ``semantic view '<name>' does not exist`` when the view is absent at check time (and ``RENAME`` raises ``semantic view '<new_name>' already exists`` if the target name is taken); ``IF EXISTS`` keeps its silent-no-op behaviour. The existence/collision check and the update are atomic only inside an explicit transaction -- under autocommit a concurrent commit in the window between them is not detected (a concurrent drop leaves the update affecting 0 rows; a concurrently taken rename target surfaces a raw key-constraint error). See :ref:`explanation-transactional-ddl` for the guard window and how to close it.
 
 .. note::

@@ -18,6 +18,110 @@
 use super::{DEFINITIONS_SCHEMA, DEFINITIONS_TABLE, DEFINITIONS_TABLE_NAME};
 use crate::sql_lit::SqlLit;
 
+/// How a statement names the schema a semantic view lives in.
+///
+/// Semantic views are scoped to a schema: `analytics.v` and `staging.v` are two
+/// different views. A statement either writes the schema out (`Named`) or
+/// leaves it to be resolved (`Unqualified`) — and what "resolved" means differs
+/// between creating a view and finding an existing one, which is why the two
+/// have separate expression builders below.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
+pub(crate) enum SchemaTarget {
+    /// No `schema.` qualifier was written.
+    Unqualified,
+    /// An explicit qualifier, already `''`-escaped exactly once.
+    Named(SqlLit),
+}
+
+/// SQL scalar yielding the schema a CREATE should write into: the catalog's
+/// canonical spelling of the named schema, or of `current_schema()` when the
+/// statement is unqualified.
+///
+/// Three things make this a lookup rather than a literal:
+///
+/// * **The catalog's spelling is authoritative.** `current_schema()` echoes
+///   whatever spelling the last `USE` used — `USE "MYSCHEMA"` reports
+///   `MYSCHEMA` for a schema actually named `MySchema`. Storing that verbatim
+///   would key rows by a spelling the catalog never had.
+/// * **`(schema_name, name)` is a primary key**, so the stored schema must be
+///   one deterministic string per schema. `DuckDB` schema names are unique
+///   case-insensitively, so the catalog spelling is exactly that.
+/// * **A missing schema must fail.** `CREATE SEMANTIC VIEW nosuch.v` errors
+///   like `CREATE TABLE nosuch.t` does, instead of silently landing the view in
+///   the current schema.
+///
+/// Scoped to `current_database()` — semantic views are single-catalog
+/// (TECH-DEBT #26), and the FF-3 guard in [`managed_catalog_guard_select`]
+/// already rejects the USE-d-into-another-database case.
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
+pub(crate) fn create_target_schema_expr(target: &SchemaTarget) -> String {
+    let wanted = match target {
+        SchemaTarget::Unqualified => "current_schema()".to_string(),
+        SchemaTarget::Named(schema) => format!("'{schema}'"),
+    };
+    format!(
+        "COALESCE( \
+           (SELECT s.schema_name FROM duckdb_schemas() s \
+             WHERE s.database_name = current_database() \
+               AND lower(s.schema_name) = lower({wanted}) \
+             LIMIT 1), \
+           error('semantic_views: schema ''' || {wanted} || \
+                 ''' does not exist') \
+         )"
+    )
+}
+
+/// SQL scalar yielding the schema an existing semantic view lives in.
+///
+/// A qualifier answers the question outright. Unqualified, the answer comes
+/// from the catalog: the one schema holding a view of that name, `NULL` when
+/// there is none (so the caller's existence guard reports the canonical
+/// "does not exist"), and an error when several schemas hold one.
+///
+/// Erroring on ambiguity rather than picking a winner is deliberate for now.
+/// `DuckDB` would resolve an unqualified reference through the caller's
+/// **search path**, and the emitted SQL here *could* read it
+/// (`current_schemas()` evaluates on the caller's connection) — but the
+/// read-side table functions cannot: they bind on a fresh
+/// `Connection(*context.db)` that has neither the caller's search path nor its
+/// current schema (TECH-DEBT #19). Preferring the search path here alone would
+/// make `DROP SEMANTIC VIEW v` and `semantic_view('v')` disagree about which
+/// `v` they mean. "Ambiguous — qualify it" is the rule both sides can keep
+/// today, and it is never silently wrong; both move to search-path preference
+/// together once TECH-DEBT #25's rewrite-time injection lands.
+///
+/// Referencing `_definitions`, this expression must not be bound on a
+/// never-bootstrapped database — every caller already runs behind
+/// [`definitions_table_guard_select`].
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
+pub(crate) fn resolved_schema_expr(target: &SchemaTarget, name: &SqlLit) -> String {
+    match target {
+        SchemaTarget::Named(schema) => format!("'{schema}'"),
+        SchemaTarget::Unqualified => format!(
+            "(SELECT CASE WHEN count(*) > 1 \
+                     THEN error('semantic view ''{name}'' is ambiguous: it exists in \
+                                 schemas ' || string_agg(schema_name, ', ' ORDER BY schema_name) \
+                                || '. Qualify the reference as <schema>.{name}') \
+                     ELSE min(schema_name) END \
+               FROM {DEFINITIONS_TABLE} WHERE name = '{name}')"
+        ),
+    }
+}
+
+/// The `WHERE` predicate identifying one semantic view row, given a schema
+/// expression from [`resolved_schema_expr`] or [`create_target_schema_expr`].
+///
+/// Schema names are compared folded on both sides: `DuckDB` matches
+/// identifiers case-insensitively, and a row written before the catalog
+/// spelling was canonicalised may carry a different case than the qualifier
+/// the caller writes. The view name needs no fold — it is stored already
+/// folded by `normalize_view_name`.
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
+pub(crate) fn row_predicate(name: &SqlLit, schema_expr: &str) -> String {
+    format!("name = '{name}' AND lower(schema_name) = lower({schema_expr})")
+}
+
 /// Build the existence-guard SELECT for non-IF-EXISTS DROP/ALTER.
 ///
 /// `name` is the view name already `''`-escaped as a [`SqlLit`] (produced
@@ -102,31 +206,72 @@ pub(crate) fn definitions_table_guard_select(name: &SqlLit) -> String {
     )
 }
 
+///
+/// `row` is the schema-scoped predicate from [`row_predicate`]. When its schema
+/// expression evaluates to `NULL` — an unqualified reference no schema holds —
+/// the predicate is never true, so the guard reports "does not exist", which is
+/// exactly the case.
+///
+/// `display` is the reference **as the caller wrote it**, used only in the
+/// message. It is separate from the name inside `row` so a qualified miss reads
+/// `semantic view 'staging.v' does not exist` rather than naming a bare `v`
+/// that does exist — in another schema.
 #[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-pub(crate) fn existence_guard_select(name: &SqlLit) -> String {
+pub(crate) fn existence_guard_select(row: &str, display: &SqlLit) -> String {
     format!(
         "SELECT CASE WHEN NOT EXISTS \
-                   (SELECT 1 FROM {DEFINITIONS_TABLE} WHERE name = '{name}') \
-                THEN error('semantic view ''{name}'' does not exist') \
+                   (SELECT 1 FROM {DEFINITIONS_TABLE} WHERE {row}) \
+                THEN error('semantic view ''{display}'' does not exist') \
                 ELSE TRUE END"
     )
 }
 
 /// Build the "target name must NOT already exist" guard for ALTER RENAME.
 /// Errors with `semantic view '<new_name>' already exists` if a row with
-/// the new name is found in `semantic_layer._definitions`. Runs as a
-/// statement of the rewrite preceding the UPDATE; its EXISTS check is
+/// the new name is found in the target schema (`schema_expr` — the schema the
+/// rename lands in, which is the source's unless the new name carries its own
+/// qualifier). Runs as a statement of the rewrite preceding the UPDATE; its
+/// EXISTS check is
 /// snapshot-consistent with the UPDATE only within an explicit caller
 /// transaction — see the transactional-scope note on
 /// [`existence_guard_select`] (FF-1 / TECH-DEBT #27) for the autocommit
 /// guard window (a concurrent committer can take the target name between the
 /// guard and the UPDATE, surfacing a raw PK constraint error).
 #[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-pub(crate) fn rename_collision_guard_select(new_name: &SqlLit) -> String {
+pub(crate) fn rename_collision_guard_select(row: &str, display: &SqlLit) -> String {
     format!(
         "SELECT CASE WHEN EXISTS \
-                   (SELECT 1 FROM {DEFINITIONS_TABLE} WHERE name = '{new_name}') \
-                THEN error('semantic view ''{new_name}'' already exists') \
+                   (SELECT 1 FROM {DEFINITIONS_TABLE} WHERE {row}) \
+                THEN error('semantic view ''{display}'' already exists') \
+                ELSE TRUE END"
+    )
+}
+
+/// Build the guard rejecting a `<database>.` prefix that names some database
+/// other than the caller's.
+///
+/// Semantic views are single-catalog (TECH-DEBT #26): the catalog table lives
+/// in one database and every read resolves against it, so a statement spelling
+/// out a *different* database cannot be honoured. It must not be quietly
+/// applied to the current one either, which is what dropping the prefix would
+/// do — `DROP SEMANTIC VIEW otherdb.analytics.v` would then delete the current
+/// database's `analytics.v`. That is a wrong-object write rather than an
+/// unsupported one, which is why this errors instead of ignoring the prefix.
+///
+/// Distinct from [`managed_catalog_guard_select`], which catches the *implicit*
+/// case (the caller `USE`-d into another database); this one catches the
+/// explicit spelling. `db` is the written database name and `display` the whole
+/// reference as the caller wrote it, both `''`-escaped exactly once. The
+/// comparison calls `current_database()` rather than baking in a literal, so it
+/// resolves on the caller's connection at execution.
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
+pub(crate) fn current_database_guard_select(db: &SqlLit, display: &SqlLit) -> String {
+    format!(
+        "SELECT CASE WHEN lower('{db}') <> lower(current_database()) \
+                THEN error('semantic_views: ''{display}'' names database ''{db}'', but \
+                            semantic views are single-catalog and this session''s database is ''' \
+                           || current_database() || \
+                           '''. Manage them from the database the extension was loaded into.') \
                 ELSE TRUE END"
     )
 }
@@ -187,9 +332,17 @@ pub(crate) fn managed_catalog_guard_select() -> String {
 mod tests {
     use super::*;
 
+    /// The schema expression a plain unqualified statement builds its guards
+    /// from. Spelled out once here so each guard test reads as "this guard,
+    /// that schema" rather than repeating the resolution subquery.
+    fn unqualified(name: &str) -> String {
+        resolved_schema_expr(&SchemaTarget::Unqualified, &SqlLit::escape(name))
+    }
+
     #[test]
     fn existence_guard_select_emits_not_exists_and_error() {
-        let g = existence_guard_select(&SqlLit::escape("sales"));
+        let sales = SqlLit::escape("sales");
+        let g = existence_guard_select(&row_predicate(&sales, &unqualified("sales")), &sales);
         assert!(g.contains("NOT EXISTS"), "missing NOT EXISTS: {g}");
         assert!(
             g.contains("FROM semantic_layer._definitions WHERE name = 'sales'"),
@@ -258,7 +411,8 @@ mod tests {
         // an outer SQL string literal preserves correct decoding (DuckDB
         // sees ''X'' as 'X' in the literal). The user-facing error message
         // must read: semantic view 'O'Brien' does not exist.
-        let g = existence_guard_select(&SqlLit::escape("O'Brien"));
+        let obrien = SqlLit::escape("O'Brien");
+        let g = existence_guard_select(&row_predicate(&obrien, &unqualified("O'Brien")), &obrien);
         assert!(
             g.contains("WHERE name = 'O''Brien'"),
             "WHERE clause wrong: {g}"
@@ -271,7 +425,10 @@ mod tests {
 
     #[test]
     fn rename_collision_guard_select_emits_exists_and_error() {
-        let g = rename_collision_guard_select(&SqlLit::escape("taken"));
+        let taken = SqlLit::escape("taken");
+        let schema =
+            resolved_schema_expr(&SchemaTarget::Named(SqlLit::escape("analytics")), &taken);
+        let g = rename_collision_guard_select(&row_predicate(&taken, &schema), &taken);
         assert!(g.contains("EXISTS"), "missing EXISTS: {g}");
         assert!(
             !g.contains("NOT EXISTS"),
@@ -280,6 +437,10 @@ mod tests {
         assert!(
             g.contains("FROM semantic_layer._definitions WHERE name = 'taken'"),
             "guard targets wrong table/predicate: {g}"
+        );
+        assert!(
+            g.contains("lower(schema_name) = lower('analytics')"),
+            "collision guard must be scoped to the target schema: {g}"
         );
         assert!(
             g.contains("error('semantic view ''taken'' already exists')"),
@@ -317,5 +478,136 @@ mod tests {
         );
         assert!(g.trim_start().starts_with("SELECT "), "not a SELECT: {g}");
         assert!(!g.contains(';'), "guard must not include ';' itself: {g}");
+    }
+
+    // --- schema scoping (TECH-DEBT #25) ---------------------------------
+
+    #[test]
+    fn create_target_schema_resolves_current_schema_when_unqualified() {
+        let e = create_target_schema_expr(&SchemaTarget::Unqualified);
+        assert!(
+            e.contains("current_schema()"),
+            "unqualified CREATE targets the current schema: {e}"
+        );
+        // The catalog's spelling, not current_schema()'s echo of the last USE
+        // — `USE \"MYSCHEMA\"` reports MYSCHEMA for a schema named MySchema,
+        // and (schema_name, name) is a primary key.
+        assert!(
+            e.contains("FROM duckdb_schemas()") && e.contains("s.schema_name"),
+            "must resolve to the catalog's canonical spelling: {e}"
+        );
+        assert!(
+            e.contains("s.database_name = current_database()"),
+            "must stay within the single semantic-view catalog: {e}"
+        );
+    }
+
+    #[test]
+    fn create_target_schema_errors_on_a_schema_that_does_not_exist() {
+        let e = create_target_schema_expr(&SchemaTarget::Named(SqlLit::escape("nosuch")));
+        assert!(
+            e.contains("lower('nosuch')"),
+            "must look up the named schema: {e}"
+        );
+        assert!(
+            e.contains("does not exist") && e.contains("error("),
+            "a missing schema must fail, not silently fall back: {e}"
+        );
+    }
+
+    #[test]
+    fn create_target_schema_escapes_quotes_in_the_schema_name() {
+        let e = create_target_schema_expr(&SchemaTarget::Named(SqlLit::escape("O'Brien")));
+        assert!(
+            e.contains("lower('O''Brien')"),
+            "embedded quote must stay doubled: {e}"
+        );
+    }
+
+    #[test]
+    fn resolved_schema_of_a_qualified_reference_is_the_qualifier() {
+        let e = resolved_schema_expr(
+            &SchemaTarget::Named(SqlLit::escape("analytics")),
+            &SqlLit::escape("v"),
+        );
+        assert_eq!(e, "'analytics'");
+        // A qualifier answers the question outright — no catalog probe, so a
+        // qualified DROP of a name that also exists elsewhere cannot be
+        // reported ambiguous.
+        assert!(
+            !e.contains("ambiguous"),
+            "a qualified reference is never ambiguous: {e}"
+        );
+    }
+
+    #[test]
+    fn resolved_schema_of_an_unqualified_reference_errors_when_ambiguous() {
+        let e = unqualified("v");
+        assert!(
+            e.contains("count(*) > 1") && e.contains("is ambiguous"),
+            "two schemas holding 'v' must error, not pick one: {e}"
+        );
+        assert!(
+            e.contains("string_agg(schema_name, ', ' ORDER BY schema_name)"),
+            "the error must name the schemas, in a stable order: {e}"
+        );
+        assert!(
+            e.contains("Qualify the reference as <schema>.v"),
+            "the error must say how to disambiguate: {e}"
+        );
+        // The wording carries no `;` on purpose: guards are joined into a
+        // multi-statement string, and every guard test asserts it contributes
+        // exactly one statement.
+        assert!(!e.contains(';'), "resolution must not embed a ';': {e}");
+        // Exactly one row -> that schema; none -> NULL, so the caller's
+        // existence guard reports the canonical "does not exist".
+        assert!(
+            e.contains("ELSE min(schema_name) END"),
+            "the unique match must resolve to its schema: {e}"
+        );
+    }
+
+    #[test]
+    fn row_predicate_matches_the_schema_case_insensitively() {
+        let p = row_predicate(&SqlLit::escape("v"), "'Analytics'");
+        assert_eq!(p, "name = 'v' AND lower(schema_name) = lower('Analytics')");
+    }
+
+    #[test]
+    fn current_database_guard_compares_against_the_live_current_database() {
+        let g = current_database_guard_select(
+            &SqlLit::escape("otherdb"),
+            &SqlLit::escape("otherdb.analytics.v"),
+        );
+        // A call, not a literal: the caller's database is only known at
+        // execution, on the caller's connection.
+        assert!(
+            g.contains("lower('otherdb') <> lower(current_database())"),
+            "must compare the written database against the live one: {g}"
+        );
+        assert!(
+            g.contains("|| current_database() ||"),
+            "the message must name the database the caller is actually in: {g}"
+        );
+        assert!(
+            g.contains("''otherdb.analytics.v'' names database ''otherdb''"),
+            "the message must quote the reference as written: {g}"
+        );
+        assert!(
+            g.contains("single-catalog"),
+            "the message must state the rule being enforced: {g}"
+        );
+        assert!(g.trim_start().starts_with("SELECT "), "not a SELECT: {g}");
+        assert!(!g.contains(';'), "guard must not include ';' itself: {g}");
+    }
+
+    #[test]
+    fn current_database_guard_escapes_quotes_in_both_slots() {
+        // The database name and the display form are embedded in one SQL
+        // string literal each; an embedded `'` must stay doubled or the
+        // emitted guard is a syntax error rather than a check.
+        let g = current_database_guard_select(&SqlLit::escape("O'Db"), &SqlLit::escape("O'Db.s.v"));
+        assert!(g.contains("lower('O''Db')"), "database slot wrong: {g}");
+        assert!(g.contains("''O''Db.s.v''"), "display slot wrong: {g}");
     }
 }

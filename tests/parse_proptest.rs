@@ -290,7 +290,12 @@ proptest! {
         // RewriteAction::Create carrying the (bare, normalized) view name.
         match result.unwrap().unwrap() {
             RewriteAction::Create { name: n, .. } => {
-                prop_assert_eq!(n, name);
+                // The generator emits bare names, so the reference must be
+                // unqualified as well as carrying the right name — a qualifier
+                // appearing from nowhere would change which schema the CREATE
+                // targets.
+                prop_assert_eq!(n.schema, None);
+                prop_assert_eq!(n.name, name);
             }
             other => prop_assert!(false, "Expected RewriteAction::Create, got: {:?}", other),
         }
@@ -309,7 +314,10 @@ proptest! {
         // arb_view_name() is already lowercase, so the DROP fold and the raw
         // DESCRIBE passthrough both carry `name` verbatim.
         match rewrite_result(&ddl).unwrap() {
-            RewriteAction::Drop { name: n, .. } => prop_assert_eq!(n, name),
+            RewriteAction::Drop { name: n, .. } => {
+                prop_assert_eq!(n.schema, None);
+                prop_assert_eq!(n.name, name);
+            }
             RewriteAction::Passthrough(sql) =>
                 prop_assert_eq!(sql, format!("SELECT * FROM {fn_name}('{name}')")),
             other => prop_assert!(false, "unexpected rewrite action: {:?}", other),
@@ -382,7 +390,10 @@ proptest! {
         // the passthrough SQL carries the quoted form, not the bare content.
         let action = rewrite_result(&ddl).unwrap();
         match action {
-            RewriteAction::Drop { name, .. } => prop_assert_eq!(name, folded.clone()),
+            RewriteAction::Drop { name, .. } => {
+                prop_assert_eq!(name.schema, None);
+                prop_assert_eq!(name.name, folded.clone());
+            }
             RewriteAction::Passthrough(sql) => {
                 let expected =
                     format!("SELECT * FROM {fn_name}('{}')", quoted.replace('\'', "''"));
@@ -403,7 +414,10 @@ proptest! {
         let (prefix, _kind, fn_name) = NAME_ONLY_FORMS[form_idx];
         let ddl = format!("{prefix} {name}");
         match rewrite_result(&ddl).unwrap() {
-            RewriteAction::Drop { name: n, .. } => prop_assert_eq!(n, name.to_ascii_lowercase()),
+            RewriteAction::Drop { name: n, .. } => {
+                prop_assert_eq!(n.schema, None);
+                prop_assert_eq!(n.name, name.to_ascii_lowercase());
+            }
             RewriteAction::Passthrough(sql) =>
                 prop_assert_eq!(sql, format!("SELECT * FROM {fn_name}('{name}')")),
             other => prop_assert!(false, "unexpected rewrite action: {:?}", other),
@@ -625,7 +639,8 @@ proptest! {
                 mode: CreateMode::Create,
                 ..
             } => {
-                prop_assert_eq!(n, name);
+                prop_assert_eq!(n.schema, None);
+                prop_assert_eq!(n.name, name);
             }
             other => prop_assert!(
                 false,

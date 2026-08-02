@@ -59,7 +59,7 @@ fn crlf_body_parses_identically_to_lf() {
                 mode: cm,
             },
         ) => {
-            assert_eq!(cn, "crlf_view", "view name drift under CRLF");
+            assert_eq!(cn.name, "crlf_view", "view name drift under CRLF");
             assert_eq!(cn, ln);
             assert_eq!(cm, CreateMode::OrReplace);
             assert_eq!(cm, lm);

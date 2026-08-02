@@ -191,6 +191,7 @@ fn build_def(s: &Schema) -> SemanticViewDefinition {
         created_on: None,
         database_name: None,
         schema_name: None,
+        resolution_schema_name: None,
         comment: None,
     }
 }

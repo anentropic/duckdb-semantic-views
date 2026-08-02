@@ -51,7 +51,7 @@ proptest! {
 
         match action {
             RewriteAction::Create { name, def: got, mode } => {
-                prop_assert_eq!(name, "rt_view", "view name drift\n{}", ddl);
+                prop_assert_eq!(name.name, "rt_view", "view name drift\n{}", ddl);
                 // render_create_ddl emits `CREATE OR REPLACE`.
                 prop_assert_eq!(mode, CreateMode::OrReplace, "mode drift\n{}", ddl);
                 // Inference-invariant fields must survive the front door

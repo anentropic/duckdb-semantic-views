@@ -150,6 +150,14 @@ All three variants work with both the ``AS`` keyword body and the ``FROM YAML`` 
 
 .. note::
 
+   **Semantic views live in a schema.** ``<name>`` may carry a ``<schema>.`` (or ``<database>.<schema>.``) qualifier, and that qualifier decides where the view is created — ``CREATE SEMANTIC VIEW analytics.sales`` puts the view in ``analytics`` regardless of which schema the session is currently in. Without a qualifier the view is created in the session's current schema, exactly as an unqualified ``CREATE TABLE`` would be. Naming a schema that does not exist is an error rather than a silent fall back to the current schema.
+
+   Two schemas may each hold a view of the same name, so ``analytics.sales`` and ``staging.sales`` are two different views. A reference that names neither — ``DROP SEMANTIC VIEW sales``, ``semantic_view('sales')`` — resolves to the one view of that name when exactly one exists, and is an error naming the candidate schemas when several do. (DuckDB would resolve such a reference through the session's search path; semantic views cannot yet, because the read-side table functions bind on a connection that has neither the search path nor the current schema. Qualify the reference in the meantime.)
+
+   Unqualified table names in the body resolve in the **creating session's** schema, not in the view's — so a semantic view in ``analytics`` built over ``main.orders`` can be written as ``CREATE SEMANTIC VIEW analytics.sales AS TABLES (o AS orders ...)`` from a session in ``main``. This follows DuckDB's rule for a view body.
+
+.. note::
+
    All four ``CREATE`` body variants participate in your surrounding transaction. ``BEGIN ... ROLLBACK`` discards an uncommitted ``CREATE``. See :ref:`explanation-transactional-ddl`.
 
 .. note::

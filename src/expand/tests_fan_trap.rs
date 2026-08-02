@@ -89,6 +89,7 @@ fn fan_trap_three_table_def() -> SemanticViewDefinition {
         created_on: None,
         database_name: None,
         schema_name: None,
+        resolution_schema_name: None,
         comment: None,
     }
 }
@@ -174,6 +175,7 @@ fn fan_trap_one_to_one_safe() {
         created_on: None,
         database_name: None,
         schema_name: None,
+        resolution_schema_name: None,
         comment: None,
     };
     let req = QueryRequest {

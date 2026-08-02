@@ -8,7 +8,7 @@
 //! thin coordinator that declares the submodules and re-exports the public API.
 
 use crate::errors::ParseError;
-use crate::ident::{find_identifier_end, normalize_view_name};
+use crate::ident::{find_identifier_end, parse_view_ref, ViewRef};
 use crate::sql_lit::SqlLit;
 use crate::util::{byte_offset_within, extract_single_quoted_prefix, SingleQuoteError};
 
@@ -84,13 +84,14 @@ fn extract_raw_name_only(
     Ok(raw_name.to_string())
 }
 
-/// Extract and normalize the view name from a name-only DDL statement (DROP).
-/// Folds unquoted names to lowercase and reduces a qualified name to its bare
-/// last part at parse time — appropriate for the native-SQL emitters that bake
-/// the name in. Read-side rewrites use [`extract_raw_name_only`] instead.
-fn extract_name_only(trimmed: &str, prefix_len: usize, base: usize) -> Result<String, ParseError> {
+/// Extract and normalize the view reference from a name-only DDL statement
+/// (DROP). Folds every part to lowercase and keeps any `schema.` qualifier —
+/// semantic views are schema-scoped, so `analytics.v` and `staging.v` are two
+/// views and the emitters need to know which one was written. Read-side
+/// rewrites use [`extract_raw_name_only`] instead.
+fn extract_name_only(trimmed: &str, prefix_len: usize, base: usize) -> Result<ViewRef, ParseError> {
     let raw = extract_raw_name_only(trimmed, prefix_len, base)?;
-    normalize_view_name(&raw).map_err(|e| ParseError {
+    parse_view_ref(&raw).map_err(|e| ParseError {
         message: format!("Invalid view name: {e}"),
         // Point the caret at the name token itself, not the end of the prefix:
         // with whitespace after the prefix the two differ. Matches the other
@@ -193,7 +194,7 @@ fn rewrite_alter(
         });
     }
     let raw_view_name = &after_prefix[..name_end];
-    let view_name = normalize_view_name(raw_view_name).map_err(|e| ParseError {
+    let view_name = parse_view_ref(raw_view_name).map_err(|e| ParseError {
         message: format!("Invalid view name: {e}"),
         position: Some(abs(after_prefix)),
     })?;
@@ -232,7 +233,7 @@ fn rewrite_alter(
                 position: Some(abs(trailing)),
             });
         }
-        let new_name = normalize_view_name(new_name_raw).map_err(|e| ParseError {
+        let new_name = parse_view_ref(new_name_raw).map_err(|e| ParseError {
             message: format!("Invalid new view name in RENAME TO: {e}"),
             position: Some(abs(after_op)),
         })?;
@@ -429,7 +430,7 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, ParseError> {
 pub enum RewriteAction {
     /// CREATE from an in-memory definition (AS-body, or inline `FROM YAML $$..$$`).
     Create {
-        name: String,
+        name: ViewRef,
         def: Box<crate::model::SemanticViewDefinition>,
         mode: CreateMode,
     },
@@ -437,30 +438,55 @@ pub enum RewriteAction {
     /// `__sv_compute_create_from_yaml` helper table function.
     CreateFromYamlFile {
         file_path: String,
-        name: String,
+        name: ViewRef,
         comment: String,
         mode: CreateMode,
     },
     /// DROP — native DELETE against the catalog table.
-    Drop { name: String, if_exists: bool },
+    Drop { name: ViewRef, if_exists: bool },
     /// ALTER ... RENAME TO — native UPDATE of the `name` column.
     AlterRename {
-        name: String,
-        new_name: String,
+        name: ViewRef,
+        new_name: ViewRef,
         if_exists: bool,
     },
     /// ALTER ... SET COMMENT — native UPDATE via `json_merge_patch`.
     AlterSetComment {
-        name: String,
+        name: ViewRef,
         comment: String,
         if_exists: bool,
     },
     /// ALTER ... UNSET COMMENT — native UPDATE via `json_merge_patch`.
-    AlterUnsetComment { name: String, if_exists: bool },
+    AlterUnsetComment { name: ViewRef, if_exists: bool },
     /// Read-side DDL (DESCRIBE / SHOW / SHOW COLUMNS) already lowered to final
     /// `SELECT * FROM <read_side_fn>(...)` SQL that `DuckDB` runs on the caller's
     /// connection unchanged.
     Passthrough(String),
+}
+
+impl RewriteAction {
+    /// Every view reference a write DDL names — one for CREATE / DROP / ALTER,
+    /// two for `ALTER … RENAME TO` (source and target, either of which may
+    /// carry its own qualifier). Empty for `Passthrough`, which names nothing
+    /// the write-side guards apply to.
+    ///
+    /// Exists so guards that hold for *all* write DDL — the single-catalog
+    /// database check — are written once at the dispatch point instead of
+    /// repeated in every emitter.
+    // Consumed by `rewrite_to_native_sql` (extension-only); unused under
+    // `cargo test`'s bundled build, where the emitters are compiled out.
+    #[cfg_attr(not(feature = "extension"), allow(dead_code))]
+    pub(crate) fn referenced_views(&self) -> Vec<&ViewRef> {
+        match self {
+            RewriteAction::Create { name, .. }
+            | RewriteAction::CreateFromYamlFile { name, .. }
+            | RewriteAction::Drop { name, .. }
+            | RewriteAction::AlterSetComment { name, .. }
+            | RewriteAction::AlterUnsetComment { name, .. } => vec![name],
+            RewriteAction::AlterRename { name, new_name, .. } => vec![name, new_name],
+            RewriteAction::Passthrough(_) => Vec::new(),
+        }
+    }
 }
 
 /// CREATE conflict mode, mirroring the three `DdlKind` CREATE variants.
@@ -543,6 +569,16 @@ mod tests {
     // `crate::parse::*` supplies the coordinator re-exports (detect_*,
     // escape helpers, PARSE_* consts) that were in scope before the split.
     use crate::parse::*;
+
+    /// Parse a view reference for use in an expected [`RewriteAction`].
+    ///
+    /// Routing the expectation through the same parser the production path
+    /// uses keeps `name: vref("v")` as readable as the `name: "v".to_string()`
+    /// it replaced, while also pinning the qualifier slot: `vref("v")` asserts
+    /// unqualified, `vref("analytics.v")` asserts the schema was captured.
+    fn vref(name: &str) -> ViewRef {
+        parse_view_ref(name).expect("test view reference must parse")
+    }
 
     /// Plan a DDL statement, expecting a recognized, valid statement.
     fn plan(query: &str) -> RewriteAction {
@@ -929,7 +965,7 @@ mod tests {
         assert_eq!(
             plan("DROP SEMANTIC VIEW sales"),
             RewriteAction::Drop {
-                name: "sales".to_string(),
+                name: vref("sales"),
                 if_exists: false,
             }
         );
@@ -940,7 +976,7 @@ mod tests {
         assert_eq!(
             plan("DROP SEMANTIC VIEW IF EXISTS sales"),
             RewriteAction::Drop {
-                name: "sales".to_string(),
+                name: vref("sales"),
                 if_exists: true,
             }
         );
@@ -964,7 +1000,7 @@ mod tests {
         assert_eq!(
             plan("DROP SEMANTIC VIEW it's_a_view"),
             RewriteAction::Drop {
-                name: "it's_a_view".to_string(),
+                name: vref("it's_a_view"),
                 if_exists: false,
             }
         );
@@ -983,7 +1019,7 @@ mod tests {
         assert_eq!(
             plan("DROP SEMANTIC VIEW Sales"),
             RewriteAction::Drop {
-                name: "sales".to_string(),
+                name: vref("sales"),
                 if_exists: false,
             }
         );
@@ -1001,14 +1037,14 @@ mod tests {
         ) else {
             panic!("expected RewriteAction::Create");
         };
-        assert_eq!(name, "sales");
+        assert_eq!(name, vref("sales"));
 
         // ALTER folds both the target and the RENAME TO name.
         assert_eq!(
             plan("ALTER SEMANTIC VIEW Sales RENAME TO NewSales"),
             RewriteAction::AlterRename {
-                name: "sales".to_string(),
-                new_name: "newsales".to_string(),
+                name: vref("sales"),
+                new_name: vref("newsales"),
                 if_exists: false,
             }
         );
@@ -1022,7 +1058,7 @@ mod tests {
         assert_eq!(
             plan("DROP SEMANTIC VIEW \"Sales\""),
             RewriteAction::Drop {
-                name: "sales".to_string(),
+                name: vref("sales"),
                 if_exists: false,
             }
         );
@@ -1034,13 +1070,13 @@ mod tests {
         ) else {
             panic!("expected RewriteAction::Create");
         };
-        assert_eq!(name, "sales");
+        assert_eq!(name, vref("sales"));
 
         assert_eq!(
             plan("ALTER SEMANTIC VIEW \"Sales\" RENAME TO \"NewSales\""),
             RewriteAction::AlterRename {
-                name: "sales".to_string(),
-                new_name: "newsales".to_string(),
+                name: vref("sales"),
+                new_name: vref("newsales"),
                 if_exists: false,
             }
         );
@@ -1114,7 +1150,7 @@ mod tests {
         assert_eq!(
             plan("DROP SEMANTIC VIEW\"my view\""),
             RewriteAction::Drop {
-                name: "my view".to_string(),
+                name: vref("my view"),
                 if_exists: false,
             }
         );
@@ -1131,7 +1167,7 @@ mod tests {
         assert_eq!(
             plan("DROP SEMANTIC VIEW a -- trailing comment"),
             RewriteAction::Drop {
-                name: "a".to_string(),
+                name: vref("a"),
                 if_exists: false,
             }
         );
@@ -1143,8 +1179,8 @@ mod tests {
         assert_eq!(
             plan("ALTER SEMANTIC VIEW a RENAME TO x -- oops"),
             RewriteAction::AlterRename {
-                name: "a".to_string(),
-                new_name: "x".to_string(),
+                name: vref("a"),
+                new_name: vref("x"),
                 if_exists: false,
             }
         );
@@ -1159,7 +1195,7 @@ mod tests {
         assert_eq!(
             plan("DROP /* which? */ SEMANTIC VIEW a"),
             RewriteAction::Drop {
-                name: "a".to_string(),
+                name: vref("a"),
                 if_exists: false,
             }
         );
@@ -1171,7 +1207,7 @@ mod tests {
         assert_eq!(
             plan("ALTER SEMANTIC VIEW a SET COMMENT = 'keep -- this /* too */'"),
             RewriteAction::AlterSetComment {
-                name: "a".to_string(),
+                name: vref("a"),
                 comment: "keep -- this /* too */".to_string(),
                 if_exists: false,
             }
@@ -1184,7 +1220,7 @@ mod tests {
         assert_eq!(
             plan("/* outer /* inner */ still comment */ DROP SEMANTIC VIEW a"),
             RewriteAction::Drop {
-                name: "a".to_string(),
+                name: vref("a"),
                 if_exists: false,
             }
         );
@@ -1217,15 +1253,15 @@ mod tests {
         assert_eq!(
             plan("ALTER SEMANTIC VIEW a RENAME  \t TO b"),
             RewriteAction::AlterRename {
-                name: "a".to_string(),
-                new_name: "b".to_string(),
+                name: vref("a"),
+                new_name: vref("b"),
                 if_exists: false,
             }
         );
         assert_eq!(
             plan("ALTER SEMANTIC VIEW a SET   COMMENT = 'x'"),
             RewriteAction::AlterSetComment {
-                name: "a".to_string(),
+                name: vref("a"),
                 comment: "x".to_string(),
                 if_exists: false,
             }
@@ -1233,7 +1269,7 @@ mod tests {
         assert_eq!(
             plan("ALTER SEMANTIC VIEW a UNSET\tCOMMENT"),
             RewriteAction::AlterUnsetComment {
-                name: "a".to_string(),
+                name: vref("a"),
                 if_exists: false,
             }
         );
@@ -1269,8 +1305,8 @@ mod tests {
         assert_eq!(
             plan("ALTER SEMANTIC VIEW \"my view\" RENAME TO w"),
             RewriteAction::AlterRename {
-                name: "my view".to_string(),
-                new_name: "w".to_string(),
+                name: vref("my view"),
+                new_name: vref("w"),
                 if_exists: false,
             }
         );
@@ -1658,7 +1694,7 @@ mod tests {
                 panic!("expected RewriteAction::Create");
             };
             assert_eq!(mode, CreateMode::Create);
-            assert_eq!(name, "v", "Must carry view name");
+            assert_eq!(name, vref("v"), "Must carry view name");
         }
 
         #[test]
@@ -1705,7 +1741,7 @@ mod tests {
             assert_eq!(
                 plan(query),
                 RewriteAction::Drop {
-                    name: "v".to_string(),
+                    name: vref("v"),
                     if_exists: false,
                 }
             );
@@ -2490,7 +2526,7 @@ mod tests {
         assert_eq!(
             plan("ALTER SEMANTIC VIEW v SET COMMENT = 'hello'"),
             RewriteAction::AlterSetComment {
-                name: "v".to_string(),
+                name: vref("v"),
                 comment: "hello".to_string(),
                 if_exists: false,
             }
@@ -2502,7 +2538,7 @@ mod tests {
         assert_eq!(
             plan("ALTER SEMANTIC VIEW v UNSET COMMENT"),
             RewriteAction::AlterUnsetComment {
-                name: "v".to_string(),
+                name: vref("v"),
                 if_exists: false,
             }
         );
@@ -2513,7 +2549,7 @@ mod tests {
         assert_eq!(
             plan("ALTER SEMANTIC VIEW IF EXISTS v SET COMMENT = 'hello'"),
             RewriteAction::AlterSetComment {
-                name: "v".to_string(),
+                name: vref("v"),
                 comment: "hello".to_string(),
                 if_exists: true,
             }
@@ -2525,7 +2561,7 @@ mod tests {
         assert_eq!(
             plan("ALTER SEMANTIC VIEW IF EXISTS v UNSET COMMENT"),
             RewriteAction::AlterUnsetComment {
-                name: "v".to_string(),
+                name: vref("v"),
                 if_exists: true,
             }
         );
@@ -2536,8 +2572,8 @@ mod tests {
         assert_eq!(
             plan("ALTER SEMANTIC VIEW v RENAME TO w"),
             RewriteAction::AlterRename {
-                name: "v".to_string(),
-                new_name: "w".to_string(),
+                name: vref("v"),
+                new_name: vref("w"),
                 if_exists: false,
             }
         );
@@ -2560,7 +2596,7 @@ mod tests {
         assert_eq!(
             plan("ALTER SEMANTIC VIEW v SET COMMENT = 'it''s a test'"),
             RewriteAction::AlterSetComment {
-                name: "v".to_string(),
+                name: vref("v"),
                 comment: "it's a test".to_string(),
                 if_exists: false,
             }
@@ -2679,18 +2715,20 @@ metrics:
     expr: SUM(o.amount)
     source_table: o
 $$"#;
-        let action = rewrite_ddl_yaml_body(DdlKind::Create, "test_view", yaml_text, None).unwrap();
+        let action =
+            rewrite_ddl_yaml_body(DdlKind::Create, &vref("test_view"), yaml_text, None).unwrap();
         let RewriteAction::Create { name, mode, .. } = action else {
             panic!("expected RewriteAction::Create, got {action:?}");
         };
-        assert_eq!(name, "test_view");
+        assert_eq!(name, vref("test_view"));
         assert_eq!(mode, CreateMode::Create);
     }
 
     #[test]
     fn test_yaml_rewrite_create_or_replace() {
         let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
-        let action = rewrite_ddl_yaml_body(DdlKind::CreateOrReplace, "v", yaml_text, None).unwrap();
+        let action =
+            rewrite_ddl_yaml_body(DdlKind::CreateOrReplace, &vref("v"), yaml_text, None).unwrap();
         assert!(matches!(
             action,
             RewriteAction::Create {
@@ -2704,7 +2742,7 @@ $$"#;
     fn test_yaml_rewrite_create_if_not_exists() {
         let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
         let result =
-            rewrite_ddl_yaml_body(DdlKind::CreateIfNotExists, "v", yaml_text, None).unwrap();
+            rewrite_ddl_yaml_body(DdlKind::CreateIfNotExists, &vref("v"), yaml_text, None).unwrap();
         assert!(matches!(
             result,
             RewriteAction::Create {
@@ -2718,7 +2756,7 @@ $$"#;
     fn test_yaml_rewrite_trailing_content_rejected() {
         let yaml_text =
             "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$ extra stuff";
-        let err = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap_err();
+        let err = rewrite_ddl_yaml_body(DdlKind::Create, &vref("v"), yaml_text, None).unwrap_err();
         assert!(err
             .message
             .contains("Unexpected content after closing dollar-quote"));
@@ -2727,7 +2765,8 @@ $$"#;
     #[test]
     fn test_yaml_rewrite_invalid_yaml() {
         let yaml_text = "$$\n: : : not valid yaml [[[$$";
-        let err = rewrite_ddl_yaml_body(DdlKind::Create, "bad_view", yaml_text, None).unwrap_err();
+        let err =
+            rewrite_ddl_yaml_body(DdlKind::Create, &vref("bad_view"), yaml_text, None).unwrap_err();
         assert!(err.message.contains("bad_view"));
     }
 
@@ -2737,7 +2776,7 @@ $$"#;
             "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\ncomment: yaml comment\n$$";
         let result = rewrite_ddl_yaml_body(
             DdlKind::Create,
-            "v",
+            &vref("v"),
             yaml_text,
             Some("ddl comment".to_string()),
         )
@@ -2760,7 +2799,7 @@ tables:
 dimensions: []
 metrics: []
 $$"#;
-        let result = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap();
+        let result = rewrite_ddl_yaml_body(DdlKind::Create, &vref("v"), yaml_text, None).unwrap();
         let RewriteAction::Create { def, .. } = result else {
             panic!("expected RewriteAction::Create, got {result:?}");
         };
@@ -2771,7 +2810,7 @@ $$"#;
     #[test]
     fn test_yaml_rewrite_tagged_dollar_quote() {
         let yaml_text = "$yaml$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$yaml$";
-        let result = rewrite_ddl_yaml_body(DdlKind::Create, "v", yaml_text, None).unwrap();
+        let result = rewrite_ddl_yaml_body(DdlKind::Create, &vref("v"), yaml_text, None).unwrap();
         assert!(matches!(result, RewriteAction::Create { .. }));
     }
 
@@ -2790,7 +2829,7 @@ $$"#;
         let RewriteAction::Create { name, mode, .. } = plan(query) else {
             panic!("expected RewriteAction::Create");
         };
-        assert_eq!(name, "yaml_test");
+        assert_eq!(name, vref("yaml_test"));
         assert_eq!(mode, CreateMode::Create);
     }
 
@@ -2971,14 +3010,18 @@ $$"#;
 
     #[test]
     fn test_rewrite_ddl_yaml_file_body_create() {
-        let result =
-            rewrite_ddl_yaml_file_body(DdlKind::Create, "myview", "'/path/to/def.yaml'", None)
-                .unwrap();
+        let result = rewrite_ddl_yaml_file_body(
+            DdlKind::Create,
+            &vref("myview"),
+            "'/path/to/def.yaml'",
+            None,
+        )
+        .unwrap();
         assert_eq!(
             result,
             RewriteAction::CreateFromYamlFile {
                 file_path: "/path/to/def.yaml".to_string(),
-                name: "myview".to_string(),
+                name: vref("myview"),
                 comment: String::new(),
                 mode: CreateMode::Create,
             }
@@ -2989,7 +3032,7 @@ $$"#;
     fn test_rewrite_ddl_yaml_file_body_replace() {
         let result = rewrite_ddl_yaml_file_body(
             DdlKind::CreateOrReplace,
-            "v",
+            &vref("v"),
             "'/f.yaml'",
             Some("a comment".into()),
         )
@@ -2998,7 +3041,7 @@ $$"#;
             result,
             RewriteAction::CreateFromYamlFile {
                 file_path: "/f.yaml".to_string(),
-                name: "v".to_string(),
+                name: vref("v"),
                 comment: "a comment".to_string(),
                 mode: CreateMode::OrReplace,
             }
@@ -3008,12 +3051,13 @@ $$"#;
     #[test]
     fn test_rewrite_ddl_yaml_file_body_if_not_exists() {
         let result =
-            rewrite_ddl_yaml_file_body(DdlKind::CreateIfNotExists, "v", "'/f.yaml'", None).unwrap();
+            rewrite_ddl_yaml_file_body(DdlKind::CreateIfNotExists, &vref("v"), "'/f.yaml'", None)
+                .unwrap();
         assert_eq!(
             result,
             RewriteAction::CreateFromYamlFile {
                 file_path: "/f.yaml".to_string(),
-                name: "v".to_string(),
+                name: vref("v"),
                 comment: String::new(),
                 mode: CreateMode::IfNotExists,
             }
@@ -3024,7 +3068,7 @@ $$"#;
     fn test_rewrite_ddl_yaml_file_body_with_comment() {
         let result = rewrite_ddl_yaml_file_body(
             DdlKind::Create,
-            "v",
+            &vref("v"),
             "'/f.yaml'",
             Some("my comment".into()),
         )
@@ -3037,7 +3081,7 @@ $$"#;
 
     #[test]
     fn test_rewrite_ddl_yaml_file_body_empty_path() {
-        let err = rewrite_ddl_yaml_file_body(DdlKind::Create, "v", "''", None).unwrap_err();
+        let err = rewrite_ddl_yaml_file_body(DdlKind::Create, &vref("v"), "''", None).unwrap_err();
         assert!(
             err.message.contains("File path cannot be empty"),
             "Error: {}",
@@ -3047,8 +3091,9 @@ $$"#;
 
     #[test]
     fn test_rewrite_ddl_yaml_file_body_trailing_content() {
-        let err = rewrite_ddl_yaml_file_body(DdlKind::Create, "v", "'/f.yaml' extra stuff", None)
-            .unwrap_err();
+        let err =
+            rewrite_ddl_yaml_file_body(DdlKind::Create, &vref("v"), "'/f.yaml' extra stuff", None)
+                .unwrap_err();
         assert!(
             err.message.contains("Unexpected content after file path"),
             "Error: {}",
@@ -3186,7 +3231,7 @@ $$"#;
         assert_eq!(
             plan(q),
             RewriteAction::Drop {
-                name: "v".to_string(),
+                name: vref("v"),
                 if_exists: false,
             }
         );
@@ -3271,7 +3316,7 @@ $$"#;
             assert_eq!(
                 plan("DROP SEMANTIC VIEW \"db\".\"sch\".\"v\""),
                 RewriteAction::Drop {
-                    name: "v".to_string(),
+                    name: vref("db.sch.v"),
                     if_exists: false,
                 }
             );
@@ -3282,7 +3327,7 @@ $$"#;
             assert_eq!(
                 plan("DROP SEMANTIC VIEW \"orders_sv\""),
                 RewriteAction::Drop {
-                    name: "orders_sv".to_string(),
+                    name: vref("orders_sv"),
                     if_exists: false,
                 }
             );
@@ -3293,7 +3338,9 @@ $$"#;
             assert_eq!(
                 plan("DROP SEMANTIC VIEW db.sch.v"),
                 RewriteAction::Drop {
-                    name: "v".to_string(),
+                    // The qualifier is kept, not discarded: it pins WHICH `v`
+                    // the DROP means now that two schemas may each hold one.
+                    name: vref("db.sch.v"),
                     if_exists: false,
                 }
             );
@@ -3304,7 +3351,7 @@ $$"#;
             assert_eq!(
                 plan("DROP SEMANTIC VIEW main.\"orders_sv\""),
                 RewriteAction::Drop {
-                    name: "orders_sv".to_string(),
+                    name: vref("main.orders_sv"),
                     if_exists: false,
                 }
             );
@@ -3317,7 +3364,7 @@ $$"#;
             assert_eq!(
                 plan("DROP SEMANTIC VIEW \"my view\""),
                 RewriteAction::Drop {
-                    name: "my view".to_string(),
+                    name: vref("my view"),
                     if_exists: false,
                 }
             );
@@ -3328,7 +3375,7 @@ $$"#;
             assert_eq!(
                 plan("DROP SEMANTIC VIEW IF EXISTS \"db\".\"sch\".\"v\""),
                 RewriteAction::Drop {
-                    name: "v".to_string(),
+                    name: vref("db.sch.v"),
                     if_exists: true,
                 }
             );
@@ -3377,47 +3424,56 @@ $$"#;
                                     DIMENSIONS (o.region AS o.region) \
                                     METRICS (o.total AS SUM(o.amount))";
 
-        /// Plan a CREATE query and return the bare, normalized name it
-        /// captured in `RewriteAction::Create`.
-        fn create_name(query: &str) -> String {
+        /// Plan a CREATE query and return the reference it captured in
+        /// `RewriteAction::Create`.
+        fn create_ref(query: &str) -> ViewRef {
             match plan(query) {
                 RewriteAction::Create { name, .. } => name,
                 other => panic!("expected RewriteAction::Create, got {other:?}"),
             }
         }
 
+        // Semantic views are schema-scoped, so a qualifier is no longer
+        // discarded on the way to the emitter: these pin BOTH halves — the
+        // bare name in the name slot, and the qualifier the CREATE now
+        // honours (it decides which schema the row lands in).
+
         #[test]
-        fn create_with_quoted_fqn_extracts_bare_name() {
+        fn create_with_quoted_fqn_captures_schema_and_bare_name() {
             let q = format!("CREATE SEMANTIC VIEW \"db\".\"sch\".\"orders_sv\" {MINIMAL_BODY}");
-            assert_eq!(create_name(&q), "orders_sv");
+            assert_eq!(create_ref(&q), vref("db.sch.orders_sv"));
         }
 
         #[test]
-        fn create_or_replace_with_quoted_fqn_extracts_bare_name() {
+        fn create_or_replace_with_quoted_fqn_captures_schema_and_bare_name() {
             let q = format!(
                 "CREATE OR REPLACE SEMANTIC VIEW \"db\".\"sch\".\"orders_sv\" {MINIMAL_BODY}"
             );
-            assert_eq!(create_name(&q), "orders_sv");
+            assert_eq!(create_ref(&q), vref("db.sch.orders_sv"));
         }
 
         #[test]
-        fn create_if_not_exists_with_quoted_fqn_extracts_bare_name() {
+        fn create_if_not_exists_with_quoted_fqn_captures_schema_and_bare_name() {
             let q = format!(
                 "CREATE SEMANTIC VIEW IF NOT EXISTS \"db\".\"sch\".\"orders_sv\" {MINIMAL_BODY}"
             );
-            assert_eq!(create_name(&q), "orders_sv");
+            assert_eq!(create_ref(&q), vref("db.sch.orders_sv"));
         }
 
         #[test]
-        fn create_with_partial_quoting_extracts_bare_name() {
+        fn create_with_partial_quoting_captures_schema_and_bare_name() {
             let q = format!("CREATE SEMANTIC VIEW main.\"orders_sv\" {MINIMAL_BODY}");
-            assert_eq!(create_name(&q), "orders_sv");
+            let r = create_ref(&q);
+            assert_eq!(r.name, "orders_sv");
+            assert_eq!(r.schema.as_deref(), Some("main"));
         }
 
         #[test]
         fn create_with_quoted_whitespace_name_extracts_intact() {
             let q = format!("CREATE SEMANTIC VIEW \"my view\" {MINIMAL_BODY}");
-            assert_eq!(create_name(&q), "my view");
+            let r = create_ref(&q);
+            assert_eq!(r.name, "my view");
+            assert_eq!(r.schema, None, "one quoted part is a name, not a qualifier");
         }
 
         #[test]
@@ -3440,8 +3496,8 @@ $$"#;
             assert_eq!(
                 plan("ALTER SEMANTIC VIEW \"v\" RENAME TO new_name"),
                 RewriteAction::AlterRename {
-                    name: "v".to_string(),
-                    new_name: "new_name".to_string(),
+                    name: vref("v"),
+                    new_name: vref("new_name"),
                     if_exists: false,
                 }
             );
@@ -3452,8 +3508,10 @@ $$"#;
             assert_eq!(
                 plan("ALTER SEMANTIC VIEW v RENAME TO \"memory\".\"main\".\"new_v\""),
                 RewriteAction::AlterRename {
-                    name: "v".to_string(),
-                    new_name: "new_v".to_string(),
+                    name: vref("v"),
+                    // The qualifier survives into the target slot: a qualified
+                    // RENAME TO moves the view into that schema.
+                    new_name: vref("memory.main.new_v"),
                     if_exists: false,
                 }
             );
@@ -3466,8 +3524,8 @@ $$"#;
                     "ALTER SEMANTIC VIEW \"memory\".\"main\".\"v\" RENAME TO \"memory\".\"main\".\"new_v\""
                 ),
                 RewriteAction::AlterRename {
-                    name: "v".to_string(),
-                    new_name: "new_v".to_string(),
+                    name: vref("memory.main.v"),
+                    new_name: vref("memory.main.new_v"),
                     if_exists: false,
                 }
             );
@@ -3478,7 +3536,7 @@ $$"#;
             assert_eq!(
                 plan("ALTER SEMANTIC VIEW \"v\" SET COMMENT = 'x'"),
                 RewriteAction::AlterSetComment {
-                    name: "v".to_string(),
+                    name: vref("v"),
                     comment: "x".to_string(),
                     if_exists: false,
                 }
@@ -3490,7 +3548,7 @@ $$"#;
             assert_eq!(
                 plan("ALTER SEMANTIC VIEW \"v\" UNSET COMMENT"),
                 RewriteAction::AlterUnsetComment {
-                    name: "v".to_string(),
+                    name: vref("v"),
                     if_exists: false,
                 }
             );
@@ -3511,13 +3569,26 @@ $$"#;
         #[test]
         fn create_quoted_fqn_captures_bare_name() {
             let q = format!("CREATE SEMANTIC VIEW \"a\".\"b\".\"c\" {MINIMAL_BODY}");
-            assert_eq!(create_name(&q), "c");
+            assert_eq!(create_ref(&q), vref("a.b.c"));
         }
 
         #[test]
         fn create_mixed_quoting_captures_bare_name() {
             let q = format!("CREATE SEMANTIC VIEW a.\"b\".c {MINIMAL_BODY}");
-            assert_eq!(create_name(&q), "c");
+            assert_eq!(create_ref(&q), vref("a.b.c"));
+        }
+
+        #[test]
+        fn create_with_four_part_name_errors() {
+            // A fourth part cannot be silently truncated to the last one:
+            // `a.b.c.d` names nothing this catalog can hold.
+            let q = format!("CREATE SEMANTIC VIEW a.b.c.d {MINIMAL_BODY}");
+            let err = plan_rewrite(&q).unwrap_err();
+            assert!(
+                err.message.contains("Invalid view name") && err.message.contains("too many"),
+                "expected a too-many-parts error, got: {}",
+                err.message
+            );
         }
     }
 
@@ -3598,8 +3669,8 @@ $$"#;
             // would hand the TF `a.b` and resolve the view named `b` — a
             // different view that may well exist. That failure mode is a silent
             // WRONG HIT, not a miss, which is why it gets its own pin.
-            assert_eq!(normalize_view_name("\"a.b\"").unwrap(), "a.b");
-            assert_eq!(normalize_view_name("a.b").unwrap(), "b");
+            assert_eq!(crate::ident::normalize_view_name("\"a.b\"").unwrap(), "a.b");
+            assert_eq!(crate::ident::normalize_view_name("a.b").unwrap(), "b");
         }
 
         // ----- 2. the schema/database slots must also STRIP the quotes -----

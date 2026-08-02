@@ -447,10 +447,27 @@ pub struct SemanticViewDefinition {
     /// Old stored JSON without this field deserializes to None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database_name: Option<String>,
-    /// Schema name from the connection context at define time.
+    /// Schema this semantic view lives in — the qualifier written on the
+    /// CREATE name, or the creating session's schema when it was unqualified.
+    /// Mirrors the `schema_name` **column** of the catalog table, which is what
+    /// the `(schema_name, name)` primary key scopes the view by; the two are
+    /// written together and kept in lockstep.
     /// Old stored JSON without this field deserializes to None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_name: Option<String>,
+    /// Schema that unqualified table references in the body resolve against —
+    /// the creating session's `current_schema()`, following `DuckDB`'s rule
+    /// that a view body is resolved in the creating session's context rather
+    /// than in the schema the view happens to live in.
+    ///
+    /// Separate from [`Self::schema_name`] only because the two can now differ:
+    /// `CREATE SEMANTIC VIEW analytics.sales AS TABLES (o AS orders …)` issued
+    /// from `main` puts the view in `analytics` while `orders` still means
+    /// `main.orders`. Before views were schema-scoped there was one schema in
+    /// play and `schema_name` served both roles, so rows written then have no
+    /// value here and fall back to `schema_name` — exactly their old behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_schema_name: Option<String>,
     /// View-level comment describing the purpose of this semantic view.
     /// Old stored JSON without this field deserializes to None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -762,6 +779,7 @@ mod tests {
                 created_on: None,
                 database_name: None,
                 schema_name: None,
+                resolution_schema_name: None,
                 comment: None,
             };
             let json = serde_json::to_string(&def).unwrap();
@@ -1118,6 +1136,7 @@ mod tests {
                 created_on: Some("2026-04-01T12:00:00Z".to_string()),
                 database_name: Some("mydb".to_string()),
                 schema_name: Some("main".to_string()),
+                resolution_schema_name: Some("main".to_string()),
                 ..Default::default()
             };
             let json = serde_json::to_string(&def).unwrap();

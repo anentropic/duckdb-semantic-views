@@ -147,7 +147,18 @@ pub fn qualify_and_quote_table_ref(table: &str, def: &SemanticViewDefinition) ->
     if let Some(db) = &def.database_name {
         parts.push(quote_ident(db));
     }
-    if let Some(schema) = &def.schema_name {
+    // The schema the BODY resolves in, not the one the view lives in. Those
+    // differ when the CREATE name carried a qualifier — a view created as
+    // `analytics.sales` from `main` still means `main.orders` by a bare
+    // `orders`, following DuckDB's rule that a view body resolves in the
+    // creating session's context. Rows written before views were schema-scoped
+    // have no `resolution_schema_name`; falling back to `schema_name` is
+    // exactly what they always did.
+    let body_schema = def
+        .resolution_schema_name
+        .as_ref()
+        .or(def.schema_name.as_ref());
+    if let Some(schema) = body_schema {
         parts.push(quote_ident(schema));
     }
     // `table` here is logically single-part. If it parses cleanly we emit
@@ -302,6 +313,7 @@ mod tests {
             created_on: None,
             database_name: db.map(str::to_string),
             schema_name: schema.map(str::to_string),
+            resolution_schema_name: schema.map(str::to_string),
             comment: None,
         }
     }

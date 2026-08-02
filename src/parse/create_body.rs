@@ -19,7 +19,7 @@
 use super::{CreateMode, DdlKind, RewriteAction};
 use crate::body_parser::parse_keyword_body;
 use crate::errors::ParseError;
-use crate::ident::{find_identifier_end, normalize_view_name};
+use crate::ident::{find_identifier_end, parse_view_ref, ViewRef};
 use crate::util::{extract_single_quoted_prefix, is_ident_byte, SingleQuoteError};
 
 /// Extract an optional COMMENT = '...' between the view name and the AS keyword.
@@ -101,11 +101,11 @@ pub(crate) fn validate_create_body(
             position: Some(trim_offset + plen),
         });
     }
-    let name_owned = normalize_view_name(raw_name).map_err(|e| ParseError {
+    let name_owned = parse_view_ref(raw_name).map_err(|e| ParseError {
         message: format!("Invalid view name: {e}"),
         position: Some(trim_offset + plen),
     })?;
-    let name = name_owned.as_str();
+    let name = &name_owned;
 
     let after_name = &after_prefix[name_end..];
 
@@ -182,7 +182,7 @@ pub(crate) fn validate_create_body(
 /// resulting `SemanticViewDefinition` structurally to the emission stage.
 fn rewrite_ddl_keyword_body(
     kind: DdlKind,
-    name: &str,
+    name: &ViewRef,
     body_text: &str,              // text starting at "AS" (inclusive)
     body_offset: usize,           // byte offset of body_text[0] in original query
     view_comment: Option<String>, // Phase 43: optional view-level COMMENT
@@ -221,6 +221,7 @@ fn rewrite_ddl_keyword_body(
         created_on: None,
         database_name: None,
         schema_name: None,
+        resolution_schema_name: None,
         comment,
     };
 
@@ -228,7 +229,7 @@ fn rewrite_ddl_keyword_body(
     //    straight to `emit_native_create_sql` (AR-2: no JSON serialize / re-parse
     //    / re-deserialize round-trip).
     Ok(RewriteAction::Create {
-        name: name.to_string(),
+        name: name.clone(),
         def: Box::new(def),
         mode: CreateMode::from_kind(kind),
     })
@@ -270,7 +271,7 @@ pub(crate) fn extract_single_quoted(input: &str) -> Result<(String, usize), Pars
 /// path/kind/name/comment through the `String` return of `validate_and_rewrite`).
 pub(crate) fn rewrite_ddl_yaml_file_body(
     kind: DdlKind,
-    name: &str,
+    name: &ViewRef,
     file_text: &str,
     view_comment: Option<String>,
 ) -> Result<RewriteAction, ParseError> {
@@ -295,7 +296,7 @@ pub(crate) fn rewrite_ddl_yaml_file_body(
 
     Ok(RewriteAction::CreateFromYamlFile {
         file_path,
-        name: name.to_string(),
+        name: name.clone(),
         comment: view_comment.unwrap_or_default(),
         mode: CreateMode::from_kind(kind),
     })
@@ -358,7 +359,7 @@ pub(crate) fn extract_dollar_quoted(input: &str) -> Result<(String, usize), Pars
 /// infers cardinality, and carries the `SemanticViewDefinition` structurally.
 pub(crate) fn rewrite_ddl_yaml_body(
     kind: DdlKind,
-    name: &str,
+    name: &ViewRef,
     yaml_text: &str,
     view_comment: Option<String>,
 ) -> Result<RewriteAction, ParseError> {
@@ -373,7 +374,7 @@ pub(crate) fn rewrite_ddl_yaml_body(
     }
 
     let mut def =
-        crate::model::SemanticViewDefinition::from_yaml_with_size_cap(name, &yaml_content)
+        crate::model::SemanticViewDefinition::from_yaml_with_size_cap(&name.name, &yaml_content)
             .map_err(|e| ParseError {
                 message: e,
                 position: None,
@@ -386,7 +387,7 @@ pub(crate) fn rewrite_ddl_yaml_body(
     crate::graph::infer_cardinality(&def.tables, &mut def.joins)?;
 
     Ok(RewriteAction::Create {
-        name: name.to_string(),
+        name: name.clone(),
         def: Box::new(def),
         mode: CreateMode::from_kind(kind),
     })

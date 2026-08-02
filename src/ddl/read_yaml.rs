@@ -18,16 +18,16 @@ use crate::catalog::CatalogReader;
 use crate::model::SemanticViewDefinition;
 use crate::render_yaml::render_yaml_export;
 
-/// Extract the bare view name from a potentially qualified name.
+/// Parse a potentially qualified view name into a reference.
 /// Supports: `"view_name"`, `"schema.view_name"`, `"database.schema.view_name"`.
 ///
-/// Delegates to [`crate::ident::normalize_view_name`] (PA-10, code-review
+/// Delegates to [`crate::ident::parse_view_ref_lenient`] (PA-10, code-review
 /// 2026-07-02): the previous naive `rsplit('.')` split inside quoted parts,
-/// so `"a.b"` resolved to `b"` instead of `a.b`. Falls back to the input
-/// verbatim when it does not parse as an identifier (legacy behaviour for
-/// malformed names — the lookup then fails with "does not exist").
-fn resolve_bare_name(input: &str) -> String {
-    crate::ident::normalize_view_name(input).unwrap_or_else(|_| input.to_string())
+/// so `"a.b"` resolved to `b"` instead of `a.b`. Malformed names fall back to
+/// an unqualified reference carrying the input verbatim, so the lookup fails
+/// with the canonical "does not exist" rather than a grammar error.
+fn resolve_view_ref(input: &str) -> crate::ident::ViewRef {
+    crate::ident::parse_view_ref_lenient(input)
 }
 
 // ---------------------------------------------------------------------------
@@ -80,14 +80,15 @@ unsafe fn read_yaml_export(
     use crate::ddl::read_ffi::{probe_catalog_table_present, read_str_arg};
 
     let raw_name = read_str_arg(name_ptr, name_len, "view name")?;
-    let bare_name = resolve_bare_name(&raw_name);
+    let view = resolve_view_ref(&raw_name);
+    let bare_name = view.name.clone();
 
     // FF-9: a probe-query failure is distinct from "no views" (propagated).
     let present = probe_catalog_table_present(borrowed)?;
     let reader = CatalogReader::new(borrowed, present);
     let json = reader
-        .lookup(&bare_name)?
-        .ok_or_else(|| crate::catalog::view_not_found_msg(&bare_name))?;
+        .lookup(&view)?
+        .ok_or_else(|| crate::catalog::view_not_found_msg(&view.to_string()))?;
     // C-2 (code-review 2026-07-11): `from_json` for the canonical
     // "invalid definition for semantic view '<name>'" context on corrupt rows.
     let def = SemanticViewDefinition::from_json(&bare_name, &json)?;

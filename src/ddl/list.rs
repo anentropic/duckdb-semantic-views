@@ -144,7 +144,9 @@ unsafe fn list_view_rows(
         }
         rows.push(row);
     }
-    rows.sort_by(|a, b| a[1].cmp(&b[1]));
+    // Sorted by (schema, name) so two same-named views in different schemas
+    // have a stable order rather than an arbitrary one.
+    rows.sort_by(|a, b| a[4].cmp(&b[4]).then_with(|| a[1].cmp(&b[1])));
 
     // FF-6: the shared serializer errors (rather than clamping a length to
     // u32::MAX and desyncing the header from the payload) if a cell or the

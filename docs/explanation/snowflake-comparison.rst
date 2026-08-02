@@ -415,6 +415,19 @@ The DuckDB-specific behaviour worth noting before you build on it:
 See :ref:`explanation-transactional-ddl` for the full mechanism and worked examples.
 
 
+Schema Scoping and Name Resolution
+----------------------------------
+
+Both systems scope a semantic view to a schema, so ``analytics.sales`` and ``staging.sales`` are two different views and a ``<schema>.`` qualifier on ``CREATE`` / ``DROP`` / ``ALTER`` decides which one a statement means.
+
+Where they differ is what an **unqualified** reference means. Snowflake resolves it through the session's current database and schema. DuckDB Semantic Views resolves it to the one view of that name when exactly one exists, and raises an error naming the candidate schemas when several do -- rather than silently picking one. The read-side table functions bind on a connection that does not carry the caller's search path or current schema, so preferring one would make ``DROP SEMANTIC VIEW v`` and ``semantic_view('v')`` disagree about which ``v`` they mean. Qualify the reference when more than one schema holds the name.
+
+Two DuckDB-specific consequences:
+
+- **Identifiers are case-insensitive on both sides of the dot**, quoted or not, following DuckDB rather than Snowflake -- ``analytics.sales``, ``ANALYTICS.SALES`` and ``"Analytics"."Sales"`` all name the same view. Snowflake would treat the quoted spellings as case-sensitive. See :ref:`ref-create-semantic-view` for the full identifier rule.
+- **One catalog per database.** A ``<database>.`` prefix that names a database other than the session's is rejected: the extension manages a single catalog, in the database it was loaded into.
+
+
 .. _explanation-sf-not-supported:
 
 Feature Parity Notes

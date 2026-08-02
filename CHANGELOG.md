@@ -61,6 +61,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **One behaviour change to be aware of.** On these three commands `IN SCHEMA` previously meant "the view named `SCHEMA`", and now means the scope. A view whose name collides with a scope keyword is still reachable by quoting it — `IN "schema"` — and a name that merely begins with one (`IN schemas`) was never affected, since the keyword must match a whole word.
 
+- **Semantic views are scoped to a schema** (TECH-DEBT #25). A `<schema>.` qualifier on the name is now honoured everywhere it can be written: `CREATE SEMANTIC VIEW analytics.sales` puts the view in `analytics` regardless of the session's current schema, `DROP SEMANTIC VIEW staging.sales` drops only that one, and `semantic_view('analytics.sales')` reads it. Two schemas may each hold a view of the same name — previously `CREATE SEMANTIC VIEW staging.v` collided with an existing `analytics.v` and failed with a key violation for a view that, by name, did not exist. Naming a schema that does not exist is now an error rather than a silent fall back to the current schema, as `CREATE TABLE nosuch.t` is.
+
+  The schema is recorded in the catalog's own spelling rather than the caller's, so `USE MYSCHEMA` and `USE myschema` no longer file two views in one schema under two different names. `ALTER SEMANTIC VIEW analytics.sales RENAME TO staging.sales` moves the view; an unqualified `RENAME TO` leaves it where it is.
+
+  Unqualified table names in a view body still resolve in the **creating session's** schema, not the view's, following DuckDB's rule for a view body — so semantic views can live in their own schema while reading tables from another.
+
+  **A reference that names no schema** resolves to the one view of that name when exactly one exists (the common case, unchanged), and is an error naming the candidate schemas when several do. DuckDB would resolve such a reference through the session's search path; the read-side table functions cannot yet see it, and preferring it on the write side alone would make `DROP SEMANTIC VIEW v` and `semantic_view('v')` disagree about which `v` they mean. Qualify the reference in the meantime.
+
+  A `<database>.` prefix is now checked rather than discarded. Semantic views are single-catalog, so `CREATE SEMANTIC VIEW otherdb.analytics.v` cannot be honoured — it used to drop the prefix and quietly create the view in the current database's `analytics` instead, and now says so.
+
+  Existing databases are migrated in place on the next `LOAD`. A read-only database whose catalog predates schema scoping refuses to load with an instruction to open it writable once first.
+
 ### Changed
 
 - DuckDB version pin bumped to `v1.5.5`.

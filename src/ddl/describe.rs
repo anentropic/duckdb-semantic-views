@@ -51,14 +51,15 @@ unsafe fn describe_view_rows(
 
     let raw_name = read_str_arg(name_ptr, name_len, "view name")?;
     // FF-4: normalize so quoted-identifier inputs resolve like `semantic_view()`.
-    let name = crate::ident::normalize_view_name(&raw_name)
+    let view = crate::ident::parse_view_ref(&raw_name)
         .map_err(|e| format!("Invalid view name '{raw_name}': {e}"))?;
+    let name = view.name.clone();
     // FF-9: a probe-query failure is distinct from "no views" (propagated).
     let present = probe_catalog_table_present(borrowed)?;
     let reader = CatalogReader::new(borrowed, present);
     let json = reader
-        .lookup(&name)?
-        .ok_or_else(|| crate::catalog::view_not_found_msg(&name))?;
+        .lookup(&view)?
+        .ok_or_else(|| crate::catalog::view_not_found_msg(&view.to_string()))?;
     let def = SemanticViewDefinition::from_json(&name, &json)?;
     let alias_map = def.alias_to_table_map();
     let base_table = def.base_table().to_string();
