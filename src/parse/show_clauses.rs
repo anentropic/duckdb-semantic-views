@@ -101,8 +101,8 @@ pub(crate) fn build_filter_suffix(
     like_pattern: Option<&str>,
     starts_with: Option<&str>,
     limit: Option<u64>,
-    in_schema: Option<&str>,
-    in_database: Option<&str>,
+    in_schema: Option<&ScopeName>,
+    in_database: Option<&ScopeName>,
 ) -> String {
     let mut parts = Vec::new();
     if let Some(pattern) = like_pattern {
@@ -114,12 +114,10 @@ pub(crate) fn build_filter_suffix(
         parts.push(format!("name LIKE '{escaped}%'"));
     }
     if let Some(schema) = in_schema {
-        let escaped = SqlLit::escape(schema);
-        parts.push(format!("lower(schema_name) = lower('{escaped}')"));
+        parts.push(schema.predicate("schema_name", "current_schema"));
     }
     if let Some(db) = in_database {
-        let escaped = SqlLit::escape(db);
-        parts.push(format!("lower(database_name) = lower('{escaped}')"));
+        parts.push(db.predicate("database_name", "current_database"));
     }
     let mut suffix = String::new();
     if !parts.is_empty() {
@@ -133,6 +131,42 @@ pub(crate) fn build_filter_suffix(
     suffix
 }
 
+/// What a scope clause names: an explicit object, or the caller's current one.
+///
+/// Snowflake writes the name as optional — `IN SCHEMA` alone means the current
+/// schema, `IN SCHEMA analytics` a specific one — and the two cannot share a
+/// representation, because the bare form has to reach SQL as a **call** rather
+/// than a literal so it resolves on the caller's connection.
+///
+/// The bare form is exact rather than approximate, which is worth stating: the
+/// stored `schema_name` is itself stamped from `current_schema()` at CREATE
+/// time, so `IN SCHEMA` compares that function against itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScopeName {
+    /// An explicit name, already unquoted (see [`scope_name_parts`]).
+    Named(String),
+    /// The bare `IN SCHEMA` / `IN DATABASE` form — the caller's current one.
+    Current,
+}
+
+impl ScopeName {
+    /// Render this scope as a `WHERE` predicate over `column`.
+    ///
+    /// `current_fn` is the SQL function supplying the bare form's value —
+    /// `current_schema` or `current_database`. Both sides are folded for the
+    /// reasons in [`build_filter_suffix`]; for [`ScopeName::Current`] that is
+    /// belt-and-braces, since the two sides are the same function.
+    fn predicate(&self, column: &str, current_fn: &str) -> String {
+        match self {
+            Self::Named(name) => {
+                let escaped = SqlLit::escape(name);
+                format!("lower({column}) = lower('{escaped}')")
+            }
+            Self::Current => format!("lower({column}) = lower({current_fn}())"),
+        }
+    }
+}
+
 /// Parsed filter clauses from a SHOW SEMANTIC command.
 pub(crate) struct ShowClauses<'a> {
     pub(crate) like_pattern: Option<String>,
@@ -144,48 +178,88 @@ pub(crate) struct ShowClauses<'a> {
     ///
     /// A qualified `IN SCHEMA <db>.<schema>` populates **both**, which is how
     /// the database half of Snowflake's qualified form gets applied.
-    pub(crate) in_schema: Option<String>,
-    pub(crate) in_database: Option<String>,
+    ///
+    /// `IN ACCOUNT` leaves both `None`: it is Snowflake's "everything I can
+    /// see", which here is simply an unfiltered listing.
+    pub(crate) in_schema: Option<ScopeName>,
+    pub(crate) in_database: Option<ScopeName>,
     pub(crate) for_metric: Option<&'a str>,
     pub(crate) starts_with: Option<String>,
     pub(crate) limit: Option<u64>,
 }
 
-/// Parse a keyword + identifier pair from text starting with IN.
+/// True when `s` begins with `keyword` as a whole word (end-of-input counts).
 ///
-/// Checks for `IN SCHEMA <name>` or `IN DATABASE <name>`.
-/// Returns `(remaining_text, in_schema, in_database)`. `base` is the absolute
-/// byte offset of `rest[0]` in the original query, so errors carry a caret
-/// position pointing at the offending token (R-2).
+/// Distinguishes the scope keywords from an identifier that merely starts with
+/// their letters — `SCHEMAS` is a view name, `SCHEMA` is the keyword.
+fn keyword_word(s: &str, keyword: &str) -> bool {
+    starts_with_keyword_ci(s, keyword)
+        && (s.len() == keyword.len() || s.as_bytes()[keyword.len()].is_ascii_whitespace())
+}
+
+/// True when the text after `IN` opens a SCOPE clause rather than naming a view.
+///
+/// Only the scope keywords count, and only unquoted: `IN "schema"` is a view
+/// literally named `schema`, which is the escape hatch that keeps the
+/// view-name reading reachable on the commands that support both.
+pub(crate) fn in_clause_is_scope(after_in: &str) -> bool {
+    keyword_word(after_in, "SCHEMA")
+        || keyword_word(after_in, "DATABASE")
+        || keyword_word(after_in, "ACCOUNT")
+}
+
+/// True when `s` begins a clause that FOLLOWS the `IN` clause.
+///
+/// Needed to spot Snowflake's bare `IN SCHEMA` / `IN DATABASE`: with the name
+/// optional, the parser has to decide whether the next token is that name or
+/// the start of the next clause. `IN SCHEMA LIMIT 5` is the current schema
+/// limited to 5 rows, not a schema named `LIMIT`.
+fn starts_following_clause(s: &str) -> bool {
+    keyword_word(s, "LIMIT") || keyword_word(s, "FOR") || starts_with_keyword_ci(s, "STARTS")
+}
+
+/// Parse the `IN` scope clause.
+///
+/// Handles Snowflake's full scope grammar:
+/// `IN { ACCOUNT | DATABASE [db] | SCHEMA [[db.]schema] }`. Returns
+/// `(remaining_text, in_schema, in_database)`; `IN ACCOUNT` yields neither,
+/// being an unfiltered listing. `base` is the absolute byte offset of `rest[0]`
+/// in the original query, so errors carry a caret position (R-2).
 fn parse_in_scope(
     rest: &str,
     base: usize,
-) -> Result<(&str, Option<String>, Option<String>), ParseError> {
+) -> Result<(&str, Option<ScopeName>, Option<ScopeName>), ParseError> {
     let after_in = rest[2..].trim_start();
 
+    // ACCOUNT is the whole-catalog scope: accepted for Snowflake parity, and
+    // contributes no predicate because DuckDB has no account to narrow to.
+    if keyword_word(after_in, "ACCOUNT") {
+        return Ok((after_in[7..].trim_start(), None, None));
+    }
+
     // Try to match a keyword (SCHEMA or DATABASE) followed by an identifier.
-    let (keyword, kw_len, label) = if starts_with_keyword_ci(after_in, "SCHEMA")
-        && (after_in.len() == 6 || after_in.as_bytes()[6].is_ascii_whitespace())
-    {
+    let (keyword, kw_len, label) = if keyword_word(after_in, "SCHEMA") {
         ("SCHEMA", 6, "schema")
-    } else if starts_with_keyword_ci(after_in, "DATABASE")
-        && (after_in.len() == 8 || after_in.as_bytes()[8].is_ascii_whitespace())
-    {
+    } else if keyword_word(after_in, "DATABASE") {
         ("DATABASE", 8, "database")
     } else {
         return Err(ParseError {
-            message: "SHOW SEMANTIC VIEWS requires IN SCHEMA <name> or IN DATABASE <name>"
-                .to_string(),
+            message:
+                "SHOW SEMANTIC VIEWS requires IN ACCOUNT, IN SCHEMA [name] or IN DATABASE [name]"
+                    .to_string(),
             position: Some(base + byte_offset_within(rest, after_in)),
         });
     };
 
     let after_kw = after_in[kw_len..].trim_start();
-    if after_kw.is_empty() {
-        return Err(ParseError {
-            message: format!("Missing {label} name after IN {keyword}"),
-            position: Some(base + byte_offset_within(rest, after_kw)),
-        });
+    // Bare form: the name is optional in Snowflake and means "the current one".
+    // Anything that opens a following clause is that clause, not a name.
+    if after_kw.is_empty() || starts_following_clause(after_kw) {
+        return if keyword == "SCHEMA" {
+            Ok((after_kw, Some(ScopeName::Current), None))
+        } else {
+            Ok((after_kw, None, Some(ScopeName::Current)))
+        };
     }
     let (raw_name, remaining) = take_identifier(after_kw);
     let position = Some(base + byte_offset_within(rest, after_kw));
@@ -203,19 +277,19 @@ fn parse_in_scope(
 
     if keyword == "SCHEMA" {
         match parts.len() {
-            1 => Ok((remaining, parts.pop(), None)),
+            1 => Ok((remaining, parts.pop().map(ScopeName::Named), None)),
             // Pop schema first — it is the LAST part; the database qualifier
             // precedes it. Both predicates are emitted, so a same-named schema
             // in another database does not match.
             2 => {
-                let schema = parts.pop();
-                let database = parts.pop();
+                let schema = parts.pop().map(ScopeName::Named);
+                let database = parts.pop().map(ScopeName::Named);
                 Ok((remaining, schema, database))
             }
             _ => Err(too_many("<schema> or <database>.<schema>")),
         }
     } else if parts.len() == 1 {
-        Ok((remaining, None, parts.pop()))
+        Ok((remaining, None, parts.pop().map(ScopeName::Named)))
     } else {
         Err(too_many("a single <database>"))
     }
@@ -270,8 +344,8 @@ pub(crate) fn parse_show_filter_clauses<'a>(
     let mut rest = after_prefix.trim();
     let mut like_pattern: Option<String> = None;
     let mut in_view: Option<&'a str> = None;
-    let mut in_schema: Option<String> = None;
-    let mut in_database: Option<String> = None;
+    let mut in_schema: Option<ScopeName> = None;
+    let mut in_database: Option<ScopeName> = None;
     let mut for_metric: Option<&'a str> = None;
     let mut starts_with: Option<String> = None;
     let mut limit: Option<u64> = None;
@@ -304,7 +378,12 @@ pub(crate) fn parse_show_filter_clauses<'a>(
     if starts_with_keyword_ci(rest, "IN")
         && (rest.len() == 2 || rest.as_bytes()[2].is_ascii_whitespace())
     {
-        if kind == DdlKind::Show || kind == DdlKind::ShowTerse {
+        // VIEWS has no view-name slot, so `IN` there is always a scope. The
+        // other commands carry both readings on one keyword, exactly as
+        // Snowflake does, and a scope keyword wins: `IN SCHEMA` is the scope,
+        // `IN "schema"` (quoted) is still the view named `schema`.
+        let after_in = rest[2..].trim_start();
+        if kind == DdlKind::Show || kind == DdlKind::ShowTerse || in_clause_is_scope(after_in) {
             let (remaining, schema, database) = parse_in_scope(rest, abs(rest))?;
             rest = remaining;
             in_schema = schema;
@@ -356,7 +435,7 @@ pub(crate) fn parse_show_filter_clauses<'a>(
             return Err(ParseError {
                 message: format!(
                     "Expected STARTS WITH. \
-                     Usage: SHOW SEMANTIC {entity} [LIKE '<pattern>'] [IN view_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
+                     Usage: SHOW SEMANTIC {entity} [LIKE '<pattern>'] [IN {{view_name | ACCOUNT | DATABASE [db] | SCHEMA [[db.]schema]}}] [STARTS WITH '<prefix>'] [LIMIT <n>]"
                 ),
                 position: Some(abs(rest)),
             });
@@ -391,12 +470,12 @@ pub(crate) fn parse_show_filter_clauses<'a>(
         let usage = if kind == DdlKind::ShowDimensions {
             format!(
                 "Unexpected tokens: '{rest}'. \
-                 Usage: SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] [IN view_name] [FOR METRIC metric_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
+                 Usage: SHOW SEMANTIC DIMENSIONS [LIKE '<pattern>'] [IN {{view_name | ACCOUNT | DATABASE [db] | SCHEMA [[db.]schema]}}] [FOR METRIC metric_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
             )
         } else {
             format!(
                 "Unexpected tokens: '{rest}'. \
-                 Usage: SHOW SEMANTIC {entity} [LIKE '<pattern>'] [IN view_name] [STARTS WITH '<prefix>'] [LIMIT <n>]"
+                 Usage: SHOW SEMANTIC {entity} [LIKE '<pattern>'] [IN {{view_name | ACCOUNT | DATABASE [db] | SCHEMA [[db.]schema]}}] [STARTS WITH '<prefix>'] [LIMIT <n>]"
             )
         };
         return Err(ParseError {
@@ -418,7 +497,7 @@ pub(crate) fn parse_show_filter_clauses<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::build_filter_suffix;
+    use super::{build_filter_suffix, ScopeName};
 
     // R-1 (code-review 2026-07-11): every user-supplied filter value is
     // embedded in a single-quoted SQL literal via `SqlLit`, so `'` doubles to
@@ -436,7 +515,13 @@ mod tests {
             " WHERE name LIKE 'O''Br%'"
         );
         assert_eq!(
-            build_filter_suffix(None, None, None, Some("sch'ema"), Some("d'b")),
+            build_filter_suffix(
+                None,
+                None,
+                None,
+                Some(&ScopeName::Named("sch'ema".into())),
+                Some(&ScopeName::Named("d'b".into())),
+            ),
             " WHERE lower(schema_name) = lower('sch''ema') AND lower(database_name) = lower('d''b')"
         );
     }

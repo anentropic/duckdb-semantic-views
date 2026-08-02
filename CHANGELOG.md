@@ -49,6 +49,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The label declares *intent* and drives introspection — it does not change resolution or restrict access. `where_clause` already substituted any declared fact or dimension name, and a labelled member remains selectable as an ordinary dimension or fact (use `PRIVATE` to make something unqueryable). The `BOOLEAN` requirement is enforced by DuckDB's binder when the filter is first used, not at `CREATE`: typing an arbitrary SQL expression needs a binder, so a non-boolean filter raises DuckDB's own type error at query time rather than a guess at define time. Labels other than `FILTER` — Snowflake's tags, for instance — are **rejected** rather than ignored, so a definition cannot round-trip having quietly lost a label you wrote.
 
+- **`SHOW SEMANTIC DIMENSIONS` / `METRICS` / `FACTS` accept the `IN` scope clause**, matching `SHOW SEMANTIC VIEWS` and Snowflake (TECH-DEBT #25). Previously only the views listing could be narrowed to a schema or database; on the other three, `SHOW SEMANTIC DIMENSIONS IN SCHEMA main` read `SCHEMA` as a *view name* and failed with `Unexpected tokens: 'main'` — even though the reference pages documented the clause, with worked examples, for all of them.
+
+  The whole of Snowflake's scope grammar is now accepted on every SHOW command:
+
+  ```
+  IN { view_name | ACCOUNT | DATABASE [ db_name ] | SCHEMA [ [db_name.]schema_name ] }
+  ```
+
+  The name is optional: bare `IN SCHEMA` and `IN DATABASE` mean the current one. That is exact rather than approximate, because the schema recorded against a view is itself captured from `current_schema()` when it is created — both sides are the same function. `IN ACCOUNT` is accepted for compatibility and narrows nothing, DuckDB having no account.
+
+  **One behaviour change to be aware of.** On these three commands `IN SCHEMA` previously meant "the view named `SCHEMA`", and now means the scope. A view whose name collides with a scope keyword is still reachable by quoting it — `IN "schema"` — and a name that merely begins with one (`IN schemas`) was never affected, since the keyword must match a whole word.
+
 ### Changed
 
 - DuckDB version pin bumped to `v1.5.5`.
