@@ -215,7 +215,7 @@ pub(crate) fn in_clause_is_scope(after_in: &str) -> bool {
 /// the start of the next clause. `IN SCHEMA LIMIT 5` is the current schema
 /// limited to 5 rows, not a schema named `LIMIT`.
 fn starts_following_clause(s: &str) -> bool {
-    keyword_word(s, "LIMIT") || keyword_word(s, "FOR") || starts_with_keyword_ci(s, "STARTS")
+    keyword_word(s, "LIMIT") || keyword_word(s, "FOR") || keyword_word(s, "STARTS")
 }
 
 /// Parse the `IN` scope clause.
@@ -245,7 +245,7 @@ fn parse_in_scope(
     } else {
         return Err(ParseError {
             message:
-                "SHOW SEMANTIC VIEWS requires IN ACCOUNT, IN SCHEMA [name] or IN DATABASE [name]"
+                "SHOW SEMANTIC VIEWS requires a scope: IN {ACCOUNT | DATABASE [db] | SCHEMA [[db.]schema]}"
                     .to_string(),
             position: Some(base + byte_offset_within(rest, after_in)),
         });

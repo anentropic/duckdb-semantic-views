@@ -2260,8 +2260,8 @@ mod tests {
             // spelling rather than being loosened to "is an error".
             assert!(
                 err.message.contains(
-                    "SHOW SEMANTIC VIEWS requires IN ACCOUNT, \
-                     IN SCHEMA [name] or IN DATABASE [name]"
+                    "SHOW SEMANTIC VIEWS requires a scope: \
+                     IN {ACCOUNT | DATABASE [db] | SCHEMA [[db.]schema]}"
                 ),
                 "got: {err}"
             );
@@ -3901,6 +3901,35 @@ $$"#;
     /// predicates apply as they stand.
     mod show_scope_other_commands_tests {
         use super::*;
+
+        // ----- boundary: a NAME that looks like a following clause -----
+
+        #[test]
+        fn a_schema_named_startswith_is_not_the_starts_with_clause() {
+            // `starts_following_clause` tells "no name was given" from "the next
+            // clause begins here". LIMIT and FOR matched whole words; STARTS did
+            // not, so an unquoted schema named `startswith` was read as the
+            // start of a STARTS WITH clause — the bare-scope form plus a broken
+            // trailing clause, instead of a schema name. Same class as the
+            // `IN schemas` case on the view-name side.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA startswith"),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE lower(schema_name) = lower('startswith')"
+            );
+        }
+
+        #[test]
+        fn a_real_starts_with_clause_after_a_bare_scope_still_parses() {
+            // The control for the row above: `STARTS` followed by whitespace IS
+            // the clause, so tightening the match must not stop the bare scope
+            // form from composing with it.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA STARTS WITH 'a'"),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE name LIKE 'a%' AND lower(schema_name) = lower(current_schema())"
+            );
+        }
 
         // ----- (a) the scope clause reaches the other three commands -----
 

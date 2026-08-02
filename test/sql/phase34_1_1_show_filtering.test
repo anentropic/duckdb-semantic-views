@@ -302,7 +302,7 @@ products_sv	SEMANTIC_VIEW	memory	main
 statement error
 SHOW SEMANTIC VIEWS IN some_view
 ----
-SHOW SEMANTIC VIEWS requires IN ACCOUNT, IN SCHEMA [name] or IN DATABASE [name]
+SHOW SEMANTIC VIEWS requires a scope: IN {ACCOUNT | DATABASE [db] | SCHEMA [[db.]schema]}
 
 # ============================================================
 # Test 27: Error: SHOW SEMANTIC VIEWS FOR METRIC m
