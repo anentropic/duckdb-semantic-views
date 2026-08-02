@@ -1,6 +1,31 @@
 # DuckDB Semantic Views — Project Instructions
 
-If in doubt about SQL syntax or behaviour refer to what Snowflake semantic views does.
+## Snowflake is the model for *semantics*, DuckDB for *conventions*
+
+When in doubt about what a semantic view **means**, follow Snowflake: the DDL
+surface and clause set, what a metric / dimension / fact / relationship is, grain
+and fan-trap behaviour, what each `SHOW` / `DESCRIBE` command reports. That is the
+feature being built, and Snowflake is its reference implementation.
+
+But Snowflake's *host-language* rules are Snowflake's, not ours. Where the two
+disagree on something that belongs to the surrounding SQL dialect rather than to
+semantic views, **DuckDB wins**:
+
+- **Identifier quoting and case-sensitivity.** DuckDB matches identifiers
+  case-insensitively whether or not they are quoted; Snowflake folds unquoted
+  names to upper case and treats quoted ones as case-sensitive. We follow DuckDB
+  — see `ident::ident_matches`, and TECH-DEBT #25/#28 for the sites migrated onto
+  it.
+- **Name resolution.** Schema/search-path semantics follow DuckDB's rules, not
+  Snowflake's current-schema-only rule.
+- **Anything else that is a property of the dialect** rather than of semantic
+  views — literal syntax, type names and coercion, `NULL` ordering, collation.
+
+So "Snowflake does X" settles a question about semantic-view behaviour, and does
+**not** settle a question about identifiers, resolution or dialect. When a
+Snowflake behaviour can only be reproduced by breaking a DuckDB convention, keep
+the convention and record the divergence in TECH-DEBT rather than importing the
+Snowflake rule wholesale.
 
 ## Quality Gate
 
