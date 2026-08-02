@@ -56,7 +56,9 @@ Optional Filtering Clauses
 ``IN DATABASE <database_name>``
    Filters views to those in the specified database.
 
-   Both names may be written double-quoted, which is what lets a name containing whitespace be given at all: ``IN SCHEMA "my schema"``. The quotes are stripped before matching, so ``"main"`` and ``main`` select the same schema. Matching is otherwise exact — unlike view, dimension and metric names, these two are **case-sensitive**, so ``IN SCHEMA Main`` does not match a schema stored as ``main`` whether it is quoted or not.
+   Both names may be written double-quoted, which is what lets a name containing whitespace be given at all: ``IN SCHEMA "my schema"``. Matching follows DuckDB's identifier rule, the same rule view, dimension and metric names use: quotes are stripped and case is ignored, so ``"main"``, ``main`` and ``MAIN`` all select the same schema.
+
+   Case-insensitivity here is not a convenience — it is required for the filter to be answerable at all. The schema and database recorded against a semantic view come from ``current_schema()`` / ``current_database()`` at ``CREATE`` time, and DuckDB returns those as the spelling the caller last wrote in ``USE``, not the catalog's own. Two views created in one schema under ``USE MySchema`` and ``USE myschema`` are therefore recorded differently, and an exact-match filter could return at most one of them.
 
 ``STARTS WITH '<prefix>'``
    Filters views to those whose name begins with the prefix. Matching is **case-sensitive**. The prefix must be enclosed in single quotes.

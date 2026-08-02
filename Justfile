@@ -230,11 +230,20 @@ test-chunk-boundary: build
 test-differential: build
     uv run test/integration/test_differential.py
 
+# SHOW ... IN SCHEMA / IN DATABASE must fold case (TECH-DEBT #25). The stored
+# schema_name is stamped from current_schema(), which DuckDB returns as the
+# spelling the caller last USE-d — so two views in one schema can be stamped
+# differently and no single spelling of the filter returned both. Lives here
+# rather than in sqllogictest because the assertion is on returned rows and
+# list_semantic_views leads with a live created_on.
+test-show-scope-case: build
+    uv run test/integration/test_show_scope_case_insensitive.py
+
 # All Python integration suites against the built extension. This is the
 # exact set the `python-integration` CI job runs (IntegrationChecks.yml) —
 # keep the two in sync by editing THIS recipe, not the workflow.
 # (test-ducklake-ci is excluded: it has its own dedicated CI job.)
-test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-attach-migration test-readonly-fresh-drop test-chunk-boundary test-differential
+test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-attach-migration test-readonly-fresh-drop test-chunk-boundary test-differential test-show-scope-case
 
 # Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + all Python integration suites
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.

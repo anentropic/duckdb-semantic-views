@@ -41,18 +41,16 @@ fn take_identifier(rest: &str) -> (&str, &str) {
 /// the `""` escape.
 ///
 /// Only the schema / database slots need this. Their value is emitted into a
-/// plain `schema_name = '<literal>'` comparison and nothing downstream
+/// `lower(schema_name) = lower('<literal>')` comparison and nothing downstream
 /// unquotes it, so a surviving quote character is a **silent no-match** rather
 /// than an error — `IN SCHEMA "main"` matched nothing at all. The view and
 /// metric slots deliberately keep their raw text instead: their read table
 /// function normalizes once at the catalog-read boundary (FF-4), and stripping
 /// here as well would double-fold.
 ///
-/// Case is deliberately **not** folded. An unquoted `IN SCHEMA Main` is passed
-/// through as written today, so folding only the quoted spelling would make
-/// quoting mean something extra; keeping both verbatim leaves them identical.
-/// Whether these two slots should match case-insensitively at all is a
-/// separate question from quoting — see TECH-DEBT #25.
+/// Case is **not** folded here. It is folded in the emitted SQL instead, on
+/// both sides (see [`build_filter_suffix`]), so quoting still means nothing
+/// extra — `"Main"` and `Main` produce identical predicates.
 fn unquote_show_name(
     raw: &str,
     label: &str,
@@ -76,9 +74,28 @@ fn unquote_show_name(
 ///
 /// LIKE maps to `name ILIKE '<escaped>'` (case-insensitive).
 /// STARTS WITH maps to `name LIKE '<escaped>%'` (case-sensitive).
-/// IN SCHEMA maps to `schema_name = '<escaped>'`.
-/// IN DATABASE maps to `database_name = '<escaped>'`.
+/// IN SCHEMA maps to `lower(schema_name) = lower('<escaped>')`.
+/// IN DATABASE maps to `lower(database_name) = lower('<escaped>')`.
 /// All conditions combined with AND. LIMIT appended last.
+///
+/// The last two fold case because `DuckDB` resolves identifiers case-insensitively
+/// and this project follows that rule everywhere else (`ident::ident_matches`).
+/// They are the two slots where it also has to be *load-bearing*: the stored
+/// side is stamped from `current_schema()` / `current_database()` at CREATE
+/// time, which `DuckDB` returns as the spelling the caller last wrote in `USE`
+/// rather than the catalog's, so two views in one schema can be stamped
+/// `MySchema` and `myschema` and an exact match could return at most one.
+///
+/// The fold is left to SQL rather than applied to the requested name in Rust
+/// because the stored side is folded by `DuckDB`'s Unicode-aware `lower()`,
+/// while `ident::normalize_ident_part` is `to_ascii_lowercase`. Folding here
+/// would emit `'myschÉma'` against a stored `'myschéma'` and break a non-ASCII
+/// name that matches exactly today. `lower(x) = lower(y)` puts both sides
+/// through the same function.
+///
+/// It stays an equality rather than becoming `ILIKE`: `SqlLit::escape` only
+/// doubles single quotes, so a `%` or `_` in a schema name would turn into a
+/// wildcard.
 pub(crate) fn build_filter_suffix(
     like_pattern: Option<&str>,
     starts_with: Option<&str>,
@@ -97,11 +114,11 @@ pub(crate) fn build_filter_suffix(
     }
     if let Some(schema) = in_schema {
         let escaped = SqlLit::escape(schema);
-        parts.push(format!("schema_name = '{escaped}'"));
+        parts.push(format!("lower(schema_name) = lower('{escaped}')"));
     }
     if let Some(db) = in_database {
         let escaped = SqlLit::escape(db);
-        parts.push(format!("database_name = '{escaped}'"));
+        parts.push(format!("lower(database_name) = lower('{escaped}')"));
     }
     let mut suffix = String::new();
     if !parts.is_empty() {
@@ -396,7 +413,7 @@ mod tests {
         );
         assert_eq!(
             build_filter_suffix(None, None, None, Some("sch'ema"), Some("d'b")),
-            " WHERE schema_name = 'sch''ema' AND database_name = 'd''b'"
+            " WHERE lower(schema_name) = lower('sch''ema') AND lower(database_name) = lower('d''b')"
         );
     }
 
