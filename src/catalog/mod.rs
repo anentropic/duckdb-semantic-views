@@ -640,12 +640,16 @@ mod reader {
             let schemas: Vec<String> = (0..row_count)
                 .filter_map(|r| read_column_string(result.raw_mut(), 0, r))
                 .collect();
+            // The suggested spelling is identifier-quoted when the name needs
+            // it, so copy-pasting it is valid SQL for a view named `my view`
+            // or `a.b` — an unquoted suggestion would be a syntax error, or
+            // worse, would parse as a different qualified name.
             return Err(format!(
                 "semantic view '{}' is ambiguous: it exists in schemas {}. \
                  Qualify the reference as <schema>.{}",
                 view.name,
                 schemas.join(", "),
-                view.name
+                crate::expand::quote_ident_if_needed(&view.name)
             ));
         }
         Ok(read_column_string(result.raw_mut(), 1, 0))
@@ -1467,7 +1471,7 @@ mod tests {
         use crate::ddl::read_ffi::BorrowedConnection;
         let borrowed = unsafe { BorrowedConnection::new(std::ptr::null_mut()) };
         let reader = CatalogReader::new(&borrowed, false);
-        let result = reader.lookup("any_view");
+        let result = reader.lookup(&crate::ident::parse_view_ref("any_view").unwrap());
         assert!(
             matches!(result, Ok(None)),
             "expected Ok(None), got: {:?}",

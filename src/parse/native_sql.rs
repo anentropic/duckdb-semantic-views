@@ -62,6 +62,15 @@ fn escaped_parts(view: &ViewRef) -> (SqlLit, SchemaTarget) {
     (SqlLit::escape(&view.name), target)
 }
 
+/// The name as it should be *written back* in an error suggesting a qualified
+/// spelling — identifier-quoted when it needs to be, then SQL-escaped for
+/// embedding. Quoting has to happen before the SQL escape, which is why this
+/// cannot be derived from the `SqlLit` that `escaped_parts` returns.
+#[cfg(feature = "extension")]
+fn suggested_name(view: &ViewRef) -> SqlLit {
+    SqlLit::escape(&crate::expand::quote_ident_if_needed(&view.name))
+}
+
 /// [`current_database_guard_select`] for a parsed reference: the guard
 /// statement plus its trailing `; ` when a `<database>.` prefix was written,
 /// and the empty string when it was not, so callers can splice it in
@@ -478,7 +487,7 @@ fn rewrite_drop(view: &ViewRef, if_exists: bool) -> Result<Option<String>, Parse
     let (name_escaped, target) = escaped_parts(view);
     let name_escaped = &name_escaped;
     let display = SqlLit::escape(&view.to_string());
-    let schema_expr = resolved_schema_expr(&target, name_escaped);
+    let schema_expr = resolved_schema_expr(&target, name_escaped, &suggested_name(view));
     let row = row_predicate(name_escaped, &schema_expr);
     if if_exists {
         // IF EXISTS: pure DELETE on the caller's connection — affects 0
@@ -546,7 +555,7 @@ fn rewrite_alter_rename(
     let (old_escaped, new_escaped) = (&old_escaped, &new_escaped);
     let old_display = SqlLit::escape(&old.to_string());
     let new_display = SqlLit::escape(&new.to_string());
-    let source_schema = resolved_schema_expr(&old_target, old_escaped);
+    let source_schema = resolved_schema_expr(&old_target, old_escaped, &suggested_name(old));
     // Where the row ends up: the new name's own qualifier when it has one,
     // otherwise wherever the source already lives.
     let dest_schema = match &new_target {
@@ -630,7 +639,7 @@ fn rewrite_alter_comment(
 ) -> Result<Option<String>, ParseError> {
     let (name_escaped, target) = escaped_parts(view);
     let display = SqlLit::escape(&view.to_string());
-    let schema_expr = resolved_schema_expr(&target, &name_escaped);
+    let schema_expr = resolved_schema_expr(&target, &name_escaped, &suggested_name(view));
     let row = row_predicate(&name_escaped, &schema_expr);
     // Phase 65 Plan 06 — all pure-SQL on the caller's connection:
     //   - ALTER SET/UNSET COMMENT uses json_merge_patch (Plan 04 Wave 0

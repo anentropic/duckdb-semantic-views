@@ -29,7 +29,10 @@ fuzz_target!(|data: &[u8]| {
             // reconstruct to DDL. `render_create_ddl`'s ONLY error is the
             // documented legacy case of an empty `tables` list (reachable via
             // `FROM YAML $$...$$`), so any OTHER failure is a real render bug.
-            match render_create_ddl(&name, &def) {
+            // `name` is a parsed reference now that semantic views are
+            // schema-scoped; the renderer takes the bare name slot, matching
+            // the unqualified `CREATE SEMANTIC VIEW <name>` it emits.
+            match render_create_ddl(&name.name, &def) {
                 Ok(_) => {}
                 Err(_) => assert!(
                     def.tables.is_empty(),

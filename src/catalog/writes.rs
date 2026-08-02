@@ -94,15 +94,27 @@ pub(crate) fn create_target_schema_expr(target: &SchemaTarget) -> String {
 /// Referencing `_definitions`, this expression must not be bound on a
 /// never-bootstrapped database — every caller already runs behind
 /// [`definitions_table_guard_select`].
+///
+/// `suggested` is the name **identifier-quoted if it needs to be**, used only in
+/// the ambiguity message: a view called `my view` or `a.b` must be suggested as
+/// `<schema>."my view"`, since an unquoted suggestion is a syntax error or —
+/// worse, for a dotted name — parses as a different qualified reference. It is
+/// a separate argument rather than derived here because `name` has already been
+/// SQL-escaped, and identifier quoting has to happen before that (R-1: names
+/// are escaped exactly once, at the `rewrite_to_native_sql` boundary).
 #[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
-pub(crate) fn resolved_schema_expr(target: &SchemaTarget, name: &SqlLit) -> String {
+pub(crate) fn resolved_schema_expr(
+    target: &SchemaTarget,
+    name: &SqlLit,
+    suggested: &SqlLit,
+) -> String {
     match target {
         SchemaTarget::Named(schema) => format!("'{schema}'"),
         SchemaTarget::Unqualified => format!(
             "(SELECT CASE WHEN count(*) > 1 \
                      THEN error('semantic view ''{name}'' is ambiguous: it exists in \
                                  schemas ' || string_agg(schema_name, ', ' ORDER BY schema_name) \
-                                || '. Qualify the reference as <schema>.{name}') \
+                                || '. Qualify the reference as <schema>.{suggested}') \
                      ELSE min(schema_name) END \
                FROM {DEFINITIONS_TABLE} WHERE name = '{name}')"
         ),
@@ -336,7 +348,11 @@ mod tests {
     /// from. Spelled out once here so each guard test reads as "this guard,
     /// that schema" rather than repeating the resolution subquery.
     fn unqualified(name: &str) -> String {
-        resolved_schema_expr(&SchemaTarget::Unqualified, &SqlLit::escape(name))
+        resolved_schema_expr(
+            &SchemaTarget::Unqualified,
+            &SqlLit::escape(name),
+            &SqlLit::escape(&crate::expand::quote_ident_if_needed(name)),
+        )
     }
 
     #[test]
@@ -426,8 +442,11 @@ mod tests {
     #[test]
     fn rename_collision_guard_select_emits_exists_and_error() {
         let taken = SqlLit::escape("taken");
-        let schema =
-            resolved_schema_expr(&SchemaTarget::Named(SqlLit::escape("analytics")), &taken);
+        let schema = resolved_schema_expr(
+            &SchemaTarget::Named(SqlLit::escape("analytics")),
+            &taken,
+            &taken,
+        );
         let g = rename_collision_guard_select(&row_predicate(&taken, &schema), &taken);
         assert!(g.contains("EXISTS"), "missing EXISTS: {g}");
         assert!(
@@ -529,6 +548,7 @@ mod tests {
         let e = resolved_schema_expr(
             &SchemaTarget::Named(SqlLit::escape("analytics")),
             &SqlLit::escape("v"),
+            &SqlLit::escape("v"),
         );
         assert_eq!(e, "'analytics'");
         // A qualifier answers the question outright — no catalog probe, so a
@@ -571,6 +591,37 @@ mod tests {
     fn row_predicate_matches_the_schema_case_insensitively() {
         let p = row_predicate(&SqlLit::escape("v"), "'Analytics'");
         assert_eq!(p, "name = 'v' AND lower(schema_name) = lower('Analytics')");
+    }
+
+    #[test]
+    fn ambiguity_suggestion_quotes_a_name_that_needs_it() {
+        // The suggestion is meant to be copy-pasted. For a view named `my view`
+        // an unquoted `<schema>.my view` is a syntax error; for `a.b` it is
+        // worse — it parses as schema `a`, view `b`, a different reference
+        // entirely. (Raised by review on PR #186.)
+        let spaced = unqualified("my view");
+        assert!(
+            spaced.contains(r#"Qualify the reference as <schema>."my view""#),
+            "a name needing quotes must be suggested quoted: {spaced}"
+        );
+        let dotted = unqualified("a.b");
+        assert!(
+            dotted.contains(r#"Qualify the reference as <schema>."a.b""#),
+            "a dotted name must be suggested quoted, or it reads as a qualifier: {dotted}"
+        );
+        // ...and a bare-safe name stays unquoted, so the common message is not
+        // made noisier for everyone.
+        let plain = unqualified("sales");
+        assert!(
+            plain.contains("Qualify the reference as <schema>.sales"),
+            "a bare-safe name must not gain quotes: {plain}"
+        );
+        // Quoting belongs to the MESSAGE only — the lookup still matches on the
+        // raw stored name.
+        assert!(
+            spaced.contains("WHERE name = 'my view'"),
+            "lookup must use the unquoted stored name: {spaced}"
+        );
     }
 
     #[test]

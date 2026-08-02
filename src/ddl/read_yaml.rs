@@ -99,42 +99,72 @@ unsafe fn read_yaml_export(
 mod tests {
     use super::*;
 
+    // These assert on BOTH slots of the parsed reference. The name slot is the
+    // behaviour they have always pinned; the schema slot is what the qualifier
+    // now decides — semantic views are schema-scoped, so a qualifier is no
+    // longer discarded on the way to the lookup.
+
     #[test]
-    fn resolve_bare_name_unqualified() {
-        assert_eq!(resolve_bare_name("my_view"), "my_view");
+    fn resolve_view_ref_unqualified() {
+        let r = resolve_view_ref("my_view");
+        assert_eq!(r.name, "my_view");
+        assert_eq!(r.schema, None);
     }
 
     #[test]
-    fn resolve_bare_name_schema_qualified() {
-        assert_eq!(resolve_bare_name("main.my_view"), "my_view");
+    fn resolve_view_ref_schema_qualified() {
+        let r = resolve_view_ref("main.my_view");
+        assert_eq!(r.name, "my_view");
+        assert_eq!(r.schema.as_deref(), Some("main"));
     }
 
     #[test]
-    fn resolve_bare_name_fully_qualified() {
-        assert_eq!(resolve_bare_name("memory.main.my_view"), "my_view");
+    fn resolve_view_ref_fully_qualified() {
+        let r = resolve_view_ref("memory.main.my_view");
+        assert_eq!(r.name, "my_view");
+        assert_eq!(r.schema.as_deref(), Some("main"));
+        assert_eq!(r.database.as_deref(), Some("memory"));
     }
 
     #[test]
-    fn resolve_bare_name_empty() {
-        assert_eq!(resolve_bare_name(""), "");
+    fn resolve_view_ref_empty() {
+        // Not a well-formed identifier, so the lenient fallback carries the
+        // text verbatim and the lookup fails with the canonical "does not
+        // exist" rather than an identifier-grammar error.
+        let r = resolve_view_ref("");
+        assert_eq!(r.name, "");
+        assert_eq!(r.schema, None);
     }
 
     #[test]
-    fn resolve_bare_name_quoted_dot_not_split() {
+    fn resolve_view_ref_quoted_dot_not_split() {
         // PA-10: the old rsplit('.') split inside the quoted part.
-        assert_eq!(resolve_bare_name("\"a.b\""), "a.b");
-        assert_eq!(resolve_bare_name("main.\"my view\""), "my view");
+        let dotted = resolve_view_ref("\"a.b\"");
+        assert_eq!(dotted.name, "a.b");
+        assert_eq!(
+            dotted.schema, None,
+            "a quoted dot is part of the NAME, not a qualifier"
+        );
+        let spaced = resolve_view_ref("main.\"my view\"");
+        assert_eq!(spaced.name, "my view");
+        assert_eq!(spaced.schema.as_deref(), Some("main"));
     }
 
     #[test]
-    fn resolve_bare_name_folds_to_lowercase() {
+    fn resolve_view_ref_folds_to_lowercase() {
         // View-name lookup folds to lowercase the same way `normalize_view_name`
         // and every other lookup path does — for quoted names too. Under
         // DuckDB's identifier rule (and this project's documented view-name
         // normalization) quoting only lets a name carry special characters; it
         // does NOT preserve case. Stored view names are lowercase, so a request
         // written `"MyView"` must resolve to `myview` to find the view.
-        assert_eq!(resolve_bare_name("MyView"), "myview");
-        assert_eq!(resolve_bare_name("\"MyView\""), "myview");
+        assert_eq!(resolve_view_ref("MyView").name, "myview");
+        assert_eq!(resolve_view_ref("\"MyView\"").name, "myview");
+        // The qualifier folds on the same rule — it is matched against a stored
+        // schema name case-insensitively.
+        assert_eq!(
+            resolve_view_ref("MySchema.MyView").schema.as_deref(),
+            Some("myschema")
+        );
     }
 }
