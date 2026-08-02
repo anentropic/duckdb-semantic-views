@@ -17,6 +17,11 @@ use super::{
     skip_leading_whitespace, validate_create_body, DdlKind,
 };
 
+// Only the emitted-SQL unit tests name this type directly; production code
+// passes it through as `clauses.in_schema.as_ref()`.
+#[cfg(test)]
+use super::show_clauses::ScopeName;
+
 // Used by the `write_error_to_buffer_*` unit tests (which reference it as
 // `super::write_error_to_buffer`); the FFI entry points that use it in
 // production live in the `ffi` submodule.
@@ -397,8 +402,8 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, ParseError> {
                 clauses.like_pattern.as_deref(),
                 clauses.starts_with.as_deref(),
                 clauses.limit,
-                clauses.in_schema.as_deref(),
-                clauses.in_database.as_deref(),
+                clauses.in_schema.as_ref(),
+                clauses.in_database.as_ref(),
             );
             Ok(RewriteAction::Passthrough(format!("{base}{suffix}")))
         }
@@ -2065,7 +2070,13 @@ mod tests {
         #[test]
         fn test_build_filter_suffix_in_schema() {
             assert_eq!(
-                build_filter_suffix(None, None, None, Some("main"), None),
+                build_filter_suffix(
+                    None,
+                    None,
+                    None,
+                    Some(&ScopeName::Named("main".into())),
+                    None
+                ),
                 " WHERE lower(schema_name) = lower('main')"
             );
         }
@@ -2073,7 +2084,13 @@ mod tests {
         #[test]
         fn test_build_filter_suffix_in_database() {
             assert_eq!(
-                build_filter_suffix(None, None, None, None, Some("memory")),
+                build_filter_suffix(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&ScopeName::Named("memory".into()))
+                ),
                 " WHERE lower(database_name) = lower('memory')"
             );
         }
@@ -2081,7 +2098,13 @@ mod tests {
         #[test]
         fn test_build_filter_suffix_like_and_schema() {
             assert_eq!(
-                build_filter_suffix(Some("%x%"), None, None, Some("main"), None),
+                build_filter_suffix(
+                    Some("%x%"),
+                    None,
+                    None,
+                    Some(&ScopeName::Named("main".into())),
+                    None
+                ),
                 " WHERE name ILIKE '%x%' AND lower(schema_name) = lower('main')"
             );
         }
@@ -2232,9 +2255,14 @@ mod tests {
                 "IN without SCHEMA/DATABASE should be rejected for SHOW SEMANTIC VIEWS"
             );
             let err = result.unwrap_err();
+            // Wording widened when IN ACCOUNT and the bare IN SCHEMA / IN
+            // DATABASE forms landed; the assertion still names every accepted
+            // spelling rather than being loosened to "is an error".
             assert!(
-                err.message
-                    .contains("SHOW SEMANTIC VIEWS requires IN SCHEMA"),
+                err.message.contains(
+                    "SHOW SEMANTIC VIEWS requires a scope: \
+                     IN {ACCOUNT | DATABASE [db] | SCHEMA [[db.]schema]}"
+                ),
                 "got: {err}"
             );
         }
@@ -3853,6 +3881,188 @@ $$"#;
                 passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA \"a.b\""),
                 "SELECT * FROM list_semantic_views() \
                  WHERE lower(schema_name) = lower('a.b')"
+            );
+        }
+    }
+
+    /// TECH-DEBT #25 Group A — the scope clause on the other SHOW commands,
+    /// and the rest of Snowflake's `IN` grammar.
+    ///
+    /// Snowflake accepts
+    /// `IN { view_name | ACCOUNT | DATABASE [db] | SCHEMA [db.schema] }` on
+    /// SHOW SEMANTIC DIMENSIONS / METRICS / FACTS as well as VIEWS. Here the
+    /// clause was gated to VIEWS only, and the other three fell through to a
+    /// branch that takes the view-name slot unconditionally — so `SCHEMA` was
+    /// read as a view name and the rest surfaced as "Unexpected tokens".
+    ///
+    /// No rewrite plumbing is involved: those commands already emit
+    /// `show_semantic_*_all()` when no view is named, and those functions lead
+    /// with `database_name, schema_name`, so `build_filter_suffix`'s existing
+    /// predicates apply as they stand.
+    mod show_scope_other_commands_tests {
+        use super::*;
+
+        // ----- boundary: a NAME that looks like a following clause -----
+
+        #[test]
+        fn a_schema_named_startswith_is_not_the_starts_with_clause() {
+            // `starts_following_clause` tells "no name was given" from "the next
+            // clause begins here". LIMIT and FOR matched whole words; STARTS did
+            // not, so an unquoted schema named `startswith` was read as the
+            // start of a STARTS WITH clause — the bare-scope form plus a broken
+            // trailing clause, instead of a schema name. Same class as the
+            // `IN schemas` case on the view-name side.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA startswith"),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE lower(schema_name) = lower('startswith')"
+            );
+        }
+
+        #[test]
+        fn a_real_starts_with_clause_after_a_bare_scope_still_parses() {
+            // The control for the row above: `STARTS` followed by whitespace IS
+            // the clause, so tightening the match must not stop the bare scope
+            // form from composing with it.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA STARTS WITH 'a'"),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE name LIKE 'a%' AND lower(schema_name) = lower(current_schema())"
+            );
+        }
+
+        // ----- (a) the scope clause reaches the other three commands -----
+
+        #[test]
+        fn in_schema_scopes_show_dimensions() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC DIMENSIONS IN SCHEMA main"),
+                "SELECT * FROM show_semantic_dimensions_all() \
+                 WHERE lower(schema_name) = lower('main')"
+            );
+        }
+
+        #[test]
+        fn in_schema_scopes_show_metrics() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC METRICS IN SCHEMA main"),
+                "SELECT * FROM show_semantic_metrics_all() \
+                 WHERE lower(schema_name) = lower('main')"
+            );
+        }
+
+        #[test]
+        fn in_schema_scopes_show_facts() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC FACTS IN SCHEMA main"),
+                "SELECT * FROM show_semantic_facts_all() \
+                 WHERE lower(schema_name) = lower('main')"
+            );
+        }
+
+        #[test]
+        fn in_database_scopes_show_dimensions() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC DIMENSIONS IN DATABASE memory"),
+                "SELECT * FROM show_semantic_dimensions_all() \
+                 WHERE lower(database_name) = lower('memory')"
+            );
+        }
+
+        #[test]
+        fn a_qualified_schema_scopes_show_dimensions() {
+            // The qualified form from #184 has to reach the new commands too,
+            // rather than only the VIEWS path it was fixed on.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC DIMENSIONS IN SCHEMA memory.main"),
+                "SELECT * FROM show_semantic_dimensions_all() \
+                 WHERE lower(schema_name) = lower('main') \
+                 AND lower(database_name) = lower('memory')"
+            );
+        }
+
+        // ----- (b) the rest of Snowflake's IN grammar -----
+
+        #[test]
+        fn in_account_emits_no_scope_predicate() {
+            // DuckDB has no account. Snowflake's ACCOUNT scope means "everything
+            // I can see", which here is the unfiltered listing — so the clause
+            // parses and contributes nothing rather than erroring.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN ACCOUNT"),
+                "SELECT * FROM list_semantic_views()"
+            );
+        }
+
+        #[test]
+        fn in_account_scopes_show_dimensions_too() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC DIMENSIONS IN ACCOUNT"),
+                "SELECT * FROM show_semantic_dimensions_all()"
+            );
+        }
+
+        #[test]
+        fn a_bare_in_schema_scopes_to_the_current_schema() {
+            // Emitted as a call, not a literal, so it resolves on the caller's
+            // connection. That also makes it exact: `schema_name` is stamped
+            // from `current_schema()` at CREATE, so both sides are the same
+            // function.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA"),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE lower(schema_name) = lower(current_schema())"
+            );
+        }
+
+        #[test]
+        fn a_bare_in_database_scopes_to_the_current_database() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC VIEWS IN DATABASE"),
+                "SELECT * FROM list_semantic_views() \
+                 WHERE lower(database_name) = lower(current_database())"
+            );
+        }
+
+        #[test]
+        fn a_bare_in_schema_on_dimensions_is_the_scope_not_a_view_named_schema() {
+            // THE BACK-COMPAT CHANGE, pinned deliberately. Before this, on the
+            // non-VIEWS commands `IN SCHEMA` meant "the view named SCHEMA" and
+            // rewrote to show_semantic_dimensions('SCHEMA'). It now means the
+            // current schema. A view actually named `schema` is still reachable
+            // by quoting it — see the control below.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC DIMENSIONS IN SCHEMA"),
+                "SELECT * FROM show_semantic_dimensions_all() \
+                 WHERE lower(schema_name) = lower(current_schema())"
+            );
+        }
+
+        #[test]
+        fn a_quoted_view_named_schema_is_still_reachable() {
+            // The escape hatch that makes the back-compat change tolerable:
+            // quoting forces the view-name reading.
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC DIMENSIONS IN \"schema\""),
+                "SELECT * FROM show_semantic_dimensions('\"schema\"')"
+            );
+        }
+
+        // ----- controls: the view-name slot must be untouched -----
+
+        #[test]
+        fn an_ordinary_view_name_still_selects_the_single_view_function() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC DIMENSIONS IN orders_sv"),
+                "SELECT * FROM show_semantic_dimensions('orders_sv')"
+            );
+        }
+
+        #[test]
+        fn for_metric_still_composes_with_a_view_name() {
+            assert_eq!(
+                passthrough_sql("SHOW SEMANTIC DIMENSIONS IN v FOR METRIC revenue"),
+                "SELECT * FROM show_semantic_dimensions_for_metric('v', 'revenue')"
             );
         }
     }

@@ -1,0 +1,168 @@
+# The IN scope clause on SHOW SEMANTIC DIMENSIONS / METRICS / FACTS, and the
+# rest of Snowflake's IN grammar (TECH-DEBT #25, Group A).
+#
+# Snowflake accepts
+#   IN { view_name | ACCOUNT | DATABASE [db] | SCHEMA [[db.]schema] }
+# on all four SHOW SEMANTIC commands. Here the scope clause was gated to VIEWS,
+# and the other three parsed SCHEMA as a VIEW NAME, so
+# `SHOW SEMANTIC DIMENSIONS IN SCHEMA main` failed with "Unexpected tokens".
+#
+# Unlike every other file in this family, these assertions CAN be written by
+# row: `show_semantic_*_all()` leads with database_name / schema_name / view
+# name, whereas `list_semantic_views` leads with a live `created_on`. That is
+# why the VIEWS-side scope coverage lives in the Python suites and this does
+# not.
+#
+# Per-case red proof is at the unit layer
+# (`parse::rewrite::tests::show_scope_other_commands_tests`, 10 cases confirmed
+# red individually) — this file adds the extension-load -> DDL -> query path,
+# where the sqllogictest runner halts at the first failure.
+
+require semantic_views
+
+statement ok
+CREATE TABLE ssa_sales (id INTEGER, region VARCHAR, amt INTEGER);
+
+statement ok
+CREATE SEMANTIC VIEW ssa_view AS
+  TABLES (t AS ssa_sales PRIMARY KEY (id))
+  FACTS (t.amt AS t.amt)
+  DIMENSIONS (t.region AS t.region)
+  METRICS (t.total AS sum(t.amt));
+
+# ============================================================
+# Test 1: IN SCHEMA on each of the three commands that lacked it.
+# Each of these was a parse ERROR before ("Unexpected tokens: 'main'").
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN SCHEMA main
+----
+memory	main	ssa_view	ssa_sales	region	(empty)	[]	(empty)
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC METRICS IN SCHEMA main
+----
+memory	main	ssa_view	ssa_sales	total	(empty)	[]	(empty)
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC FACTS IN SCHEMA main
+----
+memory	main	ssa_view	ssa_sales	amt	(empty)	[]	(empty)
+
+# ============================================================
+# Test 2: IN DATABASE, and the qualified schema form from #184, must reach
+# the newly-enabled commands too rather than only the VIEWS path.
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN DATABASE memory
+----
+memory	main	ssa_view	ssa_sales	region	(empty)	[]	(empty)
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN SCHEMA memory.main
+----
+memory	main	ssa_view	ssa_sales	region	(empty)	[]	(empty)
+
+# ...and the database half of the qualified form is really applied.
+query TTTTTTTT
+SHOW SEMANTIC DIMENSIONS IN SCHEMA nosuchdb.main
+----
+
+# ============================================================
+# Test 3: the bare forms mean "the current one". `schema_name` is stamped
+# from current_schema() at CREATE, so both sides are the same function.
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN SCHEMA
+----
+memory	main	ssa_view	ssa_sales	region	(empty)	[]	(empty)
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN DATABASE
+----
+memory	main	ssa_view	ssa_sales	region	(empty)	[]	(empty)
+
+# The bare form still composes with a following clause — the parser has to
+# tell "no name given" from "the next clause starts here".
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN SCHEMA LIMIT 5
+----
+memory	main	ssa_view	ssa_sales	region	(empty)	[]	(empty)
+
+# ============================================================
+# Test 4: IN ACCOUNT is accepted and filters nothing (DuckDB has no account).
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN ACCOUNT
+----
+memory	main	ssa_view	ssa_sales	region	(empty)	[]	(empty)
+
+statement ok
+SHOW SEMANTIC VIEWS IN ACCOUNT
+
+# ============================================================
+# Test 5: the view-name reading is preserved. A scope KEYWORD wins, but an
+# ordinary name — and a quoted `"schema"` — still select a single view.
+# This is the escape hatch for the back-compat change: before this file's
+# feature, `IN SCHEMA` on these commands meant the view named SCHEMA.
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN ssa_view
+----
+memory	main	ssa_view	ssa_sales	region	(empty)	[]	(empty)
+
+statement ok
+CREATE SEMANTIC VIEW "schema" AS
+  TABLES (t AS ssa_sales PRIMARY KEY (id))
+  DIMENSIONS (t.id AS t.id)
+  METRICS (t.total AS sum(t.amt));
+
+# Quoted, so it is a NAME not the keyword — and it resolves to the view whose
+# dimension is `id`, distinguishable from ssa_view's `region`.
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN "schema"
+----
+memory	main	schema	ssa_sales	id	(empty)	[]	(empty)
+
+# ============================================================
+# Test 6: a name that merely STARTS with a scope keyword is still a view
+# name — the keyword match is on a whole word.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW schemas AS
+  TABLES (t AS ssa_sales PRIMARY KEY (id))
+  DIMENSIONS (t.id AS t.id)
+  METRICS (t.total AS sum(t.amt));
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN schemas
+----
+memory	main	schemas	ssa_sales	id	(empty)	[]	(empty)
+
+# ============================================================
+# Test 7: a nonexistent schema is an empty result, not an error — and not a
+# silent match either.
+# ============================================================
+
+query TTTTTTTT
+SHOW SEMANTIC DIMENSIONS IN SCHEMA nosuchschema
+----
+
+# Cleanup
+statement ok
+DROP SEMANTIC VIEW schemas;
+
+statement ok
+DROP SEMANTIC VIEW "schema";
+
+statement ok
+DROP SEMANTIC VIEW ssa_view;
+
+statement ok
+DROP TABLE ssa_sales;

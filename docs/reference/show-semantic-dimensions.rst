@@ -19,8 +19,9 @@ Syntax
 
    SHOW SEMANTIC DIMENSIONS
        [ LIKE '<pattern>' ]
-       [ IN <name> ]
-       [ IN SCHEMA <schema_name> | IN DATABASE <database_name> ]
+       [ IN { <name> | ACCOUNT
+            | DATABASE [ <database_name> ]
+            | SCHEMA [ [<database_name>.]<schema_name> ] } ]
        [ STARTS WITH '<prefix>' ]
        [ LIMIT <rows> ]
 
@@ -56,11 +57,22 @@ Optional Filtering Clauses
 ``LIKE '<pattern>'``
    Filters dimensions to those whose name matches the pattern. Uses SQL ``LIKE`` pattern syntax: ``%`` matches any sequence of characters, ``_`` matches a single character. Matching is **case-insensitive** (the extension maps ``LIKE`` to DuckDB's ``ILIKE``). The pattern must be enclosed in single quotes.
 
-``IN SCHEMA <schema_name>``
-   Filters dimensions to those in semantic views belonging to the specified schema.
+``IN ...``
+   Scopes the listing. The alternatives are mutually exclusive — ``IN`` appears at most once, so a view name and a schema cannot both be given.
 
-``IN DATABASE <database_name>``
-   Filters dimensions to those in semantic views belonging to the specified database.
+   ``IN <name>``
+      Returns dimensions for that semantic view only.
+
+   ``IN ACCOUNT``
+      Returns everything, the same as omitting ``IN`` entirely. Accepted for Snowflake compatibility; DuckDB has no account.
+
+   ``IN DATABASE [ <database_name> ]``
+      Filters dimensions to semantic views in that database, or the current database when the name is omitted.
+
+   ``IN SCHEMA [ [<database_name>.]<schema_name> ]``
+      Filters dimensions to semantic views in that schema, or the current schema when the name is omitted. Qualifying the schema with a database matches on both, so a same-named schema in another database is excluded.
+
+   Schema and database names follow DuckDB's identifier rule: quotes are stripped and case is ignored. A view named ``schema`` or ``database`` must be quoted (``IN "schema"``) to be read as a view name rather than as the scope keyword.
 
 ``STARTS WITH '<prefix>'``
    Filters dimensions to those whose name begins with the prefix. Matching is **case-sensitive**. The prefix must be enclosed in single quotes.

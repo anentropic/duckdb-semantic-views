@@ -137,22 +137,35 @@ SHOW SEMANTIC VIEWS LIKE '%sales%' IN SCHEMA main
 statement error
 SHOW SEMANTIC VIEWS IN some_view
 ----
-SHOW SEMANTIC VIEWS requires IN SCHEMA
+SHOW SEMANTIC VIEWS requires a scope: IN {ACCOUNT | DATABASE [db] | SCHEMA [[db.]schema]}
 
 # ============================================================
-# Test 15: Error: SHOW SEMANTIC VIEWS IN SCHEMA (missing name)
+# Test 15: SHOW SEMANTIC VIEWS IN SCHEMA (no name) — the CURRENT schema.
+#
+# This used to be the error "Missing schema name after IN SCHEMA". Snowflake
+# makes the name optional and reads the bare form as the caller's current
+# schema, and TECH-DEBT #25 Group A adopted that. Asserted here as a
+# behaviour, not merely as "no longer an error": the row-level proof that the
+# bare form actually filters is in test/sql/show_scope_all_commands.test,
+# which can write rows because show_semantic_*_all() has no created_on.
 # ============================================================
 
-statement error
+statement ok
 SHOW SEMANTIC VIEWS IN SCHEMA
-----
-Missing schema name after IN SCHEMA
+
+# The bare form must still leave a following clause parseable — the parser has
+# to tell "no name given" from "the next clause starts here".
+statement ok
+SHOW SEMANTIC VIEWS IN SCHEMA LIMIT 5
 
 # ============================================================
-# Test 16: Error: SHOW SEMANTIC VIEWS IN DATABASE (missing name)
+# Test 16: SHOW SEMANTIC VIEWS IN DATABASE (no name) — the CURRENT database.
+# Same change as Test 15.
 # ============================================================
 
-statement error
+statement ok
 SHOW SEMANTIC VIEWS IN DATABASE
-----
-Missing database name after IN DATABASE
+
+# ...and IN ACCOUNT, which was rejected outright before Group A.
+statement ok
+SHOW SEMANTIC VIEWS IN ACCOUNT
