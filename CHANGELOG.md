@@ -77,6 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Existing databases are migrated in place on the next `LOAD`. A read-only database whose catalog predates schema scoping refuses to load with an instruction to open it writable once first.
 
+- **`GET_DDL` takes Snowflake's third argument, `use_fully_qualified_names`** (TECH-DEBT #25). `GET_DDL('SEMANTIC_VIEW', 'analytics.sales', true)` renders `CREATE OR REPLACE SEMANTIC VIEW analytics.sales AS …`, so re-running the output puts the view back in `analytics`. Without it — still the default, as in Snowflake — the rendered name is bare, and replaying a dump recreates every view in whatever schema the restoring session happens to be in. That was harmless while views shared one flat namespace; now that they are schema-scoped, a restore silently relocates every view that does not live in the restoring session's schema.
+
+  The schema rendered is where the view *is*, not how the lookup was spelled: a bare name resolved through `search_path` still qualifies to its own schema. Schema and view name are quoted independently — `"my schema"."my view"`, never `"my schema.my view"`, which would restore into a view whose name literally contains a dot. A `NULL` third argument returns `NULL`, since "qualified or not?" has no answer there and either spelling would be a guess.
+
 ### Changed
 
 - DuckDB version pin bumped to `v1.5.5`.

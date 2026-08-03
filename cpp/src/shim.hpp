@@ -253,7 +253,9 @@ bool sv_register_show_semantic_dimensions_for_metric(duckdb_database db_handle,
 // `sv_read_yaml_from_semantic_view_exec_rust`) — same borrow contract as
 // the TF dispatchers. See `cpp/src/shim.cpp` per-callback comment blocks.
 //
-// `get_ddl(object_type VARCHAR, name VARCHAR) -> VARCHAR` — 2 args.
+// `get_ddl(object_type VARCHAR, name VARCHAR
+//          [, use_fully_qualified_names BOOLEAN]) -> VARCHAR` — 2 or 3 args,
+//   registered as one `ScalarFunctionSet` (TECH-DEBT #25).
 // `read_yaml_from_semantic_view(name VARCHAR) -> VARCHAR` — 1 arg.
 bool sv_register_get_ddl(duckdb_database db_handle,
                          char *error_buf, size_t error_buf_len);

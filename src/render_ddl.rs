@@ -434,11 +434,36 @@ fn emit_materializations(out: &mut String, def: &SemanticViewDefinition) {
 }
 
 /// Reconstruct a `CREATE OR REPLACE SEMANTIC VIEW` DDL statement from a stored
-/// definition. Returns `Err` for legacy definitions (empty `tables` vec).
+/// definition, with an unqualified view name. Returns `Err` for legacy
+/// definitions (empty `tables` vec).
 ///
 /// The output follows body parser clause ordering:
 /// TABLES -> RELATIONSHIPS -> FACTS -> DIMENSIONS -> METRICS
 pub fn render_create_ddl(name: &str, def: &SemanticViewDefinition) -> Result<String, String> {
+    render_create_ddl_qualified(name, def, false)
+}
+
+/// [`render_create_ddl`], with control over whether the rendered `CREATE` name
+/// carries the view's own schema (TECH-DEBT #25).
+///
+/// Unqualified is the default — it is Snowflake's, whose
+/// `GET_DDL(<type>, <name>[, <use_fully_qualified_names>])` renders a bare name
+/// unless the third argument says otherwise. Qualified output is what a
+/// dump/restore flow needs: re-running an unqualified `CREATE` puts the view in
+/// whatever schema the executing session happens to be in, silently relocating
+/// every view that did not live there.
+///
+/// The schema comes from the definition's `schema_name`, which mirrors the
+/// catalog column the `(schema_name, name)` key scopes the view by — so the
+/// rendered name is where the view actually is, not where the caller spelled it.
+/// A definition recording no schema is an error rather than a silent fall back
+/// to the bare name, which would reintroduce the relocation this exists to
+/// prevent.
+pub fn render_create_ddl_qualified(
+    name: &str,
+    def: &SemanticViewDefinition,
+    qualify: bool,
+) -> Result<String, String> {
     if def.tables.is_empty() {
         return Err(
             "Legacy definition format; please re-create using CREATE OR REPLACE SEMANTIC VIEW"
@@ -453,6 +478,20 @@ pub fn render_create_ddl(name: &str, def: &SemanticViewDefinition) -> Result<Str
     // fold to lowercase on re-parse (PA-8), and names with whitespace /
     // dots / specials would mis-parse entirely (RT-2).
     out.push_str("CREATE OR REPLACE SEMANTIC VIEW ");
+    if qualify {
+        // Each part is quoted on its own account: quoting the joined string
+        // would emit `"analytics.sales"`, a single name that happens to
+        // contain a dot, and restore into a view called exactly that.
+        let schema = def.schema_name.as_deref().ok_or_else(|| {
+            format!(
+                "semantic view '{name}' records no schema, so its DDL cannot be rendered with a \
+                 fully-qualified name; render it unqualified, or open the database writable once \
+                 so the schema-scoping migration records the schema"
+            )
+        })?;
+        out.push_str(&crate::expand::quote_ident_if_needed(schema));
+        out.push('.');
+    }
     out.push_str(&crate::expand::quote_ident_if_needed(name));
 
     // View-level comment
@@ -1531,5 +1570,113 @@ mod tests {
         assert!(out.is_empty());
         emit_labels(&mut out, true);
         assert_eq!(out, " LABELS = (FILTER)");
+    }
+
+    // -------------------------------------------------------------------
+    // Fully-qualified header emission (TECH-DEBT #25)
+    // -------------------------------------------------------------------
+    // `GET_DDL`'s optional third argument asks for the view's own schema in
+    // the rendered `CREATE` name, so re-running the output restores the view
+    // where it came from rather than into the restoring session's schema.
+    mod qualified_name_tests {
+        use super::*;
+
+        fn def_in_schema(schema: Option<&str>) -> SemanticViewDefinition {
+            SemanticViewDefinition {
+                schema_name: schema.map(str::to_string),
+                ..minimal_def()
+            }
+        }
+
+        /// The header carries `<schema>.<name>` when qualification is asked for.
+        #[test]
+        fn a_qualified_render_prefixes_the_recorded_schema() {
+            let def = def_in_schema(Some("analytics"));
+            let ddl = render_create_ddl_qualified("sales", &def, true).unwrap();
+            assert!(
+                ddl.starts_with("CREATE OR REPLACE SEMANTIC VIEW analytics.sales AS\n"),
+                "{ddl}"
+            );
+        }
+
+        /// Control, green before and after: the default stays unqualified —
+        /// Snowflake's default too, so the two-argument call must not move.
+        #[test]
+        fn the_default_render_is_unqualified() {
+            let def = def_in_schema(Some("analytics"));
+            let ddl = render_create_ddl("sales", &def).unwrap();
+            assert!(
+                ddl.starts_with("CREATE OR REPLACE SEMANTIC VIEW sales AS\n"),
+                "{ddl}"
+            );
+            assert!(!ddl.contains("analytics"), "{ddl}");
+        }
+
+        /// Each part is quoted on its own account. The wrong fix — quoting the
+        /// joined string — yields `"analytics.sales"`, a single name that
+        /// happens to contain a dot, and restores into a view called exactly
+        /// that. Pinned by parsing the emitted header back.
+        #[test]
+        fn a_qualified_render_quotes_the_parts_separately() {
+            let def = def_in_schema(Some("my schema"));
+            let ddl = render_create_ddl_qualified("my view", &def, true).unwrap();
+            assert!(
+                ddl.starts_with("CREATE OR REPLACE SEMANTIC VIEW \"my schema\".\"my view\" AS\n"),
+                "{ddl}"
+            );
+        }
+
+        /// The emitted header is a two-part *reference*, not a one-part name.
+        #[test]
+        fn a_qualified_header_parses_back_as_schema_and_name() {
+            let def = def_in_schema(Some("my schema"));
+            let ddl = render_create_ddl_qualified("my view", &def, true).unwrap();
+            let header = ddl
+                .strip_prefix("CREATE OR REPLACE SEMANTIC VIEW ")
+                .and_then(|rest| rest.split(" AS\n").next())
+                .expect("header is present");
+            let parsed = crate::ident::parse_view_ref(header).expect("header parses");
+            assert_eq!(parsed.schema.as_deref(), Some("my schema"), "{ddl}");
+            assert_eq!(parsed.name, "my view", "{ddl}");
+            assert_eq!(parsed.database, None, "{ddl}");
+        }
+
+        /// A definition that records no schema cannot be qualified. Emitting
+        /// the bare name instead would silently restore the view into the
+        /// executing session's schema — the exact relocation this argument
+        /// exists to prevent — so it is an error that names the view.
+        #[test]
+        fn a_qualified_render_without_a_recorded_schema_is_an_error() {
+            let def = def_in_schema(None);
+            let err = render_create_ddl_qualified("sales", &def, true).unwrap_err();
+            assert!(err.contains("sales"), "{err}");
+            assert!(err.contains("schema"), "{err}");
+        }
+
+        /// Control, green before and after: a schema-less definition still
+        /// renders unqualified, because that asks nothing of the schema.
+        #[test]
+        fn an_unqualified_render_without_a_recorded_schema_is_fine() {
+            let def = def_in_schema(None);
+            let ddl = render_create_ddl_qualified("sales", &def, false).unwrap();
+            assert!(
+                ddl.starts_with("CREATE OR REPLACE SEMANTIC VIEW sales AS\n"),
+                "{ddl}"
+            );
+        }
+
+        /// A view-level comment still lands between the name and `AS`.
+        #[test]
+        fn a_qualified_render_keeps_the_view_comment_after_the_name() {
+            let mut def = def_in_schema(Some("analytics"));
+            def.comment = Some("orders".to_string());
+            let ddl = render_create_ddl_qualified("sales", &def, true).unwrap();
+            assert!(
+                ddl.starts_with(
+                    "CREATE OR REPLACE SEMANTIC VIEW analytics.sales COMMENT = 'orders' AS\n"
+                ),
+                "{ddl}"
+            );
+        }
     }
 }

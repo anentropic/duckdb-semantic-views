@@ -266,11 +266,14 @@ extern "C" {
     // (out_ptr, out_len) populated (caller frees via sv_free_buffer), rc=1
     // on user-visible error (error_buf populated, raised as
     // InvalidInputException by the C++ side), rc=2 on internal panic.
+    // `qualify` is the optional third GET_DDL argument (0 = bare name, non-zero
+    // = schema-qualified). The two-argument arity passes 0.
     uint8_t sv_get_ddl_exec_rust(
         duckdb_connection conn,
         const uint8_t *type_ptr, size_t type_len,
         const uint8_t *name_ptr, size_t name_len,
         const uint8_t *sp_ptr, size_t sp_len,
+        uint8_t qualify,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
     uint8_t sv_read_yaml_from_semantic_view_exec_rust(
@@ -776,6 +779,63 @@ extern "C" {
 // for the rationale. Scalar functions have no `init_local` concept, so
 // D-05 (null-init refusal) does NOT apply here; the required-arg set
 // stays db_handle / name / exec_cb.
+//
+// TECH-DEBT #25 (GET_DDL qualified names): the catalog write is factored into
+// `sv_register_scalar_function_set` so a function carrying more than one arity
+// — `get_ddl`, whose third argument is optional — registers through the same
+// guards and error-buffer contract as the single-arity callers. The C entry
+// point below keeps its signature and wraps its one overload into a set.
+static bool sv_register_scalar_function_set(
+    duckdb_database db_handle,
+    const char *name,
+    ScalarFunctionSet set,
+    char *error_buf, size_t error_buf_len) {
+    auto write_err = [error_buf, error_buf_len](const char *fmt,
+                                                const char *arg1) {
+        if (error_buf == nullptr || error_buf_len == 0) {
+            return;
+        }
+        snprintf(error_buf, error_buf_len, fmt, arg1 ? arg1 : "(null)");
+    };
+    try {
+        if (db_handle == nullptr || name == nullptr) {
+            write_err(
+                "sv_register_scalar_function('%s'): null required argument",
+                name);
+            return false;
+        }
+        auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
+            db_handle->internal_ptr);
+        if (wrapper == nullptr) {
+            write_err(
+                "sv_register_scalar_function('%s'): null DatabaseWrapper",
+                name);
+            return false;
+        }
+        auto &db = *wrapper->database->instance;
+
+        CreateScalarFunctionInfo info(std::move(set));
+        info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+
+        auto &system_catalog = Catalog::GetSystemCatalog(db);
+        auto txn = CatalogTransaction::GetSystemTransaction(db);
+        system_catalog.CreateFunction(txn, info);
+        return true;
+    } catch (const std::exception &e) {
+        if (error_buf != nullptr && error_buf_len > 0) {
+            snprintf(error_buf, error_buf_len,
+                "sv_register_scalar_function('%s') failed: %s",
+                name ? name : "(null)", e.what());
+        }
+        return false;
+    } catch (...) {
+        write_err(
+            "sv_register_scalar_function('%s') failed: unknown C++ exception",
+            name);
+        return false;
+    }
+}
+
 extern "C" {
     bool sv_register_scalar_function(
         duckdb_database db_handle,
@@ -793,7 +853,7 @@ extern "C" {
             snprintf(error_buf, error_buf_len, fmt, arg1 ? arg1 : "(null)");
         };
         try {
-            if (db_handle == nullptr || name == nullptr || exec_cb == nullptr) {
+            if (name == nullptr || exec_cb == nullptr) {
                 write_err(
                     "sv_register_scalar_function('%s'): null required argument",
                     name);
@@ -809,15 +869,6 @@ extern "C" {
                     name);
                 return false;
             }
-            auto *wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(
-                db_handle->internal_ptr);
-            if (wrapper == nullptr) {
-                write_err(
-                    "sv_register_scalar_function('%s'): null DatabaseWrapper",
-                    name);
-                return false;
-            }
-            auto &db = *wrapper->database->instance;
 
             vector<LogicalType> args;
             args.reserve(arg_count);
@@ -825,15 +876,13 @@ extern "C" {
                 args.push_back(arg_types[i]);
             }
 
-            ScalarFunction fn(std::string(name), std::move(args),
-                              return_type, exec_cb);
-            CreateScalarFunctionInfo info(std::move(fn));
-            info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
-
-            auto &system_catalog = Catalog::GetSystemCatalog(db);
-            auto txn = CatalogTransaction::GetSystemTransaction(db);
-            system_catalog.CreateFunction(txn, info);
-            return true;
+            // Braces, not parens: `ScalarFunctionSet set(std::string(name));`
+            // is a function declaration (most vexing parse), not a variable.
+            ScalarFunctionSet set{std::string(name)};
+            set.AddFunction(ScalarFunction(std::string(name), std::move(args),
+                                           return_type, exec_cb));
+            return sv_register_scalar_function_set(
+                db_handle, name, std::move(set), error_buf, error_buf_len);
         } catch (const std::exception &e) {
             if (error_buf != nullptr && error_buf_len > 0) {
                 snprintf(error_buf, error_buf_len,
@@ -2073,9 +2122,17 @@ static void sv_emit_scalar_row(Vector &result, idx_t row_idx,
     FlatVector::GetData<string_t>(result)[row_idx] = out_value;
 }
 
-// get_ddl(object_type VARCHAR, name VARCHAR) -> VARCHAR
+// get_ddl(object_type VARCHAR, name VARCHAR [, use_fully_qualified_names
+// BOOLEAN]) -> VARCHAR
+//
+// Both arities land here; `args.ColumnCount()` distinguishes them. The third
+// argument mirrors Snowflake's `use_fully_qualified_names`: when true the
+// rendered CREATE name carries the view's own schema, so re-running the output
+// restores the view where it came from rather than into the executing
+// session's schema.
 static void sv_get_ddl_exec(DataChunk &args, ExpressionState &state,
                             Vector &result) {
+    const bool has_qualify_arg = args.ColumnCount() >= 3;
     auto &type_vec = args.data[0];
     auto &name_vec = args.data[1];
     type_vec.Flatten(args.size());
@@ -2085,18 +2142,33 @@ static void sv_get_ddl_exec(DataChunk &args, ExpressionState &state,
     auto &type_validity = FlatVector::Validity(type_vec);
     auto &name_validity = FlatVector::Validity(name_vec);
 
+    // Only touched when the third arity was bound; `data[2]` does not exist on
+    // the two-argument call.
+    bool *qualify_data = nullptr;
+    if (has_qualify_arg) {
+        auto &qualify_vec = args.data[2];
+        qualify_vec.Flatten(args.size());
+        qualify_data = FlatVector::GetData<bool>(qualify_vec);
+    }
+
     auto &result_validity = FlatVector::Validity(result);
 
     Connection probe(*state.GetContext().db);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
 
     for (idx_t i = 0; i < args.size(); ++i) {
-        if (!type_validity.RowIsValid(i) || !name_validity.RowIsValid(i)) {
+        // A NULL in any argument yields a NULL row, the third included: asked
+        // "qualified or not?" with NULL there is no answer, and defaulting to
+        // either spelling would be a guess.
+        if (!type_validity.RowIsValid(i) || !name_validity.RowIsValid(i) ||
+            (has_qualify_arg && !FlatVector::Validity(args.data[2]).RowIsValid(i))) {
             result_validity.SetInvalid(i);
             continue;
         }
         const string_t &t = type_data[i];
         const string_t &n = name_data[i];
+        const uint8_t qualify =
+            (has_qualify_arg && qualify_data[i]) ? uint8_t(1) : uint8_t(0);
         sv_emit_scalar_row(
             result, i, "get_ddl",
             [&](char **op, size_t *ol, char *eb, size_t ebl) {
@@ -2106,13 +2178,14 @@ static void sv_get_ddl_exec(DataChunk &args, ExpressionState &state,
                     reinterpret_cast<const uint8_t *>(n.GetData()), n.GetSize(),
                     // No search path: GET_DDL / READ_YAML are SCALAR
                     // functions, so the path cannot arrive as a named
-                    // parameter and would need a second registered arity
-                    // (a ScalarFunctionSet overload). Passing (nullptr, 0)
-                    // selects the Rust side's no-path fallback — the unique
-                    // match, or an actionable ambiguity error. Conservative
-                    // rather than wrong: it never returns another schema's
-                    // definition. Tracked in TECH-DEBT #25.
+                    // parameter. Passing (nullptr, 0) selects the Rust side's
+                    // no-path fallback — the unique match, or an actionable
+                    // ambiguity error. Conservative rather than wrong: it never
+                    // returns another schema's definition. Tracked in
+                    // TECH-DEBT #25. (The overload below adds an *arity*, not a
+                    // named parameter, so it does not carry a path either.)
                     nullptr, 0,
+                    qualify,
                     op, ol, eb, ebl);
             });
     }
@@ -2164,15 +2237,38 @@ static void sv_read_yaml_from_semantic_view_exec(DataChunk &args,
 }
 
 extern "C" {
+    // Two arities on one name (TECH-DEBT #25): the third `BOOLEAN` argument is
+    // Snowflake's `use_fully_qualified_names`. Registering a set rather than
+    // two separate functions is what lets DuckDB's binder pick by argument
+    // count; both overloads share `sv_get_ddl_exec`, which reads the third
+    // column only when it was bound.
     bool sv_register_get_ddl(duckdb_database db_handle,
                              char *error_buf, size_t error_buf_len) {
-        LogicalType args[] = {LogicalType::VARCHAR, LogicalType::VARCHAR};
-        return sv_register_scalar_function(
-            db_handle, "get_ddl",
-            args, 2,
-            LogicalType::VARCHAR,
-            sv_get_ddl_exec,
-            error_buf, error_buf_len);
+        try {
+            ScalarFunctionSet set("get_ddl");
+            set.AddFunction(ScalarFunction(
+                "get_ddl", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+                LogicalType::VARCHAR, sv_get_ddl_exec));
+            set.AddFunction(ScalarFunction(
+                "get_ddl",
+                {LogicalType::VARCHAR, LogicalType::VARCHAR,
+                 LogicalType::BOOLEAN},
+                LogicalType::VARCHAR, sv_get_ddl_exec));
+            return sv_register_scalar_function_set(
+                db_handle, "get_ddl", std::move(set), error_buf, error_buf_len);
+        } catch (const std::exception &e) {
+            if (error_buf != nullptr && error_buf_len > 0) {
+                snprintf(error_buf, error_buf_len,
+                    "sv_register_get_ddl failed: %s", e.what());
+            }
+            return false;
+        } catch (...) {
+            if (error_buf != nullptr && error_buf_len > 0) {
+                snprintf(error_buf, error_buf_len,
+                    "sv_register_get_ddl failed: unknown C++ exception");
+            }
+            return false;
+        }
     }
     bool sv_register_read_yaml_from_semantic_view(duckdb_database db_handle,
                                                   char *error_buf, size_t error_buf_len) {
