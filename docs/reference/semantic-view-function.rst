@@ -39,7 +39,7 @@ Parameters
      - Description
    * - ``<view_name>``
      - VARCHAR (positional)
-     - The name of the semantic view to query. Must match a registered view. The name is folded to lowercase and matched case-insensitively, quoted or not (``'Sales'``, ``'SALES'``, and ``'"sales"'`` all resolve to the same view), following DuckDB's identifier semantics.
+     - The name of the semantic view to query. Must match a registered view. The name is folded to lowercase and matched case-insensitively, quoted or not (``'Sales'``, ``'SALES'``, and ``'"sales"'`` all resolve to the same view), following DuckDB's identifier semantics. May carry a ``<schema>.`` qualifier — ``'analytics.sales'`` — which pins the schema; an unqualified name resolves to the one view of that name and is an error when several schemas hold one (see :ref:`ref-create-semantic-view`).
    * - ``dimensions``
      - LIST (named)
      - Optional list of dimension names to include in the result. Each name must match a dimension defined in the semantic view. Supports ``alias.*`` wildcard patterns.

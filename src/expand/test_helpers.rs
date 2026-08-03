@@ -75,6 +75,7 @@ pub(super) fn orders_view() -> SemanticViewDefinition {
         created_on: None,
         database_name: None,
         schema_name: None,
+        resolution_schema_name: None,
         comment: None,
     }
 }
@@ -127,6 +128,7 @@ pub(super) fn minimal_def(
         created_on: None,
         database_name: None,
         schema_name: None,
+        resolution_schema_name: None,
         comment: None,
     }
 }

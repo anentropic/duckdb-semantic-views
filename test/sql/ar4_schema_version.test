@@ -53,7 +53,8 @@ US	100.00
 # pre-Phase-24 `on`-only encoding), bypassing the parser. Querying it must
 # hard-error rather than silently under-checking fan traps (SG-7).
 statement ok
-INSERT INTO semantic_layer._definitions (name, definition) VALUES (
+INSERT INTO semantic_layer._definitions (schema_name, name, definition) VALUES (
+  'main',
   'ar4_legacy',
   '{"tables":[{"alias":"o","table":"ar4_orders"}],"dimensions":[{"name":"region","expr":"o.region","source_table":"o"}],"metrics":[{"name":"total","expr":"SUM(o.amount)","source_table":"o"}],"joins":[{"table":"c","on":"o.cid = c.id"}]}'
 )

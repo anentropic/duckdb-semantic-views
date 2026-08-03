@@ -440,10 +440,22 @@ def test_attach_facts_path(extension_path: Path, ext_dir: str, tmp_path: Path) -
 
     Regression guard for the cross-catalog interaction with the FACTS path
     (``sql_gen.rs:181, 224, 244``). The other DB is pre-created via a side
-    ``duckdb.connect()`` so the ADBC session only ATTACHes; the semantic view
-    is then created INSIDE the attached DB (``db2.main.attached_view``) so
-    the FACTS expansion has to emit a fully-qualified reference for the
-    per-call ``Connection(*context.db)`` to resolve it.
+    ``duckdb.connect()`` so the ADBC session only ATTACHes; the view's SOURCE
+    TABLE lives in the attached DB (``db2.main.sales``), so the FACTS expansion
+    has to emit a fully-qualified reference for the per-call
+    ``Connection(*context.db)`` to resolve it. That reference is what this
+    scenario exercises.
+
+    The view itself is created in the session's own database. It was previously
+    written ``CREATE SEMANTIC VIEW db2.main.attached_view``, and this docstring
+    claimed the view was created "inside the attached DB" — it never was. The
+    qualifier was parsed and discarded, so the view landed in ``scenario7.main``
+    exactly as an unqualified name would have. Since semantic views became
+    schema-scoped the qualifier is honoured, and a ``<database>.`` prefix naming
+    another database is rejected rather than silently retargeted — semantic
+    views are single-catalog (TECH-DEBT #26). Writing the name unqualified says
+    what actually happens and keeps the cross-catalog coverage, which was always
+    in the source-table reference rather than the view name.
     """
     db_path = str(tmp_path / "scenario7.duckdb")
     other_db_path = str(tmp_path / "other.duckdb")
@@ -482,7 +494,7 @@ def test_attach_facts_path(extension_path: Path, ext_dir: str, tmp_path: Path) -
         _execute(
             conn,
             """
-            CREATE SEMANTIC VIEW db2.main.attached_view AS
+            CREATE SEMANTIC VIEW attached_view AS
               TABLES (s AS db2.main.sales PRIMARY KEY (id))
               FACTS (s.net_amount AS s.amount * 1.0)
               DIMENSIONS (s.region AS s.region)
@@ -492,7 +504,7 @@ def test_attach_facts_path(extension_path: Path, ext_dir: str, tmp_path: Path) -
 
         rows = _scalar(
             conn,
-            "SELECT COUNT(*) FROM semantic_view('db2.main.attached_view', "
+            "SELECT COUNT(*) FROM semantic_view('attached_view', "
             "dimensions := ['region'], facts := ['net_amount'])",
         )
         assert rows == 2, f"expected 2 rows, got {rows}"

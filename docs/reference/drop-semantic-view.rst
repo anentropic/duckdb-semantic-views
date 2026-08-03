@@ -33,6 +33,10 @@ Statement Variants
 
 .. note::
 
+   **Which view a bare name means.** Semantic views are scoped to a schema, so ``<name>`` may carry a ``<schema>.`` qualifier, and it decides which view is dropped: ``DROP SEMANTIC VIEW staging.sales`` leaves ``analytics.sales`` alone. An unqualified name resolves to the one view of that name when exactly one exists; when several schemas hold one, the statement is an error naming them rather than dropping an arbitrary one. See :ref:`ref-create-semantic-view` for the full rule.
+
+.. note::
+
    ``DROP`` participates in your surrounding transaction (``BEGIN ... ROLLBACK`` restores the view). ``DROP SEMANTIC VIEW`` (without ``IF EXISTS``) raises ``semantic view '<name>' does not exist`` when the view is absent at check time; ``IF EXISTS`` keeps its silent-no-op behaviour. The existence check and the delete are atomic only inside an explicit transaction -- under autocommit a drop that another process commits in the window between them is not detected. See :ref:`explanation-transactional-ddl` for the guard window and how to close it.
 
 .. note::

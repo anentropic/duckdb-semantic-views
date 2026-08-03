@@ -80,14 +80,15 @@ unsafe fn show_dims_for_metric(
     let metric_name = read_str_arg(metric_name_ptr, metric_name_len, "metric name")?;
     // FF-4: normalize the view name so quoted-identifier inputs resolve the
     // same way they do through `semantic_view()`.
-    let view_name = crate::ident::normalize_view_name(&view_name)
+    let view = crate::ident::parse_view_ref(&view_name)
         .map_err(|e| format!("Invalid view name '{view_name}': {e}"))?;
+    let view_name = view.name.clone();
 
     let present = probe_catalog_table_present(borrowed)?;
     let reader = CatalogReader::new(borrowed, present);
-    let Some(json) = reader.lookup(&view_name)? else {
+    let Some(json) = reader.lookup(&view)? else {
         let available = reader.list_names().unwrap_or_default();
-        let not_found = crate::catalog::view_not_found_msg(&view_name);
+        let not_found = crate::catalog::view_not_found_msg(&view.to_string());
         return Err(match suggest_closest(&view_name, &available) {
             Some(suggestion) => format!("{not_found}. Did you mean '{suggestion}'?"),
             None => not_found,

@@ -132,8 +132,9 @@ unsafe fn semantic_view_bind_body(
     use crate::ddl::read_ffi::{probe_catalog_table_present, read_str_arg};
 
     let view_name_raw = read_str_arg(name_ptr, name_len, "view name")?;
-    let view_name = crate::ident::normalize_view_name(&view_name_raw)
+    let view = crate::ident::parse_view_ref(&view_name_raw)
         .map_err(|e| format!("Invalid view name '{view_name_raw}': {e}"))?;
+    let view_name = view.name.clone();
 
     let dimensions = parse_varchar_list(dims_ptr, dims_len)
         .map_err(|detail| format!("malformed `dimensions` payload: {detail}"))?;
@@ -165,7 +166,7 @@ unsafe fn semantic_view_bind_body(
     // views" instead of silently folding it into absence.
     let present = probe_catalog_table_present(borrowed)?;
     let reader = CatalogReader::new(borrowed, present);
-    let json_str = match reader.lookup(&view_name) {
+    let json_str = match reader.lookup(&view) {
         Ok(Some(j)) => j,
         Ok(None) => {
             let available = reader.list_names().unwrap_or_default();

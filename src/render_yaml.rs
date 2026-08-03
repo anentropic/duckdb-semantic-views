@@ -13,7 +13,8 @@ use crate::model::SemanticViewDefinition;
 /// Clones the definition and strips internal runtime fields that are
 /// repopulated at define time:
 /// - `created_on` (DDL-time timestamp)
-/// - `database_name` / `schema_name` (connection context)
+/// - `database_name` / `schema_name` / `resolution_schema_name` (connection
+///   context: where the view lives and where its body resolved)
 ///
 /// After stripping, `serde(skip_serializing_if)` on these fields ensures
 /// they are omitted from the YAML output entirely. (`schema_version` lives
@@ -24,6 +25,7 @@ pub fn render_yaml_export(def: &SemanticViewDefinition) -> Result<String, String
     export.created_on = None;
     export.database_name = None;
     export.schema_name = None;
+    export.resolution_schema_name = None;
 
     yaml_serde::to_string(&export).map_err(|e| format!("YAML serialization error: {e}"))
 }
@@ -61,6 +63,7 @@ mod tests {
             created_on: Some("2026-04-20T12:00:00Z".to_string()),
             database_name: Some("mydb".to_string()),
             schema_name: Some("main".to_string()),
+            resolution_schema_name: Some("main".to_string()),
             ..Default::default()
         }
     }
@@ -86,6 +89,9 @@ mod tests {
     #[test]
     fn strips_schema_name() {
         let yaml = render_yaml_export(&def_with_internals()).unwrap();
+        // Substring, so this covers `resolution_schema_name` too — both are
+        // connection context repopulated at define time, and an exported YAML
+        // re-imported elsewhere must not carry either.
         assert!(
             !yaml.contains("schema_name"),
             "schema_name should be stripped from YAML: {yaml}"
@@ -143,6 +149,7 @@ mod tests {
         expected.created_on = None;
         expected.database_name = None;
         expected.schema_name = None;
+        expected.resolution_schema_name = None;
 
         assert_eq!(expected, reimported);
     }

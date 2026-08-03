@@ -211,6 +211,104 @@ pub fn normalize_view_name(input: &str) -> Result<String, String> {
         .ok_or_else(|| "empty identifier".to_string())
 }
 
+/// A semantic-view reference split into its optional qualifier and its name.
+///
+/// [`normalize_view_name`] answers "what is this view called"; `ViewRef`
+/// answers "*which* view is this" — the difference matters once views are
+/// scoped to a schema, because `analytics.v` and `staging.v` are two views.
+/// Every part is folded to ASCII lowercase under the same `DuckDB`
+/// case-insensitivity rule `normalize_view_name` documents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewRef {
+    /// The `db` of `db.schema.name`, when written.
+    pub database: Option<String>,
+    /// The `schema` of `schema.name` or `db.schema.name`, when written.
+    /// `None` means "unqualified" — the caller decides what that resolves to
+    /// (`current_schema()` for CREATE, an existing row for DROP/ALTER/read).
+    pub schema: Option<String>,
+    /// The bare view name — always equal to [`normalize_view_name`] of the
+    /// same input (pinned by `parse_view_ref_tests::name_agrees_with_normalize_view_name`).
+    pub name: String,
+}
+
+/// [`parse_view_ref`] with a total fallback: input that is not a well-formed
+/// identifier becomes an unqualified reference carrying the text verbatim.
+///
+/// The lookup then misses and reports the canonical
+/// `semantic view '<name>' does not exist`, which is friendlier than an
+/// identifier-grammar error for read paths (`GET_DDL`,
+/// `READ_YAML_FROM_SEMANTIC_VIEW`) whose argument is a plain string rather
+/// than a parsed SQL identifier.
+#[must_use]
+pub fn parse_view_ref_lenient(input: &str) -> ViewRef {
+    parse_view_ref(input).unwrap_or_else(|_| ViewRef {
+        database: None,
+        schema: None,
+        name: input.to_string(),
+    })
+}
+
+impl std::fmt::Display for ViewRef {
+    /// Render the reference the way it was written — `schema.name` when
+    /// qualified, bare otherwise — so an error about a qualified reference
+    /// names the schema the caller asked for rather than an unqualified name
+    /// that may exist elsewhere.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(db) = &self.database {
+            write!(f, "{db}.")?;
+        }
+        if let Some(schema) = &self.schema {
+            write!(f, "{schema}.")?;
+        }
+        f.write_str(&self.name)
+    }
+}
+
+/// Parse a (possibly qualified) semantic-view reference.
+///
+/// The qualifier-preserving sibling of [`normalize_view_name`], which returns
+/// only the last part. Accepts one, two, or three parts; four or more is an
+/// error rather than a silent truncation, so `a.b.c.d` cannot quietly resolve
+/// to `d`.
+///
+/// # Errors
+///
+/// Propagates [`parse_qualified_identifier_with_quoting`]'s errors (empty
+/// input, unterminated quote, empty part between dots), and rejects references
+/// of more than three parts.
+///
+/// # Examples
+///
+/// ```ignore
+/// use semantic_views::ident::parse_view_ref;
+/// let r = parse_view_ref("analytics.Orders_SV").unwrap();
+/// assert_eq!(r.schema.as_deref(), Some("analytics"));
+/// assert_eq!(r.name, "orders_sv");
+/// ```
+pub fn parse_view_ref(input: &str) -> Result<ViewRef, String> {
+    let mut parts: Vec<String> = parse_qualified_identifier_with_quoting(input)?
+        .into_iter()
+        .map(|(part, _quoted)| part.to_ascii_lowercase())
+        .collect();
+    if parts.len() > 3 {
+        return Err(format!(
+            "too many identifier parts in '{input}' (expected at most \
+             database.schema.name)"
+        ));
+    }
+    // Pop from the end so the slots fill right-to-left: name, then schema,
+    // then database. `parse_qualified_identifier_with_quoting` never returns
+    // an empty Vec on Ok, so the first pop always succeeds.
+    let name = parts.pop().ok_or_else(|| "empty identifier".to_string())?;
+    let schema = parts.pop();
+    let database = parts.pop();
+    Ok(ViewRef {
+        database,
+        schema,
+        name,
+    })
+}
+
 /// Locate the byte offset of the FIRST delimiter that is NOT inside a quoted
 /// region. Delimiters are ASCII whitespace, `;`, and (when `allow_paren` is
 /// true) `(`.
@@ -587,6 +685,97 @@ mod tests {
             assert!(normalize_view_name("").is_err());
             assert!(normalize_view_name("\"foo").is_err());
             assert!(normalize_view_name("a..b").is_err());
+        }
+    }
+
+    mod parse_view_ref_tests {
+        use super::*;
+
+        #[test]
+        fn bare_name_has_no_qualifier() {
+            let r = parse_view_ref("orders_sv").unwrap();
+            assert_eq!(r.name, "orders_sv");
+            assert_eq!(r.schema, None);
+            assert_eq!(r.database, None);
+        }
+
+        #[test]
+        fn two_parts_are_schema_and_name() {
+            let r = parse_view_ref("analytics.orders_sv").unwrap();
+            assert_eq!(r.name, "orders_sv");
+            assert_eq!(r.schema.as_deref(), Some("analytics"));
+            assert_eq!(r.database, None);
+        }
+
+        #[test]
+        fn three_parts_are_database_schema_and_name() {
+            let r = parse_view_ref("memory.analytics.orders_sv").unwrap();
+            assert_eq!(r.name, "orders_sv");
+            assert_eq!(r.schema.as_deref(), Some("analytics"));
+            assert_eq!(r.database.as_deref(), Some("memory"));
+        }
+
+        #[test]
+        fn every_part_folds_to_lowercase() {
+            // Same DuckDB case-insensitivity rule `normalize_view_name` applies
+            // to the name — it holds for the qualifier parts too, quoted or not.
+            let r = parse_view_ref("Memory.\"Analytics\".ORDERS_SV").unwrap();
+            assert_eq!(r.database.as_deref(), Some("memory"));
+            assert_eq!(r.schema.as_deref(), Some("analytics"));
+            assert_eq!(r.name, "orders_sv");
+        }
+
+        #[test]
+        fn quoted_dot_is_one_part_not_a_qualifier() {
+            // The mirror of the SHOW ... IN SCHEMA "a.b" case: a quoted dot is
+            // part of the NAME, so this view is unqualified.
+            let r = parse_view_ref("\"a.b\"").unwrap();
+            assert_eq!(r.name, "a.b");
+            assert_eq!(r.schema, None);
+        }
+
+        #[test]
+        fn quoted_dotted_schema_qualifies_a_bare_name() {
+            let r = parse_view_ref("\"a.b\".v").unwrap();
+            assert_eq!(r.schema.as_deref(), Some("a.b"));
+            assert_eq!(r.name, "v");
+        }
+
+        #[test]
+        fn four_parts_are_rejected() {
+            let err = parse_view_ref("a.b.c.d").unwrap_err();
+            assert!(
+                err.contains("too many"),
+                "expected a too-many-parts error, got: {err}"
+            );
+        }
+
+        #[test]
+        fn parser_errors_propagate() {
+            assert!(parse_view_ref("").is_err());
+            assert!(parse_view_ref("\"foo").is_err());
+            assert!(parse_view_ref("a..b").is_err());
+        }
+
+        #[test]
+        fn name_agrees_with_normalize_view_name() {
+            // `parse_view_ref` is the qualifier-preserving sibling: for the NAME
+            // slot the two must never disagree, or a lookup routed through one
+            // would miss a row written through the other.
+            for input in [
+                "orders_sv",
+                "Sales",
+                "\"Sales\"",
+                "main.Sales",
+                "\"memory\".\"main\".\"orders_sv\"",
+                "\"a.b\"",
+            ] {
+                assert_eq!(
+                    parse_view_ref(input).unwrap().name,
+                    normalize_view_name(input).unwrap(),
+                    "name slot diverged for {input:?}"
+                );
+            }
         }
     }
 

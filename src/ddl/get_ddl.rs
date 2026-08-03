@@ -86,14 +86,15 @@ unsafe fn get_ddl(
     // other single-view read path (FF-4/PA-8 sweep). Lenient contract mirrors
     // read_yaml's `resolve_bare_name`: a name that does not parse as an
     // identifier is looked up verbatim and fails with the canonical message.
-    let name = crate::ident::normalize_view_name(&raw_name).unwrap_or(raw_name);
+    let view = crate::ident::parse_view_ref_lenient(&raw_name);
+    let name = view.name.clone();
 
     // FF-9: a probe-query failure is distinct from "no views" (propagated).
     let present = probe_catalog_table_present(borrowed)?;
     let reader = CatalogReader::new(borrowed, present);
     let json = reader
-        .lookup(&name)?
-        .ok_or_else(|| crate::catalog::view_not_found_msg(&name))?;
+        .lookup(&view)?
+        .ok_or_else(|| crate::catalog::view_not_found_msg(&view.to_string()))?;
     // C-2: `from_json` for the canonical "invalid definition for semantic
     // view '<name>'" context on corrupt rows.
     let def = SemanticViewDefinition::from_json(&name, &json)?;

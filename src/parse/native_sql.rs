@@ -20,16 +20,73 @@
 use super::{plan_rewrite, RewriteAction};
 #[cfg(feature = "extension")]
 use crate::catalog::writes::{
-    definitions_table_guard_select, existence_guard_select, rename_collision_guard_select,
+    create_target_schema_expr, current_database_guard_select, definitions_table_guard_select,
+    existence_guard_select, rename_collision_guard_select, resolved_schema_expr, row_predicate,
+    SchemaTarget,
 };
 #[cfg(feature = "extension")]
 use crate::catalog::DEFINITIONS_TABLE;
 #[cfg(feature = "extension")]
 use crate::errors::ParseError;
 #[cfg(feature = "extension")]
-use crate::ident::normalize_view_name;
+use crate::ident::{parse_view_ref, ViewRef};
 #[cfg(feature = "extension")]
 use crate::sql_lit::SqlLit;
+
+/// Re-check an already-normalised bare view name, returning it unchanged.
+///
+/// Re-quoted before re-parsing so the pass is a no-op on normalised input: a
+/// bare `a.b` would otherwise re-split into schema `a` / name `b`.
+#[cfg(feature = "extension")]
+fn revalidate_name(name: &str) -> Result<String, ParseError> {
+    parse_view_ref(&crate::expand::quote_ident(name))
+        .map(|r| r.name)
+        .map_err(|e| ParseError {
+            message: format!("Invalid view name: {e}"),
+            position: None,
+        })
+}
+
+/// Split a parsed view reference into the escaped name literal and the schema
+/// target its qualifier (if any) denotes.
+///
+/// The `database` part is not represented here — it names no schema. It is
+/// enforced separately by [`current_database_guard`], because ignoring it would
+/// silently retarget `otherdb.analytics.v` at the current database's
+/// `analytics.v`.
+#[cfg(feature = "extension")]
+fn escaped_parts(view: &ViewRef) -> (SqlLit, SchemaTarget) {
+    let target = view.schema.as_ref().map_or(SchemaTarget::Unqualified, |s| {
+        SchemaTarget::Named(SqlLit::escape(s))
+    });
+    (SqlLit::escape(&view.name), target)
+}
+
+/// The name as it should be *written back* in an error suggesting a qualified
+/// spelling — identifier-quoted when it needs to be, then SQL-escaped for
+/// embedding. Quoting has to happen before the SQL escape, which is why this
+/// cannot be derived from the `SqlLit` that `escaped_parts` returns.
+#[cfg(feature = "extension")]
+fn suggested_name(view: &ViewRef) -> SqlLit {
+    SqlLit::escape(&crate::expand::quote_ident_if_needed(&view.name))
+}
+
+/// [`current_database_guard_select`] for a parsed reference: the guard
+/// statement plus its trailing `; ` when a `<database>.` prefix was written,
+/// and the empty string when it was not, so callers can splice it in
+/// unconditionally.
+#[cfg(feature = "extension")]
+fn current_database_guard(view: &ViewRef) -> String {
+    view.database.as_ref().map_or_else(String::new, |database| {
+        format!(
+            "{}; ",
+            current_database_guard_select(
+                &SqlLit::escape(database),
+                &SqlLit::escape(&view.to_string())
+            )
+        )
+    })
+}
 
 // ---------------------------------------------------------------------------
 // v0.8.x: native-SQL rewrite for parser_override (transactional DDL)
@@ -90,6 +147,15 @@ pub(crate) fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, Parse
         return Ok(None);
     };
 
+    // Every `<database>.` prefix the statement writes must name the current
+    // database — collected before the match consumes `action`. Read-side DDL
+    // contributes none.
+    let database_guards: String = action
+        .referenced_views()
+        .into_iter()
+        .map(current_database_guard)
+        .collect();
+
     // Read-side DDL is passed through unchanged; write DDL gets the FF-3
     // single-catalog guard prepended below.
     let emitted: Option<String> = match action {
@@ -123,23 +189,19 @@ pub(crate) fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, Parse
         // escaped-vs-raw distinction is type-enforced, not by convention).
         // The comment is passed RAW — `rewrite_alter_comment` needs it
         // un-escaped to build the JSON patch and escapes the patch itself.
-        RewriteAction::Drop { name, if_exists } => rewrite_drop(&SqlLit::escape(&name), if_exists)?,
+        RewriteAction::Drop { name, if_exists } => rewrite_drop(&name, if_exists)?,
         RewriteAction::AlterRename {
             name,
             new_name,
             if_exists,
-        } => rewrite_alter_rename(
-            &SqlLit::escape(&name),
-            &SqlLit::escape(&new_name),
-            if_exists,
-        )?,
+        } => rewrite_alter_rename(&name, &new_name, if_exists)?,
         RewriteAction::AlterSetComment {
             name,
             comment,
             if_exists,
-        } => rewrite_alter_comment(&SqlLit::escape(&name), Some(&comment), if_exists)?,
+        } => rewrite_alter_comment(&name, Some(&comment), if_exists)?,
         RewriteAction::AlterUnsetComment { name, if_exists } => {
-            rewrite_alter_comment(&SqlLit::escape(&name), None, if_exists)?
+            rewrite_alter_comment(&name, None, if_exists)?
         }
     };
 
@@ -152,7 +214,7 @@ pub(crate) fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, Parse
     // The guard is a no-op on the normal single-catalog path.
     Ok(emitted.map(|dml| {
         format!(
-            "{}; {dml}",
+            "{}; {database_guards}{dml}",
             crate::catalog::writes::managed_catalog_guard_select()
         )
     }))
@@ -177,22 +239,23 @@ pub(crate) fn rewrite_to_native_sql(query: &str) -> Result<Option<String>, Parse
 /// `SELECT ... WHERE 1 = 0` fast path (zero rows returned).
 #[cfg(feature = "extension")]
 fn emit_native_create_sql(
-    name: &str,
+    view: &ViewRef,
     def: crate::model::SemanticViewDefinition,
     or_replace: bool,
     if_not_exists: bool,
 ) -> Result<Option<String>, ParseError> {
-    // Defensive validation — `name` arrives already normalised (bare,
-    // case-folded if it was unquoted) from validate_create_body via the
-    // `RewriteAction::Create` it produced. Re-quote before re-normalising so
-    // this pass is a true no-op on normalised input: normalising the BARE name
-    // again would fold a case-preserved quoted name (`"SalesView"` →
-    // `salesview`, PA-8) and split a dotted name (`"a.b"` → `b`).
-    let name = normalize_view_name(&crate::expand::quote_ident(name)).map_err(|e| ParseError {
-        message: format!("Invalid view name: {e}"),
-        position: None,
-    })?;
-    let name_escaped = SqlLit::escape(&name);
+    // Defensive validation — `view` arrives already normalised (every part
+    // case-folded) from validate_create_body via the `RewriteAction::Create` it
+    // produced. Only the NAME slot is re-checked, and re-quoted first so the
+    // pass is a true no-op on normalised input: re-parsing the bare name would
+    // split a dotted one (`"a.b"` → schema `a`, name `b`). The qualifier is
+    // carried through untouched — re-deriving it would lose it.
+    let view = ViewRef {
+        name: revalidate_name(&view.name)?,
+        ..view.clone()
+    };
+    let (name_escaped, schema_target) = escaped_parts(&view);
+    let name = &view.name;
 
     // Phase 65 (D-16, metadata-via-SQL): enrichment no longer takes a
     // catalog connection. CREATE-time `now()` / `current_database()` /
@@ -203,13 +266,20 @@ fn emit_native_create_sql(
     // column type inference (`column_type_names`, fact `output_type`)
     // is deferred to read-side bind under Plan 05's C++ Catalog API
     // migration (D-17).
-    let enriched_json = crate::ddl::define::enrich_definition_for_create(&name, def)?;
+    let enriched_json = crate::ddl::define::enrich_definition_for_create(name, def)?;
     let enriched_escaped = SqlLit::escape(&enriched_json);
+
+    // The schema this CREATE lands in — the qualifier if one was written,
+    // otherwise `current_schema()`, resolved either way to the catalog's own
+    // spelling and erroring if the schema does not exist. It appears twice in
+    // the emitted INSERT (the `schema_name` column and the JSON metadata), so
+    // the row and its definition can never disagree about where the view lives.
+    let schema_expr = create_target_schema_expr(&schema_target);
 
     // Metadata-via-SQL sub-expression: produces a VARCHAR by patching
     // the enriched JSON (no created_on / database_name / schema_name
     // fields populated by the Rust side) with the now()/current_database()
-    // /current_schema() values resolved on the caller's connection.
+    // /schema values resolved on the caller's connection.
     //
     // RFC-7396 semantics: json_merge_patch overrides any keys present in
     // the patch. Phase 39 metadata behaviour is preserved because the
@@ -225,7 +295,8 @@ fn emit_native_create_sql(
             json_object( \
               'created_on', strftime(now(), '%Y-%m-%dT%H:%M:%SZ'), \
               'database_name', current_database(), \
-              'schema_name', current_schema(), \
+              'schema_name', {schema_expr}, \
+              'resolution_schema_name', current_schema(), \
               'schema_version', {schema_version} \
             ) \
          )::VARCHAR"
@@ -248,24 +319,31 @@ fn emit_native_create_sql(
     //     parser-side `ctx.catalog.exists` pre-check above is the
     //     committed-state fast path; the CASE inside the INSERT is the
     //     same-transaction guard.
+    //
+    // All three write `(schema_name, name, definition)`; the conflict target
+    // is the `(schema_name, name)` primary key, so OR REPLACE / OR IGNORE act
+    // within the target schema only and a same-named view in another schema is
+    // left alone.
+    let occupied = row_predicate(&name_escaped, &schema_expr);
     let sql = if or_replace {
         format!(
-            "INSERT OR REPLACE INTO {DEFINITIONS_TABLE} (name, definition) \
-             VALUES ('{name_escaped}', {metadata_patched_definition}) \
+            "INSERT OR REPLACE INTO {DEFINITIONS_TABLE} (schema_name, name, definition) \
+             SELECT {schema_expr}, '{name_escaped}', {metadata_patched_definition} \
              RETURNING name AS view_name"
         )
     } else if if_not_exists {
         format!(
-            "INSERT OR IGNORE INTO {DEFINITIONS_TABLE} (name, definition) \
-             VALUES ('{name_escaped}', {metadata_patched_definition}) \
+            "INSERT OR IGNORE INTO {DEFINITIONS_TABLE} (schema_name, name, definition) \
+             SELECT {schema_expr}, '{name_escaped}', {metadata_patched_definition} \
              RETURNING name AS view_name"
         )
     } else {
         format!(
-            "INSERT INTO {DEFINITIONS_TABLE} (name, definition) \
+            "INSERT INTO {DEFINITIONS_TABLE} (schema_name, name, definition) \
              SELECT \
+               {schema_expr}, \
                CASE WHEN EXISTS (SELECT 1 FROM {DEFINITIONS_TABLE} \
-                                 WHERE name = '{name_escaped}') \
+                                 WHERE {occupied}) \
                     THEN error('semantic view ''{name_escaped}'' already exists; \
                                 use CREATE OR REPLACE SEMANTIC VIEW to overwrite') \
                     ELSE '{name_escaped}' \
@@ -296,7 +374,7 @@ fn emit_native_create_sql(
 #[cfg(feature = "extension")]
 fn emit_native_create_from_yaml_file(
     file_path: &str,
-    name: &str,
+    view: &ViewRef,
     comment: &str,
     or_replace: bool,
     if_not_exists: bool,
@@ -306,14 +384,15 @@ fn emit_native_create_from_yaml_file(
     // encodes the ON CONFLICT behaviour, chosen from `or_replace`/`if_not_exists`.
 
     // Defensive validation of the name (matches emit_native_create_sql):
-    // re-quote before re-normalising so the pass is a no-op on the
-    // already-normalised bare name — re-normalising it bare would fold a
-    // case-preserved quoted name (PA-8) or split a dotted one.
-    let name = normalize_view_name(&crate::expand::quote_ident(name)).map_err(|e| ParseError {
-        message: format!("Invalid view name: {e}"),
-        position: None,
-    })?;
-    let name_escaped = SqlLit::escape(&name);
+    // only the NAME slot is re-checked, and re-quoted first so the pass is a
+    // no-op on already-normalised input; the qualifier rides through untouched.
+    let view = ViewRef {
+        name: revalidate_name(&view.name)?,
+        ..view.clone()
+    };
+    let (name_escaped, schema_target) = escaped_parts(&view);
+    let schema_expr = create_target_schema_expr(&schema_target);
+    let occupied = row_predicate(&name_escaped, &schema_expr);
     let path_escaped = SqlLit::escape(file_path);
     let comment_escaped = SqlLit::escape(comment);
 
@@ -336,7 +415,8 @@ fn emit_native_create_from_yaml_file(
             json_object( \
               'created_on', strftime(now(), '%Y-%m-%dT%H:%M:%SZ'), \
               'database_name', current_database(), \
-              'schema_name', current_schema(), \
+              'schema_name', {schema_expr}, \
+              'resolution_schema_name', current_schema(), \
               'schema_version', {schema_version} \
             ) \
          )::VARCHAR",
@@ -356,24 +436,25 @@ fn emit_native_create_from_yaml_file(
     //                    (Phase 60 race-guard pattern carried forward).
     let sql = if or_replace {
         format!(
-            "INSERT OR REPLACE INTO {DEFINITIONS_TABLE} (name, definition) \
-             SELECT '{name_escaped}', {metadata_patched} \
+            "INSERT OR REPLACE INTO {DEFINITIONS_TABLE} (schema_name, name, definition) \
+             SELECT {schema_expr}, '{name_escaped}', {metadata_patched} \
              {helper_from} \
              RETURNING name AS view_name"
         )
     } else if if_not_exists {
         format!(
-            "INSERT OR IGNORE INTO {DEFINITIONS_TABLE} (name, definition) \
-             SELECT '{name_escaped}', {metadata_patched} \
+            "INSERT OR IGNORE INTO {DEFINITIONS_TABLE} (schema_name, name, definition) \
+             SELECT {schema_expr}, '{name_escaped}', {metadata_patched} \
              {helper_from} \
              RETURNING name AS view_name"
         )
     } else {
         format!(
-            "INSERT INTO {DEFINITIONS_TABLE} (name, definition) \
+            "INSERT INTO {DEFINITIONS_TABLE} (schema_name, name, definition) \
              SELECT \
+               {schema_expr}, \
                CASE WHEN EXISTS (SELECT 1 FROM {DEFINITIONS_TABLE} \
-                                 WHERE name = '{name_escaped}') \
+                                 WHERE {occupied}) \
                     THEN error('semantic view ''{name_escaped}'' already exists; \
                                 use CREATE OR REPLACE SEMANTIC VIEW to overwrite') \
                     ELSE '{name_escaped}' \
@@ -399,7 +480,15 @@ fn emit_native_create_from_yaml_file(
 // same `?`-chained match in `rewrite_to_native_sql`; diverging one signature
 // would fragment that dispatch.
 #[allow(clippy::unnecessary_wraps)]
-fn rewrite_drop(name_escaped: &SqlLit, if_exists: bool) -> Result<Option<String>, ParseError> {
+fn rewrite_drop(view: &ViewRef, if_exists: bool) -> Result<Option<String>, ParseError> {
+    // Which schema's `v` this DROP means: the qualifier if one was written,
+    // otherwise the one schema holding a view of that name (erroring when
+    // several do, rather than dropping an arbitrary one).
+    let (name_escaped, target) = escaped_parts(view);
+    let name_escaped = &name_escaped;
+    let display = SqlLit::escape(&view.to_string());
+    let schema_expr = resolved_schema_expr(&target, name_escaped, &suggested_name(view));
+    let row = row_predicate(name_escaped, &schema_expr);
     if if_exists {
         // IF EXISTS: pure DELETE on the caller's connection — affects 0
         // rows when the view is missing (silent no-op contract).
@@ -414,10 +503,10 @@ fn rewrite_drop(name_escaped: &SqlLit, if_exists: bool) -> Result<Option<String>
         // `definitions_table_guard_select` docs). The silent-no-op
         // contract for missing-row-but-table-present is preserved by
         // the DELETE's 0-row effect.
-        let table_guard = definitions_table_guard_select(name_escaped);
+        let table_guard = definitions_table_guard_select(&display);
         return Ok(Some(format!(
             "{table_guard}; \
-             DELETE FROM {DEFINITIONS_TABLE} WHERE name = '{name_escaped}' \
+             DELETE FROM {DEFINITIONS_TABLE} WHERE {row} \
              RETURNING name AS view_name"
         )));
     }
@@ -438,25 +527,52 @@ fn rewrite_drop(name_escaped: &SqlLit, if_exists: bool) -> Result<Option<String>
     // missing `semantic_layer._definitions` on a never-bootstrapped RO
     // DB. Three-statement form: <table_guard>; <row_guard>; <DELETE>.
     // First statement errors → second and third never bind.
-    let table_guard = definitions_table_guard_select(name_escaped);
-    let guard = existence_guard_select(name_escaped);
+    let table_guard = definitions_table_guard_select(&display);
+    let guard = existence_guard_select(&row, &display);
     Ok(Some(format!(
         "{table_guard}; \
          {guard}; \
-         DELETE FROM {DEFINITIONS_TABLE} WHERE name = '{name_escaped}' \
+         DELETE FROM {DEFINITIONS_TABLE} WHERE {row} \
          RETURNING name AS view_name"
     )))
 }
 
+///
+/// A qualifier on the NEW name moves the view: `ALTER SEMANTIC VIEW a.v RENAME
+/// TO b.v` lands it in schema `b`. An unqualified new name keeps the view where
+/// it is, so the common `RENAME TO other` never moves anything.
 #[cfg(feature = "extension")]
 // Infallible today; kept `Result`-returning for symmetry with the fallible
 // `rewrite_*` siblings dispatched through the same match (see `rewrite_drop`).
 #[allow(clippy::unnecessary_wraps)]
 fn rewrite_alter_rename(
-    old_escaped: &SqlLit,
-    new_escaped: &SqlLit,
+    old: &ViewRef,
+    new: &ViewRef,
     if_exists: bool,
 ) -> Result<Option<String>, ParseError> {
+    let (old_escaped, old_target) = escaped_parts(old);
+    let (new_escaped, new_target) = escaped_parts(new);
+    let (old_escaped, new_escaped) = (&old_escaped, &new_escaped);
+    let old_display = SqlLit::escape(&old.to_string());
+    let new_display = SqlLit::escape(&new.to_string());
+    let source_schema = resolved_schema_expr(&old_target, old_escaped, &suggested_name(old));
+    // Where the row ends up: the new name's own qualifier when it has one,
+    // otherwise wherever the source already lives.
+    let dest_schema = match &new_target {
+        SchemaTarget::Unqualified => source_schema.clone(),
+        named @ SchemaTarget::Named(_) => create_target_schema_expr(named),
+    };
+    let source_row = row_predicate(old_escaped, &source_schema);
+    let dest_row = row_predicate(new_escaped, &dest_schema);
+    // The stored definition carries a `schema_name` metadata field that the
+    // SHOW / DESCRIBE listings read. Patch it alongside the column so a
+    // schema-moving rename cannot leave the two disagreeing about where the
+    // view lives (a no-op when the rename stays put — the patch writes the
+    // same value back).
+    let moved_definition = format!(
+        "json_merge_patch(definition::JSON, \
+            json_object('schema_name', {dest_schema}))::VARCHAR"
+    );
     if if_exists {
         // IF EXISTS: pure UPDATE on the caller's connection. We still need
         // the rename-collision guard (target name must not be taken),
@@ -473,13 +589,16 @@ fn rewrite_alter_rename(
         // so neither the collision guard NOR the UPDATE bind against a
         // missing `semantic_layer._definitions` on a never-bootstrapped
         // RO DB.
-        let table_guard = definitions_table_guard_select(old_escaped);
-        let collision_guard = rename_collision_guard_select(new_escaped);
+        let table_guard = definitions_table_guard_select(&old_display);
+        let collision_guard = rename_collision_guard_select(&dest_row, &new_display);
         return Ok(Some(format!(
             "{table_guard}; \
              {collision_guard}; \
-             UPDATE {DEFINITIONS_TABLE} SET name = '{new_escaped}' \
-             WHERE name = '{old_escaped}' \
+             UPDATE {DEFINITIONS_TABLE} \
+                SET name = '{new_escaped}', \
+                    schema_name = {dest_schema}, \
+                    definition = {moved_definition} \
+              WHERE {source_row} \
              RETURNING '{old_escaped}'::VARCHAR AS old_name, name AS new_name"
         )));
     }
@@ -496,25 +615,32 @@ fn rewrite_alter_rename(
     // Phase 65.1 Plan 04 (WR-03): prepend a `definitions_table_guard` so
     // none of the row guards / UPDATE bind against a missing
     // `semantic_layer._definitions` on a never-bootstrapped RO DB.
-    let table_guard = definitions_table_guard_select(old_escaped);
-    let exist_guard = existence_guard_select(old_escaped);
-    let collision_guard = rename_collision_guard_select(new_escaped);
+    let table_guard = definitions_table_guard_select(&old_display);
+    let exist_guard = existence_guard_select(&source_row, &old_display);
+    let collision_guard = rename_collision_guard_select(&dest_row, &new_display);
     Ok(Some(format!(
         "{table_guard}; \
          {exist_guard}; \
          {collision_guard}; \
-         UPDATE {DEFINITIONS_TABLE} SET name = '{new_escaped}' \
-         WHERE name = '{old_escaped}' \
+         UPDATE {DEFINITIONS_TABLE} \
+            SET name = '{new_escaped}', \
+                schema_name = {dest_schema}, \
+                definition = {moved_definition} \
+          WHERE {source_row} \
          RETURNING '{old_escaped}'::VARCHAR AS old_name, name AS new_name"
     )))
 }
 
 #[cfg(feature = "extension")]
 fn rewrite_alter_comment(
-    name_escaped: &SqlLit,
+    view: &ViewRef,
     new_comment_raw: Option<&str>,
     if_exists: bool,
 ) -> Result<Option<String>, ParseError> {
+    let (name_escaped, target) = escaped_parts(view);
+    let display = SqlLit::escape(&view.to_string());
+    let schema_expr = resolved_schema_expr(&target, &name_escaped, &suggested_name(view));
+    let row = row_predicate(&name_escaped, &schema_expr);
     // Phase 65 Plan 06 — all pure-SQL on the caller's connection:
     //   - ALTER SET/UNSET COMMENT uses json_merge_patch (Plan 04 Wave 0
     //     spike confirmed DuckDB v1.5.2 honors RFC-7396 null-as-delete).
@@ -570,12 +696,12 @@ fn rewrite_alter_comment(
         // not exist`). On missing-table the guard errors with the
         // canonical wording; on missing-row-but-table-present the
         // UPDATE's 0-row effect preserves the silent IF EXISTS contract.
-        let table_guard = definitions_table_guard_select(name_escaped);
+        let table_guard = definitions_table_guard_select(&display);
         return Ok(Some(format!(
             "{table_guard}; \
              UPDATE {DEFINITIONS_TABLE} \
                 SET definition = json_merge_patch(definition::JSON, '{patch_json_for_sql}'::JSON)::VARCHAR \
-              WHERE name = '{name_escaped}' \
+              WHERE {row} \
              RETURNING name, '{status_label}'::VARCHAR AS status"
         )));
     }
@@ -592,14 +718,14 @@ fn rewrite_alter_comment(
     // Phase 65.1 Plan 04 (WR-03): prepend a `definitions_table_guard` so
     // neither the row guard NOR the UPDATE bind against a missing
     // `semantic_layer._definitions` on a never-bootstrapped RO DB.
-    let table_guard = definitions_table_guard_select(name_escaped);
-    let guard = existence_guard_select(name_escaped);
+    let table_guard = definitions_table_guard_select(&display);
+    let guard = existence_guard_select(&row, &display);
     Ok(Some(format!(
         "{table_guard}; \
          {guard}; \
          UPDATE {DEFINITIONS_TABLE} \
             SET definition = json_merge_patch(definition::JSON, '{patch_json_for_sql}'::JSON)::VARCHAR \
-          WHERE name = '{name_escaped}' \
+          WHERE {row} \
          RETURNING name, '{status_label}'::VARCHAR AS status"
     )))
 }

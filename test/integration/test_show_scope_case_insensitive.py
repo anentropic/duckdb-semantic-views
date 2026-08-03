@@ -21,9 +21,18 @@ catalog's. Verified against DuckDB 1.5.5:
     USE myschema  -> current_schema() = 'myschema'   <- same schema
     USE MYSCHEMA  -> current_schema() = 'MYSCHEMA'
 
-So two semantic views created in ONE schema can carry DIFFERENT stamps, and
+So two semantic views created in ONE schema could carry DIFFERENT stamps, and
 before the fix NO spelling of the filter returned both — including the
-catalog's own. That is what this file pins.
+catalog's own. That is what this file was written to pin.
+
+The divergence itself is gone: schema scoping (TECH-DEBT #25) made the stamp
+canonical, resolving the target schema through `duckdb_schemas()` rather than
+storing `current_schema()`'s echo, because `(schema_name, name)` became a
+primary key and one schema has to map to one stored string. The fold this file
+covers is still load-bearing, though — the stamp is the CATALOG's spelling, so
+a caller writing `IN SCHEMA MYSCHEMA` still needs both sides folded to match a
+stored `MySchema`. The precondition below asserts both halves: the stamps agree
+now, and they differ in case from the spellings queried.
 
 Why here and not in sqllogictest: the assertion is on returned ROWS, and
 `list_semantic_views` leads with a live `created_on` timestamp that cannot be
@@ -86,8 +95,12 @@ def main():
     conn.execute("CREATE SCHEMA MySchema")
     conn.execute("CREATE TABLE MySchema.orders (id INTEGER, amt DECIMAL(10,2))")
 
-    # Two views in ONE schema, differing only in how the caller spelled the
-    # schema in the preceding USE — so their stamped schema_name differs.
+    # Two views in ONE schema, created under different spellings of it in the
+    # preceding USE. Their stamps used to differ as a result (`MySchema` and
+    # `myschema`), which is what made a fold-free filter unanswerable: no single
+    # spelling returned both, not even the catalog's own. Schema scoping made
+    # the stamp canonical, so both now record the catalog's spelling — the
+    # stronger invariant asserted below.
     conn.execute("USE MySchema")
     conn.execute(
         "CREATE SEMANTIC VIEW v_upper AS "
@@ -101,8 +114,6 @@ def main():
         "METRICS (o.total AS sum(o.amt))"
     )
 
-    # Precondition. If this ever stops holding, the test below would still pass
-    # while proving nothing, so assert the divergent stamping explicitly.
     stamps = sorted(
         row[0]
         for row in conn.execute(
@@ -110,8 +121,20 @@ def main():
             "WHERE name IN ('v_upper', 'v_lower')"
         ).fetchall()
     )
-    print("Precondition — the two views carry different stamps:")
-    check("divergent schema_name stamps", stamps, ["MySchema", "myschema"])
+    print("Precondition — both views carry the catalog's own spelling:")
+    check("canonical schema_name stamps", stamps, ["MySchema", "MySchema"])
+
+    # ...and the fold below still has real work to do. The stamp is canonical
+    # now, but it is the CATALOG's spelling, not the caller's — so every
+    # spelling this file queries with still has to be folded to match it. Assert
+    # that explicitly: without it, a future change that stamped the *caller's*
+    # spelling would leave every case below passing for the wrong reason.
+    print("...and it differs in case from the spellings queried below:")
+    check(
+        "stored stamp is not what the caller writes",
+        [s for s in {"MYSCHEMA", "myschema", "mYsChEmA"} if s in stamps],
+        [],
+    )
 
     both = ["v_lower", "v_upper"]
 

@@ -58,6 +58,18 @@ pub fn init_catalog(
     is_read_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if is_read_only {
+        // A read-only host cannot be migrated in place. Serving it through a
+        // legacy read path instead would mean carrying two storage shapes
+        // indefinitely, so refuse with something the operator can act on.
+        if definitions_is_legacy_shape(con)? {
+            return Err(
+                "semantic_views: this database's catalog predates schema-scoped \
+                 semantic views and the database is open read-only, so it cannot \
+                 be migrated. Open it writable once (any LOAD will migrate it), \
+                 then reopen read-only."
+                    .into(),
+            );
+        }
         return Ok(());
     }
     // FF-10: `definition` is `NOT NULL`. A SQL-NULL definition is an
@@ -66,13 +78,25 @@ pub fn init_catalog(
     // as present, so a manually-tampered NULL row can neither be read nor
     // re-created. The constraint makes that state unrepresentable for new
     // catalogs (all writes always supply a definition).
+    //
+    // The key is `(schema_name, name)`: semantic views are scoped to a schema,
+    // so two schemas may each hold a `v`. `schema_name` is a column rather than
+    // a field inside `definition` precisely so the database can enforce that —
+    // buried in the JSON it was unenforceable, and the single-column key made
+    // `CREATE SEMANTIC VIEW other.v` collide with an existing `analytics.v`.
     con.execute_batch(&format!(
         "CREATE SCHEMA IF NOT EXISTS {DEFINITIONS_SCHEMA};
          CREATE TABLE IF NOT EXISTS {DEFINITIONS_TABLE} (
-             name       VARCHAR PRIMARY KEY,
-             definition VARCHAR NOT NULL
+             schema_name VARCHAR NOT NULL,
+             name        VARCHAR NOT NULL,
+             definition  VARCHAR NOT NULL,
+             PRIMARY KEY (schema_name, name)
          );"
     ))?;
+
+    // Rebuild a pre-scoping catalog. Runs before the companion import and the
+    // AR-4 version pass so both see the current shape.
+    migrate_definitions_to_schema_scoped(con)?;
 
     // One-time migration: if a v0.1.0 companion file exists alongside the database,
     // import its contents into the table then delete the file.
@@ -105,11 +129,15 @@ pub fn init_catalog(
                     )
                 })?;
             for (name, def) in &migrated {
+                // v0.1.0 companion files predate schemas entirely — there is
+                // no schema to recover from them, so imported rows are filed
+                // where they were in fact created.
                 con.execute(
                     &format!(
-                        "INSERT OR REPLACE INTO {DEFINITIONS_TABLE} (name, definition) VALUES (?, ?)"
+                        "INSERT OR REPLACE INTO {DEFINITIONS_TABLE} \
+                         (schema_name, name, definition) VALUES (?, ?, ?)"
                     ),
-                    duckdb::params![name, def],
+                    duckdb::params![UNRECORDED_SCHEMA_FALLBACK, name, def],
                 )?;
             }
             // Delete ONLY after a fully successful import. Pre-fix the file was
@@ -135,6 +163,151 @@ pub fn init_catalog(
     upgrade_definitions_schema(con)?;
 
     Ok(())
+}
+
+/// Schema a stored definition is filed under when it records none of its own.
+///
+/// Rows written before the metadata stamp existed have no `schema_name` at all.
+/// They cannot become NULL or empty — the column is half the primary key — so
+/// they land in `main`, which is where they were in fact created.
+const UNRECORDED_SCHEMA_FALLBACK: &str = "main";
+
+/// True when `_definitions` exists but predates schema scoping.
+///
+/// "Missing table" and "legacy table" must not be confused: a database that has
+/// never held a semantic view has no table, and that is not something to
+/// migrate or refuse.
+fn definitions_is_legacy_shape(con: &Connection) -> Result<bool, Box<dyn std::error::Error>> {
+    let table_exists: i64 = con.query_row(
+        "SELECT count(*) FROM information_schema.tables \
+         WHERE table_schema = ? AND table_name = ?",
+        duckdb::params![DEFINITIONS_SCHEMA, DEFINITIONS_TABLE_NAME],
+        |r| r.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(false);
+    }
+    let has_schema_column: i64 = con.query_row(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema = ? AND table_name = ? AND column_name = 'schema_name'",
+        duckdb::params![DEFINITIONS_SCHEMA, DEFINITIONS_TABLE_NAME],
+        |r| r.get(0),
+    )?;
+    Ok(has_schema_column == 0)
+}
+
+/// The schema a legacy row should migrate into, and the definition to store
+/// with it.
+///
+/// Rows written before the metadata stamp existed record no schema at all.
+/// They land in [`UNRECORDED_SCHEMA_FALLBACK`] — and the definition is
+/// **backfilled** with the same value, so the new `schema_name` column and the
+/// `schema_name` inside the JSON (which the SHOW / DESCRIBE listings read)
+/// cannot disagree about where the view lives. Every other write keeps the two
+/// in lockstep the same way: CREATE stamps both from one expression, and a
+/// schema-moving ALTER RENAME patches both.
+///
+/// Deliberately a minimal probe rather than a full `SemanticViewDefinition`
+/// parse: a row this migration cannot fully understand must still be carried
+/// across, not dropped. Losing a definition here is unrecoverable — an
+/// unparseable row keeps its bytes verbatim and is filed under the fallback.
+fn migrated_row(json: &str) -> (String, String) {
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        schema_name: Option<String>,
+    }
+    let recorded = serde_json::from_str::<Probe>(json)
+        .ok()
+        .and_then(|p| p.schema_name)
+        .filter(|s| !s.is_empty());
+    if let Some(schema) = recorded {
+        return (schema, json.to_string());
+    }
+    let fallback = UNRECORDED_SCHEMA_FALLBACK.to_string();
+    let backfilled = backfill_schema_name(json, &fallback).unwrap_or_else(|| json.to_string());
+    (fallback, backfilled)
+}
+
+/// Insert `schema_name` into a stored definition object, returning `None` when
+/// the row is not a JSON object this can safely edit (it is then carried across
+/// byte-for-byte rather than being rewritten or dropped).
+fn backfill_schema_name(json: &str, schema: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(json).ok()?;
+    value.as_object_mut()?.insert(
+        "schema_name".to_string(),
+        serde_json::Value::String(schema.to_string()),
+    );
+    serde_json::to_string(&value).ok()
+}
+
+/// Rebuild a pre-scoping `_definitions` into the `(schema_name, name)` shape.
+///
+/// A rebuild rather than an `ALTER`: `DuckDB` cannot retrofit a primary key onto
+/// an existing table. It cannot collide — the old key made `name` globally
+/// unique, so every `(schema_name, name)` derived from it is unique too.
+///
+/// Idempotent, because `init_catalog` runs on every LOAD: a catalog already in
+/// the new shape returns immediately.
+fn migrate_definitions_to_schema_scoped(
+    con: &Connection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !definitions_is_legacy_shape(con)? {
+        return Ok(());
+    }
+
+    // The schema is derived in Rust, not by a SQL `json_extract`: bootstrap
+    // must not depend on the JSON extension being loadable, and this mirrors
+    // how `upgrade_definitions_schema` below already reads rows out.
+    let rows: Vec<(String, String)> = {
+        let mut stmt = con.prepare(&format!("SELECT name, definition FROM {DEFINITIONS_TABLE}"))?;
+        let mapped =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        mapped.collect::<Result<Vec<_>, _>>()?
+    };
+
+    let staging = format!("{DEFINITIONS_SCHEMA}.{DEFINITIONS_TABLE_NAME}__scoped");
+    let swap = |con: &Connection| -> Result<(), Box<dyn std::error::Error>> {
+        con.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {staging};
+             CREATE TABLE {staging} (
+                 schema_name VARCHAR NOT NULL,
+                 name        VARCHAR NOT NULL,
+                 definition  VARCHAR NOT NULL,
+                 PRIMARY KEY (schema_name, name)
+             );"
+        ))?;
+        for (name, definition) in &rows {
+            let (schema, definition) = migrated_row(definition);
+            con.execute(
+                &format!("INSERT INTO {staging} (schema_name, name, definition) VALUES (?, ?, ?)"),
+                duckdb::params![schema, name, definition],
+            )?;
+        }
+        con.execute_batch(&format!(
+            "DROP TABLE {DEFINITIONS_TABLE};
+             ALTER TABLE {staging} RENAME TO {DEFINITIONS_TABLE_NAME};"
+        ))?;
+        Ok(())
+    };
+
+    // One transaction: a half-swapped catalog would be worse than an
+    // unmigrated one, since the old table is dropped partway through.
+    con.execute_batch("BEGIN;")?;
+    match swap(con) {
+        Ok(()) => {
+            con.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = con.execute_batch("ROLLBACK;");
+            Err(format!(
+                "semantic_views: could not migrate the catalog to schema-scoped \
+                 storage: {e}. The existing catalog was left untouched."
+            )
+            .into())
+        }
+    }
 }
 
 /// One-time `schema_version` upgrade pass over `_definitions` (AR-4).
@@ -206,6 +379,7 @@ mod reader {
 
     use crate::catalog::DEFINITIONS_TABLE;
     use crate::ddl::read_ffi::BorrowedConnection;
+    use crate::ident::ViewRef;
 
     /// Read-side handle for `semantic_layer._definitions`.
     ///
@@ -265,25 +439,42 @@ mod reader {
         ///
         /// Returns `Ok(None)` when no row exists.
         ///
+        /// Semantic views are schema-scoped, so `view.schema` decides which
+        /// row is meant. A qualified reference matches that schema only. An
+        /// unqualified one matches on name alone and is an **error** when
+        /// several schemas hold a view of that name, rather than returning an
+        /// arbitrary one — see the note on
+        /// [`crate::catalog::writes::resolved_schema_expr`] for why this side
+        /// cannot prefer the caller's search path yet (TECH-DEBT #19/#25), and
+        /// why erroring keeps reads and DROP/ALTER agreeing on which view a
+        /// bare name means.
+        ///
         /// Phase 63: when `catalog_table_present=false` (read-only host DB
         /// without a bootstrapped `_definitions` table), short-circuits to
         /// `Ok(None)` BEFORE the unsafe FFI call. Callers see the existing
         /// "semantic view '<name>' does not exist" error path. See
         /// 63-RESEARCH.md §3 Q4.
-        pub fn lookup(&self, name: &str) -> Result<Option<String>, String> {
+        pub fn lookup(&self, view: &ViewRef) -> Result<Option<String>, String> {
             if !self.catalog_table_present {
                 return Ok(None);
             }
-            unsafe { prepared_lookup(self.conn, name) }
+            unsafe { prepared_lookup(self.conn, view) }
         }
 
-        /// Whether a view with this name exists.
-        pub fn exists(&self, name: &str) -> Result<bool, String> {
-            Ok(self.lookup(name)?.is_some())
+        /// Whether a view with this reference exists.
+        pub fn exists(&self, view: &ViewRef) -> Result<bool, String> {
+            Ok(self.lookup(view)?.is_some())
         }
 
-        /// Return `(name, definition_json)` for every registered view,
-        /// sorted by name.
+        /// Return `(name, definition_json)` for every registered view, sorted
+        /// by `(schema_name, name)`.
+        ///
+        /// The schema is not returned separately because it is also inside
+        /// `definition_json`, and the two are kept in lockstep by construction:
+        /// CREATE stamps both from one expression, the schema-scoping migration
+        /// backfills the JSON from the column, and a schema-moving ALTER RENAME
+        /// patches both. Callers can therefore read the schema off the parsed
+        /// definition without a second source of truth.
         ///
         /// Phase 63: short-circuits to `Ok(Vec::new())` when
         /// `catalog_table_present=false`.
@@ -392,17 +583,40 @@ mod reader {
 
     unsafe fn prepared_lookup(
         conn: ffi::duckdb_connection,
-        name: &str,
+        view: &ViewRef,
     ) -> Result<Option<String>, String> {
+        // `$2 IS NULL` makes the schema predicate opt-in from one prepared
+        // statement: bound, it pins the schema; NULL, the name alone selects.
+        // Both sides are folded — DuckDB matches identifiers case-insensitively
+        // and a row may carry a different case than the caller writes.
         let c_sql = CString::new(format!(
-            "SELECT definition FROM {DEFINITIONS_TABLE} WHERE name = $1"
+            "SELECT schema_name, definition FROM {DEFINITIONS_TABLE} \
+              WHERE name = $1 AND ($2 IS NULL OR lower(schema_name) = lower($2)) \
+              ORDER BY schema_name"
         ))
         .map_err(|_| "SQL contains null byte".to_string())?;
         let stmt = PreparedStmt::prepare(conn, &c_sql)?;
 
-        let c_name = CString::new(name).map_err(|_| "view name contains null byte".to_string())?;
+        let c_name = CString::new(view.name.as_str())
+            .map_err(|_| "view name contains null byte".to_string())?;
         if ffi::duckdb_bind_varchar(stmt.raw(), 1, c_name.as_ptr()) != ffi::DuckDBSuccess {
             return Err("failed to bind view name".to_string());
+        }
+        // Bound as a separate `let` so the `CString` outlives the bind call and
+        // the execution that follows, rather than being a temporary dropped at
+        // the end of the binding statement.
+        let c_schema = match view.schema.as_deref() {
+            Some(s) => {
+                Some(CString::new(s).map_err(|_| "schema name contains null byte".to_string())?)
+            }
+            None => None,
+        };
+        let bind_rc = match &c_schema {
+            Some(s) => ffi::duckdb_bind_varchar(stmt.raw(), 2, s.as_ptr()),
+            None => ffi::duckdb_bind_null(stmt.raw(), 2),
+        };
+        if bind_rc != ffi::DuckDBSuccess {
+            return Err("failed to bind schema name".to_string());
         }
 
         let mut result = QueryResult::zeroed();
@@ -416,17 +630,36 @@ mod reader {
 
         let row_count = ffi::duckdb_row_count(result.raw_mut());
         if row_count == 0 {
-            Ok(None)
-        } else {
-            Ok(read_column_string(result.raw_mut(), 0, 0))
+            return Ok(None);
         }
+        // Two rows can only mean an unqualified reference matched views in
+        // different schemas (the `(schema_name, name)` primary key rules out a
+        // duplicate within one). Naming which schemas hold it turns a silent
+        // wrong answer into an actionable one.
+        if row_count > 1 {
+            let schemas: Vec<String> = (0..row_count)
+                .filter_map(|r| read_column_string(result.raw_mut(), 0, r))
+                .collect();
+            // The suggested spelling is identifier-quoted when the name needs
+            // it, so copy-pasting it is valid SQL for a view named `my view`
+            // or `a.b` — an unquoted suggestion would be a syntax error, or
+            // worse, would parse as a different qualified name.
+            return Err(format!(
+                "semantic view '{}' is ambiguous: it exists in schemas {}. \
+                 Qualify the reference as <schema>.{}",
+                view.name,
+                schemas.join(", "),
+                crate::expand::quote_ident_if_needed(&view.name)
+            ));
+        }
+        Ok(read_column_string(result.raw_mut(), 1, 0))
     }
 
     unsafe fn execute_list_all(
         conn: ffi::duckdb_connection,
     ) -> Result<Vec<(String, String)>, String> {
         let c_sql = CString::new(format!(
-            "SELECT name, definition FROM {DEFINITIONS_TABLE} ORDER BY name"
+            "SELECT name, definition FROM {DEFINITIONS_TABLE} ORDER BY schema_name, name"
         ))
         .map_err(|_| "SQL contains null byte".to_string())?;
         let mut result = QueryResult::zeroed();
@@ -454,7 +687,7 @@ mod reader {
     /// column so error-path suggestion lookups don't pay for the JSON blobs.
     unsafe fn execute_list_names(conn: ffi::duckdb_connection) -> Result<Vec<String>, String> {
         let c_sql = CString::new(format!(
-            "SELECT name FROM {DEFINITIONS_TABLE} ORDER BY name"
+            "SELECT DISTINCT name FROM {DEFINITIONS_TABLE} ORDER BY name"
         ))
         .map_err(|_| "SQL contains null byte".to_string())?;
         let mut result = QueryResult::zeroed();
@@ -513,6 +746,271 @@ mod tests {
     #[cfg(not(feature = "extension"))]
     fn in_memory_con() -> Connection {
         Connection::open_in_memory().expect("in-memory DuckDB")
+    }
+
+    /// Schema scoping: `_definitions` gains a `schema_name` column and a
+    /// composite `(schema_name, name)` primary key, so two schemas can each
+    /// hold a view of the same name.
+    ///
+    /// The legacy shape keyed on `name` alone, which is why
+    /// `CREATE SEMANTIC VIEW other.v` reported "already exists" when
+    /// `analytics.v` was present. The schema was only ever recorded *inside*
+    /// the definition JSON, where nothing could enforce it.
+    ///
+    /// Migration is a rebuild (DuckDB cannot retrofit a primary key), and it
+    /// cannot collide: the old key made `name` globally unique, so every
+    /// `(schema_name, name)` derived from it is unique too.
+    #[cfg(not(feature = "extension"))]
+    mod schema_scoped_storage_tests {
+        use super::*;
+
+        /// Build a catalog in the pre-scoping shape.
+        fn legacy_catalog(con: &Connection) {
+            con.execute_batch(&format!(
+                "CREATE SCHEMA {DEFINITIONS_SCHEMA};
+                 CREATE TABLE {DEFINITIONS_TABLE} (
+                     name       VARCHAR PRIMARY KEY,
+                     definition VARCHAR NOT NULL
+                 );"
+            ))
+            .expect("legacy catalog");
+        }
+
+        fn insert_legacy(con: &Connection, name: &str, definition: &str) {
+            con.execute(
+                &format!("INSERT INTO {DEFINITIONS_TABLE} (name, definition) VALUES (?, ?)"),
+                duckdb::params![name, definition],
+            )
+            .expect("insert legacy row");
+        }
+
+        fn scoped_rows(con: &Connection) -> Vec<(String, String)> {
+            let mut stmt = con
+                .prepare(&format!(
+                    "SELECT schema_name, name FROM {DEFINITIONS_TABLE} ORDER BY schema_name, name"
+                ))
+                .expect("select scoped rows");
+            let mapped = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .expect("map scoped rows");
+            mapped.collect::<Result<Vec<_>, _>>().expect("collect")
+        }
+
+        #[test]
+        fn a_legacy_catalog_is_migrated_and_the_schema_comes_from_the_definition() {
+            let con = in_memory_con();
+            legacy_catalog(&con);
+            insert_legacy(&con, "v", r#"{"name":"v","schema_name":"analytics"}"#);
+
+            init_catalog(&con, ":memory:", false).expect("init_catalog migrates");
+
+            assert_eq!(
+                scoped_rows(&con),
+                vec![("analytics".to_string(), "v".to_string())]
+            );
+        }
+
+        #[test]
+        fn a_row_with_no_recorded_schema_lands_in_main() {
+            // Rows written before the metadata stamp existed have no
+            // `schema_name` at all. They must not become NULL or empty — the
+            // column is part of the key.
+            let con = in_memory_con();
+            legacy_catalog(&con);
+            insert_legacy(&con, "ancient", r#"{"name":"ancient"}"#);
+
+            init_catalog(&con, ":memory:", false).expect("init_catalog migrates");
+
+            assert_eq!(
+                scoped_rows(&con),
+                vec![("main".to_string(), "ancient".to_string())]
+            );
+        }
+
+        #[test]
+        fn a_backfilled_schema_is_written_into_the_definition_too() {
+            // The SHOW / DESCRIBE listings read `schema_name` from the stored
+            // definition, so a row that gains a column value but keeps a JSON
+            // with no schema would report blank while living in `main`. Both
+            // must say the same thing.
+            let con = in_memory_con();
+            legacy_catalog(&con);
+            insert_legacy(&con, "ancient", r#"{"name":"ancient"}"#);
+
+            init_catalog(&con, ":memory:", false).expect("init_catalog migrates");
+
+            let (schema, definition): (String, String) = con
+                .query_row(
+                    &format!(
+                        "SELECT schema_name, definition FROM {DEFINITIONS_TABLE} \
+                          WHERE name = 'ancient'"
+                    ),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("migrated row");
+            assert_eq!(schema, "main");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&definition).expect("definition stays valid JSON");
+            assert_eq!(
+                parsed
+                    .get("schema_name")
+                    .and_then(serde_json::Value::as_str),
+                Some("main"),
+                "definition must record the same schema as the column: {definition}"
+            );
+            assert_eq!(
+                parsed.get("name").and_then(serde_json::Value::as_str),
+                Some("ancient"),
+                "backfill must not disturb the rest of the definition: {definition}"
+            );
+        }
+
+        #[test]
+        fn a_row_whose_definition_is_not_json_survives_verbatim() {
+            // Dropping a row this migration cannot parse would destroy user
+            // data irrecoverably. It is filed under the fallback schema with
+            // its bytes untouched.
+            let con = in_memory_con();
+            legacy_catalog(&con);
+            insert_legacy(&con, "corrupt", "not json at all");
+
+            init_catalog(&con, ":memory:", false).expect("init_catalog migrates");
+
+            let (schema, definition): (String, String) = con
+                .query_row(
+                    &format!(
+                        "SELECT schema_name, definition FROM {DEFINITIONS_TABLE} \
+                          WHERE name = 'corrupt'"
+                    ),
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("migrated row");
+            assert_eq!(schema, "main");
+            assert_eq!(definition, "not json at all");
+        }
+
+        #[test]
+        fn migration_preserves_every_row_and_its_definition() {
+            // The rebuild drops and recreates the table; losing or corrupting a
+            // definition here destroys user data irrecoverably, so assert the
+            // payload survives byte-for-byte alongside the count.
+            let con = in_memory_con();
+            legacy_catalog(&con);
+            insert_legacy(&con, "a", r#"{"name":"a","schema_name":"s1"}"#);
+            insert_legacy(&con, "b", r#"{"name":"b","schema_name":"s2"}"#);
+            insert_legacy(&con, "c", r#"{"name":"c"}"#);
+
+            init_catalog(&con, ":memory:", false).expect("init_catalog migrates");
+
+            assert_eq!(
+                scoped_rows(&con),
+                vec![
+                    ("main".to_string(), "c".to_string()),
+                    ("s1".to_string(), "a".to_string()),
+                    ("s2".to_string(), "b".to_string()),
+                ]
+            );
+            let def: String = con
+                .query_row(
+                    &format!("SELECT definition FROM {DEFINITIONS_TABLE} WHERE name = 'a'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("definition survives");
+            assert_eq!(def, r#"{"name":"a","schema_name":"s1"}"#);
+        }
+
+        #[test]
+        fn the_composite_key_lets_two_schemas_hold_the_same_name() {
+            // The whole point. Under the old single-column key the second
+            // insert violated the primary key.
+            let con = in_memory_con();
+            init_catalog(&con, ":memory:", false).expect("fresh catalog");
+
+            for schema in ["analytics", "reporting"] {
+                con.execute(
+                    &format!(
+                        "INSERT INTO {DEFINITIONS_TABLE} (schema_name, name, definition) \
+                         VALUES (?, 'v', '{{}}')"
+                    ),
+                    duckdb::params![schema],
+                )
+                .expect("same name in a second schema");
+            }
+            assert_eq!(scoped_rows(&con).len(), 2);
+        }
+
+        #[test]
+        fn the_same_name_in_one_schema_is_still_rejected() {
+            // Over-widening guard: scoping must not weaken uniqueness WITHIN a
+            // schema, which is what the key is for.
+            let con = in_memory_con();
+            init_catalog(&con, ":memory:", false).expect("fresh catalog");
+
+            let insert = format!(
+                "INSERT INTO {DEFINITIONS_TABLE} (schema_name, name, definition) \
+                 VALUES ('analytics', 'v', '{{}}')"
+            );
+            con.execute(&insert, []).expect("first insert");
+            assert!(
+                con.execute(&insert, []).is_err(),
+                "a duplicate (schema, name) must still violate the primary key"
+            );
+        }
+
+        #[test]
+        fn migrating_is_idempotent() {
+            // init_catalog runs on every LOAD. A second pass must not rebuild
+            // an already-scoped table (and must not lose rows doing so).
+            let con = in_memory_con();
+            legacy_catalog(&con);
+            insert_legacy(&con, "v", r#"{"name":"v","schema_name":"analytics"}"#);
+
+            init_catalog(&con, ":memory:", false).expect("first");
+            init_catalog(&con, ":memory:", false).expect("second");
+
+            assert_eq!(
+                scoped_rows(&con),
+                vec![("analytics".to_string(), "v".to_string())]
+            );
+        }
+
+        #[test]
+        fn a_read_only_database_with_a_legacy_catalog_refuses_to_load() {
+            // A read-only host cannot be migrated in place, and silently
+            // serving it through a legacy path would mean two storage shapes
+            // live forever. Refuse with an actionable message instead.
+            let con = in_memory_con();
+            legacy_catalog(&con);
+            insert_legacy(&con, "v", r#"{"name":"v"}"#);
+
+            let err = init_catalog(&con, "/tmp/x.db", true)
+                .expect_err("legacy + read-only must not load");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("read-only") && msg.contains("semantic_views"),
+                "error should name the extension and the read-only cause, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn a_read_only_database_that_is_already_scoped_loads_fine() {
+            // The control: read-only is not itself an error, only read-only
+            // WITH an unmigrated catalog.
+            let con = in_memory_con();
+            init_catalog(&con, ":memory:", false).expect("scope it while writable");
+            init_catalog(&con, "/tmp/x.db", true).expect("read-only load of a scoped catalog");
+        }
+
+        #[test]
+        fn a_read_only_database_with_no_catalog_at_all_still_loads() {
+            // Control for the detection logic: "no table" must not be mistaken
+            // for "legacy table". A fresh read-only DB has never had one.
+            let con = in_memory_con();
+            init_catalog(&con, "/tmp/x.db", true).expect("read-only load with no catalog");
+        }
     }
 
     // TEMPORARY: smoke test for v0.8.0 race-guard SQL shape.
@@ -613,7 +1111,8 @@ mod tests {
             ("single_v", single),
         ] {
             con.execute(
-                "INSERT INTO semantic_layer._definitions (name, definition) VALUES (?, ?)",
+                "INSERT INTO semantic_layer._definitions (schema_name, name, definition) \
+                 VALUES ('main', ?, ?)",
                 duckdb::params![name, def],
             )
             .unwrap();
@@ -795,7 +1294,8 @@ mod tests {
 
         let json = r#"{"base_table":"orders","dimensions":[],"metrics":[]}"#;
         con.execute(
-            "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO semantic_layer._definitions (schema_name, name, definition) \
+             VALUES ('main', ?, ?)",
             duckdb::params!["orders", json],
         )
         .unwrap();
@@ -869,7 +1369,8 @@ mod tests {
             let con = Connection::open(db_path).expect("open file-backed DB (session 1)");
             init_catalog(&con, db_path, false).unwrap();
             con.execute(
-                "INSERT OR REPLACE INTO semantic_layer._definitions (name, definition) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO semantic_layer._definitions (schema_name, name, definition) \
+             VALUES ('main', ?, ?)",
                 duckdb::params!["sales", json],
             )
             .unwrap();
@@ -970,7 +1471,7 @@ mod tests {
         use crate::ddl::read_ffi::BorrowedConnection;
         let borrowed = unsafe { BorrowedConnection::new(std::ptr::null_mut()) };
         let reader = CatalogReader::new(&borrowed, false);
-        let result = reader.lookup("any_view");
+        let result = reader.lookup(&crate::ident::parse_view_ref("any_view").unwrap());
         assert!(
             matches!(result, Ok(None)),
             "expected Ok(None), got: {:?}",

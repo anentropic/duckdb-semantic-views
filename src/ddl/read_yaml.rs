@@ -18,16 +18,16 @@ use crate::catalog::CatalogReader;
 use crate::model::SemanticViewDefinition;
 use crate::render_yaml::render_yaml_export;
 
-/// Extract the bare view name from a potentially qualified name.
+/// Parse a potentially qualified view name into a reference.
 /// Supports: `"view_name"`, `"schema.view_name"`, `"database.schema.view_name"`.
 ///
-/// Delegates to [`crate::ident::normalize_view_name`] (PA-10, code-review
+/// Delegates to [`crate::ident::parse_view_ref_lenient`] (PA-10, code-review
 /// 2026-07-02): the previous naive `rsplit('.')` split inside quoted parts,
-/// so `"a.b"` resolved to `b"` instead of `a.b`. Falls back to the input
-/// verbatim when it does not parse as an identifier (legacy behaviour for
-/// malformed names — the lookup then fails with "does not exist").
-fn resolve_bare_name(input: &str) -> String {
-    crate::ident::normalize_view_name(input).unwrap_or_else(|_| input.to_string())
+/// so `"a.b"` resolved to `b"` instead of `a.b`. Malformed names fall back to
+/// an unqualified reference carrying the input verbatim, so the lookup fails
+/// with the canonical "does not exist" rather than a grammar error.
+fn resolve_view_ref(input: &str) -> crate::ident::ViewRef {
+    crate::ident::parse_view_ref_lenient(input)
 }
 
 // ---------------------------------------------------------------------------
@@ -80,14 +80,15 @@ unsafe fn read_yaml_export(
     use crate::ddl::read_ffi::{probe_catalog_table_present, read_str_arg};
 
     let raw_name = read_str_arg(name_ptr, name_len, "view name")?;
-    let bare_name = resolve_bare_name(&raw_name);
+    let view = resolve_view_ref(&raw_name);
+    let bare_name = view.name.clone();
 
     // FF-9: a probe-query failure is distinct from "no views" (propagated).
     let present = probe_catalog_table_present(borrowed)?;
     let reader = CatalogReader::new(borrowed, present);
     let json = reader
-        .lookup(&bare_name)?
-        .ok_or_else(|| crate::catalog::view_not_found_msg(&bare_name))?;
+        .lookup(&view)?
+        .ok_or_else(|| crate::catalog::view_not_found_msg(&view.to_string()))?;
     // C-2 (code-review 2026-07-11): `from_json` for the canonical
     // "invalid definition for semantic view '<name>'" context on corrupt rows.
     let def = SemanticViewDefinition::from_json(&bare_name, &json)?;
@@ -98,42 +99,72 @@ unsafe fn read_yaml_export(
 mod tests {
     use super::*;
 
+    // These assert on BOTH slots of the parsed reference. The name slot is the
+    // behaviour they have always pinned; the schema slot is what the qualifier
+    // now decides — semantic views are schema-scoped, so a qualifier is no
+    // longer discarded on the way to the lookup.
+
     #[test]
-    fn resolve_bare_name_unqualified() {
-        assert_eq!(resolve_bare_name("my_view"), "my_view");
+    fn resolve_view_ref_unqualified() {
+        let r = resolve_view_ref("my_view");
+        assert_eq!(r.name, "my_view");
+        assert_eq!(r.schema, None);
     }
 
     #[test]
-    fn resolve_bare_name_schema_qualified() {
-        assert_eq!(resolve_bare_name("main.my_view"), "my_view");
+    fn resolve_view_ref_schema_qualified() {
+        let r = resolve_view_ref("main.my_view");
+        assert_eq!(r.name, "my_view");
+        assert_eq!(r.schema.as_deref(), Some("main"));
     }
 
     #[test]
-    fn resolve_bare_name_fully_qualified() {
-        assert_eq!(resolve_bare_name("memory.main.my_view"), "my_view");
+    fn resolve_view_ref_fully_qualified() {
+        let r = resolve_view_ref("memory.main.my_view");
+        assert_eq!(r.name, "my_view");
+        assert_eq!(r.schema.as_deref(), Some("main"));
+        assert_eq!(r.database.as_deref(), Some("memory"));
     }
 
     #[test]
-    fn resolve_bare_name_empty() {
-        assert_eq!(resolve_bare_name(""), "");
+    fn resolve_view_ref_empty() {
+        // Not a well-formed identifier, so the lenient fallback carries the
+        // text verbatim and the lookup fails with the canonical "does not
+        // exist" rather than an identifier-grammar error.
+        let r = resolve_view_ref("");
+        assert_eq!(r.name, "");
+        assert_eq!(r.schema, None);
     }
 
     #[test]
-    fn resolve_bare_name_quoted_dot_not_split() {
+    fn resolve_view_ref_quoted_dot_not_split() {
         // PA-10: the old rsplit('.') split inside the quoted part.
-        assert_eq!(resolve_bare_name("\"a.b\""), "a.b");
-        assert_eq!(resolve_bare_name("main.\"my view\""), "my view");
+        let dotted = resolve_view_ref("\"a.b\"");
+        assert_eq!(dotted.name, "a.b");
+        assert_eq!(
+            dotted.schema, None,
+            "a quoted dot is part of the NAME, not a qualifier"
+        );
+        let spaced = resolve_view_ref("main.\"my view\"");
+        assert_eq!(spaced.name, "my view");
+        assert_eq!(spaced.schema.as_deref(), Some("main"));
     }
 
     #[test]
-    fn resolve_bare_name_folds_to_lowercase() {
+    fn resolve_view_ref_folds_to_lowercase() {
         // View-name lookup folds to lowercase the same way `normalize_view_name`
         // and every other lookup path does — for quoted names too. Under
         // DuckDB's identifier rule (and this project's documented view-name
         // normalization) quoting only lets a name carry special characters; it
         // does NOT preserve case. Stored view names are lowercase, so a request
         // written `"MyView"` must resolve to `myview` to find the view.
-        assert_eq!(resolve_bare_name("MyView"), "myview");
-        assert_eq!(resolve_bare_name("\"MyView\""), "myview");
+        assert_eq!(resolve_view_ref("MyView").name, "myview");
+        assert_eq!(resolve_view_ref("\"MyView\"").name, "myview");
+        // The qualifier folds on the same rule — it is matched against a stored
+        // schema name case-insensitively.
+        assert_eq!(
+            resolve_view_ref("MySchema.MyView").schema.as_deref(),
+            Some("myschema")
+        );
     }
 }

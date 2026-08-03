@@ -1,0 +1,353 @@
+# Semantic views are scoped to a schema (TECH-DEBT #25).
+#
+# The catalog table used to key definitions by `name` alone, so a schema was
+# only ever recorded as a metadata string inside the JSON definition. Two
+# consequences, both fixed here:
+#
+#   * `CREATE SEMANTIC VIEW staging.v` collided with an existing `analytics.v`
+#     — one flat namespace, so the second CREATE hit a primary-key violation
+#     for a view that, by name, did not exist;
+#   * a `schema.` qualifier on CREATE / DROP / ALTER was PARSED and then
+#     DISCARDED, so `CREATE SEMANTIC VIEW analytics.v` silently filed the view
+#     under whatever `current_schema()` happened to be.
+#
+# `_definitions` now keys on `(schema_name, name)` and the qualifier decides
+# which schema a statement means.
+#
+# The sqllogictest runner halts a file at its first failing statement, so the
+# per-case red proof for the SQL builders is at the unit layer
+# (`catalog::writes::tests`, `ident::tests::parse_view_ref_tests`,
+# `parse::rewrite::tests`). This file covers what those cannot: the whole
+# extension-load -> DDL -> query path against a real catalog.
+
+require semantic_views
+
+statement ok
+CREATE SCHEMA analytics;
+
+statement ok
+CREATE SCHEMA staging;
+
+statement ok
+CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO orders VALUES (1, 100, 'north'), (2, 250, 'south');
+
+# ============================================================
+# 1. The same name in two schemas — the case the flat key made
+#    impossible.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW analytics.sales AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+statement ok
+CREATE SEMANTIC VIEW staging.sales AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS COUNT(*));
+
+query TT rowsort
+SELECT schema_name, name FROM semantic_layer._definitions
+----
+analytics	sales
+staging	sales
+
+# The qualifier decides where the row lands — it is not the current schema.
+# `current_schema()` is `main` throughout this file.
+query T
+SELECT count(*) FROM semantic_layer._definitions WHERE schema_name = 'main'
+----
+0
+
+# ...and it reaches the stored definition too, so SHOW agrees with the column.
+query TT rowsort
+SELECT schema_name, name FROM list_semantic_views()
+----
+analytics	sales
+staging	sales
+
+# A bare source table in the body still means the CREATING SESSION's schema,
+# not the view's. `orders` lives in `main`; both views live elsewhere and read
+# it fine. This is DuckDB's rule for a view body, and it is what makes "put the
+# semantic views in their own schema" usable at all.
+query I
+SELECT total FROM semantic_view('analytics.sales', metrics := ['total'])
+----
+350
+
+# ...and `IN SCHEMA` finds them where their names say they are. This is the
+# symptom that opened this whole item: the qualifier was parsed and discarded,
+# so `CREATE SEMANTIC VIEW analytics.sales` filed the view under `main` and
+# `IN SCHEMA analytics` returned nothing. Asserted through the `_all` listing
+# because it leads with database/schema columns, where `list_semantic_views`
+# leads with a live `created_on` that cannot be written down.
+query TTTTTTTT rowsort
+SHOW SEMANTIC METRICS IN SCHEMA analytics
+----
+memory	analytics	sales	orders	total	(empty)	[]	(empty)
+
+# ============================================================
+# 2. A qualified reference reads the view it names.
+# ============================================================
+
+query I
+SELECT total FROM semantic_view('analytics.sales', metrics := ['total'])
+----
+350
+
+query I
+SELECT total FROM semantic_view('staging.sales', metrics := ['total'])
+----
+2
+
+# ============================================================
+# 3. An unqualified reference to an ambiguous name is an error,
+#    not an arbitrary pick.
+# ============================================================
+
+statement error
+SELECT total FROM semantic_view('sales', metrics := ['total'])
+----
+is ambiguous
+
+statement error
+DESCRIBE SEMANTIC VIEW sales
+----
+is ambiguous
+
+statement error
+DROP SEMANTIC VIEW sales
+----
+is ambiguous
+
+# IF EXISTS does not absorb ambiguity. It means "do not complain if the view is
+# absent" — an ambiguous name is not absent, and silently dropping one of two
+# would be the wrong-view-deleted case IF EXISTS was never meant to license.
+statement error
+DROP SEMANTIC VIEW IF EXISTS sales
+----
+is ambiguous
+
+statement error
+ALTER SEMANTIC VIEW IF EXISTS sales SET COMMENT = 'x'
+----
+is ambiguous
+
+# Both views are still there — the errors above changed nothing.
+query I
+SELECT count(*) FROM semantic_layer._definitions
+----
+2
+
+# A genuinely absent view keeps IF EXISTS's silent no-op.
+statement ok
+DROP SEMANTIC VIEW IF EXISTS no_such_view
+
+# ============================================================
+# 4. An unqualified reference to a name only one schema holds
+#    still resolves — the common case is unchanged.
+# ============================================================
+
+statement ok
+DROP SEMANTIC VIEW staging.sales;
+
+query I
+SELECT total FROM semantic_view('sales', metrics := ['total'])
+----
+350
+
+query I
+SELECT count(*) FROM semantic_layer._definitions
+----
+1
+
+# The DROP took the view it named and left the other one alone.
+query TT
+SELECT schema_name, name FROM semantic_layer._definitions
+----
+analytics	sales
+
+# ============================================================
+# 5. Naming a schema that does not exist is an error, not a
+#    silent fallback to the current schema.
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW nosuch.v AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  METRICS (o.total AS SUM(o.amount));
+----
+schema 'nosuch' does not exist
+
+# ============================================================
+# 6. A qualified miss names the schema the caller asked for,
+#    instead of a bare name that exists elsewhere.
+# ============================================================
+
+statement error
+DROP SEMANTIC VIEW staging.sales
+----
+semantic view 'staging.sales' does not exist
+
+# ============================================================
+# 7. ALTER honours the qualifier, and a qualified RENAME TO
+#    moves the view between schemas.
+# ============================================================
+
+statement ok
+ALTER SEMANTIC VIEW analytics.sales SET COMMENT = 'scoped';
+
+query T
+SELECT comment FROM list_semantic_views() WHERE name = 'sales'
+----
+scoped
+
+statement ok
+ALTER SEMANTIC VIEW analytics.sales RENAME TO staging.revenue;
+
+query TT
+SELECT schema_name, name FROM semantic_layer._definitions
+----
+staging	revenue
+
+# An unqualified RENAME TO leaves the view where it is.
+statement ok
+ALTER SEMANTIC VIEW staging.revenue RENAME TO income;
+
+query TT
+SELECT schema_name, name FROM semantic_layer._definitions
+----
+staging	income
+
+# ============================================================
+# 8. Schema names match case-insensitively, like every other
+#    DuckDB identifier, and are stored in the catalog's own
+#    spelling rather than the caller's.
+# ============================================================
+
+query I
+SELECT total FROM semantic_view('STAGING.income', metrics := ['total'])
+----
+350
+
+statement ok
+CREATE SCHEMA "MixedCase";
+
+statement ok
+CREATE SEMANTIC VIEW mixedcase.v AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  METRICS (o.total AS SUM(o.amount));
+
+# Written `mixedcase`, stored `MixedCase` — the catalog's spelling wins, so the
+# primary key cannot hold two rows for one schema.
+query T
+SELECT schema_name FROM semantic_layer._definitions WHERE name = 'v'
+----
+MixedCase
+
+# ============================================================
+# 9. CREATE OR REPLACE / IF NOT EXISTS act within the target
+#    schema only.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW analytics.v AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  METRICS (o.total AS COUNT(*));
+
+query I
+SELECT count(*) FROM semantic_layer._definitions WHERE name = 'v'
+----
+2
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW analytics.v AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  METRICS (o.total AS SUM(o.amount));
+
+# Still two rows: the REPLACE hit `analytics.v` and left `MixedCase.v` alone.
+query I
+SELECT count(*) FROM semantic_layer._definitions WHERE name = 'v'
+----
+2
+
+query I
+SELECT total FROM semantic_view('analytics.v', metrics := ['total'])
+----
+350
+
+statement ok
+CREATE SEMANTIC VIEW IF NOT EXISTS analytics.v AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  METRICS (o.total AS COUNT(*));
+
+query I
+SELECT total FROM semantic_view('analytics.v', metrics := ['total'])
+----
+350
+
+# A plain CREATE over an occupied (schema, name) is still the friendly error.
+statement error
+CREATE SEMANTIC VIEW analytics.v AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  METRICS (o.total AS COUNT(*));
+----
+already exists
+
+# ============================================================
+# 10. A four-part name is rejected rather than truncated to its
+#     last part.
+# ============================================================
+
+statement error
+DROP SEMANTIC VIEW a.b.c.d
+----
+too many identifier parts
+
+# ============================================================
+# 11. A <database>. prefix must name the current database.
+#
+# Semantic views are single-catalog, so a statement naming another
+# database cannot be honoured — and must not be quietly applied to
+# this one, which is what dropping the prefix would do.
+# ============================================================
+
+# The current database spelled out is fine, case-insensitively.
+statement ok
+CREATE SEMANTIC VIEW MEMORY.analytics.qualified_ok AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  METRICS (o.total AS SUM(o.amount));
+
+query TT
+SELECT schema_name, name FROM semantic_layer._definitions WHERE name = 'qualified_ok'
+----
+analytics	qualified_ok
+
+statement error
+CREATE SEMANTIC VIEW otherdb.analytics.v2 AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  METRICS (o.total AS SUM(o.amount));
+----
+single-catalog
+
+statement error
+DROP SEMANTIC VIEW otherdb.analytics.qualified_ok
+----
+single-catalog
+
+# The view named above is untouched — the guard ran before the DELETE.
+query I
+SELECT count(*) FROM semantic_layer._definitions WHERE name = 'qualified_ok'
+----
+1
+
+# A RENAME's TARGET is checked too, not only its source.
+statement error
+ALTER SEMANTIC VIEW analytics.qualified_ok RENAME TO otherdb.analytics.moved
+----
+single-catalog

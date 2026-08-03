@@ -167,18 +167,31 @@ FROM semantic_view('orders_sv', metrics := ['total']);
 300.00
 
 # ------------------------------------------------------------------------
-# QID-06 — error messages reference the unquoted bare name
+# QID-06 — error messages reference the UNQUOTED reference
 # ------------------------------------------------------------------------
+#
+# The point of these two is that no quote characters leak into the message.
+# Since semantic views became schema-scoped the message also carries the
+# qualifier, because the qualifier now decides which view was looked for: a
+# bare `nonexistent_view` would name something that could well exist in
+# another schema. The unqualified spelling still reports the bare name (the
+# case just below).
 
-# DESCRIBE on missing view — error says 'nonexistent_view', NOT the quoted form
+# DESCRIBE on missing view — unquoted, and naming the schema searched
 statement error
 DESCRIBE SEMANTIC VIEW "memory"."main"."nonexistent_view";
 ----
-semantic view 'nonexistent_view' does not exist
+semantic view 'memory.main.nonexistent_view' does not exist
 
 # DROP on missing view — same shape
 statement error
 DROP SEMANTIC VIEW "memory"."main"."nonexistent_view";
+----
+semantic view 'memory.main.nonexistent_view' does not exist
+
+# An unqualified reference reports the bare name, unchanged.
+statement error
+DROP SEMANTIC VIEW nonexistent_view;
 ----
 semantic view 'nonexistent_view' does not exist
 
