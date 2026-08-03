@@ -88,12 +88,13 @@ unsafe fn get_ddl(
     // identifier is looked up verbatim and fails with the canonical message.
     let view = crate::ident::parse_view_ref_lenient(&raw_name);
     let name = view.name.clone();
+    let search_path: Vec<String> = Vec::new();
 
     // FF-9: a probe-query failure is distinct from "no views" (propagated).
     let present = probe_catalog_table_present(borrowed)?;
     let reader = CatalogReader::new(borrowed, present);
     let json = reader
-        .lookup(&view)?
+        .lookup(&view, &search_path)?
         .ok_or_else(|| crate::catalog::view_not_found_msg(&view.to_string()))?;
     // C-2: `from_json` for the canonical "invalid definition for semantic
     // view '<name>'" context on corrupt rows.

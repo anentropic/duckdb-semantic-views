@@ -454,16 +454,20 @@ mod reader {
         /// `Ok(None)` BEFORE the unsafe FFI call. Callers see the existing
         /// "semantic view '<name>' does not exist" error path. See
         /// 63-RESEARCH.md §3 Q4.
-        pub fn lookup(&self, view: &ViewRef) -> Result<Option<String>, String> {
+        pub fn lookup(
+            &self,
+            view: &ViewRef,
+            search_path: &[String],
+        ) -> Result<Option<String>, String> {
             if !self.catalog_table_present {
                 return Ok(None);
             }
-            unsafe { prepared_lookup(self.conn, view) }
+            unsafe { prepared_lookup(self.conn, view, search_path) }
         }
 
         /// Whether a view with this reference exists.
-        pub fn exists(&self, view: &ViewRef) -> Result<bool, String> {
-            Ok(self.lookup(view)?.is_some())
+        pub fn exists(&self, view: &ViewRef, search_path: &[String]) -> Result<bool, String> {
+            Ok(self.lookup(view, search_path)?.is_some())
         }
 
         /// Return `(name, definition_json)` for every registered view, sorted
@@ -584,11 +588,14 @@ mod reader {
     unsafe fn prepared_lookup(
         conn: ffi::duckdb_connection,
         view: &ViewRef,
+        search_path: &[String],
     ) -> Result<Option<String>, String> {
         // `$2 IS NULL` makes the schema predicate opt-in from one prepared
-        // statement: bound, it pins the schema; NULL, the name alone selects.
-        // Both sides are folded — DuckDB matches identifiers case-insensitively
-        // and a row may carry a different case than the caller writes.
+        // statement: bound, it pins the schema; NULL, the name alone selects
+        // every schema's view of that name and `resolve_in_search_path`
+        // decides between them. Both sides are folded — DuckDB matches
+        // identifiers case-insensitively and a row may carry a different case
+        // than the caller writes.
         let c_sql = CString::new(format!(
             "SELECT schema_name, definition FROM {DEFINITIONS_TABLE} \
               WHERE name = $1 AND ($2 IS NULL OR lower(schema_name) = lower($2)) \
@@ -628,31 +635,22 @@ mod reader {
             ));
         }
 
+        // Collect every candidate and let the pure rule pick. More than one row
+        // can only mean an unqualified reference matched views in different
+        // schemas — the `(schema_name, name)` primary key rules out duplicates
+        // within one.
         let row_count = ffi::duckdb_row_count(result.raw_mut());
-        if row_count == 0 {
-            return Ok(None);
+        let mut rows: Vec<(String, String)> =
+            Vec::with_capacity(usize::try_from(row_count).unwrap_or(0));
+        for r in 0..row_count {
+            let schema = read_column_string(result.raw_mut(), 0, r).unwrap_or_default();
+            let Some(definition) = read_column_string(result.raw_mut(), 1, r) else {
+                continue;
+            };
+            rows.push((schema, definition));
         }
-        // Two rows can only mean an unqualified reference matched views in
-        // different schemas (the `(schema_name, name)` primary key rules out a
-        // duplicate within one). Naming which schemas hold it turns a silent
-        // wrong answer into an actionable one.
-        if row_count > 1 {
-            let schemas: Vec<String> = (0..row_count)
-                .filter_map(|r| read_column_string(result.raw_mut(), 0, r))
-                .collect();
-            // The suggested spelling is identifier-quoted when the name needs
-            // it, so copy-pasting it is valid SQL for a view named `my view`
-            // or `a.b` — an unquoted suggestion would be a syntax error, or
-            // worse, would parse as a different qualified name.
-            return Err(format!(
-                "semantic view '{}' is ambiguous: it exists in schemas {}. \
-                 Qualify the reference as <schema>.{}",
-                view.name,
-                schemas.join(", "),
-                crate::expand::quote_ident_if_needed(&view.name)
-            ));
-        }
-        Ok(read_column_string(result.raw_mut(), 1, 0))
+        crate::catalog::resolve_in_search_path(view, &rows, search_path)
+            .map(|opt| opt.map(ToString::to_string))
     }
 
     unsafe fn execute_list_all(
@@ -714,11 +712,197 @@ mod reader {
 #[cfg(feature = "extension")]
 pub use reader::CatalogReader;
 
+/// Pick which of the rows a bare view name matched is the one the reference
+/// means, following `DuckDB`'s search-path rule: the first schema on the path
+/// that holds a view of that name wins.
+///
+/// Split out of the FFI lookup so the rule is unit-testable without a
+/// connection — the reader does the I/O, this decides.
+///
+/// `rows` is every `(schema_name, definition)` the name matched, and
+/// `search_path` the caller's resolution order (see
+/// [`crate::parse::SEARCH_PATH_SQL`] for how it reaches the read side).
+///
+/// Two cases are not a plain first-match:
+///
+/// * **The name exists, but in no schema on the path.** `DuckDB` treats that
+///   as "does not exist", and so do we — but the error says where it *does*
+///   live, because "does not exist" for a view that `SHOW SEMANTIC VIEWS`
+///   plainly lists is otherwise baffling.
+/// * **No search path was supplied at all.** That means the call did not come
+///   through the parser override — a directly-invoked table function, or SQL
+///   emitted before injection existed. Falling back to "the unique match, or an
+///   ambiguity error" keeps such calls working and never picks arbitrarily.
+///
+/// # Errors
+///
+/// Returns `Err` when the name cannot be resolved to exactly one view and
+/// picking one would be a guess.
+pub(crate) fn resolve_in_search_path<'a>(
+    view: &crate::ident::ViewRef,
+    rows: &'a [(String, String)],
+    search_path: &[String],
+) -> Result<Option<&'a str>, String> {
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    // A qualified reference is already filtered to its schema by the query, and
+    // `(schema_name, name)` is a primary key, so at most one row can come back.
+    if view.schema.is_some() || rows.len() == 1 {
+        return Ok(Some(rows[0].1.as_str()));
+    }
+    if search_path.is_empty() {
+        let schemas: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
+        return Err(format!(
+            "semantic view '{}' is ambiguous: it exists in schemas {}. \
+             Qualify the reference as <schema>.{}",
+            view.name,
+            schemas.join(", "),
+            crate::expand::quote_ident_if_needed(&view.name)
+        ));
+    }
+    for candidate in search_path {
+        if let Some((_, definition)) = rows
+            .iter()
+            .find(|(schema, _)| crate::ident::ident_matches(schema, candidate))
+        {
+            return Ok(Some(definition.as_str()));
+        }
+    }
+    let schemas: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
+    Err(format!(
+        "semantic view '{}' does not exist on the search path. It exists in \
+         schemas {}, none of which are on the current search path ({}). \
+         Qualify the reference as <schema>.{}, or add the schema to search_path.",
+        view.name,
+        schemas.join(", "),
+        search_path.join(", "),
+        crate::expand::quote_ident_if_needed(&view.name)
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(not(feature = "extension"))]
     use duckdb::Connection;
+
+    mod search_path_resolution_tests {
+        use super::*;
+        use crate::ident::parse_view_ref;
+
+        fn rows(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(s, d)| ((*s).to_string(), (*d).to_string()))
+                .collect()
+        }
+
+        #[test]
+        fn no_rows_is_not_found() {
+            let r =
+                resolve_in_search_path(&parse_view_ref("v").unwrap(), &[], &["main".to_string()]);
+            assert_eq!(r.unwrap(), None);
+        }
+
+        #[test]
+        fn first_schema_on_the_path_wins() {
+            // The whole point of the rule: `b` is earlier on the path, so
+            // `b.v` is what a bare `v` means — even though `a` sorts first.
+            let all = rows(&[("a", "DEF_A"), ("b", "DEF_B")]);
+            let path = ["b".to_string(), "a".to_string()];
+            let got = resolve_in_search_path(&parse_view_ref("v").unwrap(), &all, &path).unwrap();
+            assert_eq!(got, Some("DEF_B"));
+        }
+
+        #[test]
+        fn path_order_decides_not_row_order() {
+            // Same rows, reversed path: the answer must flip. This is what
+            // separates real search-path resolution from "pick the first row".
+            let all = rows(&[("a", "DEF_A"), ("b", "DEF_B")]);
+            let got = resolve_in_search_path(
+                &parse_view_ref("v").unwrap(),
+                &all,
+                &["a".to_string(), "b".to_string()],
+            )
+            .unwrap();
+            assert_eq!(got, Some("DEF_A"));
+        }
+
+        #[test]
+        fn schema_matching_is_case_insensitive() {
+            // The stored spelling is the catalog's; the path carries whatever
+            // the caller's USE / SET wrote.
+            let all = rows(&[("MySchema", "DEF")]);
+            let got = resolve_in_search_path(
+                &parse_view_ref("v").unwrap(),
+                &all,
+                &["MYSCHEMA".to_string()],
+            )
+            .unwrap();
+            assert_eq!(got, Some("DEF"));
+        }
+
+        #[test]
+        fn a_single_match_resolves_without_consulting_the_path() {
+            // The overwhelmingly common case: one view of that name anywhere.
+            // It resolves even if its schema is not on the path, which keeps
+            // pre-existing single-schema setups working unchanged.
+            let all = rows(&[("analytics", "DEF")]);
+            let got =
+                resolve_in_search_path(&parse_view_ref("v").unwrap(), &all, &["main".to_string()])
+                    .unwrap();
+            assert_eq!(got, Some("DEF"));
+        }
+
+        #[test]
+        fn several_matches_none_on_the_path_is_an_actionable_error() {
+            let all = rows(&[("a", "DEF_A"), ("b", "DEF_B")]);
+            let err =
+                resolve_in_search_path(&parse_view_ref("v").unwrap(), &all, &["main".to_string()])
+                    .unwrap_err();
+            assert!(err.contains("does not exist on the search path"), "{err}");
+            // Naming where it DOES live is the difference between a baffling
+            // error and one the reader can act on.
+            assert!(err.contains("a, b"), "must say where it lives: {err}");
+            assert!(err.contains("main"), "must say what the path was: {err}");
+        }
+
+        #[test]
+        fn a_qualified_reference_takes_the_row_it_was_given() {
+            // The query already filtered to the named schema, and
+            // (schema_name, name) is a key, so the path is irrelevant here.
+            let all = rows(&[("staging", "DEF")]);
+            let got = resolve_in_search_path(
+                &parse_view_ref("staging.v").unwrap(),
+                &all,
+                &["main".to_string()],
+            )
+            .unwrap();
+            assert_eq!(got, Some("DEF"));
+        }
+
+        #[test]
+        fn without_a_search_path_ambiguity_is_still_an_error() {
+            // No path means the call bypassed the parser override — a directly
+            // invoked table function, or SQL emitted before injection existed.
+            // Guessing would be wrong; the pre-injection rule still applies.
+            let all = rows(&[("a", "DEF_A"), ("b", "DEF_B")]);
+            let err = resolve_in_search_path(&parse_view_ref("v").unwrap(), &all, &[]).unwrap_err();
+            assert!(err.contains("is ambiguous"), "{err}");
+            assert!(err.contains("a, b"), "{err}");
+        }
+
+        #[test]
+        fn the_suggested_name_is_quoted_when_it_needs_to_be() {
+            // Same copy-pasteability rule as the write side (PR #186 review):
+            // an unquoted `<schema>.a.b` would parse as a three-part name.
+            let all = rows(&[("a", "DEF_A"), ("b", "DEF_B")]);
+            let err =
+                resolve_in_search_path(&parse_view_ref("\"a.b\"").unwrap(), &all, &[]).unwrap_err();
+            assert!(err.contains(r#"<schema>."a.b""#), "{err}");
+        }
+    }
 
     #[test]
     fn definitions_table_const_is_consistent() {
@@ -1471,7 +1655,7 @@ mod tests {
         use crate::ddl::read_ffi::BorrowedConnection;
         let borrowed = unsafe { BorrowedConnection::new(std::ptr::null_mut()) };
         let reader = CatalogReader::new(&borrowed, false);
-        let result = reader.lookup(&crate::ident::parse_view_ref("any_view").unwrap());
+        let result = reader.lookup(&crate::ident::parse_view_ref("any_view").unwrap(), &[]);
         assert!(
             matches!(result, Ok(None)),
             "expected Ok(None), got: {:?}",

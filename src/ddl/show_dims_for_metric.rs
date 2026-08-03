@@ -83,10 +83,11 @@ unsafe fn show_dims_for_metric(
     let view = crate::ident::parse_view_ref(&view_name)
         .map_err(|e| format!("Invalid view name '{view_name}': {e}"))?;
     let view_name = view.name.clone();
+    let search_path: Vec<String> = Vec::new();
 
     let present = probe_catalog_table_present(borrowed)?;
     let reader = CatalogReader::new(borrowed, present);
-    let Some(json) = reader.lookup(&view)? else {
+    let Some(json) = reader.lookup(&view, &search_path)? else {
         let available = reader.list_names().unwrap_or_default();
         let not_found = crate::catalog::view_not_found_msg(&view.to_string());
         return Err(match suggest_closest(&view_name, &available) {
