@@ -134,7 +134,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known limitations
 
-- Multi-grain queries whose metrics include a **window metric**, an **active semi-additive metric** (a `NON ADDITIVE BY` whose snapshot dimension is not itself queried), or **role-playing (`USING`) resolution** keep raising the fan-trap error: those strategies emit their own base-anchored CTEs. Query such metrics at a single grain.
 - A **dimension below a metric's own grain** (`SUM(customers.balance)` grouped by an order-grain dimension) remains an error in both engines: the metric's rows genuinely fan across the dimension's values, so there is no single correct value per group. Snowflake likewise requires dimensions to be reachable from a metric's table through many-to-one relationships.
 
 ## [0.11.0] - 2026-07-20
