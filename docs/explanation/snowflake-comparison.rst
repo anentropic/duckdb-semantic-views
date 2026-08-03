@@ -420,7 +420,9 @@ Schema Scoping and Name Resolution
 
 Both systems scope a semantic view to a schema, so ``analytics.sales`` and ``staging.sales`` are two different views and a ``<schema>.`` qualifier on ``CREATE`` / ``DROP`` / ``ALTER`` decides which one a statement means.
 
-Where they differ is what an **unqualified** reference means. Snowflake resolves it through the session's current database and schema. DuckDB Semantic Views resolves it to the one view of that name when exactly one exists, and raises an error naming the candidate schemas when several do -- rather than silently picking one. The read-side table functions bind on a connection that does not carry the caller's search path or current schema, so preferring one would make ``DROP SEMANTIC VIEW v`` and ``semantic_view('v')`` disagree about which ``v`` they mean. Qualify the reference when more than one schema holds the name.
+Where they differ is how an **unqualified** reference is resolved. Snowflake uses the session's current database and schema; DuckDB Semantic Views uses DuckDB's own rule, the session ``search_path`` -- the first schema on it holding a view of that name wins, so ``SET search_path = 'staging'`` makes a bare ``sales`` mean ``staging.sales``. A view that is the only one of its name resolves whether or not its schema is on the path.
+
+A name that exists only in schemas *off* the path is a miss. The error names the schemas it does live in and the path that was searched, rather than reporting a bare "does not exist" for a view ``SHOW SEMANTIC VIEWS`` plainly lists.
 
 Two DuckDB-specific consequences:
 
