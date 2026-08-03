@@ -712,6 +712,23 @@ mod reader {
 #[cfg(feature = "extension")]
 pub use reader::CatalogReader;
 
+/// The schemas holding a name, sorted, for the two "which one did you mean"
+/// errors below.
+///
+/// Sorted here rather than relied on from the query. The reader's lookup does
+/// carry `ORDER BY schema_name`, so these messages are not unstable today — but
+/// [`resolve_in_search_path`] is a pure function whose signature promises
+/// nothing about row order, and the write side sorts explicitly
+/// (`string_agg(… ORDER BY schema_name)`). Depending on a caller's `ORDER BY`
+/// that nothing here enforces is the kind of coupling that breaks quietly when
+/// the query is next edited. (Raised by review on PR #187.)
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
+fn candidate_schemas(rows: &[(String, String)]) -> String {
+    let mut schemas: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
+    schemas.sort_unstable();
+    schemas.join(", ")
+}
+
 /// Pick which of the rows a bare view name matched is the one the reference
 /// means, following `DuckDB`'s search-path rule: the first schema on the path
 /// that holds a view of that name wins.
@@ -757,12 +774,11 @@ pub(crate) fn resolve_in_search_path<'a>(
         return Ok(Some(rows[0].1.as_str()));
     }
     if search_path.is_empty() {
-        let schemas: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
         return Err(format!(
             "semantic view '{}' is ambiguous: it exists in schemas {}. \
              Qualify the reference as <schema>.{}",
             view.name,
-            schemas.join(", "),
+            candidate_schemas(rows),
             crate::expand::quote_ident_if_needed(&view.name)
         ));
     }
@@ -774,13 +790,12 @@ pub(crate) fn resolve_in_search_path<'a>(
             return Ok(Some(definition.as_str()));
         }
     }
-    let schemas: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
     Err(format!(
         "semantic view '{}' does not exist on the search path. It exists in \
          schemas {}, none of which are on the current search path ({}). \
          Qualify the reference as <schema>.{}, or add the schema to search_path.",
         view.name,
-        schemas.join(", "),
+        candidate_schemas(rows),
         search_path.join(", "),
         crate::expand::quote_ident_if_needed(&view.name)
     ))
@@ -832,6 +847,40 @@ mod tests {
             )
             .unwrap();
             assert_eq!(got, Some("DEF_A"));
+        }
+
+        // Both error paths name the candidate schemas, and both sort them
+        // before doing so. The reader's query does carry `ORDER BY
+        // schema_name`, so these are not flaky today — but this is a pure
+        // function whose signature promises nothing about row order, and the
+        // write side sorts explicitly (`string_agg(… ORDER BY schema_name)`).
+        // Depending on a caller's ORDER BY that nothing here enforces is the
+        // kind of coupling that breaks silently when the query is edited.
+        // (Raised by review on PR #187.)
+
+        #[test]
+        fn the_ambiguity_error_names_schemas_in_a_stable_order() {
+            let all = rows(&[("staging", "DEF_S"), ("analytics", "DEF_A")]);
+            let err = resolve_in_search_path(&parse_view_ref("v").unwrap(), &all, &[]).unwrap_err();
+            assert!(
+                err.contains("schemas analytics, staging"),
+                "schemas must be sorted regardless of row order: {err}"
+            );
+        }
+
+        #[test]
+        fn the_off_path_error_names_schemas_in_a_stable_order() {
+            let all = rows(&[("staging", "DEF_S"), ("analytics", "DEF_A")]);
+            let err = resolve_in_search_path(
+                &parse_view_ref("v").unwrap(),
+                &all,
+                &["elsewhere".to_string()],
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("schemas analytics, staging"),
+                "schemas must be sorted regardless of row order: {err}"
+            );
         }
 
         #[test]

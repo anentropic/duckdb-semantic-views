@@ -121,14 +121,19 @@ pub(crate) fn resolved_schema_expr(
     match target {
         SchemaTarget::Named(schema) => format!("'{schema}'"),
         SchemaTarget::Unqualified => {
-            let path = format!(
-                "list_transform({}, s -> lower(s))",
-                crate::parse::search_path::SEARCH_PATH_SQL
-            );
+            // The path twice over, and the difference matters. `folded` is for
+            // matching — identifiers compare case-insensitively, and a row may
+            // carry a different case than the path entry. `path` is what the
+            // caller configured, and is what the message shows: reporting
+            // `(analytics)` to someone who wrote `SET search_path = 'Analytics'`
+            // names a path they did not set, and disagrees with the read side,
+            // which prints its input verbatim.
+            let path = crate::parse::search_path::SEARCH_PATH_SQL;
+            let folded = format!("list_transform({path}, s -> lower(s))");
             // 1-based position of a row's schema on the path, or NULL when the
             // schema is not on it. `count(rank)` therefore counts the reachable
             // candidates, and `arg_min` over it picks the earliest.
-            let rank = format!("list_position({path}, lower(schema_name))");
+            let rank = format!("list_position({folded}, lower(schema_name))");
             format!(
                 "(SELECT CASE \
                      WHEN count(*) <= 1 THEN min(schema_name) \
@@ -640,6 +645,18 @@ mod tests {
         assert!(
             e.contains("or add the schema to search_path"),
             "the error must offer the other remedy too: {e}"
+        );
+        // The path is shown as the caller spelled it. Folding is a matching
+        // concern: reporting `(analytics)` to someone who wrote
+        // `SET search_path = 'Analytics'` describes a path they did not
+        // configure, and disagrees with the read side, which prints its input
+        // verbatim. (Raised by review on PR #187.)
+        assert!(
+            e.contains(&format!(
+                "array_to_string({}, ', ')",
+                crate::parse::search_path::SEARCH_PATH_SQL
+            )),
+            "the message must render the unfolded path: {e}"
         );
     }
 

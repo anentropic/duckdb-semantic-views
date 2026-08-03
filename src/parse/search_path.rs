@@ -122,6 +122,28 @@ fn matching_close_paren(sql: &str, open: usize) -> Option<usize> {
     None
 }
 
+/// True when this call's own argument list already names `search_path` as a
+/// named parameter.
+///
+/// A plain `contains("search_path")` over the argument text was wrong twice
+/// over. It missed a caller's `SEARCH_PATH := …` — SQL named parameters are
+/// case-insensitive, so that *is* the same argument, and appending a second one
+/// yields a duplicate-parameter error rather than the resolution asked for. And
+/// it treated a view whose name merely contains the text —
+/// `semantic_view('my_search_path_view')` — as if the argument were present,
+/// silently skipping injection for exactly those views.
+///
+/// Looking for the identifier followed by `:=` gets both right:
+/// [`crate::expr_tokens::scan_references`] already skips literal content and
+/// folds case through the project's one identifier-match rule, so a
+/// `where_clause` predicate mentioning `search_path` is literal text here, not
+/// an argument.
+fn has_search_path_argument(args: &str) -> bool {
+    crate::expr_tokens::scan_references(args)
+        .into_iter()
+        .any(|r| r.key() == "search_path" && args[r.end..].trim_start().starts_with(":="))
+}
+
 /// Append `search_path := …` to every resolving read-function call in `sql`.
 ///
 /// Returns the input untouched (as `Cow::Borrowed`) when there is nothing to
@@ -154,9 +176,9 @@ pub(crate) fn inject_search_path(sql: &str) -> Cow<'_, str> {
         let Some(close) = matching_close_paren(sql, open) else {
             continue;
         };
-        // An explicit `search_path` inside this call's own argument list means
-        // the caller (or an earlier pass) already supplied one.
-        if sql[open..close].contains("search_path") {
+        // An explicit `search_path` named argument in this call's own list
+        // means the caller (or an earlier pass) already supplied one.
+        if has_search_path_argument(&sql[open..close]) {
             continue;
         }
         insert_at.push(close);
@@ -285,6 +307,50 @@ mod tests {
         assert!(
             matches!(inject_search_path(sql), Cow::Borrowed(_)),
             "an explicit path must not be overridden: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_caller_supplied_search_path_wins_whatever_its_case() {
+        // SQL named parameters are case-insensitive, so this IS the same
+        // argument. Appending a second one produces a duplicate-parameter
+        // error rather than the resolution the caller asked for.
+        // (Raised by review on PR #187.)
+        for sql in [
+            "SELECT * FROM semantic_view('v', SEARCH_PATH := ['analytics'])",
+            "SELECT * FROM semantic_view('v', Search_Path := ['analytics'])",
+        ] {
+            assert!(
+                matches!(inject_search_path(sql), Cow::Borrowed(_)),
+                "an explicit path must not be overridden: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_view_name_that_merely_contains_the_parameter_text_is_still_injected() {
+        // The argument-present check must look for the named parameter, not for
+        // the text anywhere in the call: a view legitimately named
+        // `my_search_path_view` would otherwise resolve with no path at all —
+        // silently, and only for views whose names contain that substring.
+        // (Raised by review on PR #187.)
+        let got = inject_search_path("SELECT * FROM semantic_view('my_search_path_view')");
+        assert!(
+            got.contains("search_path :="),
+            "a literal is not a named argument: {got}"
+        );
+    }
+
+    #[test]
+    fn a_where_clause_mentioning_the_parameter_is_not_an_argument() {
+        // Same rule from the other side: `search_path` inside a predicate
+        // string is literal content, not this call's named parameter.
+        let got = inject_search_path(
+            "SELECT * FROM semantic_view('v', where_clause := 'search_path = 1')",
+        );
+        assert!(
+            got.contains("search_path := list_concat"),
+            "a predicate string is not a named argument: {got}"
         );
     }
 
