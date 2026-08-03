@@ -97,9 +97,9 @@ fn matching_close_paren(sql: &str, open: usize) -> Option<usize> {
     let mut i = open;
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' => i = crate::expr_tokens::skip_single_quoted_from(bytes, i),
+            b'\'' => i = crate::expr_tokens::skip_single_quoted(bytes, i),
             b'$' => {
-                if let Some(next) = crate::expr_tokens::skip_dollar_quoted_from(bytes, i) {
+                if let Some(next) = crate::expr_tokens::try_skip_dollar_quoted(bytes, i) {
                     i = next;
                     continue;
                 }

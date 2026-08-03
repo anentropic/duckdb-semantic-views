@@ -207,24 +207,10 @@ fn followed_by_open_paren(bytes: &[u8], pos: usize) -> bool {
     j < bytes.len() && bytes[j] == b'('
 }
 
-/// [`skip_single_quoted`] re-exported for callers outside this module that
-/// must agree with the tokenizer on where a literal ends — notably
-/// `parse::search_path`, which scans for a call's closing paren and must not
-/// mistake a `)` inside `'…'` for it.
-pub(crate) fn skip_single_quoted_from(bytes: &[u8], i: usize) -> usize {
-    skip_single_quoted(bytes, i)
-}
-
-/// [`try_skip_dollar_quoted`] re-exported for the same reason as
-/// [`skip_single_quoted_from`].
-pub(crate) fn skip_dollar_quoted_from(bytes: &[u8], i: usize) -> Option<usize> {
-    try_skip_dollar_quoted(bytes, i)
-}
-
 /// Byte offset just past the closing `'` of a single-quoted string starting at
 /// `bytes[i] == '\''`, honouring the `''` escape. Saturates at `len` for an
 /// unterminated literal.
-fn skip_single_quoted(bytes: &[u8], i: usize) -> usize {
+pub(crate) fn skip_single_quoted(bytes: &[u8], i: usize) -> usize {
     let len = bytes.len();
     let mut j = i + 1;
     while j < len {
@@ -243,7 +229,7 @@ fn skip_single_quoted(bytes: &[u8], i: usize) -> usize {
 /// If `bytes[i]` opens a valid `$tag$` dollar quote, return the byte offset just
 /// past its matching close (saturating at `len` if unterminated); otherwise
 /// `None` (so a lone `$` is treated as an ordinary non-identifier byte).
-fn try_skip_dollar_quoted(bytes: &[u8], i: usize) -> Option<usize> {
+pub(crate) fn try_skip_dollar_quoted(bytes: &[u8], i: usize) -> Option<usize> {
     let tag_len = crate::util::read_dollar_tag_len(bytes, i)?;
     let len = bytes.len();
     let tag = &bytes[i..i + tag_len];

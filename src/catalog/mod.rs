@@ -738,6 +738,11 @@ pub use reader::CatalogReader;
 ///
 /// Returns `Err` when the name cannot be resolved to exactly one view and
 /// picking one would be a guess.
+///
+/// Compiled unconditionally so the rule is unit-tested under plain `cargo test`;
+/// only the extension-gated reader calls it, so the bundled non-test build sees
+/// it as dead.
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
 pub(crate) fn resolve_in_search_path<'a>(
     view: &crate::ident::ViewRef,
     rows: &'a [(String, String)],
