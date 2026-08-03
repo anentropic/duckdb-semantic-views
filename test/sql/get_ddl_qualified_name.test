@@ -83,11 +83,17 @@ SELECT starts_with(
 true
 
 # The schema rendered is where the view IS, not how the caller spelled the
-# lookup: a bare name resolved through the search path still qualifies to
-# `analytics`.
-
-statement ok
-SET search_path = 'analytics';
+# lookup — a BARE name renders `analytics` too.
+#
+# It gets there by UNIQUE MATCH, not through `search_path`. `GET_DDL` is a
+# scalar, and scalars have no named parameters, so the parser override cannot
+# hand it the caller's path (TECH-DEBT #25, blocked on #19); it uses the
+# no-path fallback — the unique match, else an ambiguity error (§7).
+#
+# An earlier draft of this file set `search_path` before this call and said so
+# in the comment. The assertion passed either way, because `sales` lives in
+# exactly one schema at this point — so the `SET` proved nothing and named a
+# mechanism that is not in play. Caught in review on PR #188.
 
 query T
 SELECT starts_with(
@@ -96,9 +102,6 @@ SELECT starts_with(
 );
 ----
 true
-
-statement ok
-RESET search_path;
 
 # ============================================================
 # 3. CONTROL (green before and after). The emitted header
@@ -178,3 +181,39 @@ statement error
 SELECT GET_DDL('SEMANTIC_VIEW', 'analytics.nosuch', true);
 ----
 does not exist
+
+# ============================================================
+# 7. A bare name is the UNIQUE match, not a search-path walk.
+#    Once two schemas hold `sales`, the bare lookup is an
+#    ambiguity error however `search_path` is set — which is
+#    what makes §2's bare-name assertion a unique-match proof
+#    rather than a path-resolution one. Kept last, because it
+#    is the second `sales` that breaks §3's single-row check.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW staging.sales AS
+  TABLES (o AS main.orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.revenue AS SUM(o.amount));
+
+statement ok
+SET search_path = 'analytics';
+
+statement error
+SELECT GET_DDL('SEMANTIC_VIEW', 'sales', true);
+----
+is ambiguous
+
+statement ok
+RESET search_path;
+
+# Qualifying it is the way through, exactly as the error says.
+
+query T
+SELECT starts_with(
+  GET_DDL('SEMANTIC_VIEW', 'staging.sales', true),
+  'CREATE OR REPLACE SEMANTIC VIEW staging.sales AS'
+);
+----
+true

@@ -37,7 +37,7 @@ Parameters
      - The object type. Only ``'SEMANTIC_VIEW'`` is supported (case-insensitive).
    * - ``<name>``
      - VARCHAR
-     - The name of the semantic view, optionally schema-qualified (``analytics.sales``). An unqualified name resolves through the session's ``search_path``. Returns an error if the view does not exist.
+     - The name of the semantic view, optionally schema-qualified (``analytics.sales``). An unqualified name resolves to the unique view of that name; if several schemas hold one, the result is an ambiguity error naming them, not a ``search_path`` walk (see :ref:`ref-get-ddl-resolution`). Returns an error if the view does not exist.
    * - ``<use_fully_qualified_names>``
      - BOOLEAN
      - Optional. When ``true``, the rendered ``CREATE`` name carries the view's own schema, so re-running the output recreates the view in that schema. Defaults to ``false`` (a bare name), matching Snowflake. A ``NULL`` returns ``NULL``.
@@ -56,9 +56,31 @@ The rendered DDL re-parses to the same definition. In particular:
 - A view name that needs quoting (embedded whitespace or non-ASCII characters) is quoted in the rendered ``CREATE OR REPLACE SEMANTIC VIEW`` header. (Mixed-case names are never quoted for case: names fold to lowercase — see :ref:`ref-create-semantic-view`.)
 - With ``<use_fully_qualified_names>`` set to ``true``, the schema and the view name are quoted independently — ``"my schema"."my view"``, never ``"my schema.my view"`` — so the header re-parses as a schema-qualified reference rather than as one name containing a dot.
 
-The schema rendered is where the view actually lives, not how the lookup was spelled: ``GET_DDL('SEMANTIC_VIEW', 'sales', true)`` on a view resolved through ``search_path`` still renders that view's own schema.
+The schema rendered is where the view actually lives, not how the lookup was spelled: ``GET_DDL('SEMANTIC_VIEW', 'sales', true)`` on a view that lives in ``analytics`` renders ``analytics.sales``.
 
 If the definition records no schema — possible only for a catalog row written before semantic views were schema-scoped and never migrated — asking for a fully-qualified name is an error rather than a silent fall back to the bare name, which would relocate the view on restore.
+
+
+.. _ref-get-ddl-resolution:
+
+How an unqualified name resolves
+================================
+
+``GET_DDL`` is a **scalar** function, and scalar functions have no named parameters, so the extension cannot hand it the session's ``search_path`` the way it does for the ``semantic_view()`` table function. An unqualified name therefore resolves to the **unique** view of that name, wherever it lives:
+
+- exactly one schema holds it — that view is returned, whether or not its schema is on ``search_path``;
+- several schemas hold it — an error naming them, so the answer is never a silent pick;
+- none holds it — the usual ``does not exist`` error.
+
+``SET search_path`` does **not** disambiguate here. Qualify the name instead:
+
+.. code-block:: sql
+
+   SET search_path = 'analytics';
+   SELECT GET_DDL('SEMANTIC_VIEW', 'sales');    -- still an error if staging.sales exists too
+   SELECT GET_DDL('SEMANTIC_VIEW', 'analytics.sales');  -- unambiguous
+
+``READ_YAML_FROM_SEMANTIC_VIEW`` is a scalar too and follows the same rule. The DDL statements and ``semantic_view()`` **do** follow ``search_path`` — see :ref:`ref-create-semantic-view`.
 
 
 .. _ref-get-ddl-examples:
