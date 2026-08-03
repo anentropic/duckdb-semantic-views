@@ -1,0 +1,219 @@
+# GET_DDL's optional third argument — fully-qualified view names
+# (TECH-DEBT #25).
+#
+# Semantic views are scoped to a schema, but GET_DDL rendered a bare CREATE
+# name, so re-running its output put the view in whatever schema the executing
+# session happened to be in. For a dump/restore flow that silently relocates
+# every view that does not live in the restoring session's schema.
+#
+# Snowflake's signature is
+# `GET_DDL(<type>, <name>[, <use_fully_qualified_names>])` and its DEFAULT is
+# unqualified — so the two-argument form was right and the gap was the missing
+# third argument. Both spellings are pinned here: a regression that qualified
+# unconditionally would break every existing caller.
+#
+# The sqllogictest runner halts a file at its first failing statement, so the
+# per-case red proof for the render logic is at the unit layer
+# (`render_ddl::tests::qualified_name_tests`, seven cases confirmed red or
+# green individually). This file covers what those cannot: the whole
+# extension-load -> DDL -> GET_DDL path against a real catalog, including that
+# the emitted header re-executes into the right schema. The dynamic
+# fetch-and-replay round trip — which needs the DDL string as *input* to a
+# later statement, something sqllogictest cannot express — is in
+# test/integration/test_get_ddl_qualified_name.py.
+#
+# Verified per case by neutering the qualification branch and walking the file:
+# the THREE `qualify = true` assertions (sections 2 and 4) went red, and
+# everything else passed unfixed. Sections 1, 3, 5 and 6 are therefore
+# CONTROLS, and are labelled as such below rather than counted as evidence —
+# section 3 in particular pins schema-scoped CREATE (already shipped), not this
+# change.
+
+require semantic_views
+
+statement ok
+CREATE SCHEMA analytics;
+
+statement ok
+CREATE SCHEMA staging;
+
+statement ok
+CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER, region VARCHAR);
+
+statement ok
+CREATE SEMANTIC VIEW analytics.sales AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.revenue AS SUM(o.amount));
+
+# ============================================================
+# 1. CONTROL (green before and after). The default is
+#    unqualified — Snowflake's default too, so the
+#    two-argument call must not move.
+# ============================================================
+
+query T
+SELECT starts_with(
+  GET_DDL('SEMANTIC_VIEW', 'analytics.sales'),
+  'CREATE OR REPLACE SEMANTIC VIEW sales AS'
+);
+----
+true
+
+# ... and an explicit false is the same thing.
+
+query T
+SELECT starts_with(
+  GET_DDL('SEMANTIC_VIEW', 'analytics.sales', false),
+  'CREATE OR REPLACE SEMANTIC VIEW sales AS'
+);
+----
+true
+
+# ============================================================
+# 2. true renders the view's own schema.
+# ============================================================
+
+query T
+SELECT starts_with(
+  GET_DDL('SEMANTIC_VIEW', 'analytics.sales', true),
+  'CREATE OR REPLACE SEMANTIC VIEW analytics.sales AS'
+);
+----
+true
+
+# The schema rendered is where the view IS, not how the caller spelled the
+# lookup — a BARE name renders `analytics` too.
+#
+# It gets there by UNIQUE MATCH, not through `search_path`. `GET_DDL` is a
+# scalar, and scalars have no named parameters, so the parser override cannot
+# hand it the caller's path (TECH-DEBT #25, blocked on #19); it uses the
+# no-path fallback — the unique match, else an ambiguity error (§7).
+#
+# An earlier draft of this file set `search_path` before this call and said so
+# in the comment. The assertion passed either way, because `sales` lives in
+# exactly one schema at this point — so the `SET` proved nothing and named a
+# mechanism that is not in play. Caught in review on PR #188.
+
+query T
+SELECT starts_with(
+  GET_DDL('SEMANTIC_VIEW', 'sales', true),
+  'CREATE OR REPLACE SEMANTIC VIEW analytics.sales AS'
+);
+----
+true
+
+# ============================================================
+# 3. CONTROL (green before and after). The emitted header
+#    restores into the view's own schema from a session
+#    sitting somewhere else — that is schema-scoped CREATE,
+#    already shipped. It is here so the round trip reads
+#    end to end, not as evidence for this change.
+# ============================================================
+
+statement ok
+USE memory.staging;
+
+statement ok
+CREATE OR REPLACE SEMANTIC VIEW analytics.sales AS
+  TABLES (o AS main.orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.revenue AS SUM(o.amount));
+
+# It went back to analytics, not to staging where the session was.
+# `SHOW SEMANTIC VIEWS` is rewritten by the parser override and so cannot be a
+# subquery; `list_semantic_views()` is the same listing as a table function.
+
+query T
+SELECT schema_name FROM list_semantic_views() WHERE name = 'sales';
+----
+analytics
+
+statement ok
+USE memory.main;
+
+# ============================================================
+# 4. Each part is quoted on its own account. The wrong fix —
+#    quoting the joined string — emits `"my schema.my view"`,
+#    one name that happens to contain a dot.
+# ============================================================
+
+statement ok
+CREATE SCHEMA "my schema";
+
+statement ok
+CREATE SEMANTIC VIEW "my schema"."my view" AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.revenue AS SUM(o.amount));
+
+query T
+SELECT starts_with(
+  GET_DDL('SEMANTIC_VIEW', '"my schema"."my view"', true),
+  'CREATE OR REPLACE SEMANTIC VIEW "my schema"."my view" AS'
+);
+----
+true
+
+# ============================================================
+# 5. A NULL third argument is a NULL row: asked "qualified or
+#    not?" with NULL there is no answer, and either spelling
+#    would be a guess. (Green before and after — the arity
+#    did not exist to return anything else.)
+# ============================================================
+
+query T
+SELECT GET_DDL('SEMANTIC_VIEW', 'analytics.sales', NULL) IS NULL;
+----
+true
+
+# ============================================================
+# 6. CONTROL (green before and after). The argument does not
+#    change what GET_DDL rejects.
+# ============================================================
+
+statement error
+SELECT GET_DDL('TABLE', 'orders', true);
+----
+unsupported object type
+
+statement error
+SELECT GET_DDL('SEMANTIC_VIEW', 'analytics.nosuch', true);
+----
+does not exist
+
+# ============================================================
+# 7. A bare name is the UNIQUE match, not a search-path walk.
+#    Once two schemas hold `sales`, the bare lookup is an
+#    ambiguity error however `search_path` is set — which is
+#    what makes §2's bare-name assertion a unique-match proof
+#    rather than a path-resolution one. Kept last, because it
+#    is the second `sales` that breaks §3's single-row check.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW staging.sales AS
+  TABLES (o AS main.orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.revenue AS SUM(o.amount));
+
+statement ok
+SET search_path = 'analytics';
+
+statement error
+SELECT GET_DDL('SEMANTIC_VIEW', 'sales', true);
+----
+is ambiguous
+
+statement ok
+RESET search_path;
+
+# Qualifying it is the way through, exactly as the error says.
+
+query T
+SELECT starts_with(
+  GET_DDL('SEMANTIC_VIEW', 'staging.sales', true),
+  'CREATE OR REPLACE SEMANTIC VIEW staging.sales AS'
+);
+----
+true

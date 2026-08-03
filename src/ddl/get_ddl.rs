@@ -1,6 +1,12 @@
-//! `GET_DDL` scalar function: wraps [`crate::render_ddl::render_create_ddl`] as a
-//! C++ Catalog API scalar so that `SELECT GET_DDL('SEMANTIC_VIEW', 'name')`
-//! works inside `DuckDB`.
+//! `GET_DDL` scalar function: wraps
+//! [`crate::render_ddl::render_create_ddl_qualified`] as a C++ Catalog API
+//! scalar so that `SELECT GET_DDL('SEMANTIC_VIEW', 'name')` works inside
+//! `DuckDB`.
+//!
+//! The optional third argument — `GET_DDL('SEMANTIC_VIEW', 'name', true)` —
+//! renders the view's own schema into the `CREATE` name, matching Snowflake's
+//! `use_fully_qualified_names`. It is registered as a second arity on the same
+//! `ScalarFunctionSet` (see `sv_register_get_ddl` in `cpp/src/shim.cpp`).
 //!
 //! The render logic itself lives in [`crate::render_ddl`] (always compiled,
 //! unit-tested under `cargo test`). This module adds the extension-only Rust
@@ -14,7 +20,7 @@
 
 use crate::catalog::CatalogReader;
 use crate::model::SemanticViewDefinition;
-use crate::render_ddl::render_create_ddl;
+use crate::render_ddl::render_create_ddl_qualified;
 
 // ---------------------------------------------------------------------------
 // Phase 65 Plan 05 Task 4 (Wave 3) — sv_get_ddl_exec_rust
@@ -31,7 +37,9 @@ use crate::render_ddl::render_create_ddl;
 ///
 /// `conn` is a borrowed handle (do NOT disconnect). `type_ptr` and `name_ptr`
 /// must each point to the corresponding number of UTF-8 bytes (not
-/// NUL-terminated).
+/// NUL-terminated). `qualify` is `0` (bare name) or non-zero (schema-qualified
+/// name); the C++ side maps the optional third `BOOLEAN` argument onto it and
+/// passes `0` when the caller wrote the two-argument form.
 #[cfg(feature = "extension")]
 #[no_mangle]
 pub unsafe extern "C" fn sv_get_ddl_exec_rust(
@@ -42,6 +50,7 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
     name_len: usize,
     sp_ptr: *const u8,
     sp_len: usize,
+    qualify: u8,
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
     error_buf: *mut u8,
@@ -56,7 +65,7 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
         "sv_get_ddl_exec_rust",
         |borrowed| unsafe {
             get_ddl(
-                borrowed, type_ptr, type_len, name_ptr, name_len, sp_ptr, sp_len,
+                borrowed, type_ptr, type_len, name_ptr, name_len, sp_ptr, sp_len, qualify,
             )
         },
     )
@@ -69,6 +78,10 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
 ///
 /// `type_ptr` / `name_ptr` must each be null or point to the matching number
 /// of readable bytes.
+// The argument list mirrors the FFI boundary above (three ptr/len pairs plus
+// the qualify flag); collapsing it into a struct would only move the same
+// unsafety one hop.
+#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "extension")]
 unsafe fn get_ddl(
     borrowed: &crate::ddl::read_ffi::BorrowedConnection,
@@ -78,6 +91,7 @@ unsafe fn get_ddl(
     name_len: usize,
     sp_ptr: *const u8,
     sp_len: usize,
+    qualify: u8,
 ) -> Result<Vec<u8>, String> {
     use crate::ddl::read_ffi::{probe_catalog_table_present, read_str_arg};
 
@@ -107,7 +121,7 @@ unsafe fn get_ddl(
     // C-2: `from_json` for the canonical "invalid definition for semantic
     // view '<name>'" context on corrupt rows.
     let def = SemanticViewDefinition::from_json(&name, &json)?;
-    render_create_ddl(&name, &def)
+    render_create_ddl_qualified(&name, &def, qualify != 0)
         .map(String::into_bytes)
         .map_err(|e| format!("GET_DDL error: {e}"))
 }
