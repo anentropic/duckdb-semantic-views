@@ -75,28 +75,38 @@ pub(crate) fn create_target_schema_expr(target: &SchemaTarget) -> String {
 /// SQL scalar yielding the schema an existing semantic view lives in.
 ///
 /// A qualifier answers the question outright. Unqualified, the answer comes
-/// from the catalog: the one schema holding a view of that name, `NULL` when
-/// there is none (so the caller's existence guard reports the canonical
-/// "does not exist"), and an error when several schemas hold one.
+/// from the catalog, resolved through the caller's **search path** — `DuckDB`'s
+/// rule for every other unqualified object name, and the one the read side now
+/// follows too. The branches, in the order the emitted `CASE` takes them:
 ///
-/// Erroring on ambiguity rather than picking a winner is deliberate for now.
-/// `DuckDB` would resolve an unqualified reference through the caller's
-/// **search path**, and the emitted SQL here *could* read it
-/// (`current_schemas()` evaluates on the caller's connection) — but the
-/// read-side table functions cannot: they bind on a fresh
-/// `Connection(*context.db)` that has neither the caller's search path nor its
-/// current schema (TECH-DEBT #19). Preferring the search path here alone would
-/// make `DROP SEMANTIC VIEW v` and `semantic_view('v')` disagree about which
-/// `v` they mean. "Ambiguous — qualify it" is the rule both sides can keep
-/// today, and it is never silently wrong; both move to search-path preference
-/// together once TECH-DEBT #25's rewrite-time injection lands.
+/// * **At most one candidate** — that schema, or `NULL` when the name matched
+///   nothing (so the caller's existence guard reports the canonical "does not
+///   exist"). A lone view is reachable by its bare name even from a schema
+///   that is off the path, which is what makes an unqualified `DROP` keep
+///   working in the ordinary single-schema case.
+/// * **No candidate is on the path** — an error naming the schemas the view
+///   *does* live in. `DuckDB` would call this "does not exist"; bare, that is
+///   baffling for a view `SHOW SEMANTIC VIEWS` plainly lists, so the message
+///   says where it is and how to reach it.
+/// * **Otherwise** — the candidate whose schema appears earliest on the path.
+///
+/// This mirrors [`crate::catalog::resolve_in_search_path`] branch for branch,
+/// deliberately: writes and reads resolving a bare name differently would mean
+/// `DROP SEMANTIC VIEW v` deleting a view other than the one `semantic_view('v')`
+/// reads. The read side is handed the path as a table-function argument the
+/// parser override injects (TECH-DEBT #19/#25); here the emitted SQL runs on
+/// the caller's own connection, so it just evaluates
+/// [`crate::parse::search_path::SEARCH_PATH_SQL`] directly.
+///
+/// Both sides of the position lookup are folded — `DuckDB` matches identifiers
+/// case-insensitively, and a row may carry a different case than the path entry.
 ///
 /// Referencing `_definitions`, this expression must not be bound on a
 /// never-bootstrapped database — every caller already runs behind
 /// [`definitions_table_guard_select`].
 ///
 /// `suggested` is the name **identifier-quoted if it needs to be**, used only in
-/// the ambiguity message: a view called `my view` or `a.b` must be suggested as
+/// the off-path message: a view called `my view` or `a.b` must be suggested as
 /// `<schema>."my view"`, since an unquoted suggestion is a syntax error or —
 /// worse, for a dotted name — parses as a different qualified reference. It is
 /// a separate argument rather than derived here because `name` has already been
@@ -110,14 +120,31 @@ pub(crate) fn resolved_schema_expr(
 ) -> String {
     match target {
         SchemaTarget::Named(schema) => format!("'{schema}'"),
-        SchemaTarget::Unqualified => format!(
-            "(SELECT CASE WHEN count(*) > 1 \
-                     THEN error('semantic view ''{name}'' is ambiguous: it exists in \
-                                 schemas ' || string_agg(schema_name, ', ' ORDER BY schema_name) \
-                                || '. Qualify the reference as <schema>.{suggested}') \
-                     ELSE min(schema_name) END \
+        SchemaTarget::Unqualified => {
+            let path = format!(
+                "list_transform({}, s -> lower(s))",
+                crate::parse::search_path::SEARCH_PATH_SQL
+            );
+            // 1-based position of a row's schema on the path, or NULL when the
+            // schema is not on it. `count(rank)` therefore counts the reachable
+            // candidates, and `arg_min` over it picks the earliest.
+            let rank = format!("list_position({path}, lower(schema_name))");
+            format!(
+                "(SELECT CASE \
+                     WHEN count(*) <= 1 THEN min(schema_name) \
+                     WHEN count({rank}) = 0 \
+                       THEN error('semantic view ''{name}'' does not exist on the search path. \
+                                   It exists in schemas ' \
+                                  || string_agg(schema_name, ', ' ORDER BY schema_name) \
+                                  || ', none of which are on the current search path (' \
+                                  || array_to_string({path}, ', ') \
+                                  || '). Qualify the reference as <schema>.{suggested}, or add \
+                                      the schema to search_path.') \
+                     ELSE arg_min(schema_name, {rank}) \
+                            FILTER (WHERE {rank} IS NOT NULL) END \
                FROM {DEFINITIONS_TABLE} WHERE name = '{name}')"
-        ),
+            )
+        }
     }
 }
 
@@ -560,30 +587,73 @@ mod tests {
         );
     }
 
+    // The three tests below replace a single earlier one that pinned the
+    // interim "two schemas hold this name -> error" rule. That rule is gone,
+    // so its assertions could not be carried forward verbatim; each branch it
+    // covered is now pinned by one of these, and the off-path and
+    // unique-match branches it did not distinguish are pinned separately.
+
     #[test]
-    fn resolved_schema_of_an_unqualified_reference_errors_when_ambiguous() {
+    fn resolved_schema_of_an_unqualified_reference_follows_the_search_path() {
         let e = unqualified("v");
+        // The same expression the parser override hands the read side, so
+        // `DROP SEMANTIC VIEW v` and `semantic_view('v')` cannot disagree
+        // about which `v` they mean.
         assert!(
-            e.contains("count(*) > 1") && e.contains("is ambiguous"),
-            "two schemas holding 'v' must error, not pick one: {e}"
+            e.contains(crate::parse::search_path::SEARCH_PATH_SQL),
+            "must resolve through the caller's search path: {e}"
+        );
+        // Earliest schema on the path wins. `min(schema_name)` would pick
+        // alphabetically, which is a different view whenever the path order
+        // and the alphabet disagree.
+        assert!(
+            e.contains("list_position") && e.contains("arg_min(schema_name"),
+            "must pick the earliest path position, not the alphabetical first: {e}"
         );
         assert!(
-            e.contains("string_agg(schema_name, ', ' ORDER BY schema_name)"),
-            "the error must name the schemas, in a stable order: {e}"
-        );
-        assert!(
-            e.contains("Qualify the reference as <schema>.v"),
-            "the error must say how to disambiguate: {e}"
+            !e.contains("is ambiguous"),
+            "the path decides; a second candidate is no longer an error: {e}"
         );
         // The wording carries no `;` on purpose: guards are joined into a
         // multi-statement string, and every guard test asserts it contributes
         // exactly one statement.
         assert!(!e.contains(';'), "resolution must not embed a ';': {e}");
-        // Exactly one row -> that schema; none -> NULL, so the caller's
-        // existence guard reports the canonical "does not exist".
+    }
+
+    #[test]
+    fn resolved_schema_reports_a_name_that_is_off_the_path() {
+        let e = unqualified("v");
         assert!(
-            e.contains("ELSE min(schema_name) END"),
-            "the unique match must resolve to its schema: {e}"
+            e.contains("does not exist on the search path"),
+            "an off-path name must say so rather than resolving: {e}"
+        );
+        assert!(
+            e.contains("string_agg(schema_name, ', ' ORDER BY schema_name)"),
+            "the error must name the schemas it DOES live in, in a stable order: {e}"
+        );
+        assert!(
+            e.contains("Qualify the reference as <schema>.v"),
+            "the error must say how to reach it: {e}"
+        );
+        // Same wording as the read side's `resolve_in_search_path`, so the two
+        // paths cannot drift into describing the same situation differently.
+        assert!(
+            e.contains("or add the schema to search_path"),
+            "the error must offer the other remedy too: {e}"
+        );
+    }
+
+    #[test]
+    fn a_single_candidate_resolves_without_consulting_the_path() {
+        // Mirrors `resolve_in_search_path`, where one row short-circuits ahead
+        // of the path check: a view that is the only one of its name stays
+        // reachable by that bare name even from a schema that is off-path.
+        // Zero rows fall into the same branch and yield NULL, so the caller's
+        // existence guard reports the canonical "does not exist".
+        let e = unqualified("v");
+        assert!(
+            e.contains("WHEN count(*) <= 1 THEN min(schema_name)"),
+            "the unique match must resolve on its own: {e}"
         );
     }
 
@@ -594,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguity_suggestion_quotes_a_name_that_needs_it() {
+    fn off_path_suggestion_quotes_a_name_that_needs_it() {
         // The suggestion is meant to be copy-pasted. For a view named `my view`
         // an unquoted `<schema>.my view` is a syntax error; for `a.b` it is
         // worse — it parses as schema `a`, view `b`, a different reference

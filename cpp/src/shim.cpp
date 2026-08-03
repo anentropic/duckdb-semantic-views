@@ -592,7 +592,7 @@ static std::vector<std::pair<std::string, LogicalType>> sv_semantic_named_params
         // `where := '…'` is a syntax error before the binder ever sees it.
         {"where_clause", LogicalType::VARCHAR},
         // The caller's schema resolution order, injected by the parser
-        // override (see `crate::parse::SEARCH_PATH_SQL`). The read side binds
+        // override (see `crate::parse::search_path::SEARCH_PATH_SQL`). The read side binds
         // on a fresh connection that cannot see the caller's search path or
         // current schema, so the only way it can resolve an unqualified view
         // name the way DuckDB would is to be handed the path — TECH-DEBT #19.

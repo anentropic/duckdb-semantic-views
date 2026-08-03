@@ -106,37 +106,43 @@ SELECT total FROM semantic_view('staging.sales', metrics := ['total'])
 2
 
 # ============================================================
-# 3. An unqualified reference to an ambiguous name is an error,
-#    not an arbitrary pick.
+# 3. An unqualified reference follows the caller's search path,
+#    the way it does for every other DuckDB object.
+#
+# `current_schema()` is `main` here and neither view is on the
+# path, so the name is a miss — but a bare "does not exist" for
+# a view SHOW plainly lists is baffling, so the error says where
+# it actually lives.
 # ============================================================
 
 statement error
 SELECT total FROM semantic_view('sales', metrics := ['total'])
 ----
-is ambiguous
+does not exist on the search path
 
 statement error
 DESCRIBE SEMANTIC VIEW sales
 ----
-is ambiguous
+does not exist on the search path
 
 statement error
 DROP SEMANTIC VIEW sales
 ----
-is ambiguous
+does not exist on the search path
 
-# IF EXISTS does not absorb ambiguity. It means "do not complain if the view is
-# absent" — an ambiguous name is not absent, and silently dropping one of two
-# would be the wrong-view-deleted case IF EXISTS was never meant to license.
+# IF EXISTS does not absorb this. It means "do not complain if the view is
+# absent" — a name that exists off the path is not absent, and silently
+# dropping one of two would be the wrong-view-deleted case IF EXISTS was never
+# meant to license.
 statement error
 DROP SEMANTIC VIEW IF EXISTS sales
 ----
-is ambiguous
+does not exist on the search path
 
 statement error
 ALTER SEMANTIC VIEW IF EXISTS sales SET COMMENT = 'x'
 ----
-is ambiguous
+does not exist on the search path
 
 # Both views are still there — the errors above changed nothing.
 query I
@@ -149,12 +155,87 @@ statement ok
 DROP SEMANTIC VIEW IF EXISTS no_such_view
 
 # ============================================================
-# 4. An unqualified reference to a name only one schema holds
-#    still resolves — the common case is unchanged.
+# 3b. Putting a schema on the path makes the bare name resolve,
+#     and the ORDER of the path picks the winner.
+#
+# The read side binds on a fresh connection that can see neither
+# the caller's search path nor its current schema, so the parser
+# override injects the path as a table-function argument
+# (TECH-DEBT #19/#25). These cases are what prove the injection
+# actually happens: without it the read functions fall back to
+# "the unique match, else ambiguous" and every query below
+# errors instead of answering.
+#
+# `analytics.sales` totals 350; `staging.sales` counts 2 rows.
 # ============================================================
 
 statement ok
-DROP SEMANTIC VIEW staging.sales;
+SET search_path = 'analytics';
+
+query I
+SELECT total FROM semantic_view('sales', metrics := ['total'])
+----
+350
+
+statement ok
+SET search_path = 'staging';
+
+query I
+SELECT total FROM semantic_view('sales', metrics := ['total'])
+----
+2
+
+# Both on the path: the FIRST entry wins, and reversing the path
+# reverses the answer. This is the assertion that would still
+# pass if resolution were alphabetical, or "whatever the catalog
+# returns first" — so it is asserted in both orders.
+statement ok
+SET search_path = 'analytics,staging';
+
+query I
+SELECT total FROM semantic_view('sales', metrics := ['total'])
+----
+350
+
+statement ok
+SET search_path = 'staging,analytics';
+
+query I
+SELECT total FROM semantic_view('sales', metrics := ['total'])
+----
+2
+
+# The other read commands resolve through the same path, so they
+# agree with each other and not just with themselves.
+# `DESCRIBE SEMANTIC VIEW` rewrites to this call and cannot be
+# wrapped in a subquery, so the assertion is written against the
+# table function it becomes; that the statement form is injected
+# too is what section 3's search-path error above shows.
+query T
+SELECT property_value FROM describe_semantic_view('sales')
+  WHERE object_kind = 'METRIC' AND property = 'EXPRESSION'
+----
+COUNT(*)
+
+# ...and so does the WRITE side. A DROP that resolved differently
+# from the read would delete a view other than the one
+# `semantic_view('sales')` had just returned.
+statement ok
+DROP SEMANTIC VIEW sales;
+
+query TT
+SELECT schema_name, name FROM semantic_layer._definitions
+----
+analytics	sales
+
+statement ok
+RESET search_path;
+
+# ============================================================
+# 4. An unqualified reference to a name only one schema holds
+#    still resolves — even from off the path, so the ordinary
+#    single-schema case is unchanged.
+# ============================================================
 
 query I
 SELECT total FROM semantic_view('sales', metrics := ['total'])
@@ -166,7 +247,8 @@ SELECT count(*) FROM semantic_layer._definitions
 ----
 1
 
-# The DROP took the view it named and left the other one alone.
+# The path-resolved DROP above took `staging.sales` and left `analytics.sales`
+# alone — the read and the write picked the same view.
 query TT
 SELECT schema_name, name FROM semantic_layer._definitions
 ----

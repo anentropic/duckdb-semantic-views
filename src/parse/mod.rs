@@ -38,6 +38,8 @@ mod native_sql;
 #[cfg(feature = "extension")]
 pub(crate) use native_sql::rewrite_to_native_sql;
 
+/// Rewrite-time injection of the caller's schema resolution order (#25/#19).
+pub(crate) mod search_path;
 mod show_clauses;
 pub(crate) use show_clauses::{build_filter_suffix, parse_show_filter_clauses};
 

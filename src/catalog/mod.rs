@@ -721,7 +721,7 @@ pub use reader::CatalogReader;
 ///
 /// `rows` is every `(schema_name, definition)` the name matched, and
 /// `search_path` the caller's resolution order (see
-/// [`crate::parse::SEARCH_PATH_SQL`] for how it reaches the read side).
+/// [`crate::parse::search_path::SEARCH_PATH_SQL`] for how it reaches the read side).
 ///
 /// Two cases are not a plain first-match:
 ///
