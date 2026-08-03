@@ -169,6 +169,7 @@ fn show_entities_one(
     kind: EntityKind,
     borrowed: &BorrowedConnection,
     view_name: &str,
+    search_path: &[String],
 ) -> Result<Vec<u8>, String> {
     // FF-4: normalize the requested name so quoted-identifier inputs resolve
     // the same way they do through `semantic_view()` (folds to lowercase
@@ -178,7 +179,7 @@ fn show_entities_one(
     let view_name = view.name.clone();
     let present = unsafe { probe_catalog_table_present(borrowed) }?;
     let reader = CatalogReader::new(borrowed, present);
-    let Some(json) = reader.lookup(&view)? else {
+    let Some(json) = reader.lookup(&view, search_path)? else {
         return Err(crate::catalog::view_not_found_msg(&view.to_string()));
     };
     // FF-9: named single-view SHOW propagates a parse error — the user asked
@@ -230,6 +231,8 @@ macro_rules! entity_dispatchers {
             conn: libduckdb_sys::duckdb_connection,
             name_ptr: *const u8,
             name_len: usize,
+            sp_ptr: *const u8,
+            sp_len: usize,
             out_ptr: *mut *mut u8,
             out_len: *mut usize,
             error_buf: *mut u8,
@@ -244,7 +247,9 @@ macro_rules! entity_dispatchers {
                 stringify!($one_sym),
                 |borrowed| {
                     let view_name = unsafe { read_str_arg(name_ptr, name_len, "view name") }?;
-                    show_entities_one($kind, borrowed, &view_name)
+                    let search_path =
+                        unsafe { crate::ddl::read_ffi::read_search_path(sp_ptr, sp_len) }?;
+                    show_entities_one($kind, borrowed, &view_name, &search_path)
                 },
             )
         }

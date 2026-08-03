@@ -406,6 +406,25 @@ pub unsafe fn read_str_arg(ptr: *const u8, len: usize, what: &str) -> Result<Str
     }
 }
 
+/// Decode the caller's schema resolution order from the shared varchar-list
+/// wire format — the same encoding the `dimensions` / `metrics` / `facts`
+/// named parameters use.
+///
+/// A null or empty buffer yields an empty path, which is the "no path was
+/// supplied" case [`crate::catalog::resolve_in_search_path`] falls back on: a
+/// table function invoked directly rather than through the parser override.
+/// That has to stay working, so absence is not an error.
+///
+/// # Safety
+///
+/// `ptr` must either be null (with `len == 0`) or point to `len` readable
+/// bytes in the varchar-list wire format.
+#[cfg(feature = "extension")]
+pub unsafe fn read_search_path(ptr: *const u8, len: usize) -> Result<Vec<String>, String> {
+    crate::query::wire::parse_varchar_list(ptr, len)
+        .map_err(|detail| format!("malformed `search_path` payload: {detail}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

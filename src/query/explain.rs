@@ -61,6 +61,8 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
     conn: libduckdb_sys::duckdb_connection,
     name_ptr: *const u8,
     name_len: usize,
+    sp_ptr: *const u8,
+    sp_len: usize,
     dims_ptr: *const u8,
     dims_len: usize,
     metrics_ptr: *const u8,
@@ -89,6 +91,8 @@ pub unsafe extern "C" fn sv_explain_semantic_view_bind_rust(
                 borrowed,
                 name_ptr,
                 name_len,
+                sp_ptr,
+                sp_len,
                 dims_ptr,
                 dims_len,
                 metrics_ptr,
@@ -119,6 +123,8 @@ unsafe fn explain_semantic_view_bind_body(
     borrowed: &crate::ddl::read_ffi::BorrowedConnection,
     name_ptr: *const u8,
     name_len: usize,
+    sp_ptr: *const u8,
+    sp_len: usize,
     dims_ptr: *const u8,
     dims_len: usize,
     metrics_ptr: *const u8,
@@ -134,6 +140,7 @@ unsafe fn explain_semantic_view_bind_body(
     let view = crate::ident::parse_view_ref(&view_name_raw)
         .map_err(|e| format!("Invalid view name '{view_name_raw}': {e}"))?;
     let view_name = view.name.clone();
+    let search_path = unsafe { crate::ddl::read_ffi::read_search_path(sp_ptr, sp_len) }?;
 
     let dimensions = parse_varchar_list(dims_ptr, dims_len)
         .map_err(|detail| format!("malformed `dimensions` payload: {detail}"))?;
@@ -167,7 +174,7 @@ unsafe fn explain_semantic_view_bind_body(
     // views" instead of silently folding it into absence.
     let present = probe_catalog_table_present(borrowed)?;
     let reader = CatalogReader::new(borrowed, present);
-    let json_str = match reader.lookup(&view) {
+    let json_str = match reader.lookup(&view, &search_path) {
         Ok(Some(j)) => j,
         Ok(None) => {
             let available = reader.list_names().unwrap_or_default();

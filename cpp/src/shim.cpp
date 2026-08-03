@@ -214,37 +214,44 @@ extern "C" {
     uint8_t sv_show_columns_in_semantic_view_bind_rust(
         duckdb_connection conn,
         const uint8_t *name_ptr, size_t name_len,
+        const uint8_t *sp_ptr, size_t sp_len,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
     uint8_t sv_describe_semantic_view_bind_rust(
         duckdb_connection conn,
         const uint8_t *name_ptr, size_t name_len,
+        const uint8_t *sp_ptr, size_t sp_len,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
     uint8_t sv_show_semantic_dimensions_bind_rust(
         duckdb_connection conn,
         const uint8_t *name_ptr, size_t name_len,
+        const uint8_t *sp_ptr, size_t sp_len,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
     uint8_t sv_show_semantic_metrics_bind_rust(
         duckdb_connection conn,
         const uint8_t *name_ptr, size_t name_len,
+        const uint8_t *sp_ptr, size_t sp_len,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
     uint8_t sv_show_semantic_facts_bind_rust(
         duckdb_connection conn,
         const uint8_t *name_ptr, size_t name_len,
+        const uint8_t *sp_ptr, size_t sp_len,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
     uint8_t sv_show_semantic_materializations_bind_rust(
         duckdb_connection conn,
         const uint8_t *name_ptr, size_t name_len,
+        const uint8_t *sp_ptr, size_t sp_len,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
     uint8_t sv_show_semantic_dimensions_for_metric_bind_rust(
         duckdb_connection conn,
         const uint8_t *view_name_ptr, size_t view_name_len,
         const uint8_t *metric_name_ptr, size_t metric_name_len,
+        const uint8_t *sp_ptr, size_t sp_len,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
 
@@ -263,11 +270,13 @@ extern "C" {
         duckdb_connection conn,
         const uint8_t *type_ptr, size_t type_len,
         const uint8_t *name_ptr, size_t name_len,
+        const uint8_t *sp_ptr, size_t sp_len,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
     uint8_t sv_read_yaml_from_semantic_view_exec_rust(
         duckdb_connection conn,
         const uint8_t *name_ptr, size_t name_len,
+        const uint8_t *sp_ptr, size_t sp_len,
         char **out_ptr, size_t *out_len,
         char *error_buf, size_t error_buf_len);
 
@@ -283,6 +292,7 @@ extern "C" {
     uint8_t sv_explain_semantic_view_bind_rust(
         duckdb_connection conn,
         const uint8_t *name_ptr, size_t name_len,
+        const uint8_t *sp_ptr, size_t sp_len,
         const uint8_t *dims_ptr, size_t dims_len,
         const uint8_t *metrics_ptr, size_t metrics_len,
         const uint8_t *facts_ptr, size_t facts_len,
@@ -312,6 +322,7 @@ extern "C" {
     uint8_t sv_semantic_view_bind_rust(
         duckdb_connection conn,
         const uint8_t *name_ptr, size_t name_len,
+        const uint8_t *sp_ptr, size_t sp_len,
         const uint8_t *dims_ptr, size_t dims_len,
         const uint8_t *metrics_ptr, size_t metrics_len,
         const uint8_t *facts_ptr, size_t facts_len,
@@ -580,6 +591,12 @@ static std::vector<std::pair<std::string, LogicalType>> sv_semantic_named_params
         // DuckDB's parser reserves that keyword in named-parameter position:
         // `where := '…'` is a syntax error before the binder ever sees it.
         {"where_clause", LogicalType::VARCHAR},
+        // The caller's schema resolution order, injected by the parser
+        // override (see `crate::parse::search_path::SEARCH_PATH_SQL`). The read side binds
+        // on a fresh connection that cannot see the caller's search path or
+        // current schema, so the only way it can resolve an unqualified view
+        // name the way DuckDB would is to be handed the path — TECH-DEBT #19.
+        {"search_path", list_varchar},
     };
 }
 
@@ -732,6 +749,13 @@ extern "C" {
         spec.exec_cb = exec_cb;
         spec.init_local_cb = init_cb;
         spec.init_global_cb = nullptr;
+        // Every read TF registered through this wrapper accepts the caller's
+        // schema resolution order. Declared uniformly rather than per-TF: the
+        // parser override injects it into any read-TF call it rewrites, and a
+        // TF that takes no view name simply ignores it. `semantic_view` and
+        // `explain_semantic_view` declare it via `sv_semantic_named_params`.
+        spec.named_params.emplace_back("search_path",
+                                       LogicalType::LIST(LogicalType::VARCHAR));
         return sv_register_table_function_core(
             db_handle, spec, "sv_register_table_function", error_buf,
             error_buf_len);
@@ -1347,6 +1371,27 @@ static void sv_run_varchar_bind(ClientContext &context,
     sv_parse_varchar_payload(payload.ptr, payload.len, bd, fn_name);
 }
 
+// Serialise the caller's schema resolution order from the `search_path` named
+// parameter into the shared varchar-list wire format.
+//
+// Absent or NULL yields an empty buffer, which the Rust side reads as "no path
+// supplied" and falls back to its pre-injection rule. That matters: a table
+// function invoked directly, rather than through the parser override that
+// injects the path, must keep working.
+// Defined further down, next to the other named-parameter marshalling it
+// shares its wire format with; forward-declared here because the single-name
+// bind helper below is the first caller.
+static std::vector<uint8_t> sv_serialise_string_list(const Value &list_val,
+                                                     const char *param_name);
+
+static std::vector<uint8_t> sv_search_path_payload(TableFunctionBindInput &input) {
+    auto it = input.named_parameters.find("search_path");
+    if (it == input.named_parameters.end() || it->second.IsNull()) {
+        return {};
+    }
+    return sv_serialise_string_list(it->second, "search_path");
+}
+
 // Variant for TFs with one VARCHAR argument (the view name). Extracts the
 // name from input.inputs[0] and forwards it as (ptr, len) to the dispatcher
 // alongside the borrowed connection handle.
@@ -1367,6 +1412,7 @@ static void sv_run_varchar_bind_with_name(ClientContext &context,
                               ": view name is required (positional arg 0)");
     }
     std::string name = input.inputs[0].GetValue<std::string>();
+    std::vector<uint8_t> sp = sv_search_path_payload(input);
     Connection probe(*context.db);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
     SvOwnedBuffer payload;
@@ -1374,6 +1420,7 @@ static void sv_run_varchar_bind_with_name(ClientContext &context,
     std::memset(error_buf, 0, sizeof(error_buf));
     uint8_t rc = dispatcher(borrowed,
                             reinterpret_cast<const uint8_t *>(name.data()), name.size(),
+                            sp.empty() ? nullptr : sp.data(), sp.size(),
                             &payload.ptr, &payload.len,
                             error_buf, sizeof(error_buf));
     if (rc != 0) {
@@ -1403,6 +1450,7 @@ static void sv_run_varchar_bool_bind_with_two_names(
     }
     std::string name1 = input.inputs[0].GetValue<std::string>();
     std::string name2 = input.inputs[1].GetValue<std::string>();
+    std::vector<uint8_t> sp = sv_search_path_payload(input);
     Connection probe(*context.db);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
     SvOwnedBuffer payload;
@@ -1411,6 +1459,7 @@ static void sv_run_varchar_bool_bind_with_two_names(
     uint8_t rc = dispatcher(borrowed,
                             reinterpret_cast<const uint8_t *>(name1.data()), name1.size(),
                             reinterpret_cast<const uint8_t *>(name2.data()), name2.size(),
+                            sp.empty() ? nullptr : sp.data(), sp.size(),
                             &payload.ptr, &payload.len,
                             error_buf, sizeof(error_buf));
     if (rc != 0) {
@@ -1731,9 +1780,10 @@ static unique_ptr<FunctionData> sv_show_columns_in_semantic_view_bind(
         context, input, *bd, 8, "show_columns_in_semantic_view",
         [](duckdb_connection borrowed,
            const uint8_t *np, size_t nl,
+           const uint8_t *sp, size_t spl,
            char **op, size_t *ol, char *eb, size_t ebl) {
             return sv_show_columns_in_semantic_view_bind_rust(
-                borrowed, np, nl, op, ol, eb, ebl);
+                borrowed, np, nl, sp, spl, op, ol, eb, ebl);
         });
     return std::move(bd);
 }
@@ -1755,9 +1805,10 @@ static unique_ptr<FunctionData> sv_describe_semantic_view_bind(
         context, input, *bd, 5, "describe_semantic_view",
         [](duckdb_connection borrowed,
            const uint8_t *np, size_t nl,
+           const uint8_t *sp, size_t spl,
            char **op, size_t *ol, char *eb, size_t ebl) {
             return sv_describe_semantic_view_bind_rust(
-                borrowed, np, nl, op, ol, eb, ebl);
+                borrowed, np, nl, sp, spl, op, ol, eb, ebl);
         });
     return std::move(bd);
 }
@@ -1780,9 +1831,10 @@ static unique_ptr<FunctionData> sv_show_semantic_dimensions_bind(
         context, input, *bd, 8, "show_semantic_dimensions",
         [](duckdb_connection borrowed,
            const uint8_t *np, size_t nl,
+           const uint8_t *sp, size_t spl,
            char **op, size_t *ol, char *eb, size_t ebl) {
             return sv_show_semantic_dimensions_bind_rust(
-                borrowed, np, nl, op, ol, eb, ebl);
+                borrowed, np, nl, sp, spl, op, ol, eb, ebl);
         });
     return std::move(bd);
 }
@@ -1805,9 +1857,10 @@ static unique_ptr<FunctionData> sv_show_semantic_metrics_bind(
         context, input, *bd, 8, "show_semantic_metrics",
         [](duckdb_connection borrowed,
            const uint8_t *np, size_t nl,
+           const uint8_t *sp, size_t spl,
            char **op, size_t *ol, char *eb, size_t ebl) {
             return sv_show_semantic_metrics_bind_rust(
-                borrowed, np, nl, op, ol, eb, ebl);
+                borrowed, np, nl, sp, spl, op, ol, eb, ebl);
         });
     return std::move(bd);
 }
@@ -1830,9 +1883,10 @@ static unique_ptr<FunctionData> sv_show_semantic_facts_bind(
         context, input, *bd, 8, "show_semantic_facts",
         [](duckdb_connection borrowed,
            const uint8_t *np, size_t nl,
+           const uint8_t *sp, size_t spl,
            char **op, size_t *ol, char *eb, size_t ebl) {
             return sv_show_semantic_facts_bind_rust(
-                borrowed, np, nl, op, ol, eb, ebl);
+                borrowed, np, nl, sp, spl, op, ol, eb, ebl);
         });
     return std::move(bd);
 }
@@ -1855,9 +1909,10 @@ static unique_ptr<FunctionData> sv_show_semantic_materializations_bind(
         context, input, *bd, 7, "show_semantic_materializations",
         [](duckdb_connection borrowed,
            const uint8_t *np, size_t nl,
+           const uint8_t *sp, size_t spl,
            char **op, size_t *ol, char *eb, size_t ebl) {
             return sv_show_semantic_materializations_bind_rust(
-                borrowed, np, nl, op, ol, eb, ebl);
+                borrowed, np, nl, sp, spl, op, ol, eb, ebl);
         });
     return std::move(bd);
 }
@@ -1884,9 +1939,10 @@ static unique_ptr<FunctionData> sv_show_semantic_dimensions_for_metric_bind(
         [](duckdb_connection borrowed,
            const uint8_t *vn, size_t vnl,
            const uint8_t *mn, size_t mnl,
+           const uint8_t *sp, size_t spl,
            char **op, size_t *ol, char *eb, size_t ebl) {
             return sv_show_semantic_dimensions_for_metric_bind_rust(
-                borrowed, vn, vnl, mn, mnl, op, ol, eb, ebl);
+                borrowed, vn, vnl, mn, mnl, sp, spl, op, ol, eb, ebl);
         });
     return std::move(bd);
 }
@@ -2048,6 +2104,15 @@ static void sv_get_ddl_exec(DataChunk &args, ExpressionState &state,
                     borrowed,
                     reinterpret_cast<const uint8_t *>(t.GetData()), t.GetSize(),
                     reinterpret_cast<const uint8_t *>(n.GetData()), n.GetSize(),
+                    // No search path: GET_DDL / READ_YAML are SCALAR
+                    // functions, so the path cannot arrive as a named
+                    // parameter and would need a second registered arity
+                    // (a ScalarFunctionSet overload). Passing (nullptr, 0)
+                    // selects the Rust side's no-path fallback — the unique
+                    // match, or an actionable ambiguity error. Conservative
+                    // rather than wrong: it never returns another schema's
+                    // definition. Tracked in TECH-DEBT #25.
+                    nullptr, 0,
                     op, ol, eb, ebl);
             });
     }
@@ -2081,6 +2146,15 @@ static void sv_read_yaml_from_semantic_view_exec(DataChunk &args,
                 return sv_read_yaml_from_semantic_view_exec_rust(
                     borrowed,
                     reinterpret_cast<const uint8_t *>(n.GetData()), n.GetSize(),
+                    // No search path: GET_DDL / READ_YAML are SCALAR
+                    // functions, so the path cannot arrive as a named
+                    // parameter and would need a second registered arity
+                    // (a ScalarFunctionSet overload). Passing (nullptr, 0)
+                    // selects the Rust side's no-path fallback — the unique
+                    // match, or an actionable ambiguity error. Conservative
+                    // rather than wrong: it never returns another schema's
+                    // definition. Tracked in TECH-DEBT #25.
+                    nullptr, 0,
                     op, ol, eb, ebl);
             });
     }
@@ -2210,6 +2284,7 @@ static unique_ptr<FunctionData> sv_explain_semantic_view_bind(
     if (it_w != input.named_parameters.end() && !it_w->second.IsNull()) {
         where_clause = it_w->second.GetValue<std::string>();
     }
+    std::vector<uint8_t> sp_buf = sv_search_path_payload(input);
 
     Connection probe(*context.db);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
@@ -2221,6 +2296,7 @@ static unique_ptr<FunctionData> sv_explain_semantic_view_bind(
     uint8_t rc = sv_explain_semantic_view_bind_rust(
         borrowed,
         reinterpret_cast<const uint8_t *>(view_name.data()), view_name.size(),
+        sp_buf.empty()      ? nullptr : sp_buf.data(),      sp_buf.size(),
         dims_buf.empty()    ? nullptr : dims_buf.data(),    dims_buf.size(),
         metrics_buf.empty() ? nullptr : metrics_buf.data(), metrics_buf.size(),
         facts_buf.empty()   ? nullptr : facts_buf.data(),   facts_buf.size(),
@@ -2508,6 +2584,7 @@ static unique_ptr<FunctionData> sv_semantic_view_bind(
     if (it_w != input.named_parameters.end() && !it_w->second.IsNull()) {
         where_clause = it_w->second.GetValue<std::string>();
     }
+    std::vector<uint8_t> sp_buf = sv_search_path_payload(input);
 
     Connection probe(*context.db);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
@@ -2518,6 +2595,7 @@ static unique_ptr<FunctionData> sv_semantic_view_bind(
     uint8_t rc = sv_semantic_view_bind_rust(
         borrowed,
         reinterpret_cast<const uint8_t *>(view_name.data()), view_name.size(),
+        sp_buf.empty()      ? nullptr : sp_buf.data(),      sp_buf.size(),
         dims_buf.empty()    ? nullptr : dims_buf.data(),    dims_buf.size(),
         metrics_buf.empty() ? nullptr : metrics_buf.data(), metrics_buf.size(),
         facts_buf.empty()   ? nullptr : facts_buf.data(),   facts_buf.size(),

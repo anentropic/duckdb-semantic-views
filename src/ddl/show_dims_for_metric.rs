@@ -33,6 +33,8 @@ pub unsafe extern "C" fn sv_show_semantic_dimensions_for_metric_bind_rust(
     view_name_len: usize,
     metric_name_ptr: *const u8,
     metric_name_len: usize,
+    sp_ptr: *const u8,
+    sp_len: usize,
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
     error_buf: *mut u8,
@@ -52,6 +54,8 @@ pub unsafe extern "C" fn sv_show_semantic_dimensions_for_metric_bind_rust(
                 view_name_len,
                 metric_name_ptr,
                 metric_name_len,
+                sp_ptr,
+                sp_len,
             )
         },
     )
@@ -75,6 +79,8 @@ unsafe fn show_dims_for_metric(
     view_name_len: usize,
     metric_name_ptr: *const u8,
     metric_name_len: usize,
+    sp_ptr: *const u8,
+    sp_len: usize,
 ) -> Result<Vec<u8>, String> {
     let view_name = read_str_arg(view_name_ptr, view_name_len, "view name")?;
     let metric_name = read_str_arg(metric_name_ptr, metric_name_len, "metric name")?;
@@ -83,10 +89,11 @@ unsafe fn show_dims_for_metric(
     let view = crate::ident::parse_view_ref(&view_name)
         .map_err(|e| format!("Invalid view name '{view_name}': {e}"))?;
     let view_name = view.name.clone();
+    let search_path = unsafe { crate::ddl::read_ffi::read_search_path(sp_ptr, sp_len) }?;
 
     let present = probe_catalog_table_present(borrowed)?;
     let reader = CatalogReader::new(borrowed, present);
-    let Some(json) = reader.lookup(&view)? else {
+    let Some(json) = reader.lookup(&view, &search_path)? else {
         let available = reader.list_names().unwrap_or_default();
         let not_found = crate::catalog::view_not_found_msg(&view.to_string());
         return Err(match suggest_closest(&view_name, &available) {

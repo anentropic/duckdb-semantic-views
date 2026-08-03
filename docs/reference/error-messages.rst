@@ -798,6 +798,24 @@ and ``ALTER ... RENAME`` additionally raises, when the target name is taken:
 **Fix:** Decide on the contract you want. Use ``IF EXISTS`` if a missing target should silently no-op (``DROP SEMANTIC VIEW IF EXISTS my_view``, ``ALTER SEMANTIC VIEW IF EXISTS my_view ...``). If you need the check and the write to be atomic under concurrency, wrap the statement in an explicit transaction (``BEGIN; DROP SEMANTIC VIEW my_view; COMMIT;``): all statements then share one snapshot, and a conflicting concurrent commit makes your ``COMMIT`` fail with a retryable transaction-conflict error instead of slipping through the window. See :ref:`explanation-transactional-ddl` for the full mechanism.
 
 
+Unqualified name that is not on the search path
+-----------------------------------------------
+
+.. code-block:: text
+
+   semantic view '<name>' does not exist on the search path. It exists in
+   schemas <schemas>, none of which are on the current search path (<path>).
+   Qualify the reference as <schema>.<name>, or add the schema to search_path.
+
+**Cause:** An unqualified reference resolves through the session's ``search_path``, the same rule DuckDB applies to an unqualified table name. A view of this name exists, but only in schemas that are not on the path — so by that rule it is not visible from here. DuckDB would report a plain "does not exist"; this message says where the view actually is instead, because a bare not-found is confusing for something ``SHOW SEMANTIC VIEWS`` plainly lists.
+
+This applies to reads and writes alike, and ``IF EXISTS`` does not suppress it: that clause means "do not complain if the view is absent", and a view sitting off the path is not absent. Suppressing it would let a ``DROP`` silently remove one of several same-named views.
+
+**Fix:** Either qualify the reference (``DROP SEMANTIC VIEW analytics.sales``, ``semantic_view('analytics.sales')``) or put the schema on the path (``SET search_path = 'analytics'``). When several schemas hold the name, the first one on the path wins.
+
+**Note:** A view that is the *only* one of its name resolves whether or not its schema is on the path, so this error only appears once a second view shares the name.
+
+
 .. _ref-err-wildcard:
 
 Wildcard Errors

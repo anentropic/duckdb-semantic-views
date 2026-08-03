@@ -67,7 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Unqualified table names in a view body still resolve in the **creating session's** schema, not the view's, following DuckDB's rule for a view body — so semantic views can live in their own schema while reading tables from another.
 
-  **A reference that names no schema** resolves to the one view of that name when exactly one exists (the common case, unchanged), and is an error naming the candidate schemas when several do. DuckDB would resolve such a reference through the session's search path; the read-side table functions cannot yet see it, and preferring it on the write side alone would make `DROP SEMANTIC VIEW v` and `semantic_view('v')` disagree about which `v` they mean. Qualify the reference in the meantime.
+  **A reference that names no schema follows the session's search path**, the way it does for every other DuckDB object: the first schema on `search_path` holding a view of that name wins, so `SET search_path = 'staging'` makes a bare `sales` mean `staging.sales`. A view that is the only one of its name resolves whether or not its schema is on the path, which keeps the ordinary single-schema case unchanged. Reads and writes resolve identically — `DROP SEMANTIC VIEW v` removes the view `semantic_view('v')` returns.
+
+  A name that exists *only* in schemas off the path is a miss, but not a bare one: the error names the schemas it does live in, the path that was searched, and the two ways out (qualify it, or add the schema to `search_path`). `IF EXISTS` does not absorb that — it means "do not complain if the view is absent", and a view sitting off the path is not absent.
+
+  Two exceptions, both narrow: `GET_DDL` and `READ_YAML_FROM_SEMANTIC_VIEW` are scalar functions, which cannot take the search path, so they still resolve a bare name to the unique match and report an error when several schemas hold it.
 
   A `<database>.` prefix is now checked rather than discarded. Semantic views are single-catalog, so `CREATE SEMANTIC VIEW otherdb.analytics.v` cannot be honoured — it used to drop the prefix and quietly create the view in the current database's `analytics` instead, and now says so.
 
