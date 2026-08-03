@@ -111,6 +111,8 @@ pub unsafe extern "C" fn sv_show_semantic_materializations_bind_rust(
     conn: libduckdb_sys::duckdb_connection,
     name_ptr: *const u8,
     name_len: usize,
+    sp_ptr: *const u8,
+    sp_len: usize,
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
     error_buf: *mut u8,
@@ -130,7 +132,7 @@ pub unsafe extern "C" fn sv_show_semantic_materializations_bind_rust(
             let view = crate::ident::parse_view_ref(&view_name)
                 .map_err(|e| format!("Invalid view name '{view_name}': {e}"))?;
             let view_name = view.name.clone();
-            let search_path: Vec<String> = Vec::new();
+            let search_path = unsafe { crate::ddl::read_ffi::read_search_path(sp_ptr, sp_len) }?;
             let present = unsafe { probe_catalog_table_present(borrowed) }?;
             let reader = CatalogReader::new(borrowed, present);
             let Some(json) = reader.lookup(&view, &search_path)? else {

@@ -49,6 +49,8 @@ pub unsafe extern "C" fn sv_read_yaml_from_semantic_view_exec_rust(
     conn: libduckdb_sys::duckdb_connection,
     name_ptr: *const u8,
     name_len: usize,
+    sp_ptr: *const u8,
+    sp_len: usize,
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
     error_buf: *mut u8,
@@ -61,7 +63,7 @@ pub unsafe extern "C" fn sv_read_yaml_from_semantic_view_exec_rust(
         error_buf,
         error_buf_len,
         "sv_read_yaml_from_semantic_view_exec_rust",
-        |borrowed| unsafe { read_yaml_export(borrowed, name_ptr, name_len) },
+        |borrowed| unsafe { read_yaml_export(borrowed, name_ptr, name_len, sp_ptr, sp_len) },
     )
 }
 
@@ -76,13 +78,15 @@ unsafe fn read_yaml_export(
     borrowed: &crate::ddl::read_ffi::BorrowedConnection,
     name_ptr: *const u8,
     name_len: usize,
+    sp_ptr: *const u8,
+    sp_len: usize,
 ) -> Result<Vec<u8>, String> {
     use crate::ddl::read_ffi::{probe_catalog_table_present, read_str_arg};
 
     let raw_name = read_str_arg(name_ptr, name_len, "view name")?;
     let view = resolve_view_ref(&raw_name);
     let bare_name = view.name.clone();
-    let search_path: Vec<String> = Vec::new();
+    let search_path = unsafe { crate::ddl::read_ffi::read_search_path(sp_ptr, sp_len) }?;
 
     // FF-9: a probe-query failure is distinct from "no views" (propagated).
     let present = probe_catalog_table_present(borrowed)?;

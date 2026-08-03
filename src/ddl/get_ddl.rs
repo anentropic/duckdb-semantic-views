@@ -40,6 +40,8 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
     type_len: usize,
     name_ptr: *const u8,
     name_len: usize,
+    sp_ptr: *const u8,
+    sp_len: usize,
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
     error_buf: *mut u8,
@@ -52,7 +54,11 @@ pub unsafe extern "C" fn sv_get_ddl_exec_rust(
         error_buf,
         error_buf_len,
         "sv_get_ddl_exec_rust",
-        |borrowed| unsafe { get_ddl(borrowed, type_ptr, type_len, name_ptr, name_len) },
+        |borrowed| unsafe {
+            get_ddl(
+                borrowed, type_ptr, type_len, name_ptr, name_len, sp_ptr, sp_len,
+            )
+        },
     )
 }
 
@@ -70,6 +76,8 @@ unsafe fn get_ddl(
     type_len: usize,
     name_ptr: *const u8,
     name_len: usize,
+    sp_ptr: *const u8,
+    sp_len: usize,
 ) -> Result<Vec<u8>, String> {
     use crate::ddl::read_ffi::{probe_catalog_table_present, read_str_arg};
 
@@ -88,7 +96,7 @@ unsafe fn get_ddl(
     // identifier is looked up verbatim and fails with the canonical message.
     let view = crate::ident::parse_view_ref_lenient(&raw_name);
     let name = view.name.clone();
-    let search_path: Vec<String> = Vec::new();
+    let search_path = unsafe { crate::ddl::read_ffi::read_search_path(sp_ptr, sp_len) }?;
 
     // FF-9: a probe-query failure is distinct from "no views" (propagated).
     let present = probe_catalog_table_present(borrowed)?;

@@ -19,6 +19,8 @@ pub unsafe extern "C" fn sv_describe_semantic_view_bind_rust(
     conn: libduckdb_sys::duckdb_connection,
     name_ptr: *const u8,
     name_len: usize,
+    sp_ptr: *const u8,
+    sp_len: usize,
     out_ptr: *mut *mut u8,
     out_len: *mut usize,
     error_buf: *mut u8,
@@ -31,7 +33,7 @@ pub unsafe extern "C" fn sv_describe_semantic_view_bind_rust(
         error_buf,
         error_buf_len,
         "sv_describe_semantic_view_bind_rust",
-        |borrowed| unsafe { describe_view_rows(borrowed, name_ptr, name_len) },
+        |borrowed| unsafe { describe_view_rows(borrowed, name_ptr, name_len, sp_ptr, sp_len) },
     )
 }
 
@@ -46,6 +48,8 @@ unsafe fn describe_view_rows(
     borrowed: &crate::ddl::read_ffi::BorrowedConnection,
     name_ptr: *const u8,
     name_len: usize,
+    sp_ptr: *const u8,
+    sp_len: usize,
 ) -> Result<Vec<u8>, String> {
     use crate::ddl::read_ffi::{probe_catalog_table_present, read_str_arg, serialize_varchar_rows};
 
@@ -54,7 +58,7 @@ unsafe fn describe_view_rows(
     let view = crate::ident::parse_view_ref(&raw_name)
         .map_err(|e| format!("Invalid view name '{raw_name}': {e}"))?;
     let name = view.name.clone();
-    let search_path: Vec<String> = Vec::new();
+    let search_path = unsafe { crate::ddl::read_ffi::read_search_path(sp_ptr, sp_len) }?;
     // FF-9: a probe-query failure is distinct from "no views" (propagated).
     let present = probe_catalog_table_present(borrowed)?;
     let reader = CatalogReader::new(borrowed, present);
