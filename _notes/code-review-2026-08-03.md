@@ -417,7 +417,7 @@ Cortex-only concepts — `time_dimensions`, `custom_instructions`, `sample_value
 `explain_semantic_view()`, `list_semantic_views()`, and DuckLake/Iceberg/Parquet sources are
 clearly labelled extension-only additions.
 
-### PAR-1 — MEDIUM (docs): the highest-traffic query reference page is stale on three counts
+### PAR-1 — MEDIUM (docs): the highest-traffic query reference page is stale on three counts — RESOLVED 2026-08-04
 
 `docs/reference/semantic-view-function.rst`:
 1. Does **not document `where_clause :=` at all** (nor `search_path :=`), despite the parameter
@@ -428,7 +428,18 @@ clearly labelled extension-only additions.
    pre-#187 interim rule; search-path resolution replaced it (5f06ce8), and
    `create-semantic-view.rst` has the new rule. The two pages now contradict each other.
 3. Line 135 says "Column types are inferred at define time" — removed in v0.10.0; types are
-   inferred at bind via a LIMIT-0 probe (`src/expand/resolution.rs:234-249`).
+   inferred at bind via a LIMIT-0 probe (`src/query/table_function.rs:241`; the
+   `resolution.rs` line reference in the original finding was stale).
+
+**Resolved 2026-08-04.** All three corrected in `docs/reference/semantic-view-function.rst`:
+`where_clause` added to the syntax block, the parameter table and a new
+`ref-sv-pre-agg-filtering` section under Filtering (which now contrasts the pre- and
+post-aggregation filters explicitly) plus an example; `search_path` documented as
+parser-injected rather than hand-written; the view-name rule replaced with the search-path
+rule from `create-semantic-view.rst`; and the type-inference sentence rewritten to describe
+the bind-time `LIMIT 0` probe, including that dimension-and-metric queries still prefer
+CREATE-time persisted types on pre-v0.10.0 catalog rows. `sphinx-build -W` clean. No
+TECH-DEBT entry: the drift is fully closed, with no deliberately-degraded remainder.
 
 ### PAR-2 — MEDIUM: `SHOW SEMANTIC DIMENSIONS/METRICS/FACTS` returns an empty `data_type` for all views created ≥ v0.10.0 — a *pinned interim state whose follow-up never landed*
 
@@ -764,11 +775,12 @@ Status as of 2026-08-04. ✅ = landed on `main`; ⏳ = in review; ❌ = withdraw
 1. ✅ **EXP-9 and EXP-10** — the two silent-wrong-number paths. PR #189 (TECH-DEBT #39/#40).
 2. ✅ **PBT-6** — `where_clause` randomized in all five numeric oracles, each mutation-verified.
    PRs #189 + #191 (TECH-DEBT #41). ❌ **PBT-7** withdrawn: its premise was false, see above.
-3. ⏳ **EXP-12 paired migration** — all four window-inner-metric sites → `ident_matches`, together.
+3. ✅ **EXP-12 paired migration** — all four window-inner-metric sites → `ident_matches`, together.
    PR #192 (TECH-DEBT #43). Found to be an *active* wrong-number bug, not the latent one filed.
-   ⏳ **CAT-1/CAT-2** — TECH-DEBT #44/#45. CAT-1's duplicate-row/stale-read symptom was reproduced
-   end-to-end against a real pre-scoping database before fixing.
-4. **REL-1/REL-2** (tag state), **PAR-1** (`semantic-view-function.rst` drift). ARCH-13's
+   ✅ **CAT-1/CAT-2** — TECH-DEBT #44/#45. CAT-1's duplicate-row/stale-read symptom was reproduced
+   end-to-end against a real pre-scoping database before fixing. All three merged in PR #192.
+4. ✅ **PAR-1** — `semantic-view-function.rst` drift, all three counts corrected.
+   **REL-1/REL-2** (tag state) still open — they are release decisions, not code changes. ARCH-13's
    sub-items are partly overtaken: MAINTAINER.md's `where_clause.rs` omission and the "eight fuzz
    targets" miscount were fixed on `main` independently; the TECH-DEBT #28 status marker is still
    ambiguous.
