@@ -85,12 +85,50 @@ const FILTERS: [usize; 3] = [3, 4, 5];
 #[derive(Debug, Clone)]
 enum Pred {
     /// `<member> <op> <literal>` for a comparable member (index into `WMEMBERS`).
-    Cmp(usize, &'static str, i64),
-    /// A bare filter member — the substitution/precedence surface.
-    Filter(usize),
+    /// The `bool` is EXP-14's surface: when true the member is named by its
+    /// `<table>.<name>` qualified form instead of bare.
+    Cmp(usize, &'static str, i64, bool),
+    /// A filter member — the substitution/precedence surface. The `bool` is the
+    /// same qualified/bare choice as `Cmp`.
+    Filter(usize, bool),
     And(Box<Pred>, Box<Pred>),
     Or(Box<Pred>, Box<Pred>),
     Not(Box<Pred>),
+}
+
+/// Whether this predicate names any member qualified, and whether any bare.
+/// Used by the anti-vacuity guard to prove the generator reaches both spellings.
+fn reference_spellings_of(p: &Pred, qualified: &mut bool, bare: &mut bool) {
+    match p {
+        Pred::Cmp(_, _, _, q) | Pred::Filter(_, q) => {
+            if *q {
+                *qualified = true;
+            } else {
+                *bare = true;
+            }
+        }
+        Pred::And(a, b) | Pred::Or(a, b) => {
+            reference_spellings_of(a, qualified, bare);
+            reference_spellings_of(b, qualified, bare);
+        }
+        Pred::Not(a) => reference_spellings_of(a, qualified, bare),
+    }
+}
+
+/// How a generated predicate names member `m`: bare (`ftd`) or qualified by the
+/// member's own table (`t.ftd`).
+///
+/// EXP-14: the qualified spelling was keyed nowhere, so it matched no member and
+/// survived into the emitted SQL as a raw column — never substituted, and never
+/// metric-checked. Both spellings denote the same member, so both must produce
+/// the same number as the oracle; that is what varying this flag tests.
+fn member_ref(m: usize, qualified: bool) -> String {
+    let (name, _, table) = WMEMBERS[m];
+    if qualified {
+        format!("{table}.{name}")
+    } else {
+        name.to_string()
+    }
 }
 
 impl Pred {
@@ -98,20 +136,27 @@ impl Pred {
     /// SQL parse matches this AST, filter members left BARE.
     fn to_member_sql(&self) -> String {
         match self {
-            Pred::Cmp(m, op, k) => format!("{} {op} {k}", WMEMBERS[*m].0),
-            Pred::Filter(m) => WMEMBERS[*m].0.to_string(),
+            Pred::Cmp(m, op, k, q) => format!("{} {op} {k}", member_ref(*m, *q)),
+            Pred::Filter(m, q) => member_ref(*m, *q),
             Pred::And(a, b) => format!("({} AND {})", a.to_member_sql(), b.to_member_sql()),
             Pred::Or(a, b) => format!("({} OR {})", a.to_member_sql(), b.to_member_sql()),
             Pred::Not(a) => format!("(NOT {})", a.to_member_sql()),
         }
     }
 
+    /// `(any_qualified, any_bare)` across this predicate's member references.
+    fn reference_spellings(&self) -> (bool, bool) {
+        let (mut q, mut b) = (false, false);
+        reference_spellings_of(self, &mut q, &mut b);
+        (q, b)
+    }
+
     /// The oracle's independent rendering: raw columns, filter members expanded,
     /// every operand explicitly parenthesized.
     fn to_raw_sql(&self) -> String {
         match self {
-            Pred::Cmp(m, op, k) => format!("({} {op} {k})", WMEMBERS[*m].1),
-            Pred::Filter(m) => format!("({})", WMEMBERS[*m].1),
+            Pred::Cmp(m, op, k, _) => format!("({} {op} {k})", WMEMBERS[*m].1),
+            Pred::Filter(m, _) => format!("({})", WMEMBERS[*m].1),
             Pred::And(a, b) => format!("({} AND {})", a.to_raw_sql(), b.to_raw_sql()),
             Pred::Or(a, b) => format!("({} OR {})", a.to_raw_sql(), b.to_raw_sql()),
             Pred::Not(a) => format!("(NOT {})", a.to_raw_sql()),
@@ -122,7 +167,7 @@ impl Pred {
     /// into whichever CTE evaluates it.
     fn tables(&self, out: &mut Vec<&'static str>) {
         match self {
-            Pred::Cmp(m, _, _) | Pred::Filter(m) => out.push(WMEMBERS[*m].2),
+            Pred::Cmp(m, _, _, _) | Pred::Filter(m, _) => out.push(WMEMBERS[*m].2),
             Pred::And(a, b) | Pred::Or(a, b) => {
                 a.tables(out);
                 b.tables(out);
@@ -135,7 +180,7 @@ impl Pred {
     fn references_filter(&self) -> bool {
         match self {
             Pred::Cmp(..) => false,
-            Pred::Filter(_) => true,
+            Pred::Filter(..) => true,
             Pred::And(a, b) | Pred::Or(a, b) => a.references_filter() || b.references_filter(),
             Pred::Not(a) => a.references_filter(),
         }
@@ -150,8 +195,9 @@ fn arb_pred() -> impl Strategy<Value = Pred> {
             comparable,
             prop_oneof![Just("<"), Just("<="), Just("="), Just("<>"), Just(">="), Just(">")],
             -1i64..=3,
-        ).prop_map(|(m, op, k)| Pred::Cmp(m, op, k)),
-        2 => filters.prop_map(Pred::Filter),
+            prop::bool::ANY,
+        ).prop_map(|(m, op, k, q)| Pred::Cmp(m, op, k, q)),
+        2 => (filters, prop::bool::ANY).prop_map(|(m, q)| Pred::Filter(m, q)),
     ];
     leaf.prop_recursive(3, 8, 2, |inner| {
         prop_oneof![
@@ -698,6 +744,8 @@ fn generator_reaches_both_where_clause_branches() {
     let mut with_pred = 0usize;
     let mut without_pred = 0usize;
     let mut with_filter = 0usize;
+    let mut qualified_ref = 0usize;
+    let mut bare_ref = 0usize;
     let mut pred_below_grain = 0usize;
     let mut pred_at_or_above_grain = 0usize;
     let mut multi_grain_with_pred = 0usize;
@@ -722,6 +770,9 @@ fn generator_reaches_both_where_clause_branches() {
                 if p.references_filter() {
                     with_filter += 1;
                 }
+                let (q, b) = p.reference_spellings();
+                qualified_ref += usize::from(q);
+                bare_ref += usize::from(b);
                 distinct.insert(p.to_member_sql());
                 if dim_below || case.sel_metrics.is_empty() {
                     continue;
@@ -761,6 +812,15 @@ fn generator_reaches_both_where_clause_branches() {
         with_filter > 0,
         "generator never referenced a filter member -- member substitution and \
          its parenthesization are untested"
+    );
+    // EXP-14 guard. `where_clause: None` in all five harnesses is how EXP-9/EXP-10
+    // reached main; a qualification flag pinned to `false` would be the same
+    // mistake one level down -- the field present, the generator never varying it.
+    assert!(
+        qualified_ref > 0 && bare_ref > 0,
+        "where_clause members must be named BOTH bare and <table>.<name> across \
+         cases (qualified={qualified_ref}, bare={bare_ref}); with either at zero \
+         the qualified-reference resolution EXP-14 fixed is untested"
     );
     assert!(
         pred_below_grain > 0,

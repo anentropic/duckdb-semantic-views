@@ -86,29 +86,65 @@ pub(super) fn resolve_where_clause(
     // `expand::facts`, derived metrics in `expand::per_grain`) already wrap for
     // exactly this reason. Wrapping unconditionally keeps the three consistent;
     // a redundant `(o.region)` around a plain column is harmless.
+    // EXP-14: every member is keyed BOTH bare (`order_date`) and by its own
+    // `source_table.name` (`o.order_date`), because `scan_references` keys a
+    // dotted chain by the whole chain. Keying bare only meant a qualified
+    // reference matched nothing: it survived into the SQL as a raw column —
+    // silently filtering on different semantics than the member wherever a
+    // dimension's expression differs from a same-named physical column — and
+    // skipped the metric check entirely, so `o.revenue > 5` slipped past
+    // `WhereClauseReferencesMetric`. This mirrors `expand::facts::insert_fact_keys`
+    // and the dotted-reference handling at the NA-dim and window sites
+    // (TECH-DEBT #28/#30). Keying by the member's OWN table is what keeps a
+    // *foreign* qualifier (`c.order_date`) an ordinary column, per E-3.
+    let keys_for = |source_table: Option<&str>, name: &str| {
+        let mut keys = Vec::with_capacity(2);
+        if let Some(st) = source_table {
+            keys.push(normalize_ident_part(&format!("{st}.{name}")));
+        }
+        keys.push(normalize_ident_part(name));
+        keys
+    };
+
     let mut dim_exprs: HashMap<String, String> = HashMap::new();
     let mut member_tables: HashMap<String, Option<&str>> = HashMap::new();
     for dim in &def.dimensions {
-        let key = normalize_ident_part(&dim.name);
-        dim_exprs.insert(key.clone(), format!("({})", dim.expr));
-        member_tables.insert(key, dim.source_table.as_deref());
+        // Dimensions are never PRIVATE — `PRIVATE` on a dimension is rejected at
+        // CREATE (`body_parser::entries`), which is why `sql_gen`'s `Resolvable`
+        // impl has `unreachable!("dimensions cannot be private")`. So there is no
+        // access check to make here, only on facts below.
+        for key in keys_for(dim.source_table.as_deref(), &dim.name) {
+            dim_exprs.insert(key.clone(), format!("({})", dim.expr));
+            member_tables.insert(key, dim.source_table.as_deref());
+        }
     }
+    // EXP-13: a PRIVATE fact is deliberately NOT added to the lookup. It is
+    // recorded separately so a reference to one is rejected by name rather than
+    // falling through to "unknown reference", which would leave it in the SQL as
+    // a raw column and leak the very member PRIVATE withholds.
+    let mut private_facts: HashMap<String, &str> = HashMap::new();
     for fact in &def.facts {
-        let key = normalize_ident_part(&fact.name);
-        // A dimension and a fact may share a name; the dimension wins, matching
-        // the precedence the select-list resolution already uses.
-        dim_exprs
-            .entry(key.clone())
-            .or_insert_with(|| format!("({})", fact.expr));
-        member_tables
-            .entry(key)
-            .or_insert(fact.source_table.as_deref());
+        for key in keys_for(fact.source_table.as_deref(), &fact.name) {
+            if fact.access == crate::model::AccessModifier::Private {
+                private_facts.entry(key).or_insert(fact.name.as_str());
+                continue;
+            }
+            // A dimension and a fact may share a name; the dimension wins,
+            // matching the precedence the select-list resolution already uses.
+            dim_exprs
+                .entry(key.clone())
+                .or_insert_with(|| format!("({})", fact.expr));
+            member_tables
+                .entry(key)
+                .or_insert(fact.source_table.as_deref());
+        }
     }
-    let metric_names: HashMap<String, &str> = def
-        .metrics
-        .iter()
-        .map(|m| (normalize_ident_part(&m.name), m.name.as_str()))
-        .collect();
+    let mut metric_names: HashMap<String, &str> = HashMap::new();
+    for m in &def.metrics {
+        for key in keys_for(m.source_table.as_deref(), &m.name) {
+            metric_names.entry(key).or_insert(m.name.as_str());
+        }
+    }
 
     let mut source_tables: Vec<String> = Vec::new();
     let mut members: Vec<(String, Option<String>)> = Vec::new();
@@ -126,6 +162,16 @@ pub(super) fn resolve_where_clause(
                 members.push((r.raw.to_string(), table.map(str::to_ascii_lowercase)));
             }
             continue;
+        }
+        // EXP-13: a PRIVATE fact the predicate names. Checked after the member
+        // lookup so a public dimension sharing its name still resolves, and
+        // before the metric check for the same reason the metric check sits
+        // after the member lookup — the most specific match wins.
+        if let Some(fact_name) = private_facts.get(&key) {
+            return Err(ExpandError::PrivateFact {
+                view_name: view_name.to_string(),
+                name: (*fact_name).to_string(),
+            });
         }
         // Only reject a metric the predicate genuinely names. Checked after the
         // member lookup so a dimension sharing a metric's name still resolves.
@@ -175,6 +221,84 @@ mod tests {
     fn substitutes_a_fact_expression() {
         let r = resolve_where_clause("v", &def(), "net_price > 100").unwrap();
         assert_eq!(r.sql, "(o.price * (1 - o.discount)) > 100");
+    }
+
+    // EXP-13: the member lookup was built from *all* facts with no
+    // `AccessModifier` check, so a PRIVATE fact that `resolve_names` refuses to
+    // let you select could still be filtered on — and its values probed by
+    // varying the predicate. The queried-member path has enforced PRIVATE since
+    // Phase 43; the predicate path did not. (Only facts are affected: `PRIVATE`
+    // on a dimension is rejected at CREATE — see PAR-4.)
+
+    #[test]
+    fn a_private_fact_is_rejected_in_the_predicate() {
+        let def = SemanticViewDefinition::default()
+            .with_table("o", "orders", &["id"])
+            .with_private_fact("secret_margin", "o.price - o.cost", "o");
+        let err = resolve_where_clause("v", &def, "secret_margin > 0").unwrap_err();
+        assert!(
+            matches!(err, ExpandError::PrivateFact { ref name, .. } if name == "secret_margin"),
+            "expected PrivateFact, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_private_fact_is_rejected_through_a_qualified_reference_too() {
+        let def = SemanticViewDefinition::default()
+            .with_table("o", "orders", &["id"])
+            .with_private_fact("secret_margin", "o.price - o.cost", "o");
+        let err = resolve_where_clause("v", &def, "o.secret_margin > 0").unwrap_err();
+        assert!(
+            matches!(err, ExpandError::PrivateFact { ref name, .. } if name == "secret_margin"),
+            "expected PrivateFact, got {err:?}"
+        );
+    }
+
+    /// Control for EXP-13: a non-private fact of the same shape still resolves,
+    /// so the guard rejects on access rather than on being a fact at all.
+    #[test]
+    fn a_public_fact_still_resolves_in_the_predicate() {
+        let r = resolve_where_clause("v", &def(), "net_price > 100").unwrap();
+        assert_eq!(r.sql, "(o.price * (1 - o.discount)) > 100");
+    }
+
+    // EXP-14: `scan_references` keys a dotted chain as `o.order_date`, but the
+    // member lookup was keyed by bare name only. A qualified reference therefore
+    // matched nothing: it was left as a raw column (silently filtering on
+    // different semantics than the member wherever the two differ) and skipped
+    // the metric check entirely. Every other member-reference site resolves
+    // dotted references (#30/#28); this one did not.
+
+    #[test]
+    fn a_qualified_dimension_reference_is_substituted() {
+        let r = resolve_where_clause("v", &def(), "o.order_date > DATE '1995-01-01'").unwrap();
+        assert_eq!(r.sql, "(o.ordered_at) > DATE '1995-01-01'");
+        assert_eq!(r.source_tables, vec!["o"]);
+    }
+
+    #[test]
+    fn a_qualified_fact_reference_is_substituted() {
+        let r = resolve_where_clause("v", &def(), "o.net_price > 100").unwrap();
+        assert_eq!(r.sql, "(o.price * (1 - o.discount)) > 100");
+    }
+
+    #[test]
+    fn a_qualified_metric_reference_is_still_rejected() {
+        let err = resolve_where_clause("v", &def(), "o.revenue > 5").unwrap_err();
+        assert!(
+            matches!(err, ExpandError::WhereClauseReferencesMetric { ref metric_name, .. }
+                if metric_name == "revenue"),
+            "expected WhereClauseReferencesMetric, got {err:?}"
+        );
+    }
+
+    /// Control for EXP-14: a qualifier that is *not* the member's own table is a
+    /// column on another relation, not a member reference (the E-3 rule), so it
+    /// must stay untouched rather than being substituted.
+    #[test]
+    fn a_foreign_qualified_reference_is_left_as_a_raw_column() {
+        let r = resolve_where_clause("v", &def(), "c.order_date > DATE '1995-01-01'").unwrap();
+        assert_eq!(r.sql, "c.order_date > DATE '1995-01-01'");
     }
 
     /// A member whose expression is a compound of LOOSER-binding operators than
