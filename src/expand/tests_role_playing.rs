@@ -578,12 +578,34 @@ fn where_clause_on_role_playing_table_is_rejected() {
         metrics: vec![MetricName::new("departure_count")],
     };
     let result = expand("flights_sv", &def, &req);
-    assert!(
-        result.is_err(),
-        "a where_clause member on a role-playing table must not bind to the \
-         first-declared relationship silently; got: {:?}",
-        result.ok()
-    );
+    // The specific variant, not merely "an error": a bare `is_err()` would go
+    // green on any unrelated failure and stop guarding EXP-10.
+    match result {
+        Err(ExpandError::AmbiguousWhereClausePath {
+            view_name,
+            member_name,
+            member_table,
+            role_playing_table,
+            available_relationships,
+        }) => {
+            assert_eq!(view_name, "flights_sv");
+            assert_eq!(member_name, "city");
+            assert_eq!(member_table, "a");
+            assert_eq!(role_playing_table, "a");
+            // The error must name BOTH roles -- that list is what tells the
+            // user how to resolve the ambiguity.
+            assert!(
+                available_relationships.contains(&"dep_airport".to_string())
+                    && available_relationships.contains(&"arr_airport".to_string()),
+                "error must list both roles, got: {available_relationships:?}"
+            );
+        }
+        Err(other) => panic!("expected AmbiguousWhereClausePath, got: {other}"),
+        Ok(sql) => panic!(
+            "a where_clause member on a role-playing table must not bind to the \
+             first-declared relationship silently. Emitted SQL:\n{sql}"
+        ),
+    }
 }
 
 /// The wrong-number shape the rejection exists to prevent: the metric's
@@ -602,7 +624,18 @@ fn where_clause_role_playing_does_not_filter_through_the_other_role() {
     };
     let result = expand("flights_sv", &def, &req);
     match result {
-        Err(_) => {}
+        Err(ExpandError::AmbiguousWhereClausePath {
+            member_name,
+            role_playing_table,
+            ..
+        }) => {
+            assert_eq!(member_name, "city");
+            assert_eq!(role_playing_table, "a");
+        }
+        Err(other) => panic!(
+            "expected AmbiguousWhereClausePath -- a different error means this \
+             case is no longer guarding the wrong-role filter: {other}"
+        ),
         Ok(sql) => panic!(
             "expected a role-playing ambiguity error; emitted SQL instead (the \
              predicate binds to the dep_airport instance while the metric uses \

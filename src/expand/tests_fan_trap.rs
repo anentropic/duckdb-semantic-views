@@ -457,13 +457,26 @@ fn semi_additive_na_dim_on_fanning_table_blocked() {
         metrics: vec![MetricName::new("balance_at")],
     };
     let result = expand("sales", &def, &req);
-    assert!(
-        result.is_err(),
-        "the NA dimension's table fans the metric's grain inside the snapshot \
-         CTE -- RANK ties across the duplicated rows double-count the metric; \
-         got: {:?}",
-        result.ok()
-    );
+    // Assert the specific variant AND its payload: a bare `is_err()` would go
+    // green on any unrelated failure (a mistyped metric name resolving to
+    // `UnknownMetric`, say) and quietly stop guarding EXP-9.
+    match result {
+        Err(ExpandError::FanTrap { detail }) => {
+            assert_eq!(detail.view_name, "sales");
+            assert_eq!(detail.metric_name, "balance_at");
+            // The NA dimension is named as the fanning participant even though
+            // it was never queried -- that is the whole point of EXP-9.
+            assert_eq!(detail.dimension_name, "ship_ts");
+            assert_eq!(detail.dimension_table, "li");
+            assert_eq!(detail.relationship_name, "li_to_order");
+        }
+        Err(other) => panic!("expected FanTrap naming the NA dimension, got: {other}"),
+        Ok(sql) => panic!(
+            "the NA dimension's table fans the metric's grain inside the snapshot \
+             CTE -- RANK ties across the duplicated rows double-count the metric. \
+             Emitted SQL instead:\n{sql}"
+        ),
+    }
 }
 
 /// The asymmetry that makes EXP-9 unmistakable: *querying* the same dimension
@@ -479,10 +492,17 @@ fn semi_additive_na_dim_queried_is_already_blocked() {
         metrics: vec![MetricName::new("balance_at")],
     };
     let result = expand("sales", &def, &req);
-    assert!(
-        result.is_err(),
-        "control: a queried dimension on the fanning child is an existing FanTrap"
-    );
+    match result {
+        Err(ExpandError::FanTrap { detail }) => {
+            assert_eq!(detail.metric_name, "balance_at");
+            assert_eq!(detail.dimension_name, "ship_ts");
+        }
+        Err(other) => panic!(
+            "control: the queried dimension on the fanning child must still be a \
+             FanTrap, got: {other}"
+        ),
+        Ok(sql) => panic!("control: this has always been a FanTrap; got SQL:\n{sql}"),
+    }
 }
 
 /// Control: an NA dimension on a table that does NOT fan the metric's grain
@@ -514,4 +534,39 @@ fn semi_additive_na_dim_on_non_fanning_table_allowed() {
         "a many-to-one NA-dim join does not fan the metric: {:?}",
         result.err()
     );
+}
+
+/// The error payload reports the source table **as declared**, not folded.
+///
+/// Copilot review on PR #189: the EXP-9 branch initially put the lowercased
+/// lookup key in `FanTrapError.dimension_table`, while the queried-dimension
+/// branch reports `dim.source_table` verbatim. Path and cardinality lookups
+/// still use the folded key — only the message changed — so this pins the two
+/// apart with a mixed-case alias, which the lowercase-aliased tests above
+/// cannot distinguish.
+#[test]
+fn semi_additive_na_dim_fan_trap_reports_declared_table_spelling() {
+    let mut def = semi_additive_na_dim_fans_def();
+    // Re-declare the child table under a mixed-case alias, wiring every
+    // reference to it (the dimension's source, its expression, and the
+    // relationship's from side) to the new spelling.
+    def.tables[1].alias = "LiNe".to_string();
+    def.dimensions[1].source_table = Some("LiNe".to_string());
+    def.dimensions[1].expr = "LiNe.ship_ts".to_string();
+    def.joins[0].from_alias = "LiNe".to_string();
+
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![DimensionName::new("region")],
+        metrics: vec![MetricName::new("balance_at")],
+    };
+    match expand("sales", &def, &req) {
+        Err(ExpandError::FanTrap { detail }) => assert_eq!(
+            detail.dimension_table, "LiNe",
+            "the error must echo the declared spelling, not the folded lookup key"
+        ),
+        Err(other) => panic!("expected FanTrap, got: {other}"),
+        Ok(sql) => panic!("expected FanTrap; got SQL:\n{sql}"),
+    }
 }

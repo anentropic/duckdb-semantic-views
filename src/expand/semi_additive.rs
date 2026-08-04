@@ -846,7 +846,7 @@ pub(super) fn na_dim_fence_members(
     def: &SemanticViewDefinition,
     resolved_mets: &[&Metric],
     queried_dim_keys: &HashSet<String>,
-) -> Vec<(usize, String, String)> {
+) -> Vec<NaFenceMember> {
     let Ok(groups) = collect_na_groups(view_name, def, resolved_mets, queried_dim_keys) else {
         return Vec::new();
     };
@@ -862,13 +862,33 @@ pub(super) fn na_dim_fence_members(
             let Some(ref st) = dim.source_table else {
                 continue; // Base-table NA dim: nothing extra is joined.
             };
-            let table = st.to_ascii_lowercase();
             for &met_idx in &group.metric_indices {
-                members.push((met_idx, dim.name.clone(), table.clone()));
+                members.push(NaFenceMember {
+                    metric_idx: met_idx,
+                    dim_name: dim.name.clone(),
+                    source_table_raw: st.clone(),
+                    source_table_key: st.to_ascii_lowercase(),
+                });
             }
         }
     }
     members
+}
+
+/// One active NA dimension paired with a metric whose rows its join multiplies
+/// (EXP-9). See [`na_dim_fence_members`].
+pub(super) struct NaFenceMember {
+    /// Index into the `resolved_mets` slice passed to `na_dim_fence_members`.
+    pub(super) metric_idx: usize,
+    /// The NA dimension's declared name, for the error message.
+    pub(super) dim_name: String,
+    /// The source table **as declared**, preserving case and quoting. Used for
+    /// the error payload so it reads like the definition the user wrote — the
+    /// spelling the queried-dimension branch of the fence already reports.
+    pub(super) source_table_raw: String,
+    /// The lowercased alias, for path and cardinality lookups (which are keyed
+    /// on the folded spelling throughout the graph).
+    pub(super) source_table_key: String,
 }
 
 /// Aggregate functions the snapshot CTE knows how to decompose into an

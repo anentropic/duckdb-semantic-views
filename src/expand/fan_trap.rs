@@ -134,19 +134,22 @@ pub(super) fn check_fan_traps(
         .iter()
         .map(|d| crate::ident::normalize_ident_part(&d.name))
         .collect();
-    for (met_idx, na_dim_name, na_table) in
+    for na in
         super::semi_additive::na_dim_fence_members(view_name, def, resolved_mets, &queried_dim_keys)
     {
-        let met = resolved_mets[met_idx];
+        let met = resolved_mets[na.metric_idx];
         let mut met_tables = metric_grain_tables(met, def);
         if met_tables.is_empty() {
             met_tables.push(root.clone());
         }
         for met_table in &met_tables {
-            if *met_table == na_table {
+            if *met_table == na.source_table_key {
                 continue; // Same table, no fan-out possible.
             }
-            let Some(path) = find_path(met_table, &na_table, &adjacency) else {
+            // Path and cardinality lookups are keyed on the folded spelling;
+            // the error payload reports the declared one, matching the
+            // queried-dimension branch above.
+            let Some(path) = find_path(met_table, &na.source_table_key, &adjacency) else {
                 continue; // Not connected (legacy joins carrying no FK metadata).
             };
             if let Some(rel_name) = fanning_edge_on_path(&path, &card_map) {
@@ -158,8 +161,8 @@ pub(super) fn check_fan_traps(
                             .source_table
                             .clone()
                             .unwrap_or_else(|| met_table.clone()),
-                        dimension_name: na_dim_name,
-                        dimension_table: na_table,
+                        dimension_name: na.dim_name,
+                        dimension_table: na.source_table_raw,
                         relationship_name: rel_name,
                     }),
                 });
