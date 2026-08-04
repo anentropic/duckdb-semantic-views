@@ -213,8 +213,13 @@ fn insert_fact_keys<'a>(
 /// Matches `count` case-insensitively at a word boundary, followed by
 /// optional whitespace, `(`, optional whitespace, `*`, optional whitespace,
 /// `)` — i.e. `COUNT(*)`, `count( * )`, etc. The original casing of the
-/// function name is preserved; only the argument is replaced. Occurrences
-/// inside single-quoted SQL string literals are left untouched.
+/// function name is preserved; only the argument is replaced.
+///
+/// Occurrences inside a quoted region are left untouched: single-quoted string
+/// literals, double-quoted identifiers and `$tag$ … $tag$` dollar-quoted
+/// strings alike, per [`crate::util::QuoteState`]. Before EXP-16 only single
+/// quotes were tracked, so `"my count(*) col"` and `$$count(*)$$` were rewritten
+/// as though they were live calls.
 ///
 /// Returns `None` when the expression contains no `COUNT(*)` call.
 pub(super) fn rewrite_count_star(expr: &str, replacement_arg: &str) -> Option<String> {
