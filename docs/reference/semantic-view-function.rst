@@ -139,7 +139,9 @@ Output
 
 Returns a result set with one column per requested dimension, metric, or fact, in the order: dimensions first (in the order requested), then metrics or facts (in the order requested).
 
-Column types are inferred when the query is bound, by running the generated SQL as a ``LIMIT 0`` probe and reading back the result schema. Fact queries always probe; dimension-and-metric queries prefer the types persisted at ``CREATE`` time when the catalog row carries them (views created before v0.10.0) and probe otherwise. If type inference is not available, columns default to VARCHAR.
+Column types are inferred when the query is bound, by running the generated SQL as a ``LIMIT 0`` probe and reading back the result schema. Every query infers this way — there is no ``CREATE``-time type cache to fall back on, and legacy catalog rows that still carry one are ignored in favour of the probe.
+
+If the probe fails, the query raises ``semantic_view: type inference failed for query …`` with the underlying error. It does not fall back to VARCHAR: a placeholder type would mask a broken ``FACTS`` expression until something downstream tripped over it.
 
 .. versionchanged:: 0.11.0
 

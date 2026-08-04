@@ -28,11 +28,13 @@ use super::wire::{build_execution_sql, parse_varchar_list, serialize_register_pa
 //   - Catalog lookup (name normalisation, view-not-found suggestion).
 //   - Wildcard expansion + `QueryRequest` construction.
 //   - `expand::expand()` → expanded SQL.
-//   - Column-type inference at read-side bind time per D-16/D-17:
-//     * For fact queries: always probe via LIMIT 0 on the per-call conn.
-//     * For dim+metric queries: prefer DDL-time persisted types if present
-//       (back-compat for v0.7.1-era catalog rows); fall back to LIMIT 0
-//       probe on per-call conn otherwise.
+//   - Column-type inference at read-side bind time per D-16/D-17: a single
+//     unconditional LIMIT 0 probe on the per-call conn, for every query shape.
+//     AR-4 (PR-2) removed the DDL-time persisted-types fast path this comment
+//     used to describe — `column_type_names` / `column_types_inferred` are gone
+//     from the model (src/model.rs) and legacy rows carrying them fall through
+//     to the same probe. A failed probe is an error, not a VARCHAR fallback
+//     (WR-08 / D-15).
 //   - `build_execution_sql()` wrapping for HUGEINT→BIGINT casts etc.
 //
 // The dispatcher returns a flat binary buffer to the C++ side encoding

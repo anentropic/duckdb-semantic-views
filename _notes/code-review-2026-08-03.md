@@ -429,7 +429,10 @@ clearly labelled extension-only additions.
    `create-semantic-view.rst` has the new rule. The two pages now contradict each other.
 3. Line 135 says "Column types are inferred at define time" — removed in v0.10.0; types are
    inferred at bind via a LIMIT-0 probe (`src/query/table_function.rs:241`; the
-   `resolution.rs` line reference in the original finding was stale).
+   `resolution.rs` line reference in the original finding was stale). The same sentence's
+   "columns default to VARCHAR" was wrong too, and the finding did not catch it: a failed probe
+   is a hard error (WR-08 / D-15 removed the placeholder fallback precisely because it masked
+   broken `FACTS` expressions).
 
 **Resolved 2026-08-04.** All three corrected in `docs/reference/semantic-view-function.rst`:
 `where_clause` added to the syntax block, the parameter table and a new
@@ -437,9 +440,18 @@ clearly labelled extension-only additions.
 post-aggregation filters explicitly) plus an example; `search_path` documented as
 parser-injected rather than hand-written; the view-name rule replaced with the search-path
 rule from `create-semantic-view.rst`; and the type-inference sentence rewritten to describe
-the bind-time `LIMIT 0` probe, including that dimension-and-metric queries still prefer
-CREATE-time persisted types on pre-v0.10.0 catalog rows. `sphinx-build -W` clean. No
-TECH-DEBT entry: the drift is fully closed, with no deliberately-degraded remainder.
+the bind-time `LIMIT 0` probe. `sphinx-build -W` clean. No TECH-DEBT entry: the drift is fully
+closed, with no deliberately-degraded remainder.
+
+**Correction (same day, from review on PR #193).** The first pass at count 3 claimed
+dimension-and-metric queries still prefer CREATE-time persisted types on pre-v0.10.0 rows. That
+was wrong, and instructively so: it was taken from the *module doc comment* at
+`src/query/table_function.rs:31-35`, which still described the persisted-types fast path — but
+**AR-4 (PR-2) removed it**. `column_type_names` / `column_types_inferred` are gone from
+`SemanticViewDefinition` (`src/model.rs:434-440`), legacy rows carrying them fall through to
+read-side inference, and the bind body runs a single unconditional probe. So the module comment
+is itself PAR-1-class drift, and reading it instead of the code reproduced the very failure this
+finding is about. Both the module comment and the docs page are now fixed against the code.
 
 ### PAR-2 — MEDIUM: `SHOW SEMANTIC DIMENSIONS/METRICS/FACTS` returns an empty `data_type` for all views created ≥ v0.10.0 — a *pinned interim state whose follow-up never landed*
 
