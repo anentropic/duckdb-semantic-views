@@ -86,38 +86,36 @@ fn might_contain_read_call(sql: &str) -> bool {
 /// Byte offset of the `)` matching the `(` at `open`, or `None` when the call
 /// is unterminated.
 ///
-/// Skips single-quoted and `$tag$` literal content so a `)` inside a string —
-/// `semantic_view('a)b')` — is not mistaken for the close. Reuses the
-/// tokenizer's own literal skippers so this agrees with how the rest of the
-/// parser reads the same bytes.
+/// Skips single-quoted, double-quoted and `$tag$` regions so a `)` inside one —
+/// `semantic_view('a)b')` — is not mistaken for the close.
+///
+/// PARSE-4: this skipped `'…'` and `$tag$…$tag$` but not `"…"`, making it the
+/// sixth quote scanner in the crate with its own subset of the rules (ARCH-6).
+/// It now defers to [`crate::util::QuoteState`], as the expansion-side matchers
+/// do since EXP-16/EXP-17.
 fn matching_close_paren(sql: &str, open: usize) -> Option<usize> {
     let bytes = sql.as_bytes();
     debug_assert_eq!(bytes.get(open), Some(&b'('));
+    let mut quotes = crate::util::QuoteState::default();
     let mut depth = 0usize;
     let mut i = open;
     while i < bytes.len() {
-        match bytes[i] {
-            b'\'' => i = crate::expr_tokens::skip_single_quoted(bytes, i),
-            b'$' => {
-                if let Some(next) = crate::expr_tokens::try_skip_dollar_quoted(bytes, i) {
-                    i = next;
-                    continue;
+        let (next, is_live_code) = quotes.step(bytes, i);
+        if is_live_code {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    // `checked_sub` rather than `-=`: an unbalanced `)` ahead of
+                    // the opener would otherwise underflow and panic in debug.
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(i);
+                    }
                 }
-                i += 1;
+                _ => {}
             }
-            b'(' => {
-                depth += 1;
-                i += 1;
-            }
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-                i += 1;
-            }
-            _ => i += 1,
         }
+        i = next;
     }
     None
 }
@@ -205,6 +203,28 @@ mod tests {
     /// The injected suffix, for expectations that assert on the whole string.
     fn suffix() -> String {
         format!(", search_path := {SEARCH_PATH_SQL}")
+    }
+
+    /// PARSE-4: this matcher skipped `'…'` and `$tag$…$tag$` but not `"…"`, so a
+    /// `)` inside a double-quoted identifier closed the call early and the
+    /// search-path argument was spliced into the middle of the statement. It is
+    /// the sixth independent quote scanner in the crate, each with its own
+    /// subset of the rules (ARCH-6); this pins it to the shared rule.
+    #[test]
+    fn matching_close_paren_ignores_a_close_paren_inside_a_double_quoted_identifier() {
+        let sql = "semantic_view(\"a)b\")";
+        assert_eq!(matching_close_paren(sql, 13), Some(sql.len() - 1));
+    }
+
+    /// Control: the regions this matcher already handled must keep working.
+    #[test]
+    fn matching_close_paren_still_ignores_single_and_dollar_quoted_literals() {
+        let sql = "semantic_view('a)b')";
+        assert_eq!(matching_close_paren(sql, 13), Some(sql.len() - 1));
+        let sql = "semantic_view($tag$a)b$tag$)";
+        assert_eq!(matching_close_paren(sql, 13), Some(sql.len() - 1));
+        let sql = "semantic_view(nested(a))";
+        assert_eq!(matching_close_paren(sql, 13), Some(sql.len() - 1));
     }
 
     #[test]

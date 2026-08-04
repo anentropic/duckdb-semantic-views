@@ -61,7 +61,7 @@ src/
 ├── ident.rs                   # Identifier grammar: quoting, case-folding, qualified-name splitting
 ├── expr_tokens.rs             # Quote/literal-aware tokenizer for stored SQL expressions (reference find/inline)
 ├── sql_lit.rs                 # SqlLit newtype — makes "forgot to escape a string literal" a compile error
-├── util.rs                    # Shared lexical helpers (is_ident_byte, blank_sql_comments, dollar-tag grammar)
+├── util.rs                    # Shared lexical helpers (is_ident_byte, blank_sql_comments, dollar-tag grammar, QuoteState)
 ├── ffi_util.rs                # FFI seam helpers: buffer handoff, UTF-8-safe error truncation
 ├── render_ddl.rs              # SemanticViewDefinition → CREATE SEMANTIC VIEW text (GET_DDL)
 ├── render_yaml.rs             # SemanticViewDefinition → YAML

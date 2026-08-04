@@ -238,7 +238,7 @@ fence instead of erroring. d48abee fixed the hang and left the Ok/Err outcome un
 safer bias for a safety check (per SG-7's own reasoning) is to run cycle detection in
 `build_relationship_graph` and fail `UncheckableDefinition` loudly.
 
-### EXP-16 — MEDIUM-LOW: `rewrite_count_star` is blind to double-quoted identifiers and dollar-quoted strings
+### EXP-16 — MEDIUM-LOW: `rewrite_count_star` is blind to double-quoted identifiers and dollar-quoted strings — RESOLVED 2026-08-04 (TECH-DEBT #46)
 
 `src/expand/facts.rs:220-273`. The COUNT(\*) rewriter tracks only single-quote state (naive toggle
 at :229-233) — no `"…"` identifiers, no `$tag$…$tag$` strings, unlike every parse-side scanner
@@ -250,7 +250,7 @@ scanner. TECH-DEBT #28 mentions only that `util::is_word_boundary_char` "survive
 expand::facts COUNT/name matchers"; the quote-capability gap itself is unrecorded. Low likelihood,
 silent failure, mechanical fix.
 
-### EXP-17 — MEDIUM-LOW: `find_matching_paren` — fifth independent quote scanner, no dollar-quote support
+### EXP-17 — MEDIUM-LOW: `find_matching_paren` — fifth independent quote scanner, no dollar-quote support — RESOLVED 2026-08-04 (TECH-DEBT #46)
 
 `src/expand/semi_additive.rs:883-918`. Hand-rolled `Mode::{Normal,SingleQuote,DoubleQuote}` paren
 matcher used by `build_snapshot_block`'s SG-5 decomposition. A `)` inside a dollar-quoted string
@@ -373,7 +373,7 @@ another database's data silently. The bind bodies should reject a mismatched `vi
 `src/parse/show_clauses.rs:454-464`. The error message promises a positive integer; `0` parses and
 is passed through. Cosmetic inconsistency — pick one.
 
-### PARSE-4 — LOW: `matching_close_paren` in search-path injection skips single-quoted and `$tag$` literals but not double-quoted identifiers
+### PARSE-4 — LOW: `matching_close_paren` in search-path injection skips single-quoted and `$tag$` literals but not double-quoted identifiers — RESOLVED 2026-08-04 (TECH-DEBT #46)
 
 `src/parse/search_path.rs`. A `)` inside a double-quoted identifier in the argument list
 (`semantic_view('v', search_path := …)`-adjacent text) would mis-splice. Exotic — explicit
@@ -822,7 +822,12 @@ Status as of 2026-08-04. ✅ = landed on `main`; ⏳ = in review; ❌ = withdraw
    sub-items are partly overtaken: MAINTAINER.md's `where_clause.rs` omission and the "eight fuzz
    targets" miscount were fixed on `main` independently; the TECH-DEBT #28 status marker is still
    ambiguous.
-5. Remaining mediums at next opportunity: EXP-11, EXP-13/14/15, EXP-16/17, EXP-18, CAT-3/CAT-4,
-   PAR-2/PAR-3/PAR-4, PARSE-3/PARSE-4.
+5. Remaining mediums, batched into reviewable PRs (2026-08-04):
+   ✅ **EXP-16/EXP-17/PARSE-4** — the three divergent quote scanners, collapsed onto `QuoteState`
+   (TECH-DEBT #46). Delivers ARCH-6's substance for those sites; ARCH-6 stays open for the rest.
+   Then: EXP-13/14 (`where_clause` resolution), EXP-15/18 (silent fallbacks that should fail
+   loud), CAT-3/CAT-4 (catalog + read-path scoping), EXP-11 (per-grain derived anchoring — needs
+   numeric-oracle coverage, so it stands alone), PAR-2/3/4 + PARSE-3 (divergences to document or
+   implement).
 6. Structural debt as capacity allows: ARCH-6 (crate-level `QuoteState`), ARCH-7 (`expand()`
    planner), ARCH-8/9/10/11/12, TC-1, TC-2, TC-3, TC-4, CI-6.
