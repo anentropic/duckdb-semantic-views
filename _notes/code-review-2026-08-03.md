@@ -638,10 +638,18 @@ deterministic `predicate_is_applied_before_the_snapshot_not_after` test that ass
 before- and after-snapshot formulations *disagree* — so the harness fails if it ever stops being
 sensitive to the distinction — as well as asserting the extension matches the before-form.
 
-**Still open:** `window_metric_proptest` and `multi_hop_join_proptest` keep `where_clause: None` —
-the `__sv_agg`-CTE and multi-hop-chain injection sites. Both need a per-harness oracle change (the
-predicate applied before the window function; the predicate's table sitting anywhere along the
-chain), so they remain a follow-up rather than a mechanical repeat.
+**Finally `window_metric_proptest` and `multi_hop_join_proptest`** (2026-08-04), closing the gap.
+The window oracle filters the `agg` CTE only — the correlated subquery reads from it, so partition
+membership follows the filter automatically — and its guard asserts predicates on a queried
+dimension outside the effective partition are generated. The multi-hop oracle filters each grain's
+half and gains a second fence property mirroring the dimension rule: a `where_clause` member
+*below* a selected metric's grain must be rejected, since joining it in fans that metric. Both
+mutation-verified (`window.rs:236`, `per_grain.rs:1044`).
+
+**PBT-6 is now closed** — all five numeric harnesses generate and oracle-check a predicate, each
+with a generator-coverage guard so the parameter cannot silently revert to an inert default. The
+two remaining `where_clause: None` sites live in `expand_proptest.rs`, which checks structural
+parse/expand invariants rather than numbers, and are deliberately out of scope.
 
 ### PBT-7 — HIGH-VALUE GAP: the multi-grain FULL OUTER combiner has no randomized coverage
 
