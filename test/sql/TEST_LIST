@@ -92,3 +92,4 @@ test/sql/show_quoted_name_slots.test
 test/sql/show_scope_all_commands.test
 test/sql/schema_scoped_views.test
 test/sql/get_ddl_qualified_name.test
+test/sql/semantic_view_runtime_error.test

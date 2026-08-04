@@ -2557,6 +2557,80 @@ struct SemanticViewGlobalState : public GlobalTableFunctionState {
     std::unique_ptr<MaterializedQueryResult> result;
 };
 
+// Run `sql` on `probe` the way `Connection::Query` would, but polling the OUTER
+// caller's interrupt flag so a cancelled query actually stops.
+//
+// `semantic_view()` executes its expanded SQL on a per-call
+// `Connection(*context.db)`, which carries its OWN `ClientContext`, and DuckDB's
+// interrupt flag is per-`ClientContext`. `duckdb_interrupt()` — and therefore
+// ADBC's `adbc_cancel()`, the CLI's Ctrl-C, and any framework timeout built on
+// them — sets `interrupted` on the *caller's* context. A plain
+// `probe.Query(sql)` blocks until the inner query finishes and only ever reads
+// the inner context's flag, which nothing sets, so a cancelled query ran to full
+// completion and the INTERRUPT surfaced only afterwards. Nor is there a yield
+// point in between: the inner query runs eagerly from a single outer executor
+// task, and the outer executor's own interrupt checks live in
+// `PipelineExecutor::Execute`, which does not run until this callback returns.
+//
+// So this unrolls the loop `Connection::Query` runs internally
+// (`PendingQueryResult::ExecuteInternal`) to get a poll point between tasks. On a
+// cancel the flag is forwarded to the inner connection and the loop keeps
+// draining rather than throwing immediately, so the inner executor's tasks are
+// wound down before `probe` leaves the caller's scope.
+//
+// The interrupt MUST be reported bare. ADBC maps a failure to
+// ADBC_STATUS_CANCELLED only on an exact match against
+// `InterruptException::INTERRUPT_MESSAGE` ("Interrupted!"), so wrapping it the
+// way the SqlExecution path wraps every other failure would report a cancelled
+// query as an internal error. Hence it is thrown from in here, ahead of any
+// caller's wrap, instead of being returned as an error-carrying result.
+//
+// Interrupt latency is one task slice. A BLOCKED inner query (async I/O — httpfs
+// and friends) adds at most one `Executor::WAIT_TIME` (20 ms) per poll, since
+// `WaitForTask()` waits with that timeout rather than indefinitely.
+//
+// Everything else matches `Connection::Query`, including returning an
+// error-carrying result rather than throwing, so callers keep their existing
+// `HasError()` handling. The one behavioural difference: a *multi*-statement
+// string would be rejected ("Cannot prepare multiple statements at once!")
+// instead of executed. `execution_sql` is always a single generated SELECT.
+static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
+                                                      ClientContext &outer,
+                                                      const std::string &sql) {
+    auto pending = probe.PendingQuery(sql);
+    if (pending->HasError()) {
+        // Parse/bind failure — nothing has executed. Same shape
+        // Connection::Query hands back for the identical failure.
+        return make_uniq<MaterializedQueryResult>(pending->GetErrorObject());
+    }
+
+    bool forwarded = false;
+    PendingExecutionResult exec_result = PendingExecutionResult::RESULT_NOT_READY;
+    while (!PendingQueryResult::IsResultReady(exec_result)) {
+        if (!forwarded && outer.interrupted) {
+            // Sets the inner context's flag; the inner executor picks it up at
+            // its own next poll and unwinds into an INTERRUPT error, which ends
+            // this loop via EXECUTION_ERROR.
+            forwarded = true;
+            probe.Interrupt();
+        }
+        exec_result = pending->ExecuteTask();
+        if (exec_result == PendingExecutionResult::BLOCKED) {
+            pending->WaitForTask();
+        }
+    }
+
+    if (outer.interrupted) {
+        // The caller cancelled — authoritative however the inner query ended.
+        // It may have raced to completion, or stopped on the forwarded flag.
+        throw InterruptException();
+    }
+    if (pending->HasError()) {
+        return make_uniq<MaterializedQueryResult>(pending->GetErrorObject());
+    }
+    return pending->Execute();
+}
+
 // Look up DECIMAL/LIST logical types via a LIMIT-0 probe. Returns a
 // per-column LogicalType for every column in the declared schema; for
 // columns whose type_id isn't DECIMAL/LIST, the LogicalType is constructed
@@ -2748,8 +2822,17 @@ static unique_ptr<GlobalTableFunctionState> sv_semantic_view_init_global(
     // the materialised query. The Connection drops at end of scope; the
     // returned MaterializedQueryResult owns its data (via ColumnDataCollection)
     // and is safe to use across exec invocations.
+    //
+    // Routed through sv_query_interruptible rather than Connection::Query so a
+    // cancel on the CALLER's connection stops this query instead of being
+    // noticed only once it has finished — the inner query runs on `probe`'s own
+    // ClientContext, which carries its own interrupt flag. An interrupt leaves
+    // via a bare InterruptException thrown from in there, deliberately ahead of
+    // the SqlExecution wrap below: ADBC recognises a cancellation only by the
+    // exact "Interrupted!" text, so wrapping it would report it as an internal
+    // error.
     Connection probe(*context.db);
-    auto qresult = probe.Query(bd.execution_sql);
+    auto qresult = sv_query_interruptible(probe, context, bd.execution_sql);
     if (qresult->HasError()) {
         // Match the legacy QueryError::SqlExecution wording so existing
         // sqllogictest matchers stay byte-identical.

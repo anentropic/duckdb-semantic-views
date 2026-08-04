@@ -238,7 +238,8 @@ Fix: `rustup update stable`
 | `just test-sql` | SQL logic tests (DDL + query round-trips) | Builds the extension, loads it in DuckDB, runs `test/sql/*.test` files |
 | `just test-ducklake-ci` | DuckLake integration (synthetic data) | Builds extension, runs the Python DuckLake CI test — the leg included in `test-all` |
 | `just test-ducklake` | DuckLake integration (real jaffle-shop data) | Builds extension, runs the Python test against DuckLake tables; requires `just setup-ducklake` first |
-| `just test-integration` | Python integration suites | Runs the full `test/integration/*.py` suite list (caret, ADBC, multi-db, concurrency, differential, …) |
+| `just test-integration` | Python integration suites | Runs the full `test/integration/*.py` suite list (caret, ADBC, multi-db, concurrency, differential, interrupt, …) |
+| `just test-interrupt` | Query cancellation (TECH-DEBT #39) | Builds the extension and fires `con.interrupt()` from a second thread mid-query; asserts `semantic_view()` aborts early (not just eventually) and reports a bare `Interrupted!`. Part of `test-integration`. |
 | `just test-all` | Rust + SQL logic + DuckLake CI + integration | Runs `test-rust`, `test-sql`, `test-ducklake-ci`, and `test-integration` sequentially |
 | `just coverage` | Coverage report | Runs unit tests with `cargo-llvm-cov`, fails if below 80% line coverage |
 | `just lint` | Code quality (authoritative) | `cargo fmt --check` + full default-features `cargo clippy` + `cargo deny check`. The clippy step compiles the ~25 MB bundled DuckDB, so a cold run is ~10 min. |
