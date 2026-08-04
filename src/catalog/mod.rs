@@ -8,6 +8,7 @@
 //! `INSERT/DELETE/UPDATE` against `_definitions` directly on the caller's
 //! connection, and any cached mirror would diverge across rollback.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use duckdb::Connection;
@@ -211,7 +212,7 @@ fn definitions_is_legacy_shape(con: &Connection) -> Result<bool, Box<dyn std::er
 /// parse: a row this migration cannot fully understand must still be carried
 /// across, not dropped. Losing a definition here is unrecoverable — an
 /// unparseable row keeps its bytes verbatim and is filed under the fallback.
-fn migrated_row(json: &str) -> (String, String) {
+fn migrated_row(json: &str, catalog_schemas: &HashMap<String, String>) -> (String, String) {
     #[derive(serde::Deserialize)]
     struct Probe {
         #[serde(default)]
@@ -222,11 +223,53 @@ fn migrated_row(json: &str) -> (String, String) {
         .and_then(|p| p.schema_name)
         .filter(|s| !s.is_empty());
     if let Some(schema) = recorded {
-        return (schema, json.to_string());
+        // CAT-1: store the CATALOG's spelling, not the row's. `current_schema()`
+        // echoes whatever spelling was last written in `USE`, so a row created
+        // after `USE "ANALYTICS"` records `ANALYTICS` for a schema the catalog
+        // calls `analytics`. Migrated verbatim it keys under a spelling the
+        // catalog never had — and because `INSERT OR REPLACE` conflicts on the
+        // byte-equal `(schema_name, name)` key while every read guard folds
+        // case, a later `CREATE OR REPLACE analytics.v` inserts a SECOND row
+        // rather than replacing it, after which reads resolve to whichever
+        // sorts first (the stale one).
+        //
+        // A schema the catalog does not know keeps its recorded spelling: this
+        // migration must carry every row across, and dropping or failing on one
+        // is unrecoverable. Such a row is no worse off than before.
+        let canonical = catalog_schemas
+            .get(&schema.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or(schema);
+        // The column and the `schema_name` inside the JSON are documented as
+        // being in lockstep — the SHOW / DESCRIBE listings read the JSON — so
+        // rewriting one without the other would split them.
+        let aligned = backfill_schema_name(json, &canonical).unwrap_or_else(|| json.to_string());
+        return (canonical, aligned);
     }
     let fallback = UNRECORDED_SCHEMA_FALLBACK.to_string();
     let backfilled = backfill_schema_name(json, &fallback).unwrap_or_else(|| json.to_string());
     (fallback, backfilled)
+}
+
+/// Lowercased schema name -> the catalog's own spelling, for the current
+/// database. `DuckDB` schema names are unique case-insensitively, so this is a
+/// well-defined map. Mirrors the `duckdb_schemas()` lookup
+/// [`crate::catalog::writes::create_target_schema_expr`] performs at CREATE
+/// time, so a migrated row and a freshly created one key identically.
+fn catalog_schema_spellings(
+    con: &Connection,
+) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+    let mut stmt = con.prepare(
+        "SELECT s.schema_name FROM duckdb_schemas() s \
+         WHERE s.database_name = current_database()",
+    )?;
+    let mapped = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut out = HashMap::new();
+    for schema in mapped {
+        let schema = schema?;
+        out.insert(schema.to_ascii_lowercase(), schema);
+    }
+    Ok(out)
 }
 
 /// Insert `schema_name` into a stored definition object, returning `None` when
@@ -266,6 +309,10 @@ fn migrate_definitions_to_schema_scoped(
         mapped.collect::<Result<Vec<_>, _>>()?
     };
 
+    // Read once, outside the swap closure: the map is the same for every row,
+    // and the swap runs inside a transaction that drops the old table.
+    let catalog_schemas = catalog_schema_spellings(con)?;
+
     let staging = format!("{DEFINITIONS_SCHEMA}.{DEFINITIONS_TABLE_NAME}__scoped");
     let swap = |con: &Connection| -> Result<(), Box<dyn std::error::Error>> {
         con.execute_batch(&format!(
@@ -278,7 +325,7 @@ fn migrate_definitions_to_schema_scoped(
              );"
         ))?;
         for (name, definition) in &rows {
-            let (schema, definition) = migrated_row(definition);
+            let (schema, definition) = migrated_row(definition, &catalog_schemas);
             con.execute(
                 &format!("INSERT INTO {staging} (schema_name, name, definition) VALUES (?, ?, ?)"),
                 duckdb::params![schema, name, definition],
@@ -325,14 +372,25 @@ fn migrate_definitions_to_schema_scoped(
 /// loads are no-ops. The `schema_version` integer is inlined from a
 /// compile-time constant (no user input), so the `json_object` embed is safe.
 fn upgrade_definitions_schema(con: &Connection) -> Result<(), Box<dyn std::error::Error>> {
-    let rows: Vec<(String, String)> = {
-        let mut stmt = con.prepare(&format!("SELECT name, definition FROM {DEFINITIONS_TABLE}"))?;
-        let mapped =
-            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    // CAT-2: `schema_name` is selected because it is half the primary key. The
+    // stamp below must target the row that was actually verified — keying on
+    // `name` alone stamped every namesake across schemas, including rows this
+    // pass deliberately left at version 0.
+    let rows: Vec<(String, String, String)> = {
+        let mut stmt = con.prepare(&format!(
+            "SELECT schema_name, name, definition FROM {DEFINITIONS_TABLE}"
+        ))?;
+        let mapped = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
         mapped.collect::<Result<Vec<_>, _>>()?
     };
 
-    for (name, json) in rows {
+    for (schema_name, name, json) in rows {
         if crate::model::SemanticViewDefinition::stored_schema_version(&json)
             >= crate::model::CURRENT_SCHEMA_VERSION
         {
@@ -351,10 +409,10 @@ fn upgrade_definitions_schema(con: &Connection) -> Result<(), Box<dyn std::error
                 "UPDATE {DEFINITIONS_TABLE} \
                  SET definition = json_merge_patch(definition::JSON, \
                      json_object('schema_version', {version}))::VARCHAR \
-                 WHERE name = ?",
+                 WHERE schema_name = ? AND name = ?",
                 version = crate::model::CURRENT_SCHEMA_VERSION
             ),
-            duckdb::params![name],
+            duckdb::params![schema_name, name],
         )?;
     }
 
@@ -1048,6 +1106,119 @@ mod tests {
             );
         }
 
+        /// Read `schema_name` from a migrated row's column AND from inside its
+        /// stored JSON — the two the module documents as kept in lockstep.
+        fn scoped_row_and_json_schema(con: &Connection, name: &str) -> (String, String) {
+            let mut stmt = con
+                .prepare(&format!(
+                    "SELECT schema_name, definition FROM {DEFINITIONS_TABLE} WHERE name = ?"
+                ))
+                .expect("prepare");
+            let (col, json): (String, String) = stmt
+                .query_row(duckdb::params![name], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .expect("row");
+            let probe: serde_json::Value = serde_json::from_str(&json).expect("json");
+            let in_json = probe
+                .get("schema_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            (col, in_json)
+        }
+
+        // -------------------------------------------------------------------
+        // CAT-1 (code-review 2026-08-03): the migration must record the
+        // CATALOG's spelling of a schema, not the one the legacy row happens
+        // to carry.
+        //
+        // `current_schema()` echoes the spelling last written in `USE`, so a
+        // row created after `USE "ANALYTICS"` recorded `ANALYTICS` for a schema
+        // the catalog calls `analytics`. Migrated verbatim, that row keys under
+        // a spelling the catalog never had — and since `INSERT OR REPLACE`
+        // conflicts on the byte-equal `(schema_name, name)` primary key while
+        // every read guard folds case, a later `CREATE OR REPLACE
+        // analytics.v` inserts a SECOND row instead of replacing the first.
+        // Both then match the folded lookup, and `ORDER BY schema_name` puts
+        // the uppercase one first, so reads keep returning the pre-replace
+        // definition while the CREATE reported success.
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn migration_records_the_catalogs_schema_spelling_not_the_rows() {
+            let con = in_memory_con();
+            con.execute_batch("CREATE SCHEMA analytics;")
+                .expect("create schema");
+            legacy_catalog(&con);
+            // The row records the schema in a spelling `USE "ANALYTICS"` would
+            // have produced; the catalog itself calls it `analytics`.
+            insert_legacy(&con, "v", r#"{"name":"v","schema_name":"ANALYTICS"}"#);
+
+            init_catalog(&con, ":memory:", false).expect("init_catalog migrates");
+
+            assert_eq!(
+                scoped_rows(&con),
+                vec![("analytics".to_string(), "v".to_string())],
+                "the stored key must be the catalog's own spelling"
+            );
+        }
+
+        #[test]
+        fn migration_keeps_column_and_json_schema_in_lockstep_when_canonicalising() {
+            let con = in_memory_con();
+            con.execute_batch("CREATE SCHEMA analytics;")
+                .expect("create schema");
+            legacy_catalog(&con);
+            insert_legacy(&con, "v", r#"{"name":"v","schema_name":"ANALYTICS"}"#);
+
+            init_catalog(&con, ":memory:", false).expect("init_catalog migrates");
+
+            let (col, in_json) = scoped_row_and_json_schema(&con, "v");
+            assert_eq!(col, "analytics");
+            assert_eq!(
+                in_json, col,
+                "the SHOW/DESCRIBE listings read the schema out of the JSON, so \
+                 rewriting the column without the JSON would make them disagree"
+            );
+        }
+
+        /// A recorded schema that no longer exists in the catalog cannot be
+        /// canonicalised. The row must still be carried across verbatim rather
+        /// than dropped or the migration failing — losing a definition here is
+        /// unrecoverable, which is the stance `migrated_row` already documents.
+        #[test]
+        fn migration_keeps_an_unknown_schema_spelling_rather_than_dropping_the_row() {
+            let con = in_memory_con();
+            legacy_catalog(&con);
+            insert_legacy(&con, "v", r#"{"name":"v","schema_name":"GhostSchema"}"#);
+
+            init_catalog(&con, ":memory:", false).expect("init_catalog migrates");
+
+            assert_eq!(
+                scoped_rows(&con),
+                vec![("GhostSchema".to_string(), "v".to_string())],
+                "an unresolvable schema keeps its recorded spelling"
+            );
+        }
+
+        /// Control: a row already recording the catalog's spelling is untouched.
+        #[test]
+        fn migration_leaves_an_already_canonical_spelling_alone() {
+            let con = in_memory_con();
+            con.execute_batch("CREATE SCHEMA analytics;")
+                .expect("create schema");
+            legacy_catalog(&con);
+            insert_legacy(&con, "v", r#"{"name":"v","schema_name":"analytics"}"#);
+
+            init_catalog(&con, ":memory:", false).expect("init_catalog migrates");
+
+            assert_eq!(
+                scoped_rows(&con),
+                vec![("analytics".to_string(), "v".to_string())]
+            );
+        }
+
         #[test]
         fn a_row_with_no_recorded_schema_lands_in_main() {
             // Rows written before the metadata stamp existed have no
@@ -1388,6 +1559,62 @@ mod tests {
         assert_eq!(
             SemanticViewDefinition::stored_schema_version(&stored("complete_v")),
             CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    // CAT-2 (code-review 2026-08-03): the AR-4 version stamp keys on `name`
+    // alone, which was correct when `name` was the whole primary key. Under
+    // schema scoping the key is `(schema_name, name)`, so `WHERE name = ?`
+    // stamps EVERY same-named row across schemas — including one the pass
+    // deliberately left unverified. That contradicts the invariant the pass
+    // exists to maintain: an un-upgradeable row must stay at version 0 so
+    // reads hard-error rather than silently under-checking it.
+    #[cfg(not(feature = "extension"))]
+    #[test]
+    fn upgrade_stamps_only_the_row_it_verified_not_its_namesakes_in_other_schemas() {
+        use crate::model::{SemanticViewDefinition, CURRENT_SCHEMA_VERSION};
+        let con = in_memory_con();
+        init_catalog(&con, ":memory:", false).unwrap();
+        con.execute_batch("CREATE SCHEMA analytics;").unwrap();
+
+        // Same view NAME in two schemas. The `analytics` one is upgradeable;
+        // the `main` one carries a legacy `on`-only relationship and must be
+        // left alone.
+        let upgradeable =
+            r#"{"tables":[{"alias":"o","table":"orders"}],"dimensions":[],"metrics":[]}"#;
+        let incomplete = r#"{"tables":[{"alias":"o","table":"orders"}],
+            "dimensions":[],"metrics":[],
+            "joins":[{"table":"c","on":"o.cid = c.id"}]}"#;
+        for (schema, def) in [("analytics", upgradeable), ("main", incomplete)] {
+            con.execute(
+                "INSERT INTO semantic_layer._definitions (schema_name, name, definition) \
+                 VALUES (?, 'v', ?)",
+                duckdb::params![schema, def],
+            )
+            .unwrap();
+        }
+
+        init_catalog(&con, ":memory:", false).unwrap();
+
+        let stored = |schema: &str| -> String {
+            con.query_row(
+                "SELECT definition FROM semantic_layer._definitions \
+                 WHERE schema_name = ? AND name = 'v'",
+                duckdb::params![schema],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            SemanticViewDefinition::stored_schema_version(&stored("analytics")),
+            CURRENT_SCHEMA_VERSION,
+            "the verified row must be stamped"
+        );
+        assert_eq!(
+            SemanticViewDefinition::stored_schema_version(&stored("main")),
+            0,
+            "the UNVERIFIED namesake in another schema must NOT be stamped -- \
+             stamping it claims a guarantee the pass never checked"
         );
     }
 
