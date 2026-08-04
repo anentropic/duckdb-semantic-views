@@ -597,7 +597,7 @@ No `#[ignore]`, no trivially-true assertions found; extension-gated unit tests d
 roundtrip generator deliberately populates `is_filter` to defeat the vacuous-field hazard
 (`tests/common/mod.rs:260-296`).
 
-### PBT-6 — HIGH-VALUE GAP: all five differential/numeric proptests hardcode `where_clause: None`
+### PBT-6 — HIGH-VALUE GAP: all five differential/numeric proptests hardcode `where_clause: None` — PARTIALLY CLOSED 2026-08-03
 
 `tests/differential_proptest.rs:237`, and one occurrence each in `star_schema_proptest.rs`,
 `semi_additive_proptest.rs`, `window_metric_proptest.rs`, `multi_hop_join_proptest.rs`. The newest
@@ -605,6 +605,36 @@ correctness-critical feature is excluded from every numeric oracle — predicate
 only by hand-picked sqllogictest rows. EXP-10 sits exactly on this blind surface. Randomizing
 simple member predicates mirrored into each oracle's WHERE is the single highest-value test
 investment available.
+
+**Closed in two of the five** (2026-08-03), covering the two distinct emission topologies:
+
+- `differential_proptest` — the base-anchored single-table path. A generated predicate AST is
+  rendered twice: member names into `where_clause`, raw columns into the oracle's pre-aggregation
+  `WHERE`. The definition now also declares one **filter member** (`LABELS = (FILTER)`) per
+  dimension with a compound `d{i} = 0 OR d{i} = 2` expression, so substitution is not identity
+  (no physical column is named `f{i}`) and precedence is load-bearing (a bare filter member inside
+  a surrounding `AND` is only correct if the splice parenthesizes).
+- `star_schema_proptest` — the per-grain CTE path. The predicate is mirrored into **both** grain
+  halves of the oracle, which is what pins the CHANGELOG's "applied inside each grain CTE" claim.
+  It also adds a second fence property: a predicate naming a CHILD-side member alongside the
+  parent-grain metric must be rejected, since evaluating it in the parent CTE would join `t` and
+  fan `u` — the `where_clause` analogue of the existing parent-metric/child-dimension rejection.
+
+Both were **mutation-verified rather than merely observed green**, which is the point of the
+exercise: removing the parenthesization at `where_clause.rs:93` fails `differential_proptest` with
+a shrunk counterexample, and dropping the predicate from the grain CTE at `per_grain.rs:1044`
+fails `star_schema_proptest`. Each harness also carries a generator-coverage guard
+(`generator_varies_the_predicate_and_exercises_filter_members`,
+`generator_reaches_both_where_clause_branches`) asserting that the predicate actually varies, that
+filter members are actually referenced, and — in the star harness — that both fence branches are
+actually reached, so an assertion inside an unreachable branch cannot pass for coverage.
+
+**Still open:** `semi_additive_proptest`, `window_metric_proptest`, `multi_hop_join_proptest` keep
+`where_clause: None`. These are the snapshot-CTE, `__sv_agg`-CTE and multi-hop-chain injection
+sites — the remaining three of the five paths the CHANGELOG claims the predicate reaches, and the
+snapshot one is where EXP-9 lived. Extending them needs a per-harness oracle change (the predicate
+has to be applied before the `RANK` and before the window function respectively, not merely added
+to a `WHERE`), so it is a follow-up rather than a mechanical repeat of the two above.
 
 ### PBT-7 — HIGH-VALUE GAP: the multi-grain FULL OUTER combiner has no randomized coverage
 
