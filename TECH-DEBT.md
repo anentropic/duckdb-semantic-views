@@ -138,7 +138,7 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 - **Origin:** Phase 5 audit item (TEST-05 partial scope)
 - **Reason:** The loadable-extension function-pointer stubs (`duckdb_query`, `duckdb_value_varchar`, etc.) are only available at runtime when DuckDB loads the extension. A standalone fuzz binary cannot initialize these stubs.
-- **Mitigation:** Eight fuzz targets cover the non-FFI attack surface: `fuzz_json_parse`, `fuzz_yaml_parse`, `fuzz_ddl_parse`, `fuzz_keyword_body`, `fuzz_sql_expand`, `fuzz_query_names`, `fuzz_render_roundtrip`, and `fuzz_parser_override_ffi` (see `fuzz/fuzz_targets/`). SQLLogicTest provides integration coverage of the FFI layer. Post-v0.2.0, the FFI unsafe surface is much smaller — the zero-copy vector reference approach eliminated all per-type binary read/write code; only `execute_sql_raw` and `duckdb_vector_reference_vector` remain in the hot path. `tests/vector_reference_test.rs` validates zero-copy lifetime safety under `cargo test`.
+- **Mitigation:** Nine fuzz targets cover the non-FFI attack surface: `fuzz_json_parse`, `fuzz_yaml_parse`, `fuzz_ddl_parse`, `fuzz_keyword_body`, `fuzz_sql_expand`, `fuzz_query_names`, `fuzz_render_roundtrip`, `fuzz_parser_override_ffi`, and `fuzz_where_predicate` (see `fuzz/fuzz_targets/`). SQLLogicTest provides integration coverage of the FFI layer. Post-v0.2.0, the FFI unsafe surface is much smaller — the zero-copy vector reference approach eliminated all per-type binary read/write code; only `execute_sql_raw` and `duckdb_vector_reference_vector` remain in the hot path. `tests/vector_reference_test.rs` validates zero-copy lifetime safety under `cargo test`.
 
 ### 3. ✅ Sandbox test portability (resolved in Phase 6)
 
