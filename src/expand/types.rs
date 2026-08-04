@@ -410,6 +410,20 @@ pub enum ExpandError {
         role_playing_table: String,
         available_relationships: Vec<String>,
     },
+    /// A `where_clause` member whose table is (or is reached only through) a
+    /// role-playing table. Only a queried *dimension's* expression is rewritten
+    /// to a scoped alias, so a predicate member has no way to name its role
+    /// (EXP-10, code-review 2026-08-03); previously the member's table was
+    /// joined on the first-declared relationship and the predicate filtered
+    /// through it silently — even when a co-queried metric's `USING` named the
+    /// other role, so a query could group by one instance and filter by another.
+    AmbiguousWhereClausePath {
+        view_name: String,
+        member_name: String,
+        member_table: String,
+        role_playing_table: String,
+        available_relationships: Vec<String>,
+    },
     /// A requested metric is marked PRIVATE and cannot be queried directly.
     PrivateMetric { view_name: String, name: String },
     /// A requested fact is marked PRIVATE and cannot be queried directly.
@@ -685,6 +699,24 @@ impl fmt::Display for ExpandError {
                      joined via multiple relationships: [{}], and fact queries carry no USING \
                      context to pick a role. Restructure the relationship or query via a \
                      non-role-playing table.",
+                    available_relationships.join(", ")
+                )
+            }
+            Self::AmbiguousWhereClausePath {
+                view_name,
+                member_name,
+                member_table,
+                role_playing_table,
+                available_relationships,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': where_clause member '{member_name}' is \
+                     ambiguous -- reaching its table '{member_table}' requires the role-playing \
+                     table '{role_playing_table}', joined via multiple relationships: [{}], and \
+                     a where_clause carries no USING context to pick a role. Filter on a member \
+                     from a non-role-playing table, or give the target table a distinct alias \
+                     per role.",
                     available_relationships.join(", ")
                 )
             }

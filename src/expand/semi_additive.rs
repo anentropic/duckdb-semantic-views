@@ -818,6 +818,79 @@ pub(super) fn na_dim_source_tables(
         .unwrap_or_default()
 }
 
+/// A `(metric index, NA dimension name, lowercased source table)` triple —
+/// the index being into `resolved_mets` —
+/// for every ACTIVE NA dimension that contributes a **bare** join to the
+/// snapshot CTE — the same entries [`collect_na_dim_source_tables`] turns into
+/// join targets, paired back to the metrics whose rows that join multiplies.
+///
+/// EXP-9 (code-review 2026-08-03): the fan-trap fence pairs each metric against
+/// the *queried* dimensions, but the table the snapshot joins because of an
+/// **un-queried** NA dimension is joined exactly like a queried dimension's and
+/// fans the metric's grain exactly the same way. Inside the snapshot that is
+/// worse than an inflated `SUM`: `RANK` ties across the fanned duplicates of one
+/// source row are indistinguishable from ties across distinct rows, so the CTE
+/// cannot dedupe them and the metric is added once per duplicate. Handing the
+/// pairs to [`crate::expand::fan_trap::check_fan_traps`] lets it apply the check
+/// it already applies to dimensions, and name the NA dimension in the error.
+///
+/// Role-scoped NA dims (`na_dim_scoped` is `Some`) are excluded for the same
+/// reason they contribute no bare join: their ORDER BY references the instance
+/// the owning metric's `USING` already joins (T-15).
+///
+/// A malformed NA reference yields an empty list rather than an error, matching
+/// [`na_dim_source_tables`] — [`expand_semi_additive`] rebuilds the same groups
+/// and reports the real error before emission.
+pub(super) fn na_dim_fence_members(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    resolved_mets: &[&Metric],
+    queried_dim_keys: &HashSet<String>,
+) -> Vec<NaFenceMember> {
+    let Ok(groups) = collect_na_groups(view_name, def, resolved_mets, queried_dim_keys) else {
+        return Vec::new();
+    };
+    let mut members = Vec::new();
+    for group in &groups {
+        for (nd, scoped) in group.na_dims.iter().zip(&group.na_dim_scoped) {
+            if scoped.is_some() {
+                continue;
+            }
+            let Some(dim) = super::resolution::find_dimension(def, &nd.dimension) else {
+                continue;
+            };
+            let Some(ref st) = dim.source_table else {
+                continue; // Base-table NA dim: nothing extra is joined.
+            };
+            for &met_idx in &group.metric_indices {
+                members.push(NaFenceMember {
+                    metric_idx: met_idx,
+                    dim_name: dim.name.clone(),
+                    source_table_raw: st.clone(),
+                    source_table_key: st.to_ascii_lowercase(),
+                });
+            }
+        }
+    }
+    members
+}
+
+/// One active NA dimension paired with a metric whose rows its join multiplies
+/// (EXP-9). See [`na_dim_fence_members`].
+pub(super) struct NaFenceMember {
+    /// Index into the `resolved_mets` slice passed to `na_dim_fence_members`.
+    pub(super) metric_idx: usize,
+    /// The NA dimension's declared name, for the error message.
+    pub(super) dim_name: String,
+    /// The source table **as declared**, preserving case and quoting. Used for
+    /// the error payload so it reads like the definition the user wrote — the
+    /// spelling the queried-dimension branch of the fence already reports.
+    pub(super) source_table_raw: String,
+    /// The lowercased alias, for path and cardinality lookups (which are keyed
+    /// on the folded spelling throughout the graph).
+    pub(super) source_table_key: String,
+}
+
 /// Aggregate functions the snapshot CTE knows how to decompose into an
 /// inner-expression capture (CTE column) plus an outer re-aggregation.
 const SNAPSHOT_AGG_FUNCS: [&str; 5] = ["SUM", "COUNT", "AVG", "MIN", "MAX"];

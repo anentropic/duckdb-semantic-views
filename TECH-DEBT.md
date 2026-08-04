@@ -429,6 +429,47 @@ Areas where test coverage is reduced compared to ideal, with justification.
   - Both rejections have independently-reporting unit tests in `body_parser::tests`, plus controls in the same module — a legitimate `OVER` after `AS`, and the keywords inside a string literal — so over-rejection would fail as loudly as under-rejection. `misplaced_metric_clause.test` proves it end-to-end at CREATE; its two `statement ok` guards were confirmed to pass with the fix reverted, so they are guards rather than capabilities.
 - **Impact:** low severity, low frequency — the query-time error does eventually stop the user, and the correct spelling is what the docs and every example show. It is filed because the failure is *silent at the point of the mistake* and *survives GET_DDL*, which is the shape this project treats as worse than an outright error.
 
+### 39. ✅ Fan-trap fence never checked the `NON ADDITIVE BY` dimension's own table — silent double-count (EXP-9) — RESOLVED 2026-08-03
+
+- **Origin:** code review 2026-08-03 (`_notes/code-review-2026-08-03.md`, EXP-9), reviewing `v0.10.4..HEAD`. Direct descendant of EXP-3 (#—, code review 2026-07-18), which made active semi-additive metrics subject to the fence's metric × dimension and metric × metric checks but did not cover the table the snapshot joins *because of the NA dimension itself*.
+- **Symptom:** an ACTIVE semi-additive metric (its `NON ADDITIVE BY` dimension not among the queried dimensions) whose NA dimension sits on a table that fans the metric's grain was aggregated over a join that had already duplicated the metric's rows. `RANK` ties across the fanned duplicates of one source row are indistinguishable from ties across distinct rows, so the snapshot CTE could not dedupe them and the value was added once per duplicate. Wrong number, no error:
+
+  ```sql
+  -- orders (base) <- line_items (many side); one order, two line items sharing a ship_ts
+  METRICS (o.balance_at NON ADDITIVE BY (ship_ts) AS sum(o.balance))
+  semantic_view('v', metrics := ['balance_at'], dimensions := ['region'])  -- returned 200.00 for a 100.00 balance
+  ```
+
+  The asymmetry is what makes it unmistakable: *querying* `ship_ts` makes the metric regular, and the fence has always raised `FanTrap` for the identical join. The un-queried case was the permissive one.
+- **Cause:** `check_fan_traps`'s metric × dimension loop iterates `resolved_dims` — the *queried* dimensions. An un-queried NA dimension appears there nowhere, while `collect_na_dim_source_tables` joins its table into the snapshot CTE exactly as a queried dimension's table is joined. A metric at the base grain also skips the root-grain loop (`met_table == root`), so nothing checked the join at all. `snapshot_cte_anchor` does not rescue it: it returns `None` when the metric is already at the root grain, and where it *does* re-anchor it checks only that its extra tables are reachable, never that reaching them is non-fanning.
+- **Resolution:** `semi_additive::na_dim_fence_members` returns `(metric index, NA dimension name, source table)` for every active NA dimension contributing a bare join — the same entries `collect_na_dim_source_tables` turns into join targets, paired back to the metrics whose rows that join multiplies. `check_fan_traps` runs the existing path/fanning-edge test over them and reports `FanTrap` naming the NA dimension. Role-scoped NA dims are excluded for the same reason they contribute no bare join (T-15). Placed **above** the `per_grain` early return: the join lives inside the snapshot CTE, which the base-anchored and anchored/per-grain emitters both build from the shared `SnapshotBlock`.
+- **Coverage:** `expand::tests_fan_trap::{semi_additive_na_dim_on_fanning_table_blocked, semi_additive_na_dim_queried_is_already_blocked, semi_additive_na_dim_on_non_fanning_table_allowed}` (independently reporting, so the controls cannot be masked) and `test/sql/cr20260803_silent_fan_and_role.test` end-to-end with the tie that surfaces the double-count.
+
+### 40. ✅ `where_clause` member on a role-playing table bound to the first-declared relationship (EXP-10) — RESOLVED 2026-08-03
+
+- **Origin:** code review 2026-08-03 (`_notes/code-review-2026-08-03.md`, EXP-10), on the `where_clause` feature added post-v0.12.0. The role-playing seam EXP-4/EXP-5 closed for dimensions and facts, re-opened by a new member-bearing surface.
+- **Symptom:** a predicate naming a member on a role-playing table filtered through whichever relationship was declared first, silently. With a co-queried metric's `USING` naming the *other* role, the query grouped by one instance and filtered by the other:
+
+  ```sql
+  -- flights -> airports via dep AND arr; metric arr_count USING (arr)
+  semantic_view('v', metrics := ['arr_count'], where_clause := 'city = ''NYC''')
+  -- emitted: LEFT JOIN airports a ON f.dep_code = a.code
+  --          LEFT JOIN airports a__arr ON f.arr_code = a__arr.code
+  --          WHERE (a.city) = 'NYC'      <- counting arrivals, filtering departures
+  ```
+- **Cause:** role-playing ambiguity is checked for queried dimensions (`find_using_context`) and, on the facts path, for queried dimensions and facts (`check_fact_role_playing_path`). A `where_clause` member's table is in neither set: it rides `resolve_joins_pkfk`'s `fact_source_tables` parameter, whose loop — unlike the dimension loop — never consults `role_playing_bare_aliases`, so the bare alias is joined via `tree_parent`, the first-declared edge. The per-grain planner already declined this shape (where-tables are in its "strict" set), but declining routes the query to the base-anchored path, which emitted it silently.
+- **Resolution:** `role_playing::check_where_clause_role_playing_path`, the sibling of `check_fact_role_playing_path`, rejects a member whose table is (or is reached only through) a role-playing target via the shared `role_playing_on_path`. Called on both emission paths — beside `check_where_clause_fan_traps` on the metrics path, and as step 3d on the facts path — so it is decided above the per-grain / anchored / base-anchored split. New error `ExpandError::AmbiguousWhereClausePath`.
+- **Why not infer the role from a co-queried metric's `USING`:** only a queried *dimension's* expression is rewritten to a scoped alias, so a predicate member has no way to name its role; several co-queried metrics may name several roles, and a predicate is bound to none of them. Picking one would be a guess, and guessing is what produces a wrong number instead of an error — the EXP-4/EXP-5 reasoning.
+- **Coverage:** `expand::tests_role_playing::{where_clause_on_role_playing_table_is_rejected, where_clause_role_playing_does_not_filter_through_the_other_role, where_clause_on_non_role_playing_table_still_allowed}` plus `test/sql/cr20260803_silent_fan_and_role.test` (including a control that a `where_clause` on a non-role-playing table still filters pre-aggregation, and that a queried dimension still resolves through `USING`).
+
+### 41. ❓ `where_clause` still absent from three of the five numeric proptest oracles (PBT-6, partial)
+
+- **Origin:** code review 2026-08-03 (`_notes/code-review-2026-08-03.md`, PBT-6). All five differential/numeric harnesses in `tests/` pinned `where_clause: None`, so the newest number-changing feature had no randomized coverage on any path — the blind spot EXP-9 (#39) and EXP-10 (#40) reached `main` through.
+- **Closed so far (2026-08-03):** `differential_proptest` (base-anchored single-table) and `star_schema_proptest` (per-grain CTEs, plus a new rejection property for a child-side predicate against a parent-grain metric). Both generate a predicate AST rendered twice — member names into the request, raw columns into the oracle — and both declare `LABELS = (FILTER)` members with compound expressions so member substitution and its parenthesization are load-bearing rather than identity. Each carries a generator-coverage guard asserting the parameter actually varies and (in the star harness) that both fence branches are actually reached.
+- **Verified by mutation, not observation:** dropping the parenthesization (`where_clause.rs:93`) reds `differential_proptest`; dropping the predicate from the grain CTE (`per_grain.rs:1044`) reds `star_schema_proptest`. A generator that varies but whose assertions cannot fail is the failure mode this entry exists to prevent, so "it passes" was not accepted as evidence.
+- **Still open:** `semi_additive_proptest`, `window_metric_proptest`, `multi_hop_join_proptest`. These cover the `__sv_snapshot` CTE (predicate must be applied *before* the `RANK`, so filtering changes which row wins the snapshot), the `__sv_agg` CTE (before the window function runs), and multi-hop chains. Each needs a genuine per-harness oracle change rather than an added `WHERE`, which is why they were not folded into the same change. The snapshot one is the highest priority of the three — it is the path EXP-9 lived on.
+- **Why it stays filed rather than closed:** CLAUDE.md now requires a new query-semantics feature to reach the numeric oracles. That rule is only as good as the harnesses it points at, and three of the five still cannot see a predicate at all.
+
 ### 37. ✅ RESOLVED (v0.12.0) — `JoinTree`'s parent map was degenerate under fan-in onto the base table
 
 - **Origin:** discovered in v0.12.0 (Phase 69) while giving the fan-trap fence a correct path derivation. Recorded rather than fixed, to keep that milestone's diff to the per-grain change plus the fence gap it exposed.

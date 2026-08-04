@@ -7,7 +7,9 @@ use super::facts::{
 use super::fan_trap::{check_fan_traps, validate_fact_table_path};
 use super::join_resolver::resolve_joins_pkfk;
 use super::resolution::{find_dimension, find_metric, quote_stored_ident};
-use super::role_playing::{check_fact_role_playing_path, find_using_context};
+use super::role_playing::{
+    check_fact_role_playing_path, check_where_clause_role_playing_path, find_using_context,
+};
 use super::select_spec::{FromSource, GroupBy, SelectItem, SelectSpec};
 use super::types::{ExpandError, QueryRequest, ResolvedDim};
 
@@ -249,6 +251,14 @@ fn expand_facts(
     // check above.
     for fact in &resolved_facts {
         check_fact_role_playing_path(view_name, def, fact)?;
+    }
+
+    // 3d. EXP-10: a `where_clause` member on (or reached only through) a
+    // role-playing table has no way to name its role either — the predicate is
+    // spliced as the member's own expression, never rewritten to a scoped
+    // alias. Same reasoning as 3b/3c.
+    if let Some(rw) = &resolved_where {
+        check_where_clause_role_playing_path(view_name, def, &rw.members)?;
     }
 
     // 4. Resolve fact expressions via DAG inlining (fact-to-fact dependencies).
@@ -509,6 +519,11 @@ pub fn expand(
     )?;
     if let Some(rw) = &resolved_where {
         super::fan_trap::check_where_clause_fan_traps(view_name, def, &rw.members, &resolved_mets)?;
+        // EXP-10: and the role-playing seam the fan-trap check does not cover —
+        // reaching the member's table is unambiguous only if no role-playing
+        // table sits on the path. Runs on every emission path because it is
+        // decided here, above the per-grain / anchored / base-anchored split.
+        check_where_clause_role_playing_path(view_name, def, &rw.members)?;
     }
 
     if let Some(plan) = grain_plan {

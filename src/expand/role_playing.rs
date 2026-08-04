@@ -150,6 +150,47 @@ pub(super) fn check_fact_role_playing_path(
     Ok(())
 }
 
+/// Reject a `where_clause` member whose source table is (or is reached only
+/// through) a role-playing table (EXP-10, code-review 2026-08-03).
+///
+/// The sibling of [`check_fact_role_playing_path`], and rejected for the same
+/// reason: only a queried *dimension's* expression is rewritten to a scoped
+/// alias ([`find_using_context`]), so a predicate member cannot name its role.
+/// Left unchecked, the member's table rides the join resolver's
+/// `fact_source_tables` path — which, unlike the dimension path, never consults
+/// `role_playing_bare_aliases` — and binds to `tree_parent`, the first-declared
+/// edge.
+///
+/// A co-queried metric's `USING` does **not** rescue it: the metric's own joins
+/// are scoped to the named role while the bare instance the predicate filters on
+/// stays on the first-declared one, so the query groups by one instance and
+/// filters by another. Inferring the role from a co-queried metric would be a
+/// guess (several metrics may name several roles, and a predicate is not bound
+/// to any of them), and guessing is what produces a wrong number instead of an
+/// error — the reasoning behind EXP-4/EXP-5.
+pub(super) fn check_where_clause_role_playing_path(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    where_members: &[(String, Option<String>)],
+) -> Result<(), ExpandError> {
+    for (member_name, member_table) in where_members {
+        let Some(member_table) = member_table else {
+            continue; // Unqualified member: base-table grain, no role to pick.
+        };
+        if let Some(rp) = role_playing_on_path(view_name, def, member_table)? {
+            let available_relationships = relationships_to_table(def, &rp);
+            return Err(ExpandError::AmbiguousWhereClausePath {
+                view_name: view_name.to_string(),
+                member_name: member_name.clone(),
+                member_table: member_table.to_ascii_lowercase(),
+                role_playing_table: rp,
+                available_relationships,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Determine the scoped alias for a dimension from a role-playing table.
 ///
 /// Checks whether the dimension's `source_table` is reached by multiple relationships.
