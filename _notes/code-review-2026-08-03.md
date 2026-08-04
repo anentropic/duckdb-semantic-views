@@ -417,7 +417,7 @@ Cortex-only concepts — `time_dimensions`, `custom_instructions`, `sample_value
 `explain_semantic_view()`, `list_semantic_views()`, and DuckLake/Iceberg/Parquet sources are
 clearly labelled extension-only additions.
 
-### PAR-1 — MEDIUM (docs): the highest-traffic query reference page is stale on three counts
+### PAR-1 — MEDIUM (docs): the highest-traffic query reference page is stale on three counts — RESOLVED 2026-08-04
 
 `docs/reference/semantic-view-function.rst`:
 1. Does **not document `where_clause :=` at all** (nor `search_path :=`), despite the parameter
@@ -428,7 +428,30 @@ clearly labelled extension-only additions.
    pre-#187 interim rule; search-path resolution replaced it (5f06ce8), and
    `create-semantic-view.rst` has the new rule. The two pages now contradict each other.
 3. Line 135 says "Column types are inferred at define time" — removed in v0.10.0; types are
-   inferred at bind via a LIMIT-0 probe (`src/expand/resolution.rs:234-249`).
+   inferred at bind via a LIMIT-0 probe (`src/query/table_function.rs:241`; the
+   `resolution.rs` line reference in the original finding was stale). The same sentence's
+   "columns default to VARCHAR" was wrong too, and the finding did not catch it: a failed probe
+   is a hard error (WR-08 / D-15 removed the placeholder fallback precisely because it masked
+   broken `FACTS` expressions).
+
+**Resolved 2026-08-04.** All three corrected in `docs/reference/semantic-view-function.rst`:
+`where_clause` added to the syntax block, the parameter table and a new
+`ref-sv-pre-agg-filtering` section under Filtering (which now contrasts the pre- and
+post-aggregation filters explicitly) plus an example; `search_path` documented as
+parser-injected rather than hand-written; the view-name rule replaced with the search-path
+rule from `create-semantic-view.rst`; and the type-inference sentence rewritten to describe
+the bind-time `LIMIT 0` probe. `sphinx-build -W` clean. No TECH-DEBT entry: the drift is fully
+closed, with no deliberately-degraded remainder.
+
+**Correction (same day, from review on PR #193).** The first pass at count 3 claimed
+dimension-and-metric queries still prefer CREATE-time persisted types on pre-v0.10.0 rows. That
+was wrong, and instructively so: it was taken from the *module doc comment* at
+`src/query/table_function.rs:31-35`, which still described the persisted-types fast path — but
+**AR-4 (PR-2) removed it**. `column_type_names` / `column_types_inferred` are gone from
+`SemanticViewDefinition` (`src/model.rs:434-440`), legacy rows carrying them fall through to
+read-side inference, and the bind body runs a single unconditional probe. So the module comment
+is itself PAR-1-class drift, and reading it instead of the code reproduced the very failure this
+finding is about. Both the module comment and the docs page are now fixed against the code.
 
 ### PAR-2 — MEDIUM: `SHOW SEMANTIC DIMENSIONS/METRICS/FACTS` returns an empty `data_type` for all views created ≥ v0.10.0 — a *pinned interim state whose follow-up never landed*
 
@@ -750,6 +773,30 @@ checklist the release is half-finished, and the large `## [Unreleased]` section 
 of an untagged version. Decide: tag f38c3e5 retroactively as v0.12.0, or fold the 0.12.0 section
 back into Unreleased and cut v0.12.0 (or v0.13.0) from HEAD once the EXP-9/EXP-10 fixes land.
 
+**Decided 2026-08-04 (maintainer):** the second option — v0.12.0 is still being worked towards and
+will be tagged from HEAD once all its work is complete, not applied retroactively to f38c3e5.
+
+**Partly actioned 2026-08-04.** The premature `## [0.12.0] - 2026-07-28` section has been folded
+back into `## [Unreleased]` (subsections merged pairwise, 0.12.0's bullets first as the earlier
+work; its `Known limitations` kept as the final subheading; the dangling `[0.12.0]:` compare link
+removed — it pointed at a tag that does not exist). All 25 top-level bullets are preserved. This
+restores the state CLAUDE.md's milestone checklist assumes: the version section is created *at
+tag time*, and until then everything unreleased lives under `Unreleased`.
+
+Two things remain for tag time, deliberately not done now while 0.12.0 work is still landing:
+1. Rename `## [Unreleased]` to `## [0.12.0] - <date>`, add a fresh empty `Unreleased`, and add the
+   `[0.12.0]:` compare link back.
+2. **An in-version churn pass.** Now that the two sections are one version, CLAUDE.md's rule that
+   in-version churn must not be listed applies across the merged content. At least one bullet is
+   affected: the `Fixed` entry for the `where_clause` member on a role-played table (EXP-10)
+   describes a defect in `where_clause`, which is itself an unreleased `Added` feature of this same
+   version — so no released build ever had that bug and users have nothing to be told about.
+   Flagged rather than deleted here, since removing a well-written entry is a maintainer call and
+   more 0.12.0 work may yet change the picture. Re-check the whole merged set at tag time, not
+   just this one.
+
+REL-2 (the stray `v1.0` tag) is untouched and still open.
+
 ### REL-2 — stray legacy `v1.0` tag
 
 A `v1.0` tag from 2026-02-28 (old milestone naming, commit 1837274) is still on the remote.
@@ -764,11 +811,14 @@ Status as of 2026-08-04. ✅ = landed on `main`; ⏳ = in review; ❌ = withdraw
 1. ✅ **EXP-9 and EXP-10** — the two silent-wrong-number paths. PR #189 (TECH-DEBT #39/#40).
 2. ✅ **PBT-6** — `where_clause` randomized in all five numeric oracles, each mutation-verified.
    PRs #189 + #191 (TECH-DEBT #41). ❌ **PBT-7** withdrawn: its premise was false, see above.
-3. ⏳ **EXP-12 paired migration** — all four window-inner-metric sites → `ident_matches`, together.
+3. ✅ **EXP-12 paired migration** — all four window-inner-metric sites → `ident_matches`, together.
    PR #192 (TECH-DEBT #43). Found to be an *active* wrong-number bug, not the latent one filed.
-   ⏳ **CAT-1/CAT-2** — TECH-DEBT #44/#45. CAT-1's duplicate-row/stale-read symptom was reproduced
-   end-to-end against a real pre-scoping database before fixing.
-4. **REL-1/REL-2** (tag state), **PAR-1** (`semantic-view-function.rst` drift). ARCH-13's
+   ✅ **CAT-1/CAT-2** — TECH-DEBT #44/#45. CAT-1's duplicate-row/stale-read symptom was reproduced
+   end-to-end against a real pre-scoping database before fixing. All three merged in PR #192.
+4. ✅ **PAR-1** — `semantic-view-function.rst` drift, all three counts corrected.
+   **REL-1** decided and partly actioned — v0.12.0 will be cut from HEAD when its work is
+   complete; the premature CHANGELOG section is folded back into `Unreleased`, with the rename and
+   an in-version churn pass left as tag-time steps. **REL-2** (stray `v1.0` tag) still open. ARCH-13's
    sub-items are partly overtaken: MAINTAINER.md's `where_clause.rs` omission and the "eight fuzz
    targets" miscount were fixed on `main` independently; the TECH-DEBT #28 status marker is still
    ambiguous.

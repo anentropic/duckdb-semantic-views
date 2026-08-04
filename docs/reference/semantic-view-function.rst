@@ -21,7 +21,8 @@ Syntax
        '<view_name>',
        [ dimensions := [ '<dim_name>' [, ...] ] , ]
        [ metrics := [ '<metric_name>' [, ...] ] , ]
-       [ facts := [ '<fact_name>' [, ...] ] ]
+       [ facts := [ '<fact_name>' [, ...] ] , ]
+       [ where_clause := '<predicate>' ]
    )
 
 
@@ -39,7 +40,7 @@ Parameters
      - Description
    * - ``<view_name>``
      - VARCHAR (positional)
-     - The name of the semantic view to query. Must match a registered view. The name is folded to lowercase and matched case-insensitively, quoted or not (``'Sales'``, ``'SALES'``, and ``'"sales"'`` all resolve to the same view), following DuckDB's identifier semantics. May carry a ``<schema>.`` qualifier — ``'analytics.sales'`` — which pins the schema; an unqualified name resolves to the one view of that name and is an error when several schemas hold one (see :ref:`ref-create-semantic-view`).
+     - The name of the semantic view to query. Must match a registered view. The name is folded to lowercase and matched case-insensitively, quoted or not (``'Sales'``, ``'SALES'``, and ``'"sales"'`` all resolve to the same view), following DuckDB's identifier semantics. May carry a ``<schema>.`` (or ``<database>.<schema>.``) qualifier — ``'analytics.sales'`` — which pins the schema. An unqualified name resolves through the session's ``search_path``, exactly as an unqualified table reference does: the first schema on the path holding a view of that name wins. A view that is the only one of its name resolves whether or not its schema is on the path, so a single-schema setup needs no ``search_path`` at all (see :ref:`ref-create-semantic-view`).
    * - ``dimensions``
      - LIST (named)
      - Optional list of dimension names to include in the result. Each name must match a dimension defined in the semantic view. Supports ``alias.*`` wildcard patterns.
@@ -49,8 +50,14 @@ Parameters
    * - ``facts``
      - LIST (named)
      - Optional list of fact names to include in the result. Each name must match a fact defined in the semantic view. Supports ``alias.*`` wildcard patterns.
+   * - ``where_clause``
+     - VARCHAR (named)
+     - Optional predicate applied **before** metrics are aggregated — the equivalent of Snowflake's ``SEMANTIC_VIEW( … WHERE <predicate> )``. See :ref:`ref-sv-pre-agg-filtering`. An omitted, empty, or whitespace-only value is treated as absent.
+   * - ``search_path``
+     - LIST (named)
+     - The session's schema resolution order, used to resolve an unqualified ``<view_name>``. **Supplied automatically** — the extension's parser override injects the caller's search path into every ``semantic_view()`` call it rewrites, because the read side binds on a connection that cannot otherwise see it. Not intended to be written by hand.
 
-At least one of ``dimensions``, ``metrics``, or ``facts`` must be specified.
+At least one of ``dimensions``, ``metrics``, or ``facts`` must be specified. ``where_clause`` alone is not a query.
 
 .. warning::
 
@@ -132,7 +139,9 @@ Output
 
 Returns a result set with one column per requested dimension, metric, or fact, in the order: dimensions first (in the order requested), then metrics or facts (in the order requested).
 
-Column types are inferred at define time from the underlying table columns. If type inference is not available, columns default to VARCHAR.
+Column types are inferred when the query is bound, by running the generated SQL as a ``LIMIT 0`` probe and reading back the result schema. Every query infers this way — there is no ``CREATE``-time type cache to fall back on, and legacy catalog rows that still carry one are ignored in favour of the probe.
+
+If the probe fails, the query raises ``semantic_view: type inference failed for query …`` with the underlying error. It does not fall back to VARCHAR: a placeholder type would mask a broken ``FACTS`` expression until something downstream tripped over it.
 
 .. versionchanged:: 0.11.0
 
@@ -149,7 +158,12 @@ Column types are inferred at define time from the underlying table columns. If t
 Filtering
 =========
 
-Use standard SQL ``WHERE`` on the outer query to filter results:
+There are two filters, and they run on opposite sides of the aggregation.
+
+Post-aggregation — outer ``WHERE``
+----------------------------------
+
+Use standard SQL ``WHERE`` on the outer query to filter the rows the function returns:
 
 .. code-block:: sql
 
@@ -159,6 +173,34 @@ Use standard SQL ``WHERE`` on the outer query to filter results:
    ) WHERE region = 'East';
 
 The ``WHERE`` clause applies to the result set after the semantic view expansion. DuckDB's optimizer pushes predicates down into the generated query where possible.
+
+
+.. _ref-sv-pre-agg-filtering:
+
+Pre-aggregation — ``where_clause``
+----------------------------------
+
+``where_clause := '<predicate>'`` filters the rows the metrics aggregate **over**, before they are aggregated — the equivalent of Snowflake's ``SEMANTIC_VIEW( … WHERE <predicate> )``:
+
+.. code-block:: sql
+
+   SELECT * FROM semantic_view('order_metrics',
+       dimensions := ['region'],
+       metrics := ['revenue'],
+       where_clause := 'ordered_at >= DATE ''2024-01-01'''
+   );
+
+Each region's ``revenue`` is recomputed over only the matching orders. An outer ``WHERE`` cannot express this: by then the aggregation has already run over every row, and ``ordered_at`` is not in the output to filter by.
+
+The parameter is spelled ``where_clause`` rather than ``where`` because DuckDB reserves ``where`` in named-parameter position — ``where := '…'`` is a parse error before the extension is consulted.
+
+**What the predicate may name.** Declared dimensions and facts, referenced by their logical names; each is substituted to its expression, wrapped in parentheses so a member that binds looser than its surrounding context keeps its grouping. Members declared :ref:`LABELS = (FILTER) <howto-annotations-filters>` are the intended case, but any dimension or fact works — the label records intent and does not gate resolution. Naming a **metric** is rejected, matching Snowflake: the filter runs before aggregation, so an aggregate has no value yet.
+
+**Joins and fan-out.** Tables the predicate reaches are joined in and subjected to the same reachability and fan-out checks as a queried dimension's, matching Snowflake's rule that WHERE-clause members participate in the same-logical-table constraint. A member on a role-played table — one reached through two named relationships — is rejected rather than bound to whichever relationship was declared first, since the predicate has no way to say which role is meant.
+
+**Where it is applied.** Before the ``GROUP BY`` on the base-anchored and fact paths, inside each grain CTE for multi-grain queries, inside the snapshot CTE ahead of the ranking for semi-additive metrics, and inside the aggregate CTE ahead of the window function for window metrics — so a filtered number is always recomputed rather than filtered after the fact.
+
+An omitted, empty, or whitespace-only ``where_clause`` is treated as absent. The two filters compose: a pre-aggregation predicate and an outer ``WHERE`` in the same query each do their own job.
 
 
 .. _ref-sv-ordering:
@@ -219,6 +261,13 @@ Examples
        metrics := ['revenue']
    ) WHERE revenue > 100
    ORDER BY revenue DESC;
+
+   -- Pre-aggregation filtering: revenue per customer, over 2024 orders only
+   SELECT * FROM semantic_view('shop',
+       dimensions := ['customer'],
+       metrics := ['revenue'],
+       where_clause := 'ordered_at >= DATE ''2024-01-01'''
+   );
 
    -- Facts mode (row-level)
    SELECT * FROM semantic_view('shop',
