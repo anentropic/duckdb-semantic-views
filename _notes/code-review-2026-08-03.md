@@ -659,12 +659,26 @@ with a generator-coverage guard so the parameter cannot silently revert to an in
 two remaining `where_clause: None` sites live in `expand_proptest.rs`, which checks structural
 parse/expand invariants rather than numbers, and are deliberately out of scope.
 
-### PBT-7 — HIGH-VALUE GAP: the multi-grain FULL OUTER combiner has no randomized coverage
+### PBT-7 — ~~HIGH-VALUE GAP: the multi-grain FULL OUTER combiner has no randomized coverage~~ — WITHDRAWN 2026-08-04, the premise was false
 
-Both grain-related proptests are single-table/single-grain. `coalesced_key`
+**Original claim:** "Both grain-related proptests are single-table/single-grain. `coalesced_key`
 (`src/expand/per_grain.rs:1164`) and NULL-dimension-key coalescing across grain groups — the
-classic FULL-OUTER-COALESCE bug surface — are pinned only by fixed examples. Oracle shape: two
-independent GROUP BYs FULL-OUTER-joined on `IS NOT DISTINCT FROM`, random NULL-bearing shared keys.
+classic FULL-OUTER-COALESCE bug surface — are pinned only by fixed examples."
+
+**That is wrong, and was wrong when written.** Checked directly while working through the PBT-6
+items: `star_schema_proptest` spans two grains (child + parent) and `multi_hop_join_proptest` spans
+three, and *both* oracles already combine them with `FULL OUTER JOIN` on `IS NOT DISTINCT FROM`
+plus `COALESCE`d dimension keys — which is precisely the oracle shape this finding proposed
+building. Their generators emit NULL group keys and NULL/dangling foreign keys, so the
+NULL-coalescing surface was randomized too.
+
+The finding appears to have been produced by pattern-matching the two *single-table* harnesses
+(`differential_proptest`, `semi_additive_proptest`) and generalising to "both grain-related" ones
+without reading the star and multi-hop oracles. Recorded here rather than deleted, because a
+review's wrong findings are worth knowing about: this one would have cost a day building a harness
+that already existed. PBT-6, filed alongside it by the same pass, was real and is now closed —
+so the pass was not uniformly unreliable, which is exactly why individual claims need checking
+before being scheduled.
 
 ### TC-1 — the read-only legacy-catalog migration refusal is unit-simulated only
 
@@ -745,14 +759,19 @@ A `v1.0` tag from 2026-02-28 (old milestone naming, commit 1837274) is still on 
 
 ## 9. Suggested priority order
 
-1. **EXP-9 and EXP-10** — the two silent-wrong-number paths, test-first per CLAUDE.md discipline
-   (both have crisp failing repros above). Release-blocking for whatever tag comes next.
-2. **PBT-6 + PBT-7** — randomize `where_clause` in the differential proptests; add the multi-grain
-   combiner proptest. Closes the systematic blind spot that let EXP-9/EXP-10 through.
-3. **EXP-12 paired migration** (`fan_trap.rs` + `body_parser` + `per_grain.rs` window-inner-metric
-   sites → `ident_matches`, together) and **CAT-1/CAT-2** before more legacy databases migrate.
-4. **REL-1/REL-2** (tag state), **PAR-1** (`semantic-view-function.rst` drift), and the ARCH-13
-   doc-sync items (MAINTAINER.md `where_clause.rs`, "eight targets", TECH-DEBT #28 marker).
-5. Remaining mediums at next opportunity: EXP-11, EXP-16/17, CAT-3/CAT-4, PAR-2/PAR-3/PAR-4.
+Status as of 2026-08-04. ✅ = landed on `main`; ⏳ = in review; ❌ = withdrawn.
+
+1. ✅ **EXP-9 and EXP-10** — the two silent-wrong-number paths. PR #189 (TECH-DEBT #39/#40).
+2. ✅ **PBT-6** — `where_clause` randomized in all five numeric oracles, each mutation-verified.
+   PRs #189 + #191 (TECH-DEBT #41). ❌ **PBT-7** withdrawn: its premise was false, see above.
+3. ⏳ **EXP-12 paired migration** — all four window-inner-metric sites → `ident_matches`, together.
+   PR #192 (TECH-DEBT #43). Found to be an *active* wrong-number bug, not the latent one filed.
+   **CAT-1/CAT-2 still open**, and still wanted before more legacy databases migrate.
+4. **REL-1/REL-2** (tag state), **PAR-1** (`semantic-view-function.rst` drift). ARCH-13's
+   sub-items are partly overtaken: MAINTAINER.md's `where_clause.rs` omission and the "eight fuzz
+   targets" miscount were fixed on `main` independently; the TECH-DEBT #28 status marker is still
+   ambiguous.
+5. Remaining mediums at next opportunity: EXP-11, EXP-13/14/15, EXP-16/17, EXP-18, CAT-3/CAT-4,
+   PAR-2/PAR-3/PAR-4, PARSE-3/PARSE-4.
 6. Structural debt as capacity allows: ARCH-6 (crate-level `QuoteState`), ARCH-7 (`expand()`
-   planner), ARCH-8/9/10/11, TC-1, TC-4.
+   planner), ARCH-8/9/10/11/12, TC-1, TC-2, TC-3, TC-4, CI-6.
