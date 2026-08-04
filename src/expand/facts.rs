@@ -222,19 +222,18 @@ pub(super) fn rewrite_count_star(expr: &str, replacement_arg: &str) -> Option<St
     let mut out = String::with_capacity(expr.len() + replacement_arg.len());
     let mut copied = 0usize; // byte offset copied into `out` so far
     let mut pos = 0usize;
-    let mut in_string = false;
+    // EXP-16: single-quote tracking alone rewrote `count(*)` occurring inside a
+    // double-quoted identifier or a `$tag$` literal, corrupting it. `QuoteState`
+    // is the crate's one scanner and treats all three regions as inert.
+    let mut quotes = crate::util::QuoteState::default();
     let mut changed = false;
     while pos < bytes.len() {
+        let (next, is_live_code) = quotes.step(bytes, pos);
+        if !is_live_code {
+            pos = next;
+            continue;
+        }
         let byte = bytes[pos];
-        if byte == b'\'' {
-            in_string = !in_string;
-            pos += 1;
-            continue;
-        }
-        if in_string {
-            pos += 1;
-            continue;
-        }
         if (byte == b'c' || byte == b'C')
             && pos + 5 <= bytes.len()
             && bytes[pos..pos + 5].eq_ignore_ascii_case(b"count")
@@ -1005,6 +1004,33 @@ mod tests {
         assert!(rewrite_count_star("'COUNT(*)'", "x").is_none());
         // `miscount(*)` is not `count` at a word boundary.
         assert!(rewrite_count_star("miscount(*)", "x").is_none());
+    }
+
+    // EXP-16: this scanner tracked only single quotes, so `count(*)` occurring
+    // inside a double-quoted identifier or a dollar-quoted literal was rewritten
+    // as if it were live code — corrupting the identifier or the literal. Both
+    // regions are inert everywhere else in the codebase (PARSE-1); they are
+    // inert here too. Two separate tests so each region reports independently.
+
+    #[test]
+    fn rewrite_count_star_ignores_a_double_quoted_identifier() {
+        // A column literally named `count(*)` — the text is an identifier, not a call.
+        assert!(rewrite_count_star("\"my count(*) col\"", "x").is_none());
+        // …and one alongside a genuine call: only the call is rewritten.
+        assert_eq!(
+            rewrite_count_star("COUNT(*) + \"count(*)\"", "\"li\".\"id\"").as_deref(),
+            Some("COUNT(\"li\".\"id\") + \"count(*)\"")
+        );
+    }
+
+    #[test]
+    fn rewrite_count_star_ignores_a_dollar_quoted_literal() {
+        assert!(rewrite_count_star("$$count(*)$$", "x").is_none());
+        // Tagged form, and a genuine call outside it.
+        assert_eq!(
+            rewrite_count_star("COUNT(*) || $tag$count(*)$tag$", "\"li\".\"id\"").as_deref(),
+            Some("COUNT(\"li\".\"id\") || $tag$count(*)$tag$")
+        );
     }
 
     // --- inline_derived_metrics COUNT(*) rewrite tests (SG-8) ---

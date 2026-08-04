@@ -131,6 +131,103 @@ pub fn read_dollar_tag_len(bytes: &[u8], start: usize) -> Option<usize> {
     }
 }
 
+/// Byte-scan state for SQL text: tracks single-quoted string literals and
+/// double-quoted identifiers, honouring the SQL escape doubling (`''` inside
+/// a string, `""` inside a quoted identifier).
+///
+/// This is the ONE quote-tracking implementation for SQL-text scanning across
+/// the crate (PA-6, code-review 2026-07-02; promoted out of `body_parser::scan`
+/// for EXP-16/EXP-17/PARSE-4, code-review 2026-08-03): scanners that tracked only
+/// single quotes — or nothing — mis-split on quoted identifiers containing
+/// commas / parens / dots (`o."a,b"`, `o AS "tbl)x"`, `"a.b"`) and matched
+/// keywords inside string literals (PA-3: a `COMMENT = 'the PRIMARY KEY (id)
+/// lives here'` fabricated a primary key from comment text).
+///
+/// Multi-byte UTF-8 is safe by construction: only ASCII bytes are compared,
+/// and continuation bytes (>= 0x80) never equal an ASCII quote.
+///
+/// Dollar-quoted strings (`$tag$ ... $tag$`, PARSE-1 / code-review 2026-07-18)
+/// are tracked too: a `,` / `)` / keyword inside one is inert, matching the
+/// comment-blanker and the CREATE-body extractor which already share the tag
+/// grammar via [`read_dollar_tag_len`]. Without this a comma inside
+/// a dimension/metric expression's `$$...$$` split one entry into two garbage
+/// entries (the P-1/P-2 silent-mis-parse class).
+#[derive(Default, Clone, Copy)]
+pub(crate) struct QuoteState {
+    pub(crate) in_string: bool,
+    pub(crate) in_ident: bool,
+    /// When inside a `$tag$ ... $tag$` region, the byte span `[start, end)` of
+    /// the OPENING tag within the buffer being scanned; `None` otherwise. Stored
+    /// as offsets (not the tag bytes) so `QuoteState` stays `Copy`; the offsets
+    /// index the same `bytes` slice passed to every `step` call, which every
+    /// scan-in-a-loop caller preserves.
+    dollar_open: Option<(usize, usize)>,
+}
+
+impl QuoteState {
+    /// True while inside an unterminated (still-open) dollar-quoted region.
+    pub(crate) fn in_dollar(&self) -> bool {
+        self.dollar_open.is_some()
+    }
+
+    /// Consume the byte at `i`, updating quote state. Returns
+    /// `(next_index, is_live_code)` where `is_live_code` is true only when
+    /// byte `i` is outside every quoted region and is not itself a quote
+    /// delimiter. Escape pairs / whole dollar tags are consumed at once.
+    pub(crate) fn step(&mut self, bytes: &[u8], i: usize) -> (usize, bool) {
+        let b = bytes[i];
+        if let Some((ts, te)) = self.dollar_open {
+            // Inside `$tag$...$tag$`: only the IDENTICAL closing tag ends the
+            // region — a different inner tag ($z$) or a lone `$` does not.
+            if b == b'$' && bytes[i..].starts_with(&bytes[ts..te]) {
+                self.dollar_open = None;
+                return (i + (te - ts), false); // consume the whole closing tag
+            }
+            return (i + 1, false);
+        }
+        if self.in_string {
+            if b == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    return (i + 2, false); // '' escape — stay in string
+                }
+                self.in_string = false;
+            }
+            (i + 1, false)
+        } else if self.in_ident {
+            if b == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    return (i + 2, false); // "" escape — stay in ident
+                }
+                self.in_ident = false;
+            }
+            (i + 1, false)
+        } else {
+            match b {
+                b'\'' => {
+                    self.in_string = true;
+                    (i + 1, false)
+                }
+                b'"' => {
+                    self.in_ident = true;
+                    (i + 1, false)
+                }
+                b'$' => {
+                    // A valid `$tag$` opener starts a dollar-quoted region; a
+                    // lone `$` or a `$1` positional parameter (rejected by
+                    // read_dollar_tag_len) is ordinary live code.
+                    if let Some(len) = read_dollar_tag_len(bytes, i) {
+                        self.dollar_open = Some((i, i + len));
+                        (i + len, false) // consume the whole opening tag
+                    } else {
+                        (i + 1, true)
+                    }
+                }
+                _ => (i + 1, true),
+            }
+        }
+    }
+}
+
 /// Blank SQL comments out of `input`, byte-for-byte length-preserving.
 ///
 /// Every byte of a comment — `-- ...` to end of line (the newline itself is

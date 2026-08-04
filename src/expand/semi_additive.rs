@@ -950,42 +950,35 @@ fn parse_snapshot_aggregate(expr: &str) -> Result<(String, String), String> {
 }
 
 /// Byte index of the `)` matching the `(` at byte offset `open`, or `None`
-/// when unbalanced. Parens inside single-quoted SQL strings and double-quoted
-/// identifiers are ignored; the doubled-quote escapes (`''`, `""`) fall out
-/// naturally from toggling the in-quote state on every quote character.
+/// when unbalanced. Parens inside single-quoted strings, double-quoted
+/// identifiers and `$tag$` literals are ignored, along with the doubled-quote
+/// escapes (`''`, `""`).
+///
+/// EXP-17: this was a hand-rolled `Mode::{Normal,SingleQuote,DoubleQuote}`
+/// matcher that never learned `$tag$` (which parse-side scanners gained in
+/// PARSE-1), so a `)` inside a dollar-quoted literal closed the match early and
+/// mis-sliced the aggregate's argument. It now defers to [`QuoteState`], the
+/// crate's one scanner.
 fn find_matching_paren(s: &str, open: usize) -> Option<usize> {
-    enum Mode {
-        Normal,
-        SingleQuote,
-        DoubleQuote,
-    }
-    let mut mode = Mode::Normal;
+    let bytes = s.as_bytes();
+    let mut quotes = crate::util::QuoteState::default();
     let mut depth = 0usize;
-    for (i, c) in s[open..].char_indices() {
-        match mode {
-            Mode::Normal => match c {
-                '(' => depth += 1,
-                ')' => {
+    let mut i = open;
+    while i < bytes.len() {
+        let (next, is_live_code) = quotes.step(bytes, i);
+        if is_live_code {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
                     depth = depth.checked_sub(1)?;
                     if depth == 0 {
-                        return Some(open + i);
+                        return Some(i);
                     }
                 }
-                '\'' => mode = Mode::SingleQuote,
-                '"' => mode = Mode::DoubleQuote,
                 _ => {}
-            },
-            Mode::SingleQuote => {
-                if c == '\'' {
-                    mode = Mode::Normal;
-                }
-            }
-            Mode::DoubleQuote => {
-                if c == '"' {
-                    mode = Mode::Normal;
-                }
             }
         }
+        i = next;
     }
     None
 }
@@ -1024,7 +1017,33 @@ mod tests {
     use crate::expand::{expand, DimensionName, ExpandError, MetricName, QueryRequest};
     use crate::model::{NullsOrder, SortOrder};
 
-    use super::parse_snapshot_aggregate;
+    use super::{find_matching_paren, parse_snapshot_aggregate};
+
+    /// EXP-17: this matcher knew `'…'` and `"…"` but not `$tag$…$tag$`, so a
+    /// `)` inside a dollar-quoted literal closed the match early and
+    /// `build_snapshot_block`'s SG-5 decomposition mis-sliced the aggregate's
+    /// argument. Parse-side scanners learned `$tag$` in PARSE-1; this one did not.
+    #[test]
+    fn find_matching_paren_ignores_a_close_paren_inside_a_dollar_quoted_literal() {
+        // The `)` at index 10 is literal text, not the closing paren.
+        let s = "sum($tag$a)b$tag$)";
+        assert_eq!(find_matching_paren(s, 3), Some(s.len() - 1));
+
+        // Untagged `$$…$$` form.
+        let s = "sum($$a)b$$)";
+        assert_eq!(find_matching_paren(s, 3), Some(s.len() - 1));
+    }
+
+    /// Control: the regions this matcher already handled must keep working.
+    #[test]
+    fn find_matching_paren_still_ignores_quoted_regions_and_nests() {
+        let s = "sum('a)b')";
+        assert_eq!(find_matching_paren(s, 3), Some(s.len() - 1));
+        let s = "sum(\"a)b\")";
+        assert_eq!(find_matching_paren(s, 3), Some(s.len() - 1));
+        let s = "sum(coalesce(a, b))";
+        assert_eq!(find_matching_paren(s, 3), Some(s.len() - 1));
+    }
 
     /// Single table, one semi-additive metric with NA dim NOT in query.
     /// Expects CTE with RANK and conditional aggregation.
