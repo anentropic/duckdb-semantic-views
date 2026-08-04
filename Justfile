@@ -254,11 +254,19 @@ test-show-scope-qualified: build
 test-get-ddl-qualified: build
     uv run test/integration/test_get_ddl_qualified_name.py
 
+# Query cancellation: con.interrupt() must stop a running semantic_view()
+# query, not be noticed only once the inner query has finished. The inner
+# query runs on a per-call Connection whose ClientContext holds its own
+# interrupt flag, so this needs a real interrupt fired from a second thread
+# mid-query — timing that sqllogictest cannot express.
+test-interrupt: build
+    uv run test/integration/test_query_interrupt.py
+
 # All Python integration suites against the built extension. This is the
 # exact set the `python-integration` CI job runs (IntegrationChecks.yml) —
 # keep the two in sync by editing THIS recipe, not the workflow.
 # (test-ducklake-ci is excluded: it has its own dedicated CI job.)
-test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-attach-migration test-readonly-fresh-drop test-chunk-boundary test-differential test-show-scope-case test-show-scope-qualified test-get-ddl-qualified
+test-integration: test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-attach-migration test-readonly-fresh-drop test-chunk-boundary test-differential test-show-scope-case test-show-scope-qualified test-get-ddl-qualified test-interrupt
 
 # Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + all Python integration suites
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.

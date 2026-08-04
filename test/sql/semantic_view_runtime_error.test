@@ -1,0 +1,70 @@
+# Runtime (execution-time) failures of the inner query keep the SqlExecution
+# error surface.
+#
+# `semantic_view()` runs its expanded SQL from `sv_semantic_view_init_global`
+# (cpp/src/shim.cpp) and wraps any failure as
+# `semantic_view: SQL execution failed: <duckdb error>  (expanded SQL: ...)`.
+# TECH-DEBT #42 re-routed that execution through `sv_query_interruptible`
+# (PendingQuery + ExecuteTask, so the caller's interrupt flag can be polled),
+# which moved where the error is produced — from `Connection::Query`'s own
+# error-carrying result to one built from the PendingQueryResult's ErrorData.
+# Nothing pinned that wording, so the refactor could have changed the error
+# surface silently. This pins it.
+#
+# GUARD, not a capability: this passes before and after the TECH-DEBT #42
+# change by design — its job is to fail if the wrap is ever dropped, reworded,
+# or bypassed. It is not vacuous: the assertions were confirmed against the
+# built extension to be produced by exactly this branch, which is the only
+# thing that emits that text.
+#
+# Why an execution-time error specifically: bind runs a `LIMIT 0` probe over the
+# same SQL, so anything that fails at *bind* is reported by the probe as a
+# BinderException and never reaches `init_global`. A cast that fails only on
+# actual row data binds cleanly, evaluates nothing under `LIMIT 0`, and so is
+# the shape that exercises the execution path.
+
+require semantic_views
+
+statement ok
+CREATE TABLE sve_rows (id INTEGER, txt VARCHAR);
+
+statement ok
+INSERT INTO sve_rows VALUES (1, '10'), (2, 'not a number');
+
+statement ok
+CREATE SEMANTIC VIEW sve_view AS
+  TABLES (e AS sve_rows PRIMARY KEY (id))
+  DIMENSIONS (e.id AS e.id)
+  METRICS (e.bad AS sum(CAST(e.txt AS INTEGER)));
+
+# Binds fine (the LIMIT 0 probe evaluates no rows), fails at execution.
+#
+# Matched only as far as `Conversion Error:` deliberately. The wrapper prefix is
+# ours and is what this file exists to pin; everything past it is DuckDB's own
+# diagnostic wording ("Could not convert string 'not a number' to INT32"), which
+# a version bump may reword without anything here being wrong. Keeping
+# `Conversion Error:` still proves the underlying error is carried through the
+# wrapper rather than swallowed or replaced.
+statement error
+SELECT * FROM semantic_view('sve_view', metrics := ['e.bad']);
+----
+semantic_view: SQL execution failed: Conversion Error:
+
+# The expanded SQL is carried in the same message, so a user can see what ran.
+statement error
+SELECT * FROM semantic_view('sve_view', metrics := ['e.bad']);
+----
+(expanded SQL: SELECT
+
+# A metric over the rows that DO convert still works, so the view itself is
+# sound and the error above is the data's, not the definition's.
+query I
+SELECT bad FROM semantic_view('sve_view', metrics := ['e.bad'], where_clause := 'id = 1');
+----
+10
+
+statement ok
+DROP SEMANTIC VIEW sve_view;
+
+statement ok
+DROP TABLE sve_rows;
