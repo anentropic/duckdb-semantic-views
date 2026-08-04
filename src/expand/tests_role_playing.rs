@@ -551,3 +551,82 @@ fn scoped_join_on_clause_uses_correct_fk_pk() {
         "Scoped JOIN ON clause must use correct FK/PK: {sql}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// EXP-10 (code-review 2026-08-03): a `where_clause` member on a role-playing
+// table must not bind silently to the first-declared relationship.
+//
+// Role-playing ambiguity is checked for queried DIMENSIONS (`find_using_context`,
+// Phase 32) and, on the facts path, for queried dims and facts (EXP-5) — but a
+// `where_clause` member's table is in neither set. It rides
+// `resolve_joins_pkfk`'s `fact_source_tables` parameter, whose loop (unlike the
+// dimension loop) never consults `role_playing_bare_aliases`, so the bare alias
+// joins via `tree_parent` — the first-declared edge.
+//
+// Only a queried dimension's *expression* is rewritten to a scoped alias, so a
+// where-member has no way to name its role; per EXP-4/EXP-5 the correct posture
+// is to fail loudly rather than pick an edge by declaration order.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn where_clause_on_role_playing_table_is_rejected() {
+    let def = flights_airports_def();
+    let req = QueryRequest {
+        where_clause: Some("city = 'NYC'".to_string()),
+        facts: vec![],
+        dimensions: vec![],
+        metrics: vec![MetricName::new("departure_count")],
+    };
+    let result = expand("flights_sv", &def, &req);
+    assert!(
+        result.is_err(),
+        "a where_clause member on a role-playing table must not bind to the \
+         first-declared relationship silently; got: {:?}",
+        result.ok()
+    );
+}
+
+/// The wrong-number shape the rejection exists to prevent: the metric's
+/// `USING (arr_airport)` scopes its join to `a__arr_airport`, while the
+/// predicate's `a` is joined via the first-declared `dep_airport`. Filtering
+/// on departure city while counting arrivals is a silently wrong answer, not a
+/// different-but-defensible one.
+#[test]
+fn where_clause_role_playing_does_not_filter_through_the_other_role() {
+    let def = flights_airports_def();
+    let req = QueryRequest {
+        where_clause: Some("city = 'NYC'".to_string()),
+        facts: vec![],
+        dimensions: vec![],
+        metrics: vec![MetricName::new("arrival_count")],
+    };
+    let result = expand("flights_sv", &def, &req);
+    match result {
+        Err(_) => {}
+        Ok(sql) => panic!(
+            "expected a role-playing ambiguity error; emitted SQL instead (the \
+             predicate binds to the dep_airport instance while the metric uses \
+             arr_airport):\n{sql}"
+        ),
+    }
+}
+
+/// Control: the same predicate on a NON-role-playing table's member stays
+/// legal. Without this the fix above could be "reject every where_clause on a
+/// joined table" and still look green.
+#[test]
+fn where_clause_on_non_role_playing_table_still_allowed() {
+    let def = flights_airports_def();
+    let req = QueryRequest {
+        where_clause: Some("carrier = 'AA'".to_string()),
+        facts: vec![],
+        dimensions: vec![],
+        metrics: vec![MetricName::new("departure_count")],
+    };
+    let result = expand("flights_sv", &def, &req);
+    assert!(
+        result.is_ok(),
+        "a where_clause on the base table's own dimension is unambiguous: {:?}",
+        result.err()
+    );
+}
