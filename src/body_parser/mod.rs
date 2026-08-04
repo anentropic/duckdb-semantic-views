@@ -298,14 +298,18 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
             // Phase 68 B2 / D-08: accept dotted-path qualifier `alias.dim_name`
             // in addition to the bare `dim_name` form (mirrors NAB resolver).
             for ob in &ws.order_by {
+                // EXP-12: `ident_matches` so a quoted reference resolves to its
+                // unquoted declaration, as everywhere else in the language.
+                // Raw case-folding compared the quote characters as data, so
+                // `ORDER BY "region"` was rejected against a `region` dimension.
                 let dim_exists = dimensions.iter().any(|d| {
-                    if d.name.eq_ignore_ascii_case(&ob.expr) {
+                    if crate::ident::ident_matches(&d.name, &ob.expr) {
                         return true;
                     }
                     if let Some((alias_part, name_part)) = split_qualified_identifier(&ob.expr) {
                         if let Some(ref src) = d.source_table {
-                            return src.eq_ignore_ascii_case(alias_part)
-                                && d.name.eq_ignore_ascii_case(name_part);
+                            return crate::ident::ident_matches(src, alias_part)
+                                && crate::ident::ident_matches(&d.name, name_part);
                         }
                     }
                     false
@@ -329,9 +333,14 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
                 }
             }
             // Validate inner metric reference
+            // EXP-12: same canonical rule. This check was the strictest of the
+            // four sites resolving `inner_metric`, and its strictness is what
+            // kept a quoted reference out of the catalog — and so masked the
+            // fence and anchor sites, which lost the inner aggregate's grain
+            // when they did see one. All four migrate together, deliberately.
             let inner_exists = metric_names
                 .iter()
-                .any(|n| n.eq_ignore_ascii_case(&ws.inner_metric));
+                .any(|n| crate::ident::ident_matches(n, &ws.inner_metric));
             if !inner_exists {
                 let suggestion = crate::util::suggest_closest(&ws.inner_metric, &metric_names);
                 let mut msg = format!(
@@ -3668,6 +3677,90 @@ mod tests {
             err.message.contains("nonexistent"),
             "Error should mention the invalid dim: {}",
             err.message
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // EXP-12 (code-review 2026-08-03): a QUOTED reference in a window metric's
+    // inner-metric or ORDER BY slot names the same identifier as its unquoted
+    // declaration, per DuckDB's rule (CLAUDE.md: identifier matching follows
+    // `ident::ident_matches`, not raw `eq_ignore_ascii_case`, which compares
+    // the quote characters as data).
+    //
+    // These two sites, the fan-trap fence's `metric_grain_tables`, and
+    // `per_grain::window_cte_anchor` all resolve the SAME reference and must
+    // agree. `expand::window` already used the canonical key, so the CREATE
+    // side was the stricter one -- it rejected definitions the emitter could
+    // have computed.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn parse_keyword_body_window_quoted_inner_metric_accepted() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                     DIMENSIONS (o.region AS o.region) \
+                     METRICS (\
+                         o.total_qty AS SUM(o.qty), \
+                         o.avg_qty AS AVG(\"total_qty\") OVER (PARTITION BY EXCLUDING region)\
+                     )";
+        let result = parse_keyword_body(body, 0);
+        assert!(
+            result.is_ok(),
+            "a quoted inner-metric reference names the same metric as its \
+             unquoted declaration: {:?}",
+            result.err().map(|e| e.message)
+        );
+    }
+
+    #[test]
+    fn parse_keyword_body_window_quoted_case_varied_inner_metric_accepted() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                     DIMENSIONS (o.region AS o.region) \
+                     METRICS (\
+                         o.total_qty AS SUM(o.qty), \
+                         o.avg_qty AS AVG(\"Total_Qty\") OVER (PARTITION BY EXCLUDING region)\
+                     )";
+        let result = parse_keyword_body(body, 0);
+        assert!(
+            result.is_ok(),
+            "DuckDB folds case inside quotes too, so \"Total_Qty\" is total_qty: {:?}",
+            result.err().map(|e| e.message)
+        );
+    }
+
+    #[test]
+    fn parse_keyword_body_window_quoted_order_by_dim_accepted() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                     DIMENSIONS (o.region AS o.region) \
+                     METRICS (\
+                         o.total_qty AS SUM(o.qty), \
+                         o.avg_qty AS AVG(total_qty) OVER (PARTITION BY EXCLUDING region ORDER BY \"region\")\
+                     )";
+        let result = parse_keyword_body(body, 0);
+        assert!(
+            result.is_ok(),
+            "a quoted ORDER BY dimension reference names the declared dimension: {:?}",
+            result.err().map(|e| e.message)
+        );
+    }
+
+    /// Control: the checks must still REJECT a genuinely unknown name. Without
+    /// this, "accept quoted references" could degenerate into "accept anything".
+    #[test]
+    fn parse_keyword_body_window_quoted_unknown_inner_metric_still_rejected() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                     DIMENSIONS (o.region AS o.region) \
+                     METRICS (\
+                         o.total_qty AS SUM(o.qty), \
+                         o.avg_qty AS AVG(\"nope\") OVER (PARTITION BY EXCLUDING region)\
+                     )";
+        let result = parse_keyword_body(body, 0);
+        assert!(
+            result.is_err(),
+            "quoting an unknown name must not make it resolve"
+        );
+        assert!(
+            result.unwrap_err().message.contains("inner metric"),
+            "the rejection must still name the inner-metric slot"
         );
     }
 

@@ -240,6 +240,7 @@ Fix: `rustup update stable`
 | `just test-ducklake` | DuckLake integration (real jaffle-shop data) | Builds extension, runs the Python test against DuckLake tables; requires `just setup-ducklake` first |
 | `just test-integration` | Python integration suites | Runs the full `test/integration/*.py` suite list (caret, ADBC, multi-db, concurrency, differential, interrupt, …) |
 | `just test-interrupt` | Query cancellation (TECH-DEBT #42) | Builds the extension and fires `con.interrupt()` from a second thread mid-query; asserts `semantic_view()` aborts early (not just eventually) and reports a bare `Interrupted!`. Part of `test-integration`. |
+| `just test-legacy-schema-spelling` | Legacy-catalog migration (TECH-DEBT #44) | Builds a real pre-scoping database file (`_definitions` keyed on `name` alone), opens it through a real `LOAD`, and asserts the migration records the **catalog's** spelling of a schema rather than the row's — then that `CREATE OR REPLACE` replaces the migrated row instead of duplicating it. Part of `test-integration`. |
 | `just test-all` | Rust + SQL logic + DuckLake CI + integration | Runs `test-rust`, `test-sql`, `test-ducklake-ci`, and `test-integration` sequentially |
 | `just coverage` | Coverage report | Runs unit tests with `cargo-llvm-cov`, fails if below 80% line coverage |
 | `just lint` | Code quality (authoritative) | `cargo fmt --check` + full default-features `cargo clippy` + `cargo deny check`. The clippy step compiles the ~25 MB bundled DuckDB, so a cold run is ~10 min. |

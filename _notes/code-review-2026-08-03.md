@@ -182,7 +182,15 @@ now inconsistent about it. **Fix direction:** apply the empty→root substitutio
 contributing the root, or have `decompose` decline when a dependency has `source_table == None`
 and an aggregate in its expression).
 
-### EXP-12 — MEDIUM: window inner-metric matching quote-sensitive in fence & CREATE, quote-insensitive in the emitter
+### EXP-12 — MEDIUM: window inner-metric matching quote-sensitive in fence & CREATE, quote-insensitive in the emitter — RESOLVED 2026-08-04 (TECH-DEBT #43)
+
+**Resolution note.** All four sites migrated to `ident_matches` in one change, as this entry
+required. Worth recording what the fix surfaced: the hazard was described here as latent — real
+only once the CREATE check moved — but it was already active for any definition carrying a quoted
+reference. Measured directly: the quoted spelling anchored `__sv_agg` at the base table and
+computed the inner aggregate over a fanned join (140 → 340) while the unquoted spelling anchored at
+the aggregate's own grain. The CREATE check's strictness was the only thing keeping that
+unreachable through DDL, which is exactly why the sites had to move together.
 
 `src/expand/fan_trap.rs:402-406` (`metric_grain_tables` resolves `ws.inner_metric` via
 `eq_ignore_ascii_case`); `src/body_parser/mod.rs:331-349` (CREATE inner-metric check, same) and
@@ -302,7 +310,7 @@ rank column is exactly the failure shape this project treats as worst-in-class. 
 
 ## 3. Catalog & schema-scoping findings
 
-### CAT-1 — MEDIUM: migration keeps the legacy JSON's schema spelling verbatim — `INSERT OR REPLACE`/`OR IGNORE` can create a duplicate logical row, and reads then resolve to the stale one
+### CAT-1 — MEDIUM: migration keeps the legacy JSON's schema spelling verbatim — RESOLVED 2026-08-04 (TECH-DEBT #44) — `INSERT OR REPLACE`/`OR IGNORE` can create a duplicate logical row, and reads then resolve to the stale one
 
 `src/catalog/mod.rs:214-230` (`migrated_row` uses the recorded spelling unnormalized);
 `src/parse/native_sql.rs:343-354` (`INSERT OR REPLACE`/`OR IGNORE` conflict on the byte-equal
@@ -323,7 +331,7 @@ OR REPLACE has no guard by design; OR IGNORE's absorb relies on the PK.
 **Fix direction:** canonicalize the schema spelling during migration (the same `duckdb_schemas()`
 lookup `create_target_schema_expr` performs), or fold `schema_name` on write.
 
-### CAT-2 — MEDIUM-LOW: `upgrade_definitions_schema` UPDATE is schema-blind after schema scoping
+### CAT-2 — MEDIUM-LOW: `upgrade_definitions_schema` UPDATE is schema-blind after schema scoping — RESOLVED 2026-08-04 (TECH-DEBT #45)
 
 `src/catalog/mod.rs:349-359`. The AR-4 version stamp runs `UPDATE … WHERE name = ?`, so with the
 new `(schema_name, name)` key it stamps *every* same-named row across schemas — including a row the
@@ -651,12 +659,26 @@ with a generator-coverage guard so the parameter cannot silently revert to an in
 two remaining `where_clause: None` sites live in `expand_proptest.rs`, which checks structural
 parse/expand invariants rather than numbers, and are deliberately out of scope.
 
-### PBT-7 — HIGH-VALUE GAP: the multi-grain FULL OUTER combiner has no randomized coverage
+### PBT-7 — ~~HIGH-VALUE GAP: the multi-grain FULL OUTER combiner has no randomized coverage~~ — WITHDRAWN 2026-08-04, the premise was false
 
-Both grain-related proptests are single-table/single-grain. `coalesced_key`
+**Original claim:** "Both grain-related proptests are single-table/single-grain. `coalesced_key`
 (`src/expand/per_grain.rs:1164`) and NULL-dimension-key coalescing across grain groups — the
-classic FULL-OUTER-COALESCE bug surface — are pinned only by fixed examples. Oracle shape: two
-independent GROUP BYs FULL-OUTER-joined on `IS NOT DISTINCT FROM`, random NULL-bearing shared keys.
+classic FULL-OUTER-COALESCE bug surface — are pinned only by fixed examples."
+
+**That is wrong, and was wrong when written.** Checked directly while working through the PBT-6
+items: `star_schema_proptest` spans two grains (child + parent) and `multi_hop_join_proptest` spans
+three, and *both* oracles already combine them with `FULL OUTER JOIN` on `IS NOT DISTINCT FROM`
+plus `COALESCE`d dimension keys — which is precisely the oracle shape this finding proposed
+building. Their generators emit NULL group keys and NULL/dangling foreign keys, so the
+NULL-coalescing surface was randomized too.
+
+The finding appears to have been produced by pattern-matching the two *single-table* harnesses
+(`differential_proptest`, `semi_additive_proptest`) and generalising to "both grain-related" ones
+without reading the star and multi-hop oracles. Recorded here rather than deleted, because a
+review's wrong findings are worth knowing about: this one would have cost a day building a harness
+that already existed. PBT-6, filed alongside it by the same pass, was real and is now closed —
+so the pass was not uniformly unreliable, which is exactly why individual claims need checking
+before being scheduled.
 
 ### TC-1 — the read-only legacy-catalog migration refusal is unit-simulated only
 
@@ -737,14 +759,20 @@ A `v1.0` tag from 2026-02-28 (old milestone naming, commit 1837274) is still on 
 
 ## 9. Suggested priority order
 
-1. **EXP-9 and EXP-10** — the two silent-wrong-number paths, test-first per CLAUDE.md discipline
-   (both have crisp failing repros above). Release-blocking for whatever tag comes next.
-2. **PBT-6 + PBT-7** — randomize `where_clause` in the differential proptests; add the multi-grain
-   combiner proptest. Closes the systematic blind spot that let EXP-9/EXP-10 through.
-3. **EXP-12 paired migration** (`fan_trap.rs` + `body_parser` + `per_grain.rs` window-inner-metric
-   sites → `ident_matches`, together) and **CAT-1/CAT-2** before more legacy databases migrate.
-4. **REL-1/REL-2** (tag state), **PAR-1** (`semantic-view-function.rst` drift), and the ARCH-13
-   doc-sync items (MAINTAINER.md `where_clause.rs`, "eight targets", TECH-DEBT #28 marker).
-5. Remaining mediums at next opportunity: EXP-11, EXP-16/17, CAT-3/CAT-4, PAR-2/PAR-3/PAR-4.
+Status as of 2026-08-04. ✅ = landed on `main`; ⏳ = in review; ❌ = withdrawn.
+
+1. ✅ **EXP-9 and EXP-10** — the two silent-wrong-number paths. PR #189 (TECH-DEBT #39/#40).
+2. ✅ **PBT-6** — `where_clause` randomized in all five numeric oracles, each mutation-verified.
+   PRs #189 + #191 (TECH-DEBT #41). ❌ **PBT-7** withdrawn: its premise was false, see above.
+3. ⏳ **EXP-12 paired migration** — all four window-inner-metric sites → `ident_matches`, together.
+   PR #192 (TECH-DEBT #43). Found to be an *active* wrong-number bug, not the latent one filed.
+   ⏳ **CAT-1/CAT-2** — TECH-DEBT #44/#45. CAT-1's duplicate-row/stale-read symptom was reproduced
+   end-to-end against a real pre-scoping database before fixing.
+4. **REL-1/REL-2** (tag state), **PAR-1** (`semantic-view-function.rst` drift). ARCH-13's
+   sub-items are partly overtaken: MAINTAINER.md's `where_clause.rs` omission and the "eight fuzz
+   targets" miscount were fixed on `main` independently; the TECH-DEBT #28 status marker is still
+   ambiguous.
+5. Remaining mediums at next opportunity: EXP-11, EXP-13/14/15, EXP-16/17, EXP-18, CAT-3/CAT-4,
+   PAR-2/PAR-3/PAR-4, PARSE-3/PARSE-4.
 6. Structural debt as capacity allows: ARCH-6 (crate-level `QuoteState`), ARCH-7 (`expand()`
-   planner), ARCH-8/9/10/11, TC-1, TC-4.
+   planner), ARCH-8/9/10/11/12, TC-1, TC-2, TC-3, TC-4, CI-6.

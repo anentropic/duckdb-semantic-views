@@ -455,11 +455,18 @@ pub(super) fn metric_grain_tables(met: &Metric, def: &SemanticViewDefinition) ->
             .collect()
     };
     if let Some(ref ws) = met.window_spec {
-        if !ws.inner_metric.eq_ignore_ascii_case(&met.name) {
+        // EXP-12: resolve the inner-metric reference through `ident_matches`,
+        // the same canonical rule `expand::window` uses to emit it. A raw
+        // `eq_ignore_ascii_case` compares the quote characters as data, so a
+        // quoted reference (`"total"`) matched no metric, the inner aggregate's
+        // table dropped out of the grain set, and the root-grain check below
+        // had nothing to fire on — leaving the base-anchored `__sv_agg` CTE to
+        // compute that aggregate over a fanned join.
+        if !crate::ident::ident_matches(&met.name, &ws.inner_metric) {
             if let Some(inner) = def
                 .metrics
                 .iter()
-                .find(|m| m.name.eq_ignore_ascii_case(&ws.inner_metric))
+                .find(|m| crate::ident::ident_matches(&m.name, &ws.inner_metric))
             {
                 if let Some(ref st) = inner.source_table {
                     tables.push(st.to_ascii_lowercase());
