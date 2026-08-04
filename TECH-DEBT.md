@@ -495,6 +495,22 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Resolution:** select `schema_name` alongside and stamp `WHERE schema_name = ? AND name = ?`.
 - **Coverage:** `catalog::tests::upgrade_stamps_only_the_row_it_verified_not_its_namesakes_in_other_schemas` — two schemas holding a view of the same name, one upgradeable and one not; the verified row is stamped and the namesake is not. The pre-existing `upgrade_stamps_complete_rows_and_skips_incomplete` is retained unchanged as the single-schema control.
 
+### 46. ✅ Three quote scanners each tracked a different subset of the quoting rules (EXP-16 / EXP-17 / PARSE-4) — RESOLVED 2026-08-04
+
+- **Origin:** code review 2026-08-03 (`_notes/code-review-2026-08-03.md`, EXP-16, EXP-17, PARSE-4).
+- **Was:** three hand-rolled SQL-text scanners, each with its own subset of the rules. Parse-side scanners learned double-quoted identifiers in PA-6 and `$tag$` regions in PARSE-1; these never did, and no two agreed on which:
+
+  | scanner | `'…'` | `"…"` | `$tag$…$tag$` |
+  |---|---|---|---|
+  | `expand::facts::rewrite_count_star` | yes | **no** | **no** |
+  | `expand::semi_additive::find_matching_paren` | yes | yes | **no** |
+  | `parse::search_path::matching_close_paren` | yes | **no** | yes |
+
+- **Symptom:** `rewrite_count_star` rewrote the literal text `count(*)` occurring inside a double-quoted identifier or a dollar-quoted literal as though it were a live call, corrupting the identifier or the literal — the E-3 class TECH-DEBT #28 killed for reference scanning, surviving in a production scanner. `find_matching_paren` let a `)` inside a `$tag$` literal close the match early, mis-slicing the aggregate's argument in `build_snapshot_block`'s SG-5 decomposition. `matching_close_paren` let a `)` inside a double-quoted identifier close the call early; that one is hardening rather than a demonstrated end-to-end defect, since an explicit `search_path` argument short-circuits the injection — but a scanner that disagrees with its siblings about the same bytes is the hazard the other two demonstrate.
+- **Resolution:** all three defer to `QuoteState`, which already handled every region plus the `''` / `""` escapes. It moved from `body_parser::scan` to `crate::util`, beside the `read_dollar_tag_len` tag grammar it already depended on; `body_parser::scan` re-exports it so its callers are unchanged. Using it in place would have created an `expand` → `body_parser` dependency, which the move avoids. Incidentally `matching_close_paren`'s `depth -= 1` became `checked_sub` — it would have underflowed and panicked in debug on an unbalanced `)`.
+- **Coverage:** four bug tests, each reporting independently and each confirmed red before the fix (`rewrite_count_star_ignores_a_double_quoted_identifier`, `rewrite_count_star_ignores_a_dollar_quoted_literal`, `find_matching_paren_ignores_a_close_paren_inside_a_dollar_quoted_literal`, `matching_close_paren_ignores_a_close_paren_inside_a_double_quoted_identifier`), plus two controls pinning the regions each scanner already handled. Every bug test asserts a genuine construct alongside the inert one, so none can pass by the scanner simply giving up.
+- **Residual:** this delivers ARCH-6's substance for these three sites only. The remaining scanners are untouched and **ARCH-6 stays open** for them — the entry is a relocation plus three call sites, not the crate-wide sweep.
+
 ### 43. ✅ Window inner-metric / ORDER BY references resolved quote-sensitively in three of four sites (EXP-12) — RESOLVED 2026-08-04
 
 - **Origin:** code review 2026-08-03 (`_notes/code-review-2026-08-03.md`, EXP-12), filed as a *latent* hazard and confirmed on inspection to be an active one.
