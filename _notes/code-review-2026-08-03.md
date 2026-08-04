@@ -629,12 +629,19 @@ fails `star_schema_proptest`. Each harness also carries a generator-coverage gua
 filter members are actually referenced, and — in the star harness — that both fence branches are
 actually reached, so an assertion inside an unreachable branch cannot pass for coverage.
 
-**Still open:** `semi_additive_proptest`, `window_metric_proptest`, `multi_hop_join_proptest` keep
-`where_clause: None`. These are the snapshot-CTE, `__sv_agg`-CTE and multi-hop-chain injection
-sites — the remaining three of the five paths the CHANGELOG claims the predicate reaches, and the
-snapshot one is where EXP-9 lived. Extending them needs a per-harness oracle change (the predicate
-has to be applied before the `RANK` and before the window function respectively, not merely added
-to a `WHERE`), so it is a follow-up rather than a mechanical repeat of the two above.
+**Then `semi_additive_proptest`** (2026-08-04), the highest-priority of the remaining three and the
+path EXP-9 lived on. The predicate is applied before the `RANK` inside `__sv_snapshot`, so it moves
+*which row wins the snapshot* rather than only shrinking what is summed; the oracle splices it into
+every reference to the base table, including the snapshot-determining subquery. Verified by
+mutation (dropping the injection at `semi_additive.rs:297` reds the property) and by a
+deterministic `predicate_is_applied_before_the_snapshot_not_after` test that asserts the
+before- and after-snapshot formulations *disagree* — so the harness fails if it ever stops being
+sensitive to the distinction — as well as asserting the extension matches the before-form.
+
+**Still open:** `window_metric_proptest` and `multi_hop_join_proptest` keep `where_clause: None` —
+the `__sv_agg`-CTE and multi-hop-chain injection sites. Both need a per-harness oracle change (the
+predicate applied before the window function; the predicate's table sitting anywhere along the
+chain), so they remain a follow-up rather than a mechanical repeat.
 
 ### PBT-7 — HIGH-VALUE GAP: the multi-grain FULL OUTER combiner has no randomized coverage
 

@@ -32,6 +32,30 @@
 //! - The snapshot is per-partition = the queried dims minus the NA dim; when the
 //!   NA dim (`ts`) is itself queried the metric is effectively regular (a plain
 //!   `GROUP BY` aggregate), which the oracle mirrors.
+//!
+//! # PBT-6 / TECH-DEBT #41 — the `where_clause` axis
+//!
+//! The generated query now also carries a randomized pre-aggregation
+//! `where_clause`. This harness is the one that matters most for that
+//! parameter, and it is the reason the remaining three were split out of the
+//! first pass: here the predicate is applied **before the `RANK`**, inside
+//! `__sv_snapshot`, so filtering does not merely reduce what is summed — it
+//! changes *which row wins the snapshot*. Filtering away the `MAX(ts)` row
+//! promotes the next timestamp to be the snapshot, and the metric reports a
+//! different partition's balance entirely.
+//!
+//! That is what the oracle has to mirror, and why this could not be a copied
+//! `WHERE` clause: the predicate is applied to **every** reference to `s`,
+//! including the subquery that determines the snapshot timestamp. An oracle
+//! that filtered only the outer aggregate would encode post-snapshot filtering
+//! — a different query, and one that would agree with a buggy implementation
+//! that made the same mistake.
+//!
+//! A predicate over the NA dimension `ts` is therefore the highest-value shape
+//! here, and the generator-coverage guard asserts it is actually produced.
+//! Filter members (`LABELS = (FILTER)`) with compound `OR` expressions are
+//! declared so member substitution is not identity and its parenthesization is
+//! load-bearing, matching the sibling harnesses.
 
 use proptest::prelude::*;
 use semantic_views::expand::{expand, DimensionName, MetricName, QueryRequest};
@@ -39,6 +63,128 @@ use semantic_views::model::{
     AccessModifier, Dimension, Metric, NonAdditiveDim, NullsOrder, SemanticViewDefinition,
     SortOrder, TableRef,
 };
+
+/// Members a generated `where_clause` may name (PBT-6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WMember {
+    /// `s.entity` — a partition dimension.
+    Ent,
+    /// `s.ts` — the NA dimension itself. Filtering on it moves the snapshot.
+    Ts,
+    /// Filter member over `entity`: `s.entity = 0 OR s.entity = 2`.
+    Fent,
+    /// Filter member over `ts`: `s.ts = 0 OR s.ts = 2`.
+    Fts,
+}
+
+impl WMember {
+    fn name(self) -> &'static str {
+        match self {
+            WMember::Ent => "ent",
+            WMember::Ts => "ts",
+            WMember::Fent => "fent",
+            WMember::Fts => "fts",
+        }
+    }
+
+    /// The raw SQL the member's expression stands for, for the oracle.
+    fn raw(self) -> &'static str {
+        match self {
+            WMember::Ent => "s.entity",
+            WMember::Ts => "s.ts",
+            WMember::Fent => "(s.entity = 0 OR s.entity = 2)",
+            WMember::Fts => "(s.ts = 0 OR s.ts = 2)",
+        }
+    }
+
+    /// Whether the member is a bare column (so it can carry a comparison) as
+    /// opposed to a self-contained boolean filter.
+    fn is_comparable(self) -> bool {
+        matches!(self, WMember::Ent | WMember::Ts)
+    }
+
+    /// Whether the member constrains the NA dimension `ts` — the shape that
+    /// can move the snapshot rather than merely shrink the summed set.
+    fn touches_ts(self) -> bool {
+        matches!(self, WMember::Ts | WMember::Fts)
+    }
+}
+
+/// A generated pre-aggregation predicate.
+#[derive(Debug, Clone)]
+enum Pred {
+    Cmp(WMember, &'static str, i64),
+    Filter(WMember),
+    And(Box<Pred>, Box<Pred>),
+    Or(Box<Pred>, Box<Pred>),
+    Not(Box<Pred>),
+}
+
+impl Pred {
+    /// The `where_clause` text: member NAMES, composites parenthesized so the
+    /// SQL parse matches this AST, filter members left BARE.
+    fn to_member_sql(&self) -> String {
+        match self {
+            Pred::Cmp(m, op, k) => format!("{} {op} {k}", m.name()),
+            Pred::Filter(m) => m.name().to_string(),
+            Pred::And(a, b) => format!("({} AND {})", a.to_member_sql(), b.to_member_sql()),
+            Pred::Or(a, b) => format!("({} OR {})", a.to_member_sql(), b.to_member_sql()),
+            Pred::Not(a) => format!("(NOT {})", a.to_member_sql()),
+        }
+    }
+
+    /// The oracle's independent rendering: raw columns, filter members expanded,
+    /// every operand explicitly parenthesized.
+    fn to_raw_sql(&self) -> String {
+        match self {
+            Pred::Cmp(m, op, k) => format!("({} {op} {k})", m.raw()),
+            Pred::Filter(m) => format!("({})", m.raw()),
+            Pred::And(a, b) => format!("({} AND {})", a.to_raw_sql(), b.to_raw_sql()),
+            Pred::Or(a, b) => format!("({} OR {})", a.to_raw_sql(), b.to_raw_sql()),
+            Pred::Not(a) => format!("(NOT {})", a.to_raw_sql()),
+        }
+    }
+
+    /// Whether any named member constrains `ts` (generator-coverage guard).
+    fn touches_ts(&self) -> bool {
+        match self {
+            Pred::Cmp(m, _, _) | Pred::Filter(m) => m.touches_ts(),
+            Pred::And(a, b) | Pred::Or(a, b) => a.touches_ts() || b.touches_ts(),
+            Pred::Not(a) => a.touches_ts(),
+        }
+    }
+
+    /// Whether any named member is a filter member (generator-coverage guard).
+    fn references_filter(&self) -> bool {
+        match self {
+            Pred::Cmp(m, _, _) | Pred::Filter(m) => !m.is_comparable(),
+            Pred::And(a, b) | Pred::Or(a, b) => a.references_filter() || b.references_filter(),
+            Pred::Not(a) => a.references_filter(),
+        }
+    }
+}
+
+/// Predicates over the two dimensions. Literals span `-1..=3` against domains of
+/// `0..3` + NULL, so the generated set includes always-true, selective, and
+/// everything-filtered-away cases — the last of which empties a partition and
+/// leaves the snapshot undefined, which the oracle must agree about.
+fn arb_pred() -> impl Strategy<Value = Pred> {
+    let leaf = prop_oneof![
+        3 => (
+            prop_oneof![Just(WMember::Ent), Just(WMember::Ts)],
+            prop_oneof![Just("<"), Just("<="), Just("="), Just("<>"), Just(">="), Just(">")],
+            -1i64..=3,
+        ).prop_map(|(m, op, k)| Pred::Cmp(m, op, k)),
+        2 => prop_oneof![Just(WMember::Fent), Just(WMember::Fts)].prop_map(Pred::Filter),
+    ];
+    leaf.prop_recursive(3, 8, 2, |inner| {
+        prop_oneof![
+            (inner.clone(), inner.clone()).prop_map(|(a, b)| Pred::And(Box::new(a), Box::new(b))),
+            (inner.clone(), inner.clone()).prop_map(|(a, b)| Pred::Or(Box::new(a), Box::new(b))),
+            inner.prop_map(|a| Pred::Not(Box::new(a))),
+        ]
+    })
+}
 
 /// A generated instance: rows of `(entity, ts, balance)`. `None` is a SQL NULL
 /// throughout. Small `entity`/`ts` domains force duplicate `(entity, ts)` pairs
@@ -62,6 +208,9 @@ struct Case {
     order: SortOrder,
     sel_dims: Vec<usize>,
     sel_metrics: Vec<usize>,
+    /// The pre-aggregation predicate (PBT-6). `None` one case in four, keeping
+    /// the original no-predicate coverage rather than replacing it.
+    where_pred: Option<Pred>,
 }
 
 fn arb_instance() -> impl Strategy<Value = Instance> {
@@ -90,16 +239,21 @@ fn arb_case() -> impl Strategy<Value = Case> {
             prop::sample::subsequence((0..DIMS.len()).collect::<Vec<_>>(), 0..=DIMS.len());
         let met_sel =
             prop::sample::subsequence((0..METS.len()).collect::<Vec<_>>(), 0..=METS.len());
-        (Just(inst), Just(order), dim_sel, met_sel)
+        let where_pred = prop_oneof![
+            1 => Just(None),
+            3 => arb_pred().prop_map(Some),
+        ];
+        (Just(inst), Just(order), dim_sel, met_sel, where_pred)
             .prop_filter(
                 "at least one of dimensions/metrics must be selected",
-                |(_, _, sel_dims, sel_metrics)| !sel_dims.is_empty() || !sel_metrics.is_empty(),
+                |(_, _, sel_dims, sel_metrics, _)| !sel_dims.is_empty() || !sel_metrics.is_empty(),
             )
-            .prop_map(|(inst, order, sel_dims, sel_metrics)| Case {
+            .prop_map(|(inst, order, sel_dims, sel_metrics, where_pred)| Case {
                 inst,
                 order,
                 sel_dims,
                 sel_metrics,
+                where_pred,
             })
     })
 }
@@ -134,6 +288,27 @@ fn build_def(order: SortOrder) -> SemanticViewDefinition {
             comment: None,
             synonyms: vec![],
             is_filter: false,
+        },
+        // PBT-6 filter members: never selected as output, named only by a
+        // generated `where_clause`. Compound expressions, so a splice that
+        // loses its parentheses changes which rows reach the snapshot.
+        Dimension {
+            name: "fent".to_string(),
+            expr: "s.entity = 0 OR s.entity = 2".to_string(),
+            source_table: Some("s".to_string()),
+            output_type: None,
+            comment: None,
+            synonyms: vec![],
+            is_filter: true,
+        },
+        Dimension {
+            name: "fts".to_string(),
+            expr: "s.ts = 0 OR s.ts = 2".to_string(),
+            source_table: Some("s".to_string()),
+            output_type: None,
+            comment: None,
+            synonyms: vec![],
+            is_filter: true,
         },
     ];
     let metrics = vec![Metric {
@@ -213,9 +388,26 @@ fn oracle_sql(case: &Case) -> String {
     let ts_queried = case.sel_dims.contains(&TS_DIM);
     let has_metric = !case.sel_metrics.is_empty();
 
+    // PBT-6: the predicate, rendered from raw columns. It is spliced into EVERY
+    // reference to `s` below -- including the subquery that determines the
+    // snapshot timestamp. Filtering before the snapshot is picked is the whole
+    // semantic: dropping the MAX(ts) row promotes the next timestamp to be the
+    // snapshot. An oracle that filtered only the outer aggregate would encode
+    // post-snapshot filtering and would agree with an implementation that made
+    // the same mistake.
+    let pred = case.where_pred.as_ref().map(Pred::to_raw_sql);
+    // ` WHERE <pred>` for a clause-less FROM, or the empty string.
+    let where_sql = pred
+        .as_ref()
+        .map_or_else(String::new, |p| format!(" WHERE {p}"));
+    // `<pred> AND ` to prepend to an existing WHERE, or the empty string.
+    let and_pred = pred
+        .as_ref()
+        .map_or_else(String::new, |p| format!("{p} AND "));
+
     // Dims-only query -> SELECT DISTINCT (no aggregation, no snapshot).
     if !has_metric {
-        return format!("SELECT DISTINCT {} FROM s", dims.join(", "));
+        return format!("SELECT DISTINCT {} FROM s{where_sql}", dims.join(", "));
     }
 
     // ts is queried (or is the only projection) -> the metric is effectively
@@ -228,13 +420,13 @@ fn oracle_sql(case: &Case) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         if case.sel_dims.is_empty() {
-            return format!("SELECT {select} FROM s");
+            return format!("SELECT {select} FROM s{where_sql}");
         }
         let group_by = (1..=case.sel_dims.len())
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        return format!("SELECT {select} FROM s GROUP BY {group_by}");
+        return format!("SELECT {select} FROM s{where_sql} GROUP BY {group_by}");
     }
 
     // Active snapshot. Partition = queried dims (a subset of {ent}); the NA dim
@@ -269,9 +461,11 @@ fn oracle_sql(case: &Case) -> String {
 
     if part_cols.is_empty() {
         // Global snapshot: single-row subquery, filter to the snapshot ts.
+        // The predicate applies BOTH inside the snapshot subquery (so the
+        // snapshot is chosen among surviving rows) and to the outer scan.
         format!(
-            "SELECT {select} FROM s, (SELECT {snap_expr} AS snap FROM s) m \
-             WHERE s.ts IS NOT DISTINCT FROM m.snap"
+            "SELECT {select} FROM s, (SELECT {snap_expr} AS snap FROM s{where_sql}) m \
+             WHERE {and_pred}s.ts IS NOT DISTINCT FROM m.snap"
         )
     } else {
         let sub_group = part_cols.join(", ");
@@ -293,9 +487,15 @@ fn oracle_sql(case: &Case) -> String {
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
             .join(", ");
+        // Same on the partitioned path: the per-partition snapshot is computed
+        // over filtered rows, and the outer scan is filtered too. A partition
+        // emptied by the predicate drops out of both sides.
         format!(
-            "SELECT {select} FROM s JOIN (SELECT {sub_select} FROM s GROUP BY {sub_group}) m \
-             ON {join_on} GROUP BY {group_by}"
+            "SELECT {select} FROM s JOIN \
+             (SELECT {sub_select} FROM s{where_sql} GROUP BY {sub_group}) m \
+             ON {join_on}{} GROUP BY {group_by}",
+            pred.as_ref()
+                .map_or_else(String::new, |p| format!(" WHERE {p}"))
         )
     }
 }
@@ -307,7 +507,7 @@ proptest! {
     fn semi_additive_snapshot_matches_independent_oracle(case in arb_case()) {
         let def = build_def(case.order);
         let req = QueryRequest {
-            where_clause: None,
+            where_clause: case.where_pred.as_ref().map(Pred::to_member_sql),
             dimensions: case.sel_dims.iter().map(|&i| DimensionName::new(DIMS[i])).collect(),
             metrics: case.sel_metrics.iter().map(|&i| MetricName::new(METS[i])).collect(),
             facts: vec![],
@@ -356,4 +556,171 @@ proptest! {
             diff, case.order, case.sel_dims, case.sel_metrics, expanded, oracle
         );
     }
+}
+
+/// PBT-6 / TECH-DEBT #41 guard: prove the generator reaches the shapes this
+/// harness exists to cover.
+///
+/// The important one is `touches_ts`: a predicate constraining the NA dimension
+/// is what makes the snapshot *move* rather than merely shrink, and it is the
+/// only shape that distinguishes "filtered before the RANK" from "filtered
+/// after it". If the generator stopped producing those, the property would
+/// still pass while testing nothing this file was extended for.
+#[test]
+fn generator_varies_the_predicate_and_moves_the_snapshot() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    use std::collections::HashSet;
+
+    let mut runner = TestRunner::deterministic();
+    let mut with_pred = 0usize;
+    let mut without_pred = 0usize;
+    let mut with_filter = 0usize;
+    let mut touching_ts = 0usize;
+    // The snapshot-moving combination: a predicate on `ts` while `ts` is NOT
+    // queried, so the metric is an ACTIVE snapshot rather than a plain GROUP BY.
+    let mut active_snapshot_ts_pred = 0usize;
+    let mut distinct: HashSet<String> = HashSet::new();
+
+    for _ in 0..400 {
+        let case = arb_case()
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        let ts_queried = case.sel_dims.contains(&TS_DIM);
+        let has_metric = !case.sel_metrics.is_empty();
+        match &case.where_pred {
+            None => without_pred += 1,
+            Some(p) => {
+                with_pred += 1;
+                if p.references_filter() {
+                    with_filter += 1;
+                }
+                if p.touches_ts() {
+                    touching_ts += 1;
+                    if has_metric && !ts_queried {
+                        active_snapshot_ts_pred += 1;
+                    }
+                }
+                distinct.insert(p.to_member_sql());
+            }
+        }
+    }
+
+    assert!(
+        with_pred > 0 && without_pred > 0,
+        "where_clause must be both present and absent across cases \
+         (present={with_pred}, absent={without_pred})"
+    );
+    assert!(
+        with_filter > 0,
+        "generator never referenced a filter member -- member substitution and \
+         its parenthesization are untested"
+    );
+    assert!(
+        touching_ts > 0,
+        "generator never constrained the NA dimension -- nothing exercises a \
+         predicate that changes which row wins the snapshot"
+    );
+    assert!(
+        active_snapshot_ts_pred > 0,
+        "no case combined an ACTIVE snapshot with a predicate on the NA \
+         dimension; that is the only shape distinguishing filtering before the \
+         RANK from filtering after it, so the extension to this harness would \
+         be inert"
+    );
+    assert!(
+        distinct.len() > 50,
+        "generator produced only {} distinct predicates; search space collapsed",
+        distinct.len()
+    );
+}
+
+/// The oracle's defining property, pinned deterministically: filtering BEFORE
+/// the snapshot is a different query from filtering AFTER it, and the extension
+/// implements the former.
+///
+/// This is what makes the `where_clause` extension to this harness worth having.
+/// A naive oracle that applied the predicate only to the outer aggregate would
+/// still pass the randomized property against an implementation that made the
+/// same mistake — the two would be wrong together. So the two formulations are
+/// compared against each other here as well as against the extension: the test
+/// fails if they ever stop disagreeing, which would mean the randomized
+/// comparison had quietly become insensitive to the distinction.
+///
+/// Data: one entity with rows at `ts = 2` (balance 100) and `ts = 1`
+/// (balance 10), `NON ADDITIVE BY (ts)` ASC, so the unfiltered snapshot is
+/// `ts = 2` → 100. Under `where_clause := 'ts < 2'`:
+///   * filtered BEFORE the snapshot → the surviving max is `ts = 1` → **10**
+///   * filtered AFTER the snapshot  → the snapshot stays `ts = 2`, then the
+///     filter removes it → **no rows**
+#[test]
+fn predicate_is_applied_before_the_snapshot_not_after() {
+    let inst = Instance {
+        rows: vec![(Some(1), Some(2), Some(100)), (Some(1), Some(1), Some(10))],
+    };
+    let def = build_def(SortOrder::Asc);
+    let req = QueryRequest {
+        where_clause: Some("ts < 2".to_string()),
+        dimensions: vec![DimensionName::new("ent")],
+        metrics: vec![MetricName::new("bal")],
+        facts: vec![],
+    };
+    let expanded = expand("semi", &def, &req).expect("single-table snapshot query must expand");
+
+    // Filter applied inside the snapshot subquery AND the outer scan -- what
+    // `oracle_sql` builds, and what the extension is documented to do.
+    let before = "SELECT s.entity AS ent, sum(s.balance) AS bal FROM s \
+                  JOIN (SELECT s.entity AS p_entity, max(s.ts) AS snap FROM s \
+                        WHERE (s.ts < 2) GROUP BY entity) m \
+                  ON s.entity IS NOT DISTINCT FROM m.p_entity \
+                     AND s.ts IS NOT DISTINCT FROM m.snap \
+                  WHERE (s.ts < 2) GROUP BY 1";
+    // The naive alternative: snapshot chosen from unfiltered rows, predicate
+    // applied afterwards.
+    let after = "SELECT s.entity AS ent, sum(s.balance) AS bal FROM s \
+                 JOIN (SELECT s.entity AS p_entity, max(s.ts) AS snap FROM s \
+                       GROUP BY entity) m \
+                 ON s.entity IS NOT DISTINCT FROM m.p_entity \
+                    AND s.ts IS NOT DISTINCT FROM m.snap \
+                 WHERE (s.ts < 2) GROUP BY 1";
+
+    let conn = make_db(&inst);
+    let fetch = |sql: &str| -> Vec<(i64, Option<i64>)> {
+        let mut stmt = conn.prepare(sql).expect("prepare");
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows");
+        rows
+    };
+
+    let got = fetch(&expanded);
+    let want_before = fetch(before);
+    let want_after = fetch(after);
+
+    // The two formulations must genuinely disagree, or this test proves nothing
+    // and the randomized property is insensitive to the distinction.
+    assert_ne!(
+        want_before, want_after,
+        "before/after-snapshot filtering must differ on this data, otherwise the \
+         oracle's structure is not load-bearing"
+    );
+    assert_eq!(
+        want_before,
+        vec![(1i64, Some(10i64))],
+        "sanity: filtering before the snapshot promotes ts=1, giving balance 10"
+    );
+    assert!(
+        want_after.is_empty(),
+        "sanity: filtering after the snapshot removes the ts=2 winner, leaving \
+         no rows; got {want_after:?}"
+    );
+    assert_eq!(
+        got, want_before,
+        "the extension must filter BEFORE the snapshot is picked.\n--- emitted:\n{expanded}"
+    );
 }
