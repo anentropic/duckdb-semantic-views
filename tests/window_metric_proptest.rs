@@ -33,6 +33,21 @@
 //! the example tests (and the semi-additive harness already stresses ordered,
 //! NULLS-placed RANK windows); the partition/grain derivation is the piece with
 //! no prior randomized coverage.
+//!
+//! # PBT-6 / TECH-DEBT #41 — the `where_clause` axis
+//!
+//! The generated query now also carries a randomized pre-aggregation
+//! `where_clause`. On this path the predicate is injected into `__sv_agg` —
+//! *before* the window function runs — so it does two things at once: it
+//! changes the inner `SUM` of each surviving group, and, when it empties a
+//! group entirely, it removes that row from the partition the window then
+//! aggregates over. A filter applied after the window would do neither.
+//!
+//! The oracle mirrors that by filtering the `agg` CTE and nothing else: the
+//! correlated subquery reads from the already-filtered CTE, so partition
+//! membership follows automatically. Filter members (`LABELS = (FILTER)`) with
+//! compound `OR` expressions keep member substitution non-identity and its
+//! parenthesization load-bearing, as in the sibling harnesses.
 
 use proptest::prelude::*;
 use semantic_views::expand::{expand, DimensionName, MetricName, QueryRequest};
@@ -42,6 +57,97 @@ use semantic_views::model::{
 
 /// Number of dimensions (physical `s.c{i}` ↔ logical `d{i}` by index).
 const NDIMS: usize = 3;
+
+/// A generated pre-aggregation predicate over the dimensions (PBT-6).
+///
+/// `Cmp` names a dimension member by index; `Filter` names the filter member
+/// `f{i}`, whose declared expression is the compound `s.c{i} = 0 OR s.c{i} = 2`.
+#[derive(Debug, Clone)]
+enum Pred {
+    Cmp(usize, &'static str, i64),
+    Filter(usize),
+    And(Box<Pred>, Box<Pred>),
+    Or(Box<Pred>, Box<Pred>),
+    Not(Box<Pred>),
+}
+
+/// The expression declared for filter member `f{i}`.
+fn filter_expr(i: usize) -> String {
+    format!("{c} = 0 OR {c} = 2", c = dim_col(i))
+}
+
+impl Pred {
+    /// The `where_clause` text: member NAMES, composites parenthesized so the
+    /// SQL parse matches this AST, filter members left BARE.
+    fn to_member_sql(&self) -> String {
+        match self {
+            Pred::Cmp(i, op, k) => format!("{} {op} {k}", dim_name(*i)),
+            Pred::Filter(i) => format!("f{i}"),
+            Pred::And(a, b) => format!("({} AND {})", a.to_member_sql(), b.to_member_sql()),
+            Pred::Or(a, b) => format!("({} OR {})", a.to_member_sql(), b.to_member_sql()),
+            Pred::Not(a) => format!("(NOT {})", a.to_member_sql()),
+        }
+    }
+
+    /// The oracle's independent rendering: raw columns, filter members expanded,
+    /// every operand explicitly parenthesized.
+    fn to_raw_sql(&self) -> String {
+        match self {
+            Pred::Cmp(i, op, k) => format!("({} {op} {k})", dim_col(*i)),
+            Pred::Filter(i) => format!("({})", filter_expr(*i)),
+            Pred::And(a, b) => format!("({} AND {})", a.to_raw_sql(), b.to_raw_sql()),
+            Pred::Or(a, b) => format!("({} OR {})", a.to_raw_sql(), b.to_raw_sql()),
+            Pred::Not(a) => format!("(NOT {})", a.to_raw_sql()),
+        }
+    }
+
+    /// Whether any named member is a filter member (generator-coverage guard).
+    fn references_filter(&self) -> bool {
+        match self {
+            Pred::Cmp(..) => false,
+            Pred::Filter(_) => true,
+            Pred::And(a, b) | Pred::Or(a, b) => a.references_filter() || b.references_filter(),
+            Pred::Not(a) => a.references_filter(),
+        }
+    }
+
+    /// The dimension indices this predicate constrains (generator-coverage
+    /// guard): used to check that predicates on dims *outside* the effective
+    /// partition are generated, which change the inner aggregate without
+    /// changing the partition key.
+    fn dims(&self, out: &mut Vec<usize>) {
+        match self {
+            Pred::Cmp(i, _, _) | Pred::Filter(i) => out.push(*i),
+            Pred::And(a, b) | Pred::Or(a, b) => {
+                a.dims(out);
+                b.dims(out);
+            }
+            Pred::Not(a) => a.dims(out),
+        }
+    }
+}
+
+/// Predicates over the three dimensions. Literals span `-1..=3` against a
+/// dimension domain of `0..3` + NULL, so always-true, selective and
+/// everything-filtered-away cases all occur — the last emptying a group and
+/// removing it from its partition.
+fn arb_pred() -> impl Strategy<Value = Pred> {
+    let leaf = prop_oneof![
+        3 => (
+            0..NDIMS,
+            prop_oneof![Just("<"), Just("<="), Just("="), Just("<>"), Just(">="), Just(">")],
+            -1i64..=3,
+        ).prop_map(|(i, op, k)| Pred::Cmp(i, op, k)),
+        2 => (0..NDIMS).prop_map(Pred::Filter),
+    ];
+    leaf.prop_recursive(3, 8, 2, |inner| {
+        prop_oneof![
+            (inner.clone(), inner.clone()).prop_map(|(a, b)| Pred::And(Box::new(a), Box::new(b))),
+            (inner.clone(), inner.clone()).prop_map(|(a, b)| Pred::Or(Box::new(a), Box::new(b))),
+            inner.prop_map(|a| Pred::Not(Box::new(a))),
+        ]
+    })
+}
 
 /// Logical dimension name for index `i` (`d0`/`d1`/`d2`).
 fn dim_name(i: usize) -> String {
@@ -102,6 +208,9 @@ struct Case {
     func: WFunc,
     mode: PartMode,
     sel_dims: Vec<usize>,
+    /// The pre-aggregation predicate (PBT-6). `None` one case in four, keeping
+    /// the original no-predicate coverage rather than replacing it.
+    where_pred: Option<Pred>,
 }
 
 fn arb_instance() -> impl Strategy<Value = Instance> {
@@ -142,8 +251,19 @@ fn arb_case() -> impl Strategy<Value = Case> {
                 let rest: Vec<usize> = (0..NDIMS).filter(|d| !req.contains(d)).collect();
                 let rest_len = rest.len();
                 let extra = prop::sample::subsequence(rest, 0..=rest_len);
-                (Just(inst), Just(func), Just(explicit), Just(req), extra).prop_map(
-                    |(inst, func, explicit, req, extra)| {
+                let where_pred = prop_oneof![
+                    1 => Just(None),
+                    3 => arb_pred().prop_map(Some),
+                ];
+                (
+                    Just(inst),
+                    Just(func),
+                    Just(explicit),
+                    Just(req),
+                    extra,
+                    where_pred,
+                )
+                    .prop_map(|(inst, func, explicit, req, extra, where_pred)| {
                         let mut sel_dims: Vec<usize> = req.iter().copied().chain(extra).collect();
                         sel_dims.sort_unstable();
                         let mode = if explicit {
@@ -156,9 +276,9 @@ fn arb_case() -> impl Strategy<Value = Case> {
                             func,
                             mode,
                             sel_dims,
+                            where_pred,
                         }
-                    },
-                )
+                    })
             },
         )
     })
@@ -186,6 +306,19 @@ fn build_def(func: WFunc, mode: &PartMode) -> SemanticViewDefinition {
             synonyms: vec![],
             is_filter: false,
         })
+        // PBT-6 filter members: never selected as output, never part of the
+        // partition config, named only by a generated `where_clause`. Compound
+        // expressions, so a splice that loses its parentheses changes which
+        // rows reach the pre-aggregation.
+        .chain((0..NDIMS).map(|i| Dimension {
+            name: format!("f{i}"),
+            expr: filter_expr(i),
+            source_table: Some("s".to_string()),
+            output_type: None,
+            comment: None,
+            synonyms: vec![],
+            is_filter: true,
+        }))
         .collect();
     let (excluding_dims, partition_dims) = match mode {
         PartMode::Excluding(d) => (d.iter().map(|&i| dim_name(i)).collect(), vec![]),
@@ -268,9 +401,20 @@ fn partition_dims(case: &Case) -> Vec<usize> {
 fn oracle_sql(case: &Case) -> String {
     let sel = &case.sel_dims;
 
+    // PBT-6: the predicate belongs to the PRE-aggregation CTE and nowhere else.
+    // Filtering here changes each surviving group's inner SUM and, when it
+    // empties a group, removes that row from the partition the correlated
+    // subquery then aggregates over — because that subquery reads from this
+    // already-filtered CTE. Applying it after the window instead would leave
+    // both effects out.
+    let where_sql = case
+        .where_pred
+        .as_ref()
+        .map_or_else(String::new, |p| format!(" WHERE {}", p.to_raw_sql()));
+
     // The pre-aggregation CTE: SUM(s.v) grouped by all queried dims.
     let agg = if sel.is_empty() {
-        "SELECT SUM(s.v) AS w FROM s".to_string()
+        format!("SELECT SUM(s.v) AS w FROM s{where_sql}")
     } else {
         let agg_select = sel
             .iter()
@@ -282,7 +426,7 @@ fn oracle_sql(case: &Case) -> String {
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        format!("SELECT {agg_select} FROM s GROUP BY {group_by}")
+        format!("SELECT {agg_select} FROM s{where_sql} GROUP BY {group_by}")
     };
 
     let part = partition_dims(case);
@@ -318,7 +462,7 @@ proptest! {
     fn window_metric_matches_independent_oracle(case in arb_case()) {
         let def = build_def(case.func, &case.mode);
         let req = QueryRequest {
-            where_clause: None,
+            where_clause: case.where_pred.as_ref().map(Pred::to_member_sql),
             dimensions: case.sel_dims.iter().map(|&i| DimensionName::new(dim_name(i))).collect(),
             // Always query the (single) window metric so the window path fires.
             metrics: vec![MetricName::new("w")],
@@ -365,4 +509,76 @@ proptest! {
             diff, case.func, case.mode, case.sel_dims, expanded, oracle
         );
     }
+}
+
+/// PBT-6 guard: prove the generator varies the predicate and reaches the shape
+/// that makes this path distinctive.
+///
+/// The interesting one here is a predicate constraining a dimension that is
+/// **not** in the effective partition: it changes the inner aggregate of rows
+/// inside a partition without changing the partition key, so the window value
+/// moves while the grouping does not. If the generator stopped producing those,
+/// the property would still pass while covering only the easy case.
+#[test]
+fn generator_varies_the_predicate_and_reaches_non_partition_dims() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    use std::collections::HashSet;
+
+    let mut runner = TestRunner::deterministic();
+    let mut with_pred = 0usize;
+    let mut without_pred = 0usize;
+    let mut with_filter = 0usize;
+    let mut pred_off_partition = 0usize;
+    let mut distinct: HashSet<String> = HashSet::new();
+
+    for _ in 0..400 {
+        let case = arb_case()
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        let part = partition_dims(&case);
+        match &case.where_pred {
+            None => without_pred += 1,
+            Some(p) => {
+                with_pred += 1;
+                if p.references_filter() {
+                    with_filter += 1;
+                }
+                let mut ds = Vec::new();
+                p.dims(&mut ds);
+                // A constrained dim that is queried but NOT part of the
+                // partition key.
+                if ds
+                    .iter()
+                    .any(|d| case.sel_dims.contains(d) && !part.contains(d))
+                {
+                    pred_off_partition += 1;
+                }
+                distinct.insert(p.to_member_sql());
+            }
+        }
+    }
+
+    assert!(
+        with_pred > 0 && without_pred > 0,
+        "where_clause must be both present and absent across cases \
+         (present={with_pred}, absent={without_pred})"
+    );
+    assert!(
+        with_filter > 0,
+        "generator never referenced a filter member -- member substitution and \
+         its parenthesization are untested"
+    );
+    assert!(
+        pred_off_partition > 0,
+        "no case constrained a queried dimension outside the effective partition; \
+         that is the shape where filtering moves the window value without moving \
+         the partition key, so the extension would cover only the easy case"
+    );
+    assert!(
+        distinct.len() > 50,
+        "generator produced only {} distinct predicates; search space collapsed",
+        distinct.len()
+    );
 }

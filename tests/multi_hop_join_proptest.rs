@@ -62,12 +62,114 @@ struct Instance {
 const DIMS: [&str; 3] = ["td", "ucat", "wcat"];
 const METS: [&str; 4] = ["sv", "ct", "su", "sw"];
 
-/// A full case: an instance plus the non-empty subset of dims + metrics to query.
+/// Members a generated `where_clause` may name (PBT-6), one per grain plus a
+/// `LABELS = (FILTER)` member per grain whose expression is a compound `OR`.
+/// `raw` is the SQL the member stands for; `table` is the grain it lives on,
+/// which is what decides whether a predicate fans a co-queried metric.
+const WMEMBERS: [(&str, &str, &str); 6] = [
+    ("td", "t.d", "t"),
+    ("ucat", "u.ucat", "u"),
+    ("wcat", "w.wcat", "w"),
+    ("ftd", "(t.d = 0 OR t.d = 2)", "t"),
+    ("fucat", "(u.ucat = 0 OR u.ucat = 2)", "u"),
+    ("fwcat", "(w.wcat = 0 OR w.wcat = 2)", "w"),
+];
+
+/// Indices into `WMEMBERS` that are bare columns (can carry a comparison) as
+/// opposed to self-contained boolean filter members.
+const COMPARABLE: [usize; 3] = [0, 1, 2];
+/// Indices into `WMEMBERS` that are filter members.
+const FILTERS: [usize; 3] = [3, 4, 5];
+
+/// A generated pre-aggregation predicate over the chain's members (PBT-6).
+#[derive(Debug, Clone)]
+enum Pred {
+    /// `<member> <op> <literal>` for a comparable member (index into `WMEMBERS`).
+    Cmp(usize, &'static str, i64),
+    /// A bare filter member — the substitution/precedence surface.
+    Filter(usize),
+    And(Box<Pred>, Box<Pred>),
+    Or(Box<Pred>, Box<Pred>),
+    Not(Box<Pred>),
+}
+
+impl Pred {
+    /// The `where_clause` text: member NAMES, composites parenthesized so the
+    /// SQL parse matches this AST, filter members left BARE.
+    fn to_member_sql(&self) -> String {
+        match self {
+            Pred::Cmp(m, op, k) => format!("{} {op} {k}", WMEMBERS[*m].0),
+            Pred::Filter(m) => WMEMBERS[*m].0.to_string(),
+            Pred::And(a, b) => format!("({} AND {})", a.to_member_sql(), b.to_member_sql()),
+            Pred::Or(a, b) => format!("({} OR {})", a.to_member_sql(), b.to_member_sql()),
+            Pred::Not(a) => format!("(NOT {})", a.to_member_sql()),
+        }
+    }
+
+    /// The oracle's independent rendering: raw columns, filter members expanded,
+    /// every operand explicitly parenthesized.
+    fn to_raw_sql(&self) -> String {
+        match self {
+            Pred::Cmp(m, op, k) => format!("({} {op} {k})", WMEMBERS[*m].1),
+            Pred::Filter(m) => format!("({})", WMEMBERS[*m].1),
+            Pred::And(a, b) => format!("({} AND {})", a.to_raw_sql(), b.to_raw_sql()),
+            Pred::Or(a, b) => format!("({} OR {})", a.to_raw_sql(), b.to_raw_sql()),
+            Pred::Not(a) => format!("(NOT {})", a.to_raw_sql()),
+        }
+    }
+
+    /// The chain tables this predicate names — the grains that must be joined
+    /// into whichever CTE evaluates it.
+    fn tables(&self, out: &mut Vec<&'static str>) {
+        match self {
+            Pred::Cmp(m, _, _) | Pred::Filter(m) => out.push(WMEMBERS[*m].2),
+            Pred::And(a, b) | Pred::Or(a, b) => {
+                a.tables(out);
+                b.tables(out);
+            }
+            Pred::Not(a) => a.tables(out),
+        }
+    }
+
+    /// Whether any named member is a filter member (generator-coverage guard).
+    fn references_filter(&self) -> bool {
+        match self {
+            Pred::Cmp(..) => false,
+            Pred::Filter(_) => true,
+            Pred::And(a, b) | Pred::Or(a, b) => a.references_filter() || b.references_filter(),
+            Pred::Not(a) => a.references_filter(),
+        }
+    }
+}
+
+fn arb_pred() -> impl Strategy<Value = Pred> {
+    let comparable = prop::sample::select(COMPARABLE.to_vec());
+    let filters = prop::sample::select(FILTERS.to_vec());
+    let leaf = prop_oneof![
+        3 => (
+            comparable,
+            prop_oneof![Just("<"), Just("<="), Just("="), Just("<>"), Just(">="), Just(">")],
+            -1i64..=3,
+        ).prop_map(|(m, op, k)| Pred::Cmp(m, op, k)),
+        2 => filters.prop_map(Pred::Filter),
+    ];
+    leaf.prop_recursive(3, 8, 2, |inner| {
+        prop_oneof![
+            (inner.clone(), inner.clone()).prop_map(|(a, b)| Pred::And(Box::new(a), Box::new(b))),
+            (inner.clone(), inner.clone()).prop_map(|(a, b)| Pred::Or(Box::new(a), Box::new(b))),
+            inner.prop_map(|a| Pred::Not(Box::new(a))),
+        ]
+    })
+}
+
+/// A full case: an instance plus the non-empty subset of dims + metrics to query,
+/// and the optional pre-aggregation predicate (PBT-6).
 #[derive(Debug, Clone)]
 struct Case {
     inst: Instance,
     sel_dims: Vec<usize>,
     sel_metrics: Vec<usize>,
+    where_pred: Option<Pred>,
 }
 
 fn arb_instance() -> impl Strategy<Value = Instance> {
@@ -113,15 +215,20 @@ fn arb_case() -> impl Strategy<Value = Case> {
             prop::sample::subsequence((0..DIMS.len()).collect::<Vec<_>>(), 0..=DIMS.len());
         let met_sel =
             prop::sample::subsequence((0..METS.len()).collect::<Vec<_>>(), 0..=METS.len());
-        (Just(inst), dim_sel, met_sel)
+        let where_pred = prop_oneof![
+            1 => Just(None),
+            3 => arb_pred().prop_map(Some),
+        ];
+        (Just(inst), dim_sel, met_sel, where_pred)
             .prop_filter(
                 "at least one of dimensions/metrics must be selected",
-                |(_, sel_dims, sel_metrics)| !sel_dims.is_empty() || !sel_metrics.is_empty(),
+                |(_, sel_dims, sel_metrics, _)| !sel_dims.is_empty() || !sel_metrics.is_empty(),
             )
-            .prop_map(|(inst, sel_dims, sel_metrics)| Case {
+            .prop_map(|(inst, sel_dims, sel_metrics, where_pred)| Case {
                 inst,
                 sel_dims,
                 sel_metrics,
+                where_pred,
             })
     })
 }
@@ -150,10 +257,26 @@ fn build_def() -> SemanticViewDefinition {
         synonyms: vec![],
         is_filter: false,
     };
+    // PBT-6: the three filter members (`LABELS = (FILTER)`), one per grain.
+    // Never selected as output — they exist to be named by a generated
+    // `where_clause`, and their compound expressions make the member splice's
+    // parenthesization load-bearing.
+    let filter_dim = |name: &str, expr: &str, source: &str| Dimension {
+        name: name.to_string(),
+        expr: expr.to_string(),
+        source_table: Some(source.to_string()),
+        output_type: None,
+        comment: None,
+        synonyms: vec![],
+        is_filter: true,
+    };
     let dimensions = vec![
         dim("td", "t.d", "t"),
         dim("ucat", "u.ucat", "u"),
         dim("wcat", "w.wcat", "w"),
+        filter_dim("ftd", "t.d = 0 OR t.d = 2", "t"),
+        filter_dim("fucat", "u.ucat = 0 OR u.ucat = 2", "u"),
+        filter_dim("fwcat", "w.wcat = 0 OR w.wcat = 2", "w"),
     ];
     let base_metric = |name: &str, expr: &str, source: Option<&str>| Metric {
         name: name.to_string(),
@@ -339,14 +462,23 @@ fn grain_sql(case: &Case, anchor: &str) -> String {
         "w" => "FROM w",
         other => unreachable!("unexpected anchor {other}"),
     };
+    // PBT-6: the predicate is evaluated inside EVERY grain's CTE, filtering the
+    // rows that feed that grain's aggregate. Predicate members at or above the
+    // anchor are reachable along the up-chain already joined above; members
+    // BELOW it would fan the anchor, and those queries are rejected before
+    // reaching the oracle (see the fence branch in the property).
+    let where_sql = case
+        .where_pred
+        .as_ref()
+        .map_or_else(String::new, |p| format!(" WHERE {}", p.to_raw_sql()));
     if case.sel_dims.is_empty() {
-        format!("SELECT {select_items} {from}")
+        format!("SELECT {select_items} {from}{where_sql}")
     } else {
         let group_by = (1..=case.sel_dims.len())
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        format!("SELECT {select_items} {from} GROUP BY {group_by}")
+        format!("SELECT {select_items} {from}{where_sql} GROUP BY {group_by}")
     }
 }
 
@@ -430,7 +562,7 @@ proptest! {
     fn multi_hop_fence_and_aggregation(case in arb_case()) {
         let def = build_def();
         let req = QueryRequest {
-            where_clause: None,
+            where_clause: case.where_pred.as_ref().map(Pred::to_member_sql),
             dimensions: case
                 .sel_dims
                 .iter()
@@ -466,6 +598,42 @@ proptest! {
                 Ok(sql) => prop_assert!(
                     false,
                     "a dimension below a metric's grain must be rejected, got SQL:\n{sql}"
+                ),
+            }
+            return Ok(());
+        }
+
+        // PBT-6: a `where_clause` member BELOW some selected metric's grain is
+        // the same hazard through a different door. Filtering on `t` while
+        // aggregating `sum(u.uw)` means joining `t` into the u-grain CTE, and
+        // that join fans `u` — one copy per matching child row — so the sum
+        // would be inflated. There is no correct number to return, so the
+        // fence must reject it exactly as it rejects a dimension below the
+        // grain. Checked after the dimension rule, which takes precedence.
+        let mut pred_tables: Vec<&'static str> = Vec::new();
+        if let Some(p) = case.where_pred.as_ref() {
+            p.tables(&mut pred_tables);
+        }
+        let where_member_below_a_metric_grain = case.sel_metrics.iter().any(|&m| {
+            pred_tables
+                .iter()
+                .any(|&pt| level(pt) < level(metric_table(METS[m])))
+        });
+
+        if where_member_below_a_metric_grain {
+            match result {
+                Err(e) => {
+                    let msg = e.to_string();
+                    prop_assert!(
+                        msg.contains("fan trap"),
+                        "where_clause member below a metric's grain rejected, but not \
+                         as a fan trap: {msg}"
+                    );
+                }
+                Ok(sql) => prop_assert!(
+                    false,
+                    "a where_clause member below a metric's grain must be rejected \
+                     -- joining it in fans that metric. Got SQL:\n{sql}"
                 ),
             }
             return Ok(());
@@ -514,4 +682,104 @@ proptest! {
             diff, case.sel_dims, case.sel_metrics, expanded, oracle
         );
     }
+}
+
+/// PBT-6 guard: prove the generated cases reach both `where_clause` branches
+/// the property distinguishes, rather than the suite passing because one is
+/// never generated. A `prop_assert!` inside an unreachable branch is exactly as
+/// green as a correct one.
+#[test]
+fn generator_reaches_both_where_clause_branches() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    use std::collections::HashSet;
+
+    let mut runner = TestRunner::deterministic();
+    let mut with_pred = 0usize;
+    let mut without_pred = 0usize;
+    let mut with_filter = 0usize;
+    let mut pred_below_grain = 0usize;
+    let mut pred_at_or_above_grain = 0usize;
+    let mut multi_grain_with_pred = 0usize;
+    let mut distinct: HashSet<String> = HashSet::new();
+
+    for _ in 0..400 {
+        let case = arb_case()
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        // The dimension rule takes precedence in the property, so only count
+        // cases that actually reach the where-clause branch.
+        let dim_below = case.sel_metrics.iter().any(|&m| {
+            case.sel_dims
+                .iter()
+                .any(|&d| level(dim_table(DIMS[d])) < level(metric_table(METS[m])))
+        });
+        match &case.where_pred {
+            None => without_pred += 1,
+            Some(p) => {
+                with_pred += 1;
+                if p.references_filter() {
+                    with_filter += 1;
+                }
+                distinct.insert(p.to_member_sql());
+                if dim_below || case.sel_metrics.is_empty() {
+                    continue;
+                }
+                let mut tables = Vec::new();
+                p.tables(&mut tables);
+                let below = case.sel_metrics.iter().any(|&m| {
+                    tables
+                        .iter()
+                        .any(|&pt| level(pt) < level(metric_table(METS[m])))
+                });
+                if below {
+                    pred_below_grain += 1;
+                } else {
+                    pred_at_or_above_grain += 1;
+                    // Several grains in one query, each filtered by the same
+                    // predicate -- the multi-grain injection this harness adds.
+                    let grains: HashSet<&str> = case
+                        .sel_metrics
+                        .iter()
+                        .map(|&m| metric_table(METS[m]))
+                        .collect();
+                    if grains.len() > 1 {
+                        multi_grain_with_pred += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        with_pred > 0 && without_pred > 0,
+        "where_clause must be both present and absent across cases \
+         (present={with_pred}, absent={without_pred})"
+    );
+    assert!(
+        with_filter > 0,
+        "generator never referenced a filter member -- member substitution and \
+         its parenthesization are untested"
+    );
+    assert!(
+        pred_below_grain > 0,
+        "no case put a where_clause member below a selected metric's grain; the \
+         fan-trap assertion for that branch is unreachable and therefore vacuous"
+    );
+    assert!(
+        pred_at_or_above_grain > 0,
+        "no case put a where_clause member at or above every selected metric's \
+         grain; the per-grain predicate oracle is never compared"
+    );
+    assert!(
+        multi_grain_with_pred > 0,
+        "no accepted case spanned several grains while carrying a predicate; \
+         the multi-grain injection this harness exists to cover is untested"
+    );
+    assert!(
+        distinct.len() > 50,
+        "generator produced only {} distinct predicates; search space collapsed",
+        distinct.len()
+    );
 }
