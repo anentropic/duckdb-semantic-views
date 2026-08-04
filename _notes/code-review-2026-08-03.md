@@ -182,7 +182,15 @@ now inconsistent about it. **Fix direction:** apply the empty→root substitutio
 contributing the root, or have `decompose` decline when a dependency has `source_table == None`
 and an aggregate in its expression).
 
-### EXP-12 — MEDIUM: window inner-metric matching quote-sensitive in fence & CREATE, quote-insensitive in the emitter
+### EXP-12 — MEDIUM: window inner-metric matching quote-sensitive in fence & CREATE, quote-insensitive in the emitter — RESOLVED 2026-08-04 (TECH-DEBT #43)
+
+**Resolution note.** All four sites migrated to `ident_matches` in one change, as this entry
+required. Worth recording what the fix surfaced: the hazard was described here as latent — real
+only once the CREATE check moved — but it was already active for any definition carrying a quoted
+reference. Measured directly: the quoted spelling anchored `__sv_agg` at the base table and
+computed the inner aggregate over a fanned join (140 → 340) while the unquoted spelling anchored at
+the aggregate's own grain. The CREATE check's strictness was the only thing keeping that
+unreachable through DDL, which is exactly why the sites had to move together.
 
 `src/expand/fan_trap.rs:402-406` (`metric_grain_tables` resolves `ws.inner_metric` via
 `eq_ignore_ascii_case`); `src/body_parser/mod.rs:331-349` (CREATE inner-metric check, same) and

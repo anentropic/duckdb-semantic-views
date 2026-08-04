@@ -700,13 +700,18 @@ pub(super) fn window_cte_anchor(
     let mut anchor: Option<String> = None;
     for met in resolved_mets {
         let ws = met.window_spec.as_ref()?;
-        if ws.inner_metric.eq_ignore_ascii_case(&met.name) {
+        // EXP-12: `ident_matches`, not raw case-folding — the anchor decision
+        // must resolve the reference exactly as the fence and the emitter do,
+        // or a quoted reference declines the re-anchor here while the fence
+        // (which would have caught the resulting base-anchored fan) also lost
+        // the grain, and the query is silently computed over the fanned join.
+        if crate::ident::ident_matches(&met.name, &ws.inner_metric) {
             return None; // Self-referential; not a shape to re-anchor.
         }
         let inner = def
             .metrics
             .iter()
-            .find(|m| m.name.eq_ignore_ascii_case(&ws.inner_metric))?;
+            .find(|m| crate::ident::ident_matches(&m.name, &ws.inner_metric))?;
         let grains = metric_grain_tables(inner, def);
         let [only] = grains.as_slice() else {
             return None; // No grain, or an inner spanning several — decline.

@@ -1,0 +1,171 @@
+# EXP-12 (code review 2026-08-03) — a quoted window inner-metric reference must
+# behave exactly like its unquoted spelling.
+#
+# Four sites resolve `WindowSpec::inner_metric`: the CREATE-time validator, the
+# fan-trap fence's grain derivation, the per-grain planner's window anchor, and
+# the emitter. Only the emitter used the canonical identifier key; the other
+# three compared raw spellings, so `"total"` matched no metric declared as
+# `total`.
+#
+# The CREATE check being the strictest is what hid it: a quoted reference could
+# not be stored, so the fence and anchor never met one. They were broken anyway
+# — verified by constructing such a definition directly, where the quoted
+# spelling anchored `__sv_agg` at the BASE table and computed the inner
+# aggregate over a fanned join (140 became 340), while the unquoted spelling
+# anchored at the aggregate's own grain and returned 140. Migrating the CREATE
+# check alone would therefore have opened that path to ordinary DDL, which is
+# why all four moved in one change.
+#
+# The numbers below are the point: this is a wrong-number bug, so the test pins
+# the value, not merely that CREATE accepts the definition.
+
+require semantic_views
+
+statement ok
+CREATE TABLE wq_parent (id INTEGER, seg VARCHAR, amount INTEGER);
+
+statement ok
+CREATE TABLE wq_base (id INTEGER, parent_id INTEGER);
+
+statement ok
+INSERT INTO wq_parent VALUES (1, 'X', 100), (2, 'X', 40);
+
+# Parent 1 is referenced three times and parent 2 once: joining base to parent
+# multiplies parent rows 3:1, which is what inflates a base-anchored aggregate.
+statement ok
+INSERT INTO wq_base VALUES (10, 1), (11, 1), (12, 1), (13, 2);
+
+# Unquoted inner reference — the control, and the correct answer.
+statement ok
+CREATE SEMANTIC VIEW wq_plain AS
+  TABLES (
+    b AS wq_base PRIMARY KEY (id),
+    p AS wq_parent PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    b_to_p AS b(parent_id) REFERENCES p(id)
+  )
+  DIMENSIONS (
+    p.seg AS p.seg
+  )
+  METRICS (
+    p.total AS sum(p.amount),
+    b.w AS sum(total) OVER (PARTITION BY seg)
+  );
+
+# The inner aggregate is computed at its own grain: 100 + 40 = 140.
+query TI
+SELECT * FROM semantic_view('wq_plain', metrics := ['w'], dimensions := ['seg']);
+----
+X	140
+
+# Same definition with the inner reference QUOTED. Before the fix this was
+# rejected outright at CREATE ("inner metric '\"total\"' not found"), while a
+# definition carrying it reached the emitter with the fence and anchor blind to
+# the inner grain.
+statement ok
+CREATE SEMANTIC VIEW wq_quoted AS
+  TABLES (
+    b AS wq_base PRIMARY KEY (id),
+    p AS wq_parent PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    b_to_p AS b(parent_id) REFERENCES p(id)
+  )
+  DIMENSIONS (
+    p.seg AS p.seg
+  )
+  METRICS (
+    p.total AS sum(p.amount),
+    b.w AS sum("total") OVER (PARTITION BY seg)
+  );
+
+# The number that matters: 140, not the 340 a base-anchored aggregate produces.
+query TI
+SELECT * FROM semantic_view('wq_quoted', metrics := ['w'], dimensions := ['seg']);
+----
+X	140
+
+# Case varied inside the quotes. DuckDB folds case whether or not a name is
+# quoted, so "Total" is the same identifier as total.
+statement ok
+CREATE SEMANTIC VIEW wq_quoted_case AS
+  TABLES (
+    b AS wq_base PRIMARY KEY (id),
+    p AS wq_parent PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    b_to_p AS b(parent_id) REFERENCES p(id)
+  )
+  DIMENSIONS (
+    p.seg AS p.seg
+  )
+  METRICS (
+    p.total AS sum(p.amount),
+    b.w AS sum("Total") OVER (PARTITION BY seg)
+  );
+
+query TI
+SELECT * FROM semantic_view('wq_quoted_case', metrics := ['w'], dimensions := ['seg']);
+----
+X	140
+
+# A quoted ORDER BY dimension reference resolves too — the fourth site, which
+# rejected `ORDER BY "seg"` against a dimension declared `seg`.
+statement ok
+CREATE SEMANTIC VIEW wq_quoted_order AS
+  TABLES (
+    b AS wq_base PRIMARY KEY (id),
+    p AS wq_parent PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    b_to_p AS b(parent_id) REFERENCES p(id)
+  )
+  DIMENSIONS (
+    p.seg AS p.seg
+  )
+  METRICS (
+    p.total AS sum(p.amount),
+    b.w AS sum(total) OVER (PARTITION BY seg ORDER BY "seg")
+  );
+
+# Control: quoting must not make an UNKNOWN name resolve. Without this, the
+# migration could have degenerated into accepting anything.
+statement error
+CREATE SEMANTIC VIEW wq_bad AS
+  TABLES (
+    b AS wq_base PRIMARY KEY (id),
+    p AS wq_parent PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    b_to_p AS b(parent_id) REFERENCES p(id)
+  )
+  DIMENSIONS (
+    p.seg AS p.seg
+  )
+  METRICS (
+    p.total AS sum(p.amount),
+    b.w AS sum("nope") OVER (PARTITION BY seg)
+  );
+----
+inner metric
+
+# Control: an unknown quoted ORDER BY dimension is still rejected as well.
+statement error
+CREATE SEMANTIC VIEW wq_bad_order AS
+  TABLES (
+    b AS wq_base PRIMARY KEY (id),
+    p AS wq_parent PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    b_to_p AS b(parent_id) REFERENCES p(id)
+  )
+  DIMENSIONS (
+    p.seg AS p.seg
+  )
+  METRICS (
+    p.total AS sum(p.amount),
+    b.w AS sum(total) OVER (PARTITION BY seg ORDER BY "nosuch")
+  );
+----
+ORDER BY dimension

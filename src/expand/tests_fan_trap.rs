@@ -570,3 +570,169 @@ fn semi_additive_na_dim_fan_trap_reports_declared_table_spelling() {
         Ok(sql) => panic!("expected FanTrap; got SQL:\n{sql}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// EXP-12 (code-review 2026-08-03): a QUOTED window inner-metric reference must
+// behave exactly like its unquoted spelling.
+//
+// Four sites resolve `WindowSpec::inner_metric`: the CREATE-time validator
+// (`body_parser`), the fan-trap fence's `metric_grain_tables`, the per-grain
+// planner's `window_cte_anchor`, and the emitter (`expand::window`). Only the
+// emitter used the canonical identifier key; the other three compared raw
+// spellings, so `"total"` did not match a metric stored as `total`.
+//
+// The CREATE-side strictness masked the rest: a definition with a quoted
+// reference could not be stored, so the fence never saw one. Migrating CREATE
+// alone would have opened a silent inflation path -- the fence would lose the
+// inner aggregate's grain, `RootGrainFanTrap` would not fire, and the
+// base-anchored `__sv_agg` CTE would compute the inner aggregate over a fanned
+// join while the emitter happily resolved the same reference. So all four move
+// together, and the invariant tested here is the one that ties them: the
+// quoted and unquoted spellings must produce byte-identical outcomes.
+// ---------------------------------------------------------------------------
+
+/// Base `b` with parent `p` (b references p, so p is the "one" side and sits
+/// ABOVE the root grain). A window metric on `b` whose inner aggregate lives on
+/// `p` — the shape whose grain the fence must see through the reference.
+fn window_inner_ref_def(inner_ref: &str) -> SemanticViewDefinition {
+    SemanticViewDefinition {
+        tables: vec![
+            TableRef {
+                alias: "b".to_string(),
+                table: "base".to_string(),
+                pk_columns: vec!["id".to_string()],
+                ..Default::default()
+            },
+            TableRef {
+                alias: "p".to_string(),
+                table: "parent".to_string(),
+                pk_columns: vec!["id".to_string()],
+                ..Default::default()
+            },
+        ],
+        dimensions: vec![Dimension {
+            name: "seg".to_string(),
+            expr: "p.seg".to_string(),
+            source_table: Some("p".to_string()),
+            ..Default::default()
+        }],
+        metrics: vec![
+            Metric {
+                name: "total".to_string(),
+                expr: "SUM(p.amount)".to_string(),
+                source_table: Some("p".to_string()),
+                ..Default::default()
+            },
+            Metric {
+                name: "w".to_string(),
+                expr: "AVG(total)".to_string(),
+                source_table: Some("b".to_string()),
+                window_spec: Some(crate::model::WindowSpec {
+                    window_function: "AVG".to_string(),
+                    inner_metric: inner_ref.to_string(),
+                    extra_args: vec![],
+                    excluding_dims: vec![],
+                    partition_dims: vec!["seg".to_string()],
+                    order_by: vec![],
+                    frame_clause: None,
+                }),
+                ..Default::default()
+            },
+        ],
+        joins: vec![Join {
+            table: "p".to_string(),
+            from_alias: "b".to_string(),
+            fk_columns: vec!["parent_id".to_string()],
+            ref_columns: vec!["id".to_string()],
+            name: Some("b_to_p".to_string()),
+            cardinality: Cardinality::ManyToOne,
+            ..Default::default()
+        }],
+        facts: vec![],
+        materializations: vec![],
+        created_on: None,
+        database_name: None,
+        schema_name: None,
+        resolution_schema_name: None,
+        comment: None,
+    }
+}
+
+/// The EXP-12 invariant: quoting the inner-metric reference changes nothing.
+///
+/// Asserting equality of the two OUTCOMES (rather than pinning one specific
+/// answer) is deliberate — it holds whether the shape is answered by anchoring
+/// the CTE at the inner aggregate's grain or rejected by the fence, and it
+/// keeps holding if that decision is ever revisited. What it forbids is the
+/// asymmetry: the unquoted spelling seeing the inner grain while the quoted one
+/// silently does not.
+#[test]
+fn window_quoted_inner_metric_reference_behaves_like_unquoted() {
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![DimensionName::new("seg")],
+        metrics: vec![MetricName::new("w")],
+    };
+    let plain = expand("wq", &window_inner_ref_def("total"), &req);
+    let quoted = expand("wq", &window_inner_ref_def("\"total\""), &req);
+
+    match (&plain, &quoted) {
+        (Ok(a), Ok(b)) => assert_eq!(
+            a, b,
+            "quoted and unquoted inner-metric references must emit identical SQL"
+        ),
+        (Err(a), Err(b)) => assert_eq!(
+            a.to_string(),
+            b.to_string(),
+            "quoted and unquoted inner-metric references must fail identically"
+        ),
+        (Ok(sql), Err(e)) => panic!(
+            "unquoted resolved but quoted did not -- the quoted reference lost \
+             the inner aggregate's grain.\nunquoted SQL:\n{sql}\nquoted error: {e}"
+        ),
+        (Err(e), Ok(sql)) => {
+            panic!("quoted resolved but unquoted did not.\nunquoted error: {e}\nquoted SQL:\n{sql}")
+        }
+    }
+}
+
+/// The same invariant with the reference's CASE varied inside the quotes.
+/// DuckDB folds case whether or not a name is quoted, so `"TOTAL"` is `total`.
+#[test]
+fn window_quoted_case_varied_inner_metric_reference_behaves_like_unquoted() {
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![DimensionName::new("seg")],
+        metrics: vec![MetricName::new("w")],
+    };
+    let plain = expand("wq", &window_inner_ref_def("total"), &req);
+    let quoted = expand("wq", &window_inner_ref_def("\"TOTAL\""), &req);
+    assert_eq!(
+        plain.as_ref().map_err(std::string::ToString::to_string),
+        quoted.as_ref().map_err(std::string::ToString::to_string),
+        "case inside quotes is folded too, so the outcomes must match"
+    );
+}
+
+/// The fence-side half stated directly: the inner aggregate's table is part of
+/// the window metric's grain no matter how the reference is spelled. This is
+/// what would have been lost had the CREATE-side check migrated alone.
+#[test]
+fn window_quoted_inner_metric_contributes_its_grain_to_the_fence() {
+    for reference in ["total", "\"total\"", "\"Total\""] {
+        let def = window_inner_ref_def(reference);
+        let met = def
+            .metrics
+            .iter()
+            .find(|m| m.name == "w")
+            .expect("window metric");
+        let grains = crate::expand::fan_trap::metric_grain_tables(met, &def);
+        assert!(
+            grains.iter().any(|t| t == "p"),
+            "inner aggregate's table `p` must be in the grain set for reference \
+             {reference}, got {grains:?}"
+        );
+    }
+}
