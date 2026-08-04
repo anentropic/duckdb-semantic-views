@@ -761,6 +761,30 @@ checklist the release is half-finished, and the large `## [Unreleased]` section 
 of an untagged version. Decide: tag f38c3e5 retroactively as v0.12.0, or fold the 0.12.0 section
 back into Unreleased and cut v0.12.0 (or v0.13.0) from HEAD once the EXP-9/EXP-10 fixes land.
 
+**Decided 2026-08-04 (maintainer):** the second option — v0.12.0 is still being worked towards and
+will be tagged from HEAD once all its work is complete, not applied retroactively to f38c3e5.
+
+**Partly actioned 2026-08-04.** The premature `## [0.12.0] - 2026-07-28` section has been folded
+back into `## [Unreleased]` (subsections merged pairwise, 0.12.0's bullets first as the earlier
+work; its `Known limitations` kept as the final subheading; the dangling `[0.12.0]:` compare link
+removed — it pointed at a tag that does not exist). All 25 top-level bullets are preserved. This
+restores the state CLAUDE.md's milestone checklist assumes: the version section is created *at
+tag time*, and until then everything unreleased lives under `Unreleased`.
+
+Two things remain for tag time, deliberately not done now while 0.12.0 work is still landing:
+1. Rename `## [Unreleased]` to `## [0.12.0] - <date>`, add a fresh empty `Unreleased`, and add the
+   `[0.12.0]:` compare link back.
+2. **An in-version churn pass.** Now that the two sections are one version, CLAUDE.md's rule that
+   in-version churn must not be listed applies across the merged content. At least one bullet is
+   affected: the `Fixed` entry for the `where_clause` member on a role-played table (EXP-10)
+   describes a defect in `where_clause`, which is itself an unreleased `Added` feature of this same
+   version — so no released build ever had that bug and users have nothing to be told about.
+   Flagged rather than deleted here, since removing a well-written entry is a maintainer call and
+   more 0.12.0 work may yet change the picture. Re-check the whole merged set at tag time, not
+   just this one.
+
+REL-2 (the stray `v1.0` tag) is untouched and still open.
+
 ### REL-2 — stray legacy `v1.0` tag
 
 A `v1.0` tag from 2026-02-28 (old milestone naming, commit 1837274) is still on the remote.
@@ -780,7 +804,9 @@ Status as of 2026-08-04. ✅ = landed on `main`; ⏳ = in review; ❌ = withdraw
    ✅ **CAT-1/CAT-2** — TECH-DEBT #44/#45. CAT-1's duplicate-row/stale-read symptom was reproduced
    end-to-end against a real pre-scoping database before fixing. All three merged in PR #192.
 4. ✅ **PAR-1** — `semantic-view-function.rst` drift, all three counts corrected.
-   **REL-1/REL-2** (tag state) still open — they are release decisions, not code changes. ARCH-13's
+   **REL-1** decided and partly actioned — v0.12.0 will be cut from HEAD when its work is
+   complete; the premature CHANGELOG section is folded back into `Unreleased`, with the rename and
+   an in-version churn pass left as tag-time steps. **REL-2** (stray `v1.0` tag) still open. ARCH-13's
    sub-items are partly overtaken: MAINTAINER.md's `where_clause.rs` omission and the "eight fuzz
    targets" miscount were fixed on `main` independently; the TECH-DEBT #28 status marker is still
    ambiguous.
