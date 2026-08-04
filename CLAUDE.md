@@ -84,6 +84,43 @@ carry its tests with it and strive to strengthen them; if a change genuinely
 must drop a test, say so explicitly and explain why rather than letting it vanish
 in a diff.
 
+**A new query-semantics feature must reach the numeric oracles, not just fixed
+examples.** Anything that changes what number a query returns — a new query
+parameter, a new aggregation shape, a new join or CTE topology — is not
+adequately covered by hand-written `.test` rows alone. Hand-picked examples
+check the cases you thought of; the differential proptests in `tests/`
+(`differential_proptest`, `star_schema_proptest`, `multi_hop_join_proptest`,
+`semi_additive_proptest`, `window_metric_proptest`) check the cases you didn't,
+against an independently-formulated oracle. Extend at least one of them in the
+same change: generate the new construct and mirror it into that harness's oracle
+so the comparison stays honest.
+
+Watch specifically for a new parameter left pinned at its inert default in every
+generator (`where_clause: None` in all five harnesses is how EXP-9/EXP-10 — two
+silent wrong-number bugs — reached `main`). A feature that only ever appears in
+fixed examples has no randomized coverage no matter how many `.test` rows it
+has, and the field being *present* in a struct literal is not coverage: the
+generator has to vary it. If a feature genuinely cannot be oracled, say so in
+the PR and record why.
+
+**A deliberately-degraded interim state needs a TECH-DEBT entry in the same
+change.** Sometimes the right call is to ship a partial behaviour and finish it
+later — removing an inference pass before its replacement lands, accepting a
+clause but narrowing what it does, erroring where a fuller implementation would
+compute. That is legitimate. What is not legitimate is letting the *only* record
+of the unfinished half be a comment in a test that pins the degraded output.
+
+A passing test asserting the degraded value looks identical to a passing test
+asserting correct behaviour: CI stays green, review sees an assertion, and the
+promise quietly expires. (`SHOW SEMANTIC DIMENSIONS/METRICS/FACTS` has returned
+an empty `data_type` since v0.10.0 for exactly this reason — the follow-up was
+recorded only in a `phase39_metadata_storage.test` comment saying "Until Plan 05
+lands", and Plan 05 never landed. No amount of extra testing would have caught
+it; the test was there and passing.) So when you knowingly ship less than the
+full behaviour, open a TECH-DEBT entry in the same change describing what is
+missing and what would finish it, and reference that entry from the test comment
+rather than the other way round.
+
 ## Milestone Completion
 
 At the end of every milestone, before tagging:

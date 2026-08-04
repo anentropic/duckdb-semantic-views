@@ -114,6 +114,62 @@ pub(super) fn check_fan_traps(
         }
     }
 
+    // EXP-9 (code-review 2026-08-03): the loop above pairs each metric with the
+    // QUERIED dimensions, but an active semi-additive metric also drags in the
+    // table of its own `NON ADDITIVE BY` dimension — `collect_na_dim_source_tables`
+    // joins it into the snapshot CTE exactly as a queried dimension's table is
+    // joined. Un-queried, it appears in `resolved_dims` nowhere, so nothing
+    // checked it: a metric at the root grain whose NA dimension sits on a
+    // fanning child passed the whole fence (metric table == root, so the
+    // root-grain loop skips it too) and silently double-counted, while
+    // *querying* the same dimension correctly raised `FanTrap` for the identical
+    // join.
+    //
+    // Deliberately ABOVE the `per_grain` early return: this join lives inside
+    // the snapshot CTE, which both the base-anchored and the anchored/per-grain
+    // emitters build (`SnapshotBlock` is shared). `snapshot_cte_anchor` re-anchors
+    // the CTE but only checks that its extra tables are *reachable*, not that
+    // reaching them is non-fanning, so the hazard survives re-anchoring.
+    let queried_dim_keys: HashSet<String> = resolved_dims
+        .iter()
+        .map(|d| crate::ident::normalize_ident_part(&d.name))
+        .collect();
+    for na in
+        super::semi_additive::na_dim_fence_members(view_name, def, resolved_mets, &queried_dim_keys)
+    {
+        let met = resolved_mets[na.metric_idx];
+        let mut met_tables = metric_grain_tables(met, def);
+        if met_tables.is_empty() {
+            met_tables.push(root.clone());
+        }
+        for met_table in &met_tables {
+            if *met_table == na.source_table_key {
+                continue; // Same table, no fan-out possible.
+            }
+            // Path and cardinality lookups are keyed on the folded spelling;
+            // the error payload reports the declared one, matching the
+            // queried-dimension branch above.
+            let Some(path) = find_path(met_table, &na.source_table_key, &adjacency) else {
+                continue; // Not connected (legacy joins carrying no FK metadata).
+            };
+            if let Some(rel_name) = fanning_edge_on_path(&path, &card_map) {
+                return Err(ExpandError::FanTrap {
+                    detail: Box::new(FanTrapError {
+                        view_name: view_name.to_string(),
+                        metric_name: met.name.clone(),
+                        metric_table: met
+                            .source_table
+                            .clone()
+                            .unwrap_or_else(|| met_table.clone()),
+                        dimension_name: na.dim_name,
+                        dimension_table: na.source_table_raw,
+                        relationship_name: rel_name,
+                    }),
+                });
+            }
+        }
+    }
+
     // Everything below this point is a consequence of the base-anchored
     // topology: with each metric aggregated in its own per-grain CTE
     // (`per_grain`), no metric is computed over another grain's row set, so the

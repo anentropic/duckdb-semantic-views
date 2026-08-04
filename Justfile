@@ -289,24 +289,61 @@ check-test-list:
       exit 1
     fi
 
-# Run the full CI suite locally (lint + test-list sync + test + fuzz check)
-ci: lint check-test-list test-all check-fuzz docs-check
+# Verify the three places a fuzz target has to be registered agree:
+# fuzz/fuzz_targets/*.rs on disk, the [[bin]] entries in fuzz/Cargo.toml, and
+# the Fuzz.yml matrix. `just fuzz-all` derives its list from the manifest, but
+# GitHub needs the matrix before any job starts, so that copy cannot be derived
+# and is guarded here instead — the same shape as `check-test-list`.
+#
+# Pure text: no nightly, no cargo-fuzz, so it runs in the CodeQuality job
+# alongside the TEST_LIST check.
+check-fuzz-list:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    disk=$(find fuzz/fuzz_targets -maxdepth 1 -name '*.rs' -exec basename {} .rs \; | sort)
+    manifest=$(sed -n 's|^path = "fuzz_targets/\(.*\)\.rs"$|\1|p' fuzz/Cargo.toml | sort)
+    matrix=$(sed -n 's/^ *target: \[\(.*\)\]$/\1/p' .github/workflows/Fuzz.yml \
+             | tr ',' '\n' | tr -d ' ' | grep . | sort)
+    rc=0
+    if ! diff <(echo "$disk") <(echo "$manifest"); then
+      echo "ERROR: fuzz/fuzz_targets/*.rs and fuzz/Cargo.toml [[bin]] entries disagree" >&2
+      echo "  ('<' = file on disk with no [[bin]] entry, '>' = [[bin]] entry with no file)" >&2
+      rc=1
+    fi
+    if ! diff <(echo "$manifest") <(echo "$matrix"); then
+      echo "ERROR: fuzz/Cargo.toml [[bin]] entries and the Fuzz.yml matrix disagree" >&2
+      echo "  ('<' = target that CI never fuzzes, '>' = matrix entry with no target)" >&2
+      rc=1
+    fi
+    exit $rc
+
+# Run the full CI suite locally (lint + list-sync gates + test + fuzz check)
+ci: lint check-test-list check-fuzz-list test-all check-fuzz docs-check
 
 # Run a single fuzz target (default: fuzz_json_parse, 5 min timeout)
 fuzz target="fuzz_json_parse" time="300":
     cargo +nightly fuzz run {{target}} fuzz/corpus/{{target}} fuzz/seeds/{{target}} -- -max_total_time={{time}}
 
-# Run all eight fuzz targets sequentially (5 min each, 40 min total)
+# Run EVERY fuzz target sequentially (5 min each by default).
+#
+# The list is derived from `cargo fuzz list` — i.e. fuzz/Cargo.toml's [[bin]]
+# entries — so adding a target picks it up here automatically. It used to be a
+# hardcoded copy, and `fuzz_where_predicate` was left out of it from #172
+# (2026-07-29) until 2026-08-04: CI fuzzed it on every push while `just
+# fuzz-all` silently skipped it. `check-fuzz-list` guards the one copy that
+# still has to be written by hand (the Fuzz.yml matrix, which GitHub needs
+# before any job starts).
+#
+# The `mkdir -p` mirrors Fuzz.yml: libFuzzer refuses to start when the corpus /
+# seeds directories are absent, and corpus/ is gitignored.
 fuzz-all time="300":
-    cargo +nightly fuzz run fuzz_json_parse fuzz/corpus/fuzz_json_parse fuzz/seeds/fuzz_json_parse -- -max_total_time={{time}}
-    cargo +nightly fuzz run fuzz_sql_expand fuzz/corpus/fuzz_sql_expand fuzz/seeds/fuzz_sql_expand -- -max_total_time={{time}}
-    cargo +nightly fuzz run fuzz_query_names fuzz/corpus/fuzz_query_names fuzz/seeds/fuzz_query_names -- -max_total_time={{time}}
-    cargo +nightly fuzz run fuzz_ddl_parse fuzz/corpus/fuzz_ddl_parse fuzz/seeds/fuzz_ddl_parse -- -max_total_time={{time}}
-    cargo +nightly fuzz run fuzz_yaml_parse fuzz/corpus/fuzz_yaml_parse fuzz/seeds/fuzz_yaml_parse -- -max_total_time={{time}}
-    cargo +nightly fuzz run fuzz_parser_override_ffi fuzz/corpus/fuzz_parser_override_ffi fuzz/seeds/fuzz_parser_override_ffi -- -max_total_time={{time}}
-    cargo +nightly fuzz run fuzz_keyword_body fuzz/corpus/fuzz_keyword_body fuzz/seeds/fuzz_keyword_body -- -max_total_time={{time}}
-    cargo +nightly fuzz run fuzz_render_roundtrip fuzz/corpus/fuzz_render_roundtrip fuzz/seeds/fuzz_render_roundtrip -- -max_total_time={{time}}
-    cargo +nightly fuzz run fuzz_where_predicate fuzz/corpus/fuzz_where_predicate fuzz/seeds/fuzz_where_predicate -- -max_total_time={{time}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for t in $(cargo +nightly fuzz list); do
+      echo "── $t ──"
+      mkdir -p "fuzz/corpus/$t" "fuzz/seeds/$t"
+      cargo +nightly fuzz run "$t" "fuzz/corpus/$t" "fuzz/seeds/$t" -- -max_total_time={{time}}
+    done
 
 # Minimize corpus for a fuzz target (removes inputs that don't add coverage)
 fuzz-cmin target="fuzz_json_parse":

@@ -54,13 +54,142 @@ struct Instance {
 const DIMS: [&str; 2] = ["td", "ucat"];
 const METS: [&str; 3] = ["sv", "ct", "sw"];
 
+/// Members a generated `where_clause` may name (PBT-6), and which side of the
+/// join each lives on. `ftd` / `fucat` are `LABELS = (FILTER)` members whose
+/// expressions are compound `OR`s, so a splice that drops the parentheses
+/// changes the answer — the same substitution surface the single-table harness
+/// exercises, here across a join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WMember {
+    /// `t.d` — the CHILD side.
+    Td,
+    /// `u.ucat` — the PARENT side.
+    Ucat,
+    /// Filter member on the child: `t.d = 0 OR t.d = 2`.
+    Ftd,
+    /// Filter member on the parent: `u.ucat = 0 OR u.ucat = 2`.
+    Fucat,
+}
+
+impl WMember {
+    /// The member's declared name, as written in a `where_clause`.
+    fn name(self) -> &'static str {
+        match self {
+            WMember::Td => "td",
+            WMember::Ucat => "ucat",
+            WMember::Ftd => "ftd",
+            WMember::Fucat => "fucat",
+        }
+    }
+
+    /// The raw SQL the member's expression stands for, for the oracle.
+    fn raw(self) -> &'static str {
+        match self {
+            WMember::Td => "t.d",
+            WMember::Ucat => "u.ucat",
+            WMember::Ftd => "(t.d = 0 OR t.d = 2)",
+            WMember::Fucat => "(u.ucat = 0 OR u.ucat = 2)",
+        }
+    }
+
+    /// Whether the member lives on the CHILD table. A predicate touching the
+    /// child cannot be evaluated inside the parent-grain CTE without joining
+    /// `t` into it — which fans `u` — so such a query must be rejected when the
+    /// parent metric is selected.
+    fn is_child_side(self) -> bool {
+        matches!(self, WMember::Td | WMember::Ftd)
+    }
+
+    /// Whether the member is a bare column reference (so it can carry a
+    /// comparison operator) as opposed to a self-contained boolean filter.
+    fn is_comparable(self) -> bool {
+        matches!(self, WMember::Td | WMember::Ucat)
+    }
+}
+
+/// A generated pre-aggregation predicate over the star's members (PBT-6).
+#[derive(Debug, Clone)]
+enum Pred {
+    /// `<member> <op> <literal>` for a comparable member.
+    Cmp(WMember, &'static str, i64),
+    /// A bare filter member — the substitution/precedence surface.
+    Filter(WMember),
+    And(Box<Pred>, Box<Pred>),
+    Or(Box<Pred>, Box<Pred>),
+    Not(Box<Pred>),
+}
+
+impl Pred {
+    /// The `where_clause` text: member NAMES, composites parenthesized so the
+    /// SQL parse matches this AST, filter members left BARE.
+    fn to_member_sql(&self) -> String {
+        match self {
+            Pred::Cmp(m, op, k) => format!("{} {op} {k}", m.name()),
+            Pred::Filter(m) => m.name().to_string(),
+            Pred::And(a, b) => format!("({} AND {})", a.to_member_sql(), b.to_member_sql()),
+            Pred::Or(a, b) => format!("({} OR {})", a.to_member_sql(), b.to_member_sql()),
+            Pred::Not(a) => format!("(NOT {})", a.to_member_sql()),
+        }
+    }
+
+    /// The oracle's independent rendering: raw physical columns, filter members
+    /// expanded, every operand explicitly parenthesized.
+    fn to_raw_sql(&self) -> String {
+        match self {
+            Pred::Cmp(m, op, k) => format!("({} {op} {k})", m.raw()),
+            Pred::Filter(m) => format!("({})", m.raw()),
+            Pred::And(a, b) => format!("({} AND {})", a.to_raw_sql(), b.to_raw_sql()),
+            Pred::Or(a, b) => format!("({} OR {})", a.to_raw_sql(), b.to_raw_sql()),
+            Pred::Not(a) => format!("(NOT {})", a.to_raw_sql()),
+        }
+    }
+
+    /// Whether any named member lives on the child table.
+    fn touches_child(&self) -> bool {
+        match self {
+            Pred::Cmp(m, _, _) | Pred::Filter(m) => m.is_child_side(),
+            Pred::And(a, b) | Pred::Or(a, b) => a.touches_child() || b.touches_child(),
+            Pred::Not(a) => a.touches_child(),
+        }
+    }
+
+    /// Whether any named member is a filter member (generator-coverage guard).
+    fn references_filter(&self) -> bool {
+        match self {
+            Pred::Cmp(m, _, _) | Pred::Filter(m) => !m.is_comparable(),
+            Pred::And(a, b) | Pred::Or(a, b) => a.references_filter() || b.references_filter(),
+            Pred::Not(a) => a.references_filter(),
+        }
+    }
+}
+
+fn arb_pred() -> impl Strategy<Value = Pred> {
+    let leaf = prop_oneof![
+        3 => (
+            prop_oneof![Just(WMember::Td), Just(WMember::Ucat)],
+            prop_oneof![Just("<"), Just("<="), Just("="), Just("<>"), Just(">="), Just(">")],
+            -1i64..=3,
+        ).prop_map(|(m, op, k)| Pred::Cmp(m, op, k)),
+        2 => prop_oneof![Just(WMember::Ftd), Just(WMember::Fucat)].prop_map(Pred::Filter),
+    ];
+    leaf.prop_recursive(3, 8, 2, |inner| {
+        prop_oneof![
+            (inner.clone(), inner.clone()).prop_map(|(a, b)| Pred::And(Box::new(a), Box::new(b))),
+            (inner.clone(), inner.clone()).prop_map(|(a, b)| Pred::Or(Box::new(a), Box::new(b))),
+            inner.prop_map(|a| Pred::Not(Box::new(a))),
+        ]
+    })
+}
+
 /// A full case: an instance plus the non-empty subset of dims + metrics to
-/// query (indices into `DIMS` / `METS`).
+/// query (indices into `DIMS` / `METS`), and the optional pre-aggregation
+/// predicate (PBT-6).
 #[derive(Debug, Clone)]
 struct Case {
     inst: Instance,
     sel_dims: Vec<usize>,
     sel_metrics: Vec<usize>,
+    where_pred: Option<Pred>,
 }
 
 fn arb_instance() -> impl Strategy<Value = Instance> {
@@ -95,15 +224,21 @@ fn arb_case() -> impl Strategy<Value = Case> {
             prop::sample::subsequence((0..DIMS.len()).collect::<Vec<_>>(), 0..=DIMS.len());
         let met_sel =
             prop::sample::subsequence((0..METS.len()).collect::<Vec<_>>(), 0..=METS.len());
-        (Just(inst), dim_sel, met_sel)
+        // PBT-6: one case in four keeps the original no-predicate coverage.
+        let where_pred = prop_oneof![
+            1 => Just(None),
+            3 => arb_pred().prop_map(Some),
+        ];
+        (Just(inst), dim_sel, met_sel, where_pred)
             .prop_filter(
                 "at least one of dimensions/metrics must be selected",
-                |(_, sel_dims, sel_metrics)| !sel_dims.is_empty() || !sel_metrics.is_empty(),
+                |(_, sel_dims, sel_metrics, _)| !sel_dims.is_empty() || !sel_metrics.is_empty(),
             )
-            .prop_map(|(inst, sel_dims, sel_metrics)| Case {
+            .prop_map(|(inst, sel_dims, sel_metrics, where_pred)| Case {
                 inst,
                 sel_dims,
                 sel_metrics,
+                where_pred,
             })
     })
 }
@@ -148,6 +283,27 @@ fn build_def() -> SemanticViewDefinition {
             comment: None,
             synonyms: vec![],
             is_filter: false,
+        },
+        // PBT-6 filter members: never selected as output, named only by a
+        // generated `where_clause`. Compound expressions, so a splice that
+        // loses its parentheses changes the answer.
+        Dimension {
+            name: "ftd".to_string(),
+            expr: "t.d = 0 OR t.d = 2".to_string(),
+            source_table: Some("t".to_string()),
+            output_type: None,
+            comment: None,
+            synonyms: vec![],
+            is_filter: true,
+        },
+        Dimension {
+            name: "fucat".to_string(),
+            expr: "u.ucat = 0 OR u.ucat = 2".to_string(),
+            source_table: Some("u".to_string()),
+            output_type: None,
+            comment: None,
+            synonyms: vec![],
+            is_filter: true,
         },
     ];
     let base_metric = |name: &str, expr: &str, source: Option<&str>| Metric {
@@ -257,14 +413,21 @@ fn child_grain_sql(case: &Case) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let from = "FROM t LEFT JOIN u ON t.fk = u.id";
+    // PBT-6: the predicate filters the rows feeding this grain's aggregate,
+    // BEFORE the grouping. A parent-side member filters through the LEFT JOIN
+    // here, exactly as the expansion's own child-grain CTE does.
+    let where_sql = case
+        .where_pred
+        .as_ref()
+        .map_or_else(String::new, |p| format!(" WHERE {}", p.to_raw_sql()));
     if case.sel_dims.is_empty() {
-        format!("SELECT {select_items} {from}")
+        format!("SELECT {select_items} {from}{where_sql}")
     } else {
         let group_by = (1..=case.sel_dims.len())
             .map(|n| n.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        format!("SELECT {select_items} {from} GROUP BY {group_by}")
+        format!("SELECT {select_items} {from}{where_sql} GROUP BY {group_by}")
     }
 }
 
@@ -276,11 +439,20 @@ fn child_grain_sql(case: &Case) -> String {
 ///
 /// Only `ucat` can be selected alongside it: `td` lives below `u`'s grain and
 /// the query is rejected before it gets here.
+/// PBT-6: the predicate is applied inside THIS grain too, before its
+/// aggregate. Only parent-side members can appear — a predicate touching the
+/// child is rejected before it reaches the oracle (see the fence branch in the
+/// property), because evaluating it here would require joining `t` into the
+/// parent CTE and fanning `u`.
 fn parent_grain_sql(case: &Case) -> String {
+    let where_sql = case
+        .where_pred
+        .as_ref()
+        .map_or_else(String::new, |p| format!(" WHERE {}", p.to_raw_sql()));
     if case.sel_dims.is_empty() {
-        "SELECT sum(u.w) AS sw FROM u".to_string()
+        format!("SELECT sum(u.w) AS sw FROM u{where_sql}")
     } else {
-        "SELECT u.ucat AS ucat, sum(u.w) AS sw FROM u GROUP BY 1".to_string()
+        format!("SELECT u.ucat AS ucat, sum(u.w) AS sw FROM u{where_sql} GROUP BY 1")
     }
 }
 
@@ -338,7 +510,7 @@ proptest! {
     fn star_join_fence_and_aggregation(case in arb_case()) {
         let def = build_def();
         let req = QueryRequest {
-            where_clause: None,
+            where_clause: case.where_pred.as_ref().map(Pred::to_member_sql),
             dimensions: case
                 .sel_dims
                 .iter()
@@ -372,6 +544,33 @@ proptest! {
                 Ok(sql) => prop_assert!(
                     false,
                     "SUM(u.w) grouped by the child dimension t.d must be rejected, got SQL:\n{sql}"
+                ),
+            }
+            return Ok(());
+        }
+
+        // PBT-6: a predicate naming a CHILD-side member alongside the PARENT
+        // metric is the where_clause analogue of the case above. Filtering on
+        // `t` requires joining it into the parent-grain aggregate, and that
+        // join fans `u` — each parent row once per matching child row — so
+        // `sum(u.w)` would be inflated. `check_where_clause_fan_traps` must
+        // reject it; there is no correct number to return.
+        if selects_parent_metric
+            && case.where_pred.as_ref().is_some_and(Pred::touches_child)
+        {
+            match result {
+                Err(e) => {
+                    let msg = e.to_string();
+                    prop_assert!(
+                        msg.contains("fan trap"),
+                        "parent metric + child-side where_clause member rejected, \
+                         but not as a fan trap: {msg}"
+                    );
+                }
+                Ok(sql) => prop_assert!(
+                    false,
+                    "a where_clause on the child table must not be applied to the \
+                     parent-grain metric sum(u.w) -- the join fans it. Got SQL:\n{sql}"
                 ),
             }
             return Ok(());
@@ -420,4 +619,81 @@ proptest! {
             diff, expanded, oracle
         );
     }
+}
+
+/// PBT-6 guard: prove the generated cases actually reach the branches the
+/// property distinguishes, rather than the suite passing because a branch is
+/// never generated. A `prop_assert!` inside an unreachable branch is exactly as
+/// green as a correct one, so the branch counts are asserted directly.
+///
+/// Also pins that the predicate itself varies (CLAUDE.md: the field being
+/// present in a struct literal is not coverage — the generator has to vary it).
+#[test]
+fn generator_reaches_both_where_clause_branches() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    use std::collections::HashSet;
+
+    let mut runner = TestRunner::deterministic();
+    let mut with_pred = 0usize;
+    let mut without_pred = 0usize;
+    let mut with_filter = 0usize;
+    // The two branches the property treats differently under a predicate.
+    let mut parent_metric_child_pred = 0usize;
+    let mut parent_metric_parent_only_pred = 0usize;
+    let mut distinct: HashSet<String> = HashSet::new();
+
+    for _ in 0..400 {
+        let case = arb_case()
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        let selects_parent_metric = case.sel_metrics.iter().any(|&i| METS[i] == "sw");
+        let selects_child_dim = case.sel_dims.iter().any(|&i| DIMS[i] == "td");
+        match &case.where_pred {
+            None => without_pred += 1,
+            Some(p) => {
+                with_pred += 1;
+                if p.references_filter() {
+                    with_filter += 1;
+                }
+                distinct.insert(p.to_member_sql());
+                // The dim-based fence branch takes precedence in the property,
+                // so only count cases that actually reach the where-clause one.
+                if selects_parent_metric && !selects_child_dim {
+                    if p.touches_child() {
+                        parent_metric_child_pred += 1;
+                    } else {
+                        parent_metric_parent_only_pred += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        with_pred > 0 && without_pred > 0,
+        "where_clause must be both present and absent across cases \
+         (present={with_pred}, absent={without_pred})"
+    );
+    assert!(
+        with_filter > 0,
+        "generator never referenced a filter member -- the cross-table \
+         member-substitution surface is untested"
+    );
+    assert!(
+        parent_metric_child_pred > 0,
+        "no case reached the parent-metric + child-side-predicate branch; the \
+         where_clause fan-trap assertion is unreachable and therefore vacuous"
+    );
+    assert!(
+        parent_metric_parent_only_pred > 0,
+        "no case reached the parent-metric + parent-only-predicate branch; the \
+         per-grain predicate oracle is never compared"
+    );
+    assert!(
+        distinct.len() > 50,
+        "generator produced only {} distinct predicates; search space collapsed",
+        distinct.len()
+    );
 }

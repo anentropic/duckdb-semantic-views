@@ -239,7 +239,7 @@ Fix: `rustup update stable`
 | `just test-ducklake-ci` | DuckLake integration (synthetic data) | Builds extension, runs the Python DuckLake CI test — the leg included in `test-all` |
 | `just test-ducklake` | DuckLake integration (real jaffle-shop data) | Builds extension, runs the Python test against DuckLake tables; requires `just setup-ducklake` first |
 | `just test-integration` | Python integration suites | Runs the full `test/integration/*.py` suite list (caret, ADBC, multi-db, concurrency, differential, interrupt, …) |
-| `just test-interrupt` | Query cancellation (TECH-DEBT #39) | Builds the extension and fires `con.interrupt()` from a second thread mid-query; asserts `semantic_view()` aborts early (not just eventually) and reports a bare `Interrupted!`. Part of `test-integration`. |
+| `just test-interrupt` | Query cancellation (TECH-DEBT #42) | Builds the extension and fires `con.interrupt()` from a second thread mid-query; asserts `semantic_view()` aborts early (not just eventually) and reports a bare `Interrupted!`. Part of `test-integration`. |
 | `just test-all` | Rust + SQL logic + DuckLake CI + integration | Runs `test-rust`, `test-sql`, `test-ducklake-ci`, and `test-integration` sequentially |
 | `just coverage` | Coverage report | Runs unit tests with `cargo-llvm-cov`, fails if below 80% line coverage |
 | `just lint` | Code quality (authoritative) | `cargo fmt --check` + full default-features `cargo clippy` + `cargo deny check`. The clippy step compiles the ~25 MB bundled DuckDB, so a cold run is ~10 min. |
@@ -539,12 +539,12 @@ The nightly toolchain is only used for fuzzing. All other development uses stabl
 just fuzz                         # run default target (fuzz_json_parse) for 5 minutes
 just fuzz fuzz_sql_expand         # run a specific target for 5 minutes
 just fuzz fuzz_sql_expand 10      # run a specific target for 10 seconds
-just fuzz-all                     # run all eight targets sequentially (5 min each, 40 min total)
-just fuzz-all 60                  # run all eight targets for 60 seconds each
+just fuzz-all                     # run every target sequentially (5 min each; nine targets = ~45 min)
+just fuzz-all 60                  # run every target for 60 seconds each
 cargo +nightly fuzz list          # see available targets
 ```
 
-### The Eight Fuzz Targets
+### The Fuzz Targets
 
 | Target | What It Fuzzes | What It Catches |
 |--------|---------------|-----------------|
@@ -557,6 +557,8 @@ cargo +nightly fuzz list          # see available targets
 | `fuzz_query_names` | Fuzzes dimension/metric name strings against a fixed known-good definition | SQL injection via user-supplied column names, quoting bugs, name resolution panics |
 | `fuzz_where_predicate` | Arbitrary `SemanticViewDefinition` + an arbitrary `where_clause` predicate → `expand()`, across the metric and fact paths | Corruption of the pre-aggregation predicate splice — the one place arbitrary user text is interpolated verbatim into generated SQL. Same balanced-in/balanced-out oracle as `fuzz_sql_expand`, with the predicate added to the precondition (an unbalanced predicate legitimately yields unbalanced SQL). This is the seam issue #145 came from |
 | `fuzz_parser_override_ffi` | Drives the `parser_override` FFI entry path with fuzzed input | Panics crossing the FFI boundary; unexpected rc / error propagation |
+
+> **Adding a target:** a fuzz target is registered in three places — the `fuzz/fuzz_targets/<name>.rs` file, a `[[bin]]` entry in `fuzz/Cargo.toml`, and the `Fuzz.yml` matrix. `just fuzz-all` needs no update: it derives its list from `cargo fuzz list` (the manifest). The matrix must be hand-written, because GitHub resolves it before any job starts, so `just check-fuzz-list` (and the matching CodeQuality step) fails the build when the three disagree. That drift is not hypothetical: `fuzz_where_predicate` was in the CI matrix but missing from the old hardcoded `fuzz-all` list from #172 until 2026-08-04, so it fuzzed on every push and never locally.
 
 > **Note:** most targets accumulate a coverage corpus under `fuzz/corpus/<target>/` (gitignored) seeded from `fuzz/seeds/<target>/` (committed). Both directories are passed to libFuzzer — `cargo fuzz run <target> fuzz/corpus/<target> fuzz/seeds/<target> -- …` in `Fuzz.yml` and the `just fuzz` / `just fuzz-all` recipes — so committed seed files ARE used as starting inputs. `Fuzz.yml` creates the (gitignored) dirs before running; the older "corpus/seed wiring is a CI gap" note is resolved (CI-1, #135).
 
@@ -589,7 +591,7 @@ The `fuzz/artifacts/` directory is gitignored -- crash artifacts are debugging d
 
 ### CI Fuzzing
 
-The `Fuzz.yml` workflow runs all eight targets (10 minutes each) on any push that touches `src/**`, `fuzz/**`, or the Cargo manifests. A documentation-only push normally does not match that path filter at all, so the workflow never starts. When it *does* start spuriously — GitHub applies the filter to the commits a push introduces rather than its net effect, so a branch restarted on merged history can match on someone else's `src/**` commits — the cheap `changes` guard job runs and skips the eight-target matrix, which is where the cost is. See the gotcha under [CI Workflows](#ci-workflows). Crash detection works by checking for artifact files (not the fuzzer exit code), so build failures or timeouts do not trigger false positives.
+The `Fuzz.yml` workflow runs all nine targets (10 minutes each) on any push that touches `src/**`, `fuzz/**`, or the Cargo manifests. A documentation-only push normally does not match that path filter at all, so the workflow never starts. When it *does* start spuriously — GitHub applies the filter to the commits a push introduces rather than its net effect, so a branch restarted on merged history can match on someone else's `src/**` commits — the cheap `changes` guard job runs and skips the nine-target matrix, which is where the cost is. See the gotcha under [CI Workflows](#ci-workflows). Crash detection works by checking for artifact files (not the fuzzer exit code), so build failures or timeouts do not trigger false positives.
 
 On a real crash:
 
@@ -866,7 +868,7 @@ Do **not** set a directory-level nightly override (`rustup override set nightly`
 |----------|---------|--------------|
 | **BuildQuick** | Pull requests (skips doc-only changes) | Fast feedback: extension build + full sqllogictest suite on Linux x86_64 only, via the DuckDB extension-ci-tools reusable workflow. No `push` trigger (runs on PRs + manual dispatch) — `main` gets the full platform matrix from BuildAll. |
 | **BuildAll** | Push to `main` (skips doc-only changes) | Full build across 5 platforms: Linux x86_64/arm64, macOS x86_64/arm64, Windows x86_64. Runs sqllogictest on each built platform except `linux_arm64`. Excludes WASM, musl, mingw variants. |
-| **CodeQuality** | Push to `main` + pull requests (skips doc-only changes) | `TEST_LIST` sync check; `cargo fmt --check`; clippy (default **and** `--features extension`); doctests (default + the FFI `compile_fail` ABI guard); extension-feature unit tests; `cargo-deny` (license/advisory audit); 80%-line coverage floor via `cargo-llvm-cov`. Runs as **three parallel jobs** — `Lint & format`, `Doctests & extension unit tests`, `Coverage (80% minimum)` — so their three separate cold compiles of the bundled DuckDB amalgamation (clippy=check, doctests=build, coverage=instrumented) overlap on different runners instead of running serially (~32 min → ~12 min). |
+| **CodeQuality** | Push to `main` + pull requests (skips doc-only changes) | `TEST_LIST` sync check; fuzz-target registration sync check (`.rs` files vs `fuzz/Cargo.toml` `[[bin]]` entries vs the `Fuzz.yml` matrix); `cargo fmt --check`; clippy (default **and** `--features extension`); doctests (default + the FFI `compile_fail` ABI guard); extension-feature unit tests; `cargo-deny` (license/advisory audit); 80%-line coverage floor via `cargo-llvm-cov`. Runs as **three parallel jobs** — `Lint & format`, `Doctests & extension unit tests`, `Coverage (80% minimum)` — so their three separate cold compiles of the bundled DuckDB amalgamation (clippy=check, doctests=build, coverage=instrumented) overlap on different runners instead of running serially (~32 min → ~12 min). |
 | **IntegrationChecks** | Push to `main` + pull requests (skips doc-only changes) | DuckLake CI integration test **and** the full Python integration suite (`just test-integration`), each building the debug extension. |
 | **DocsCheck** | Pull requests | Sphinx docs build with `-W` (warnings as errors). Deliberately **not** path-filtered, so documentation/text-only changes are still validated when the heavier workflows skip. No `push` trigger (runs on PRs + manual dispatch) — `main` gets the build+deploy from Docs. |
 | **Docs** | Push to `main` | Same `-W` Sphinx build, then deploys the site to GitHub Pages. |

@@ -1,0 +1,225 @@
+# Code review 2026-08-03 — two silent wrong-answer paths, end to end.
+#
+# Both were "returns a wrong number with no error", the failure class this
+# project fences hardest against, and both slipped past the unit layer because
+# the surfaces they sit on were excluded from every numeric oracle (PBT-6).
+#
+#   EXP-9  — the fan-trap fence pairs each metric with the QUERIED dimensions,
+#            but an active semi-additive metric also drags in its own
+#            `NON ADDITIVE BY` dimension's table. Un-queried, that table was
+#            checked by nothing, so a metric at the base grain whose NA
+#            dimension sits on a fanning child was ranked over a join that had
+#            already duplicated its rows -- and RANK ties across those
+#            duplicates are indistinguishable from ties across distinct rows,
+#            so the snapshot CTE could not dedupe them.
+#
+#   EXP-10 — a `where_clause` member on a role-playing table was joined on the
+#            first-declared relationship, because only a queried DIMENSION's
+#            expression is rewritten to a scoped alias. With a co-queried
+#            metric's `USING` naming the other role, the query grouped by one
+#            instance and filtered by the other.
+#
+# Each case below was individually confirmed red before the fix (per CLAUDE.md:
+# the runner stops a file at its first failing statement, so the set was
+# verified by reverting the fix and walking every case). The value assertions
+# are the point -- these are wrong-NUMBER bugs, so the tests pin the numbers,
+# not just the error text.
+
+require semantic_views
+
+# ============================================================
+# EXP-9 setup: orders (base) with line_items on the many side.
+# One order, two line items -> the join duplicates the order row.
+# ============================================================
+
+statement ok
+CREATE TABLE cr803_orders (id INTEGER, region VARCHAR, balance DECIMAL(10,2));
+
+statement ok
+CREATE TABLE cr803_line_items (id INTEGER, order_id INTEGER, ship_ts TIMESTAMP);
+
+statement ok
+INSERT INTO cr803_orders VALUES (1, 'EU', 100.00);
+
+# Both line items share ONE ship_ts: the RANK tie that made the double-count
+# invisible. With distinct timestamps only one duplicate wins and the bug
+# hides; the tie is what surfaces it.
+statement ok
+INSERT INTO cr803_line_items VALUES
+  (10, 1, TIMESTAMP '2024-01-01 00:00:00'),
+  (11, 1, TIMESTAMP '2024-01-01 00:00:00');
+
+statement ok
+CREATE SEMANTIC VIEW cr803_na AS
+  TABLES (
+    o AS cr803_orders PRIMARY KEY (id),
+    li AS cr803_line_items PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o(id)
+  )
+  DIMENSIONS (
+    o.region AS o.region,
+    li.ship_ts AS li.ship_ts
+  )
+  METRICS (
+    o.balance_at NON ADDITIVE BY (ship_ts) AS sum(o.balance)
+  );
+
+# EXP-9 case 1: the metric is at the BASE grain and its NA dimension is on the
+# fanning child. Before the fix this returned 200.00 -- the order's balance
+# added once per line item, both tied at rank 1. It must now error rather than
+# answer, because one snapshot CTE has no way to rank over an un-fanned row set
+# here.
+statement error
+SELECT * FROM semantic_view('cr803_na', metrics := ['balance_at'], dimensions := ['region']);
+----
+fan trap detected
+
+# EXP-9 case 2 (control, and the asymmetry that made the bug unmistakable):
+# QUERYING the same dimension makes the metric regular, and the fence has
+# always rejected the identical join. The un-queried case must not be the
+# permissive one.
+statement error
+SELECT * FROM semantic_view('cr803_na', metrics := ['balance_at'], dimensions := ['ship_ts']);
+----
+fan trap detected
+
+# EXP-9 case 3 (control): an NA dimension on a table reached the OTHER way --
+# many-to-one, one row per base row -- does not fan, and must still compute.
+# Without this the fix could degenerate into "reject every NA dimension on
+# another table" and still look green.
+statement ok
+CREATE TABLE cr803_snapshots (id INTEGER, as_of DATE);
+
+statement ok
+INSERT INTO cr803_snapshots VALUES (7, DATE '2024-05-05');
+
+statement ok
+CREATE TABLE cr803_accounts (id INTEGER, region VARCHAR, balance DECIMAL(10,2), snap_id INTEGER);
+
+statement ok
+INSERT INTO cr803_accounts VALUES (1, 'EU', 100.00, 7), (2, 'EU', 40.00, 7);
+
+statement ok
+CREATE SEMANTIC VIEW cr803_na_safe AS
+  TABLES (
+    a AS cr803_accounts PRIMARY KEY (id),
+    s AS cr803_snapshots PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    acct_to_snap AS a(snap_id) REFERENCES s(id)
+  )
+  DIMENSIONS (
+    a.region AS a.region,
+    s.as_of AS s.as_of
+  )
+  METRICS (
+    a.balance_at NON ADDITIVE BY (as_of) AS sum(a.balance)
+  );
+
+query TT
+SELECT * FROM semantic_view('cr803_na_safe', metrics := ['balance_at'], dimensions := ['region']);
+----
+EU	140.00
+
+# ============================================================
+# EXP-10 setup: flights role-playing airports through dep + arr.
+# ============================================================
+
+statement ok
+CREATE TABLE cr803_airports (code VARCHAR, city VARCHAR);
+
+statement ok
+CREATE TABLE cr803_flights (id INTEGER, dep_code VARCHAR, arr_code VARCHAR);
+
+statement ok
+INSERT INTO cr803_airports VALUES ('JFK', 'NYC'), ('LAX', 'LA');
+
+# One flight NYC->LA and one LA->NYC. Any query that confuses the two roles
+# returns the other direction's number, so the counts differ by role.
+statement ok
+INSERT INTO cr803_flights VALUES (1, 'JFK', 'LAX'), (2, 'LAX', 'JFK');
+
+statement ok
+CREATE SEMANTIC VIEW cr803_rp AS
+  TABLES (
+    f AS cr803_flights PRIMARY KEY (id),
+    a AS cr803_airports PRIMARY KEY (code)
+  )
+  RELATIONSHIPS (
+    dep AS f(dep_code) REFERENCES a(code),
+    arr AS f(arr_code) REFERENCES a(code)
+  )
+  DIMENSIONS (
+    a.city AS a.city
+  )
+  METRICS (
+    f.dep_count USING (dep) AS count(*),
+    f.arr_count USING (arr) AS count(*)
+  );
+
+# EXP-10 case 1: the wrong-role filter. Before the fix this emitted
+#   WHERE (a.city) = 'NYC'  -- a joined on dep_code
+# while the metric counted a__arr. Counting ARRIVALS filtered by DEPARTURE
+# city returned 1 (flight 1 departs NYC), where arrivals into NYC is also 1 --
+# the numbers coincide here, which is exactly why a value assertion alone
+# cannot be trusted for this bug and the error is the right outcome.
+statement error
+SELECT * FROM semantic_view('cr803_rp', metrics := ['arr_count'], where_clause := 'city = ''NYC''');
+----
+where_clause member 'city' is ambiguous
+
+# EXP-10 case 2: no USING in the query at all -- still ambiguous, because the
+# predicate's join instance is picked by declaration order either way.
+statement error
+SELECT * FROM semantic_view('cr803_rp', metrics := ['dep_count'], where_clause := 'city = ''NYC''');
+----
+where_clause member 'city' is ambiguous
+
+# EXP-10 case 3 (control): a where_clause on a NON-role-playing table's member
+# is unaffected. Without this the fix could reject every where_clause that
+# touches a joined table and still look green.
+statement ok
+CREATE TABLE cr803_carriers (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO cr803_carriers VALUES (1, 'AA'), (2, 'UA');
+
+statement ok
+CREATE TABLE cr803_legs (id INTEGER, carrier_id INTEGER, miles INTEGER);
+
+statement ok
+INSERT INTO cr803_legs VALUES (1, 1, 300), (2, 1, 200), (3, 2, 500);
+
+statement ok
+CREATE SEMANTIC VIEW cr803_plain AS
+  TABLES (
+    l AS cr803_legs PRIMARY KEY (id),
+    c AS cr803_carriers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    leg_to_carrier AS l(carrier_id) REFERENCES c(id)
+  )
+  DIMENSIONS (
+    c.name AS c.name
+  )
+  METRICS (
+    l.total_miles AS sum(l.miles)
+  );
+
+# Pre-aggregation filtering still works, and still recomputes rather than
+# filtering the result: AA's 500 is the sum of its two legs only.
+query I
+SELECT * FROM semantic_view('cr803_plain', metrics := ['total_miles'], where_clause := 'name = ''AA''');
+----
+500
+
+# EXP-10 case 4 (control): a queried DIMENSION on the role-playing table still
+# resolves through a co-queried metric's USING, as it always has. The fix must
+# not disturb the path that already had an answer.
+query TI
+SELECT * FROM semantic_view('cr803_rp', metrics := ['arr_count'], dimensions := ['city']) ORDER BY 1;
+----
+LA	1
+NYC	1

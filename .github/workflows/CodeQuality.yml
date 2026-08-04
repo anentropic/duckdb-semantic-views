@@ -67,6 +67,29 @@ jobs:
             exit 1
           fi
 
+      # A fuzz target is registered in three places: the .rs file, a [[bin]]
+      # entry in fuzz/Cargo.toml, and the Fuzz.yml matrix. `just fuzz-all`
+      # derives its list from the manifest, but GitHub needs the matrix before
+      # any job starts, so that copy is hand-written and can drift — it did,
+      # in the other direction, from #172 until 2026-08-04. Mirrors
+      # `just check-fuzz-list`.
+      - name: Check fuzz target registration is in sync
+        run: |
+          disk=$(find fuzz/fuzz_targets -maxdepth 1 -name '*.rs' -exec basename {} .rs \; | sort)
+          manifest=$(sed -n 's|^path = "fuzz_targets/\(.*\)\.rs"$|\1|p' fuzz/Cargo.toml | sort)
+          matrix=$(sed -n 's/^ *target: \[\(.*\)\]$/\1/p' .github/workflows/Fuzz.yml \
+                   | tr ',' '\n' | tr -d ' ' | grep . | sort)
+          rc=0
+          if ! diff <(echo "$disk") <(echo "$manifest"); then
+            echo "::error::fuzz/fuzz_targets/*.rs and fuzz/Cargo.toml [[bin]] entries disagree ('<' = file with no [[bin]] entry, '>' = entry with no file)"
+            rc=1
+          fi
+          if ! diff <(echo "$manifest") <(echo "$matrix"); then
+            echo "::error::fuzz/Cargo.toml [[bin]] entries and the Fuzz.yml matrix disagree ('<' = target CI never fuzzes, '>' = matrix entry with no target)"
+            rc=1
+          fi
+          exit $rc
+
       - name: Check formatting (rustfmt)
         run: cargo fmt --check
 
