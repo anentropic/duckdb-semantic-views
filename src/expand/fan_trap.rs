@@ -701,10 +701,10 @@ pub(super) fn check_where_clause_fan_traps(
 /// PAR-6 (code-review 2026-08-03, TECH-DEBT #53). Referencing a named fact
 /// declared on another logical table is Snowflake's supported way to cross
 /// tables, and `join_resolver` now joins that table so the inlined expression
-/// binds. Joining is only sound when the path from the member's own table to
-/// the fact's does not fan: a fact on a *child* table multiplies the member's
-/// rows, which inflates a metric's aggregate (an order counted once per line
-/// item) and duplicates a dimension's output rows.
+/// binds. Joining is only sound when the path from the metric's own table to
+/// the fact's does not fan: a fact on a *child* table multiplies the metric's
+/// rows, so its aggregate counts each one once per child (an order counted
+/// once per line item).
 ///
 /// This is the same condition [`check_where_clause_fan_traps`] applies to a
 /// predicate member and [`check_fan_traps`] applies to a queried dimension,
@@ -719,7 +719,6 @@ pub(super) fn check_where_clause_fan_traps(
 pub(super) fn check_referenced_fact_fan_traps(
     view_name: &str,
     def: &SemanticViewDefinition,
-    resolved_dims: &[&crate::model::Dimension],
     resolved_mets: &[&Metric],
 ) -> Result<(), ExpandError> {
     if def.joins.is_empty() || def.facts.is_empty() {
@@ -730,22 +729,20 @@ pub(super) fn check_referenced_fact_fan_traps(
     let adjacency = build_adjacency(def);
     let root = graph.root.clone();
 
-    // (member name, the tables the member itself sits at, its expression).
-    let mut members: Vec<(&str, Vec<String>, &str)> = Vec::new();
-    for dim in resolved_dims {
-        let tables = dim
-            .source_table
-            .as_ref()
-            .map_or_else(|| vec![root.clone()], |st| vec![st.to_ascii_lowercase()]);
-        members.push((dim.name.as_str(), tables, dim.expr.as_str()));
-    }
-    for met in resolved_mets {
-        members.push((
-            met.name.as_str(),
-            metric_grain(met, def).anchored(&root),
-            met.expr.as_str(),
-        ));
-    }
+    // Metrics only. A dimension's expression is never fact-inlined (see
+    // `join_resolver`), so a fact name inside one is a column reference that
+    // fails on its own; fencing it would report a fan trap for a construct that
+    // cannot bind either way.
+    let members: Vec<(&str, Vec<String>, &str)> = resolved_mets
+        .iter()
+        .map(|met| {
+            (
+                met.name.as_str(),
+                metric_grain(met, def).anchored(&root),
+                met.expr.as_str(),
+            )
+        })
+        .collect();
 
     for (member_name, member_tables, expr) in members {
         for (fact_name, fact_table) in collect_referenced_facts(expr, &def.facts) {

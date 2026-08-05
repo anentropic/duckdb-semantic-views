@@ -122,6 +122,13 @@ fn metric_column(index: usize) -> String {
 /// a table that fans its member — so nothing joined here multiplies the anchor.
 fn group_fact_tables(def: &SemanticViewDefinition, group: &Group) -> Vec<String> {
     let mut tables: Vec<String> = Vec::new();
+    let push = |expr: &str, tables: &mut Vec<String>| {
+        for alias in super::facts::collect_referenced_fact_tables(expr, &def.facts) {
+            if !tables.contains(&alias) {
+                tables.push(alias);
+            }
+        }
+    };
     for name in &group.metric_names {
         let Some(met) = def
             .metrics
@@ -130,9 +137,23 @@ fn group_fact_tables(def: &SemanticViewDefinition, group: &Group) -> Vec<String>
         else {
             continue;
         };
-        for alias in super::facts::collect_referenced_fact_tables(&met.expr, &def.facts) {
-            if !tables.contains(&alias) {
-                tables.push(alias);
+        push(&met.expr, &mut tables);
+        // A derived metric's own expression names METRICS, not facts -- the
+        // fact references live in the base metrics inlined into it, and the
+        // expression this CTE renders is the post-inlining one. Scanning only
+        // `met.expr` here reintroduced PAR-6 inside the grain CTE for a derived
+        // metric over a cross-table fact (Copilot, #200): the aggregate named
+        // the fact's alias and `anchor_joins` never joined it. Mirrors the walk
+        // `join_resolver` does on the base-anchored path.
+        if met.source_table.is_none() {
+            for dep in super::facts::collect_transitive_metric_names(met, &def.metrics) {
+                if let Some(base) = def
+                    .metrics
+                    .iter()
+                    .find(|m| crate::ident::normalize_ident_part(&m.name) == dep)
+                {
+                    push(&base.expr, &mut tables);
+                }
             }
         }
     }

@@ -373,3 +373,108 @@ fn queried_cross_table_fact_pulls_its_join() {
         "a queried fact must pull its own table's join: {sql}"
     );
 }
+
+/// Copilot review of #200: a DERIVED metric whose base component references a
+/// cross-table fact, on the PER-GRAIN path. `group_fact_tables` scans each
+/// group's `metric_names`, and a derived metric's own expression names METRICS,
+/// not facts -- the fact references live in the base metrics inlined into it.
+/// Scanning only the derived expression reintroduced PAR-6 inside the grain
+/// CTE: `(SUM(o.amount - (p.markup))) * 2` rendered over a FROM clause with no
+/// join for `p`.
+#[test]
+fn par6_derived_metric_fact_reference_joins_inside_the_grain_cte() {
+    let def = SemanticViewDefinition::default()
+        .with_table("o", "orders", &["id"])
+        .with_table("c", "customers", &["id"])
+        .with_table("p", "products", &["id"])
+        .with_fact("prod_markup", "p.markup", "p")
+        .with_dimension("region", "c.region", Some("c"))
+        .with_metric("net", "SUM(o.amount - p.prod_markup)", Some("o"))
+        .with_metric("net_x2", "net * 2", None)
+        .with_metric("total_discount", "SUM(c.discount)", Some("c"))
+        .with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"])
+        .with_pkfk_join("o_to_p", "o", "p", &["product_id"], &["id"]);
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![DimensionName::new("region")],
+        metrics: vec![MetricName::new("net_x2"), MetricName::new("total_discount")],
+    };
+    let sql = expand("test", &def, &req).expect("two grains, one reaching a cross-table fact");
+    assert!(
+        sql.contains("(p.markup)"),
+        "the fact must still be inlined through the derived metric: {sql}"
+    );
+    assert!(
+        sql.contains(r#"LEFT JOIN "products" AS "p""#),
+        "the grain CTE that inlines the fact must join its table: {sql}"
+    );
+}
+
+/// PAR-6's facts-path sibling: a QUERIED fact whose own expression references a
+/// fact on a third table. `inline_facts` splices it in exactly as it does
+/// inside a metric, but `fact_source_tables` carries only each queried fact's
+/// own declared table, so the chain's far end was never joined.
+#[test]
+fn par6_queried_fact_chaining_to_another_table_pulls_its_join() {
+    let def = SemanticViewDefinition::default()
+        .with_table("o", "orders", &["id"])
+        .with_table("p", "products", &["id"])
+        .with_fact("prod_markup", "p.markup", "p")
+        .with_fact("net_line", "o.amount - p.prod_markup", "o")
+        .with_dimension("order_id", "o.id", Some("o"))
+        .with_metric("total", "SUM(o.amount)", Some("o"))
+        .with_pkfk_join("o_to_p", "o", "p", &["product_id"], &["id"]);
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![FactName::new("net_line")],
+        dimensions: vec![DimensionName::new("order_id")],
+        metrics: vec![],
+    };
+    let sql = expand("test", &def, &req).expect("a fact chaining across tables is answerable");
+    assert!(
+        sql.contains("(p.markup)"),
+        "the chained fact must be inlined: {sql}"
+    );
+    assert!(
+        sql.contains(r#"LEFT JOIN "products" AS "p""#),
+        "the chained fact's table must be joined: {sql}"
+    );
+}
+
+/// The asymmetry PAR-6 does NOT cover, pinned so it is not mistaken for
+/// support: `inline_facts` runs on metric and fact expressions, never on a
+/// DIMENSION's. A fact name inside a dimension expression is therefore emitted
+/// verbatim as a column reference (`c.cust_tier`, a column that does not
+/// exist) and the query fails on the unknown column whether or not `c` is
+/// joined. Collecting a join for it would attach a relation to satisfy a
+/// reference that is never substituted, so the collection is metric-only.
+///
+/// TECH-DEBT #54 holds what would finish it. Replace this pin -- do not delete
+/// it -- if dimension expressions gain fact inlining.
+#[test]
+fn dimension_fact_reference_is_not_inlined() {
+    let def = SemanticViewDefinition::default()
+        .with_table("o", "orders", &["id"])
+        .with_table("c", "customers", &["id"])
+        .with_fact("cust_tier", "c.tier", "c")
+        .with_dimension("tier_label", "c.cust_tier", Some("o"))
+        .with_metric("total", "SUM(o.amount)", Some("o"))
+        .with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"]);
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![DimensionName::new("tier_label")],
+        metrics: vec![MetricName::new("total")],
+    };
+    let sql = expand("test", &def, &req).expect("the DDL and the query are both accepted");
+    assert!(
+        sql.contains("c.cust_tier AS \"tier_label\""),
+        "TECH-DEBT #54: the reference is emitted verbatim, not inlined -- \
+         DuckDB then fails on the unknown column: {sql}"
+    );
+    assert!(
+        !sql.contains("(c.tier)"),
+        "a dimension expression is not fact-inlined: {sql}"
+    );
+}

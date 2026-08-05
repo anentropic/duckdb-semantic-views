@@ -325,9 +325,13 @@ pub(super) fn resolve_joins_pkfk<'a>(
             }
         }
     };
-    for dim in resolved_dims {
-        add_referenced_fact_tables(&dim.expr, &mut needed);
-    }
+    // Metrics only: `inline_facts` runs on metric expressions (and on other
+    // facts'), never on a dimension's, so a fact name inside a dimension
+    // expression is emitted verbatim as a column reference and the query fails
+    // on the unknown column whether or not the table is joined. Collecting the
+    // table for it would join a relation to satisfy a reference that is never
+    // substituted -- see `dimension_fact_reference_is_not_inlined`, which pins
+    // that asymmetry, and TECH-DEBT #54.
     for met in resolved_mets {
         add_referenced_fact_tables(&met.expr, &mut needed);
         // A derived metric's own expression names metrics, not facts; the fact
