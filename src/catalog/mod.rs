@@ -1023,6 +1023,19 @@ mod tests {
             assert!(err.contains("'adb.main.v'"), "got: {err}");
         }
 
+        // The message embeds the reference as written. A database alias may
+        // legally hold a dot when quoted (`ATTACH ':memory:' AS "a.b"`), and
+        // rendering it raw would print `a.b.main.v` — a four-part reference
+        // `parse_view_ref` rejects, so the error would misreport what it
+        // parsed. `ViewRef`'s Display quotes exactly the parts that need it.
+        #[test]
+        fn a_dotted_database_alias_is_named_unambiguously() {
+            let err = foreign_database_error(&parse_view_ref("\"a.b\".main.v").unwrap(), "memory")
+                .expect("a foreign database must be rejected");
+            assert!(err.contains("'\"a.b\".main.v'"), "got: {err}");
+            assert!(!err.contains("'a.b.main.v'"), "got: {err}");
+        }
+
         // A two-part reference is `schema.name`, never `database.name` — so a
         // schema that happens to share a name with some other database is not
         // mistaken for a foreign-database reference.
