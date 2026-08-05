@@ -347,7 +347,7 @@ Kept out of HIGH because the actual safety gate is content-based (`has_incomplet
 in `fan_trap::build_relationship_graph`), not the version integer — this corrupts metadata and the
 stated invariant, not query safety. Fix: `WHERE schema_name = ? AND name = ?`.
 
-### CAT-3 — MEDIUM-LOW: v0.1.0 companion import doesn't backfill `schema_name` into the JSON, breaking the documented column/JSON lockstep
+### CAT-3 — MEDIUM-LOW: v0.1.0 companion import doesn't backfill `schema_name` into the JSON, breaking the documented column/JSON lockstep — RESOLVED 2026-08-05 (TECH-DEBT #49)
 
 `src/catalog/mod.rs:129-140` (import inserts `def` verbatim under `UNRECORDED_SCHEMA_FALLBACK`);
 `src/ddl/list.rs:126-140` (SHOW listings read `d.schema_name` from the parsed JSON,
@@ -359,7 +359,7 @@ but its JSON has no `schema_name`, so `SHOW SEMANTIC VIEWS` lists it with an emp
 `SHOW SEMANTIC VIEWS IN SCHEMA main` misses it. Name-based lookup still works (schema comes from
 the column). Low likelihood (v0.1.0 files), one-line fix.
 
-### CAT-4 — LOW: read paths silently ignore a `database.` qualifier that write DDL rejects
+### CAT-4 — LOW: read paths silently ignore a `database.` qualifier that write DDL rejects — RESOLVED 2026-08-05 (TECH-DEBT #49)
 
 `src/query/table_function.rs` / `explain.rs` / `ddl/describe.rs` bind bodies (`parse_view_ref`
 captures `database`, nothing checks it); `prepared_lookup` has no database predicate.

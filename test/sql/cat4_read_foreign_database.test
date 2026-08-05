@@ -1,0 +1,128 @@
+# CAT-4 (code-review 2026-08-03): a `<database>.` qualifier naming some other
+# database must be rejected on READ paths, exactly as it already is on write DDL.
+#
+# Semantic views are single-catalog (TECH-DEBT #26). Write DDL rejects an
+# explicit foreign-database prefix via `current_database_guard_select` precisely
+# because dropping the prefix would make `DROP SEMANTIC VIEW otherdb.analytics.v`
+# delete the CURRENT database's `analytics.v` — a wrong-object write rather than
+# an unsupported one.
+#
+# The read paths captured `view.database` and then ignored it, so
+# `semantic_view('adb.main.v', ...)` silently resolved against the managed
+# catalog's `main.v` and returned another database's data under that name. The
+# same wrong-object argument applies, so the reads now reject it too. Every read
+# surface funnels through `CatalogReader::lookup`, which is where the guard sits.
+
+require semantic_views
+
+statement ok
+CREATE TABLE base (id INTEGER PRIMARY KEY, region VARCHAR, amt DECIMAL(10,2));
+
+statement ok
+INSERT INTO base VALUES (1, 'US', 10.00), (2, 'EU', 20.00);
+
+statement ok
+CREATE SEMANTIC VIEW v AS
+  TABLES (b AS base PRIMARY KEY (id))
+  DIMENSIONS (b.region AS b.region)
+  METRICS (b.total AS SUM(b.amt));
+
+statement ok
+ATTACH ':memory:' AS adb;
+
+# ------------------------------------------------------------------
+# Every read surface rejects a foreign-database qualifier.
+#
+# The query surfaces are given dimensions/metrics so the ONLY thing that can
+# fail is the guard: a bare `semantic_view('x')` errors with "specify at least"
+# before any lookup happens, which would make these cases vacuous.
+# ------------------------------------------------------------------
+
+statement error
+SELECT * FROM semantic_view('adb.main.v', dimensions := ['region'], metrics := ['total']);
+----
+single-catalog
+
+statement error
+DESCRIBE SEMANTIC VIEW adb.main.v;
+----
+single-catalog
+
+statement error
+SELECT get_ddl('SEMANTIC_VIEW', 'adb.main.v');
+----
+single-catalog
+
+statement error
+SELECT read_yaml_from_semantic_view('adb.main.v');
+----
+single-catalog
+
+statement error
+SELECT * FROM explain_semantic_view('adb.main.v', dimensions := ['region'], metrics := ['total']);
+----
+single-catalog
+
+# The error names the database that was written, so the caller can see which of
+# the two spellings is the wrong one.
+statement error
+SELECT * FROM semantic_view('adb.main.v', dimensions := ['region']);
+----
+names database 'adb'
+
+# A foreign qualifier is rejected on its own terms, not as a side effect of the
+# view being missing: a name that exists in no schema at all reports the
+# single-catalog error too, so the guard cannot be confused with "not found".
+statement error
+SELECT * FROM semantic_view('adb.main.nonexistent', dimensions := ['region']);
+----
+single-catalog
+
+# ------------------------------------------------------------------
+# A qualifier naming the CURRENT database is still honoured — the guard
+# rejects a foreign database, not three-part references as such.
+# (`phase64_quoted_idents.test` pins the same shape on the missing-view path.)
+# ------------------------------------------------------------------
+
+query TR
+SELECT region, total FROM semantic_view('memory.main.v', dimensions := ['region'], metrics := ['total']) ORDER BY region;
+----
+EU	20.00
+US	10.00
+
+query TR
+SELECT region, total FROM semantic_view('v', dimensions := ['region'], metrics := ['total']) ORDER BY region;
+----
+EU	20.00
+US	10.00
+
+# Case-insensitively, per DuckDB's identifier rule — `MEMORY` is `memory`.
+query I
+SELECT count(*) FROM semantic_view('MEMORY.main.v', dimensions := ['region']);
+----
+2
+
+# ------------------------------------------------------------------
+# Reads stay pinned to the managed catalog across USE, so an explicit
+# qualifier naming the session's *own* attached database is still foreign
+# to the catalog — the definitions live in the primary.
+# ------------------------------------------------------------------
+
+statement ok
+USE adb;
+
+statement error
+SELECT * FROM semantic_view('adb.main.v', dimensions := ['region']);
+----
+single-catalog
+
+query I
+SELECT count(*) FROM semantic_view('v', dimensions := ['region']);
+----
+2
+
+statement ok
+USE memory;
+
+statement ok
+DROP SEMANTIC VIEW v;

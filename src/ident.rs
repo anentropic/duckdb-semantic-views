@@ -253,14 +253,24 @@ impl std::fmt::Display for ViewRef {
     /// qualified, bare otherwise — so an error about a qualified reference
     /// names the schema the caller asked for rather than an unqualified name
     /// that may exist elsewhere.
+    ///
+    /// Each part is quoted only when a bare emission would not round-trip, so
+    /// the rendering re-parses to this same reference. Without that, a part
+    /// holding a dot — legal when quoted, as in `ATTACH ':memory:' AS "a.b"` —
+    /// prints as `a.b.main.v`, which reads as the four-part reference
+    /// [`parse_view_ref`] would have *rejected*. `parse_view_ref` has already
+    /// folded every part to lowercase, which is exactly
+    /// [`quote_ident_if_needed`]'s bare-safe alphabet, so ordinary names are
+    /// untouched.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::expand::quote_ident_if_needed;
         if let Some(db) = &self.database {
-            write!(f, "{db}.")?;
+            write!(f, "{}.", quote_ident_if_needed(db))?;
         }
         if let Some(schema) = &self.schema {
-            write!(f, "{schema}.")?;
+            write!(f, "{}.", quote_ident_if_needed(schema))?;
         }
-        f.write_str(&self.name)
+        f.write_str(&quote_ident_if_needed(&self.name))
     }
 }
 
@@ -755,6 +765,30 @@ mod tests {
             assert!(parse_view_ref("").is_err());
             assert!(parse_view_ref("\"foo").is_err());
             assert!(parse_view_ref("a..b").is_err());
+        }
+
+        #[test]
+        fn display_leaves_ordinary_parts_bare() {
+            // Positive control for `display_round_trips_a_part_needing_quotes`:
+            // the common case must not grow quotes, or every error message
+            // naming a plain view would start shouting.
+            let r = parse_view_ref("memory.analytics.orders_sv").unwrap();
+            assert_eq!(r.to_string(), "memory.analytics.orders_sv");
+        }
+
+        #[test]
+        fn display_round_trips_a_part_needing_quotes() {
+            // A database alias may legally contain a dot when quoted
+            // (`ATTACH ':memory:' AS "a.b"`), and this parser accepts it.
+            // Rendering the parts raw prints `a.b.main.v` — indistinguishable
+            // from the four-part reference `parse_view_ref` would have
+            // REJECTED, so an error naming the reference would misreport what
+            // was actually parsed. The rendering must re-parse to the same
+            // reference.
+            let r = parse_view_ref("\"a.b\".main.v").unwrap();
+            assert_eq!(r.database.as_deref(), Some("a.b"));
+            assert_eq!(r.to_string(), "\"a.b\".main.v");
+            assert_eq!(parse_view_ref(&r.to_string()).unwrap(), r);
         }
 
         #[test]

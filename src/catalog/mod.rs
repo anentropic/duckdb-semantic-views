@@ -133,12 +133,24 @@ pub fn init_catalog(
                 // v0.1.0 companion files predate schemas entirely — there is
                 // no schema to recover from them, so imported rows are filed
                 // where they were in fact created.
+                //
+                // CAT-3: backfilled into the JSON as well, exactly as
+                // `migrated_row` does for the legacy-table rebuild. The import
+                // is the fourth writer of a definition, and the column and the
+                // `schema_name` inside the JSON are documented as being in
+                // lockstep — the SHOW / DESCRIBE listings read the JSON, so a
+                // row written to the column alone lists with an empty schema
+                // and is missed by `SHOW SEMANTIC VIEWS IN SCHEMA main`. A
+                // definition this cannot edit is still carried across verbatim
+                // rather than dropped.
+                let aligned = backfill_schema_name(def, UNRECORDED_SCHEMA_FALLBACK)
+                    .unwrap_or_else(|| def.clone());
                 con.execute(
                     &format!(
                         "INSERT OR REPLACE INTO {DEFINITIONS_TABLE} \
                          (schema_name, name, definition) VALUES (?, ?, ?)"
                     ),
-                    duckdb::params![UNRECORDED_SCHEMA_FALLBACK, name, def],
+                    duckdb::params![UNRECORDED_SCHEMA_FALLBACK, name, aligned],
                 )?;
             }
             // Delete ONLY after a fully successful import. Pre-fix the file was
@@ -517,6 +529,27 @@ mod reader {
             view: &ViewRef,
             search_path: &[String],
         ) -> Result<Option<String>, String> {
+            // CAT-4: a reference spelling out a foreign database names an
+            // object this catalog cannot hold, so resolving it against the
+            // managed catalog would answer a question that was not asked.
+            // Checked here rather than at each bind site because every read
+            // surface — semantic_view(), explain_semantic_view(), DESCRIBE,
+            // SHOW SEMANTIC COLUMNS/ENTITIES, GET_DDL, READ_YAML — reaches the
+            // catalog through this one function.
+            //
+            // Ahead of the `catalog_table_present` short-circuit: a wrong-object
+            // reference is wrong whether or not this database has a catalog, and
+            // reporting it as "does not exist" would suggest the qualifier was
+            // honoured and the view simply absent.
+            //
+            // Only a reference that actually wrote a `<database>.` prefix pays
+            // for the extra query, which is the rare case.
+            if view.database.is_some() {
+                let current = unsafe { query_current_database(self.conn)? };
+                if let Some(err) = crate::catalog::foreign_database_error(view, &current) {
+                    return Err(err);
+                }
+            }
             if !self.catalog_table_present {
                 return Ok(None);
             }
@@ -711,6 +744,29 @@ mod reader {
             .map(|opt| opt.map(ToString::to_string))
     }
 
+    /// The database the reader's connection resolves against — the one holding
+    /// `semantic_layer._definitions`.
+    ///
+    /// Read on the borrowed probe connection, not the caller's, so a caller
+    /// `USE`-d into an attached database still compares against the managed
+    /// catalog. That is the comparison CAT-4 wants: reads are pinned to the
+    /// primary regardless of `USE`, so `adb.main.v` is foreign even to a
+    /// session sitting in `adb`.
+    unsafe fn query_current_database(conn: ffi::duckdb_connection) -> Result<String, String> {
+        let c_sql = CString::new("SELECT current_database()")
+            .map_err(|_| "SQL contains null byte".to_string())?;
+        let mut result = QueryResult::zeroed();
+        let rc = ffi::duckdb_query(conn, c_sql.as_ptr(), result.raw_mut());
+        if rc != ffi::DuckDBSuccess {
+            return Err(result_error_message(
+                result.raw_mut(),
+                "current_database() query failed",
+            ));
+        }
+        read_column_string(result.raw_mut(), 0, 0)
+            .ok_or_else(|| "current_database() returned no value".to_string())
+    }
+
     unsafe fn execute_list_all(
         conn: ffi::duckdb_connection,
     ) -> Result<Vec<(String, String)>, String> {
@@ -785,6 +841,45 @@ fn candidate_schemas(rows: &[(String, String)]) -> String {
     let mut schemas: Vec<&str> = rows.iter().map(|(s, _)| s.as_str()).collect();
     schemas.sort_unstable();
     schemas.join(", ")
+}
+
+/// The error a read must raise when a reference spells out a `<database>.`
+/// prefix naming a database other than the one holding the catalog, or `None`
+/// when the reference is fine to resolve.
+///
+/// Semantic views are single-catalog (TECH-DEBT #26): `semantic_layer._definitions`
+/// lives in one database and every read resolves against it. Write DDL already
+/// refuses an explicit foreign-database prefix
+/// ([`crate::catalog::writes::current_database_guard_select`]) because dropping
+/// the prefix would make `DROP SEMANTIC VIEW otherdb.analytics.v` delete the
+/// *current* database's `analytics.v` — a wrong-object write rather than an
+/// unsupported one. CAT-4: the same argument applies to reads. Ignoring the
+/// prefix makes `semantic_view('otherdb.analytics.v')` return this catalog's
+/// data under another database's name, with nothing to tell the caller that the
+/// database they asked for was never consulted.
+///
+/// The comparison folds case per `DuckDB`'s identifier rule (CLAUDE.md: dialect
+/// questions follow `DuckDB`), so `MEMORY.main.v` and `memory.main.v` are the
+/// same reference. `ViewRef`'s parts are already lowercased by
+/// [`crate::ident::parse_view_ref`]; `current_database()` returns the catalog's
+/// own spelling, which need not be lowercase.
+///
+/// Split out of the FFI reader so the rule is unit-testable without a
+/// connection — the reader supplies `current_database`, this decides.
+#[cfg_attr(not(any(feature = "extension", test)), allow(dead_code))]
+pub(crate) fn foreign_database_error(
+    view: &crate::ident::ViewRef,
+    current_database: &str,
+) -> Option<String> {
+    let written = view.database.as_deref()?;
+    if crate::ident::ident_matches(written, current_database) {
+        return None;
+    }
+    Some(format!(
+        "semantic_views: '{view}' names database '{written}', but semantic views \
+         are single-catalog and the catalog lives in '{current_database}'. Drop \
+         the database qualifier, or name '{current_database}'."
+    ))
 }
 
 /// Pick which of the rows a bare view name matched is the one the reference
@@ -864,6 +959,94 @@ mod tests {
     use super::*;
     #[cfg(not(feature = "extension"))]
     use duckdb::Connection;
+
+    // CAT-4 (code-review 2026-08-03): the read side's foreign-database rule.
+    // The end-to-end coverage is `test/sql/cat4_read_foreign_database.test`,
+    // which pins every read surface; these pin the decision itself, including
+    // the cases the .test file cannot reach without a second attached catalog.
+    mod foreign_database_tests {
+        use super::*;
+        use crate::ident::parse_view_ref;
+
+        #[test]
+        fn unqualified_reference_is_never_foreign() {
+            assert_eq!(
+                foreign_database_error(&parse_view_ref("v").unwrap(), "memory"),
+                None
+            );
+        }
+
+        #[test]
+        fn schema_qualified_reference_is_never_foreign() {
+            assert_eq!(
+                foreign_database_error(&parse_view_ref("analytics.v").unwrap(), "memory"),
+                None
+            );
+        }
+
+        #[test]
+        fn matching_database_resolves() {
+            assert_eq!(
+                foreign_database_error(&parse_view_ref("memory.main.v").unwrap(), "memory"),
+                None
+            );
+        }
+
+        // DuckDB matches identifiers case-insensitively (CLAUDE.md: dialect
+        // questions follow DuckDB), and `current_database()` returns the
+        // catalog's own spelling — which may differ in case from the reference.
+        #[test]
+        fn database_comparison_folds_case() {
+            assert_eq!(
+                foreign_database_error(&parse_view_ref("MEMORY.main.v").unwrap(), "memory"),
+                None
+            );
+            assert_eq!(
+                foreign_database_error(&parse_view_ref("memory.main.v").unwrap(), "MEMORY"),
+                None
+            );
+            assert_eq!(
+                foreign_database_error(&parse_view_ref("\"Memory\".main.v").unwrap(), "memory"),
+                None
+            );
+        }
+
+        #[test]
+        fn foreign_database_is_rejected() {
+            let err = foreign_database_error(&parse_view_ref("adb.main.v").unwrap(), "memory")
+                .expect("a foreign database must be rejected");
+            // Both spellings, so the caller can see which of the two is wrong.
+            assert!(err.contains("names database 'adb'"), "got: {err}");
+            assert!(err.contains("the catalog lives in 'memory'"), "got: {err}");
+            assert!(err.contains("single-catalog"), "got: {err}");
+            // The whole reference as written, not just the bare name.
+            assert!(err.contains("'adb.main.v'"), "got: {err}");
+        }
+
+        // The message embeds the reference as written. A database alias may
+        // legally hold a dot when quoted (`ATTACH ':memory:' AS "a.b"`), and
+        // rendering it raw would print `a.b.main.v` — a four-part reference
+        // `parse_view_ref` rejects, so the error would misreport what it
+        // parsed. `ViewRef`'s Display quotes exactly the parts that need it.
+        #[test]
+        fn a_dotted_database_alias_is_named_unambiguously() {
+            let err = foreign_database_error(&parse_view_ref("\"a.b\".main.v").unwrap(), "memory")
+                .expect("a foreign database must be rejected");
+            assert!(err.contains("'\"a.b\".main.v'"), "got: {err}");
+            assert!(!err.contains("'a.b.main.v'"), "got: {err}");
+        }
+
+        // A two-part reference is `schema.name`, never `database.name` — so a
+        // schema that happens to share a name with some other database is not
+        // mistaken for a foreign-database reference.
+        #[test]
+        fn two_part_reference_is_a_schema_not_a_database() {
+            assert_eq!(
+                foreign_database_error(&parse_view_ref("adb.v").unwrap(), "memory"),
+                None
+            );
+        }
+    }
 
     mod search_path_resolution_tests {
         use super::*;
@@ -1696,6 +1879,57 @@ mod tests {
         assert!(
             !companion.exists(),
             "companion file should be deleted after a successful import"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[cfg(not(feature = "extension"))]
+    #[test]
+    fn migration_companion_import_backfills_schema_name_into_json() {
+        // CAT-3 (code-review 2026-08-03): the companion import is the fourth
+        // writer of a definition row, and the only one that used to skip the
+        // `schema_name` backfill `migrated_row` documents as keeping the
+        // column and the JSON in lockstep. An imported row filed under column
+        // `schema_name = 'main'` whose JSON carried no `schema_name` listed
+        // with an empty schema in `SHOW SEMANTIC VIEWS`, and was missed
+        // entirely by `SHOW SEMANTIC VIEWS IN SCHEMA main` — the listings read
+        // the JSON, not the column.
+        let tmp = std::env::temp_dir();
+        let db_path_buf = tmp.join("test_cat3_backfill.duckdb");
+        let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
+        let companion = tmp.join("test_cat3_backfill.duckdb.semantic_views");
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(&companion);
+
+        std::fs::write(
+            &companion,
+            r#"{"orders": "{\"base_table\":\"orders\",\"dimensions\":[],\"metrics\":[]}"}"#,
+        )
+        .unwrap();
+        let con = Connection::open(db_path).expect("open file-backed DB");
+        init_catalog(&con, db_path, false).expect("valid companion file imports cleanly");
+
+        let (schema_col, definition): (String, String) = con
+            .query_row(
+                "SELECT schema_name, definition FROM semantic_layer._definitions \
+                 WHERE name = 'orders'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(schema_col, UNRECORDED_SCHEMA_FALLBACK);
+
+        let parsed: serde_json::Value = serde_json::from_str(&definition).unwrap();
+        let in_json = parsed
+            .get("schema_name")
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(
+            in_json,
+            Some(schema_col.as_str()),
+            "the imported row's JSON must record the same schema as its column, \
+             or the SHOW listings (which read the JSON) disagree with lookup \
+             (which reads the column); got definition: {definition}"
         );
 
         let _ = std::fs::remove_file(db_path);
