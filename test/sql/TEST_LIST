@@ -95,3 +95,4 @@ test/sql/get_ddl_qualified_name.test
 test/sql/cr20260803_silent_fan_and_role.test
 test/sql/semantic_view_runtime_error.test
 test/sql/cr20260803_window_quoted_inner_ref.test
+test/sql/cat4_read_foreign_database.test
