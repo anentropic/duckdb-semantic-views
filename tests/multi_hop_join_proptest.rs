@@ -75,8 +75,10 @@ const WMEMBERS: [(&str, &str, &str); 6] = [
     ("fwcat", "(w.wcat = 0 OR w.wcat = 2)", "w"),
 ];
 
-/// Indices into `WMEMBERS` that are bare columns (can carry a comparison) as
-/// opposed to self-contained boolean filter members.
+/// Indices into `WMEMBERS` that are plain columns (can carry a comparison) as
+/// opposed to self-contained boolean filter members. "Plain" is about the
+/// member's *expression*; it says nothing about the bare-vs-qualified spelling
+/// the predicate names it by, which is an independent axis (see [`member_ref`]).
 const COMPARABLE: [usize; 3] = [0, 1, 2];
 /// Indices into `WMEMBERS` that are filter members.
 const FILTERS: [usize; 3] = [3, 4, 5];
@@ -133,7 +135,12 @@ fn member_ref(m: usize, qualified: bool) -> String {
 
 impl Pred {
     /// The `where_clause` text: member NAMES, composites parenthesized so the
-    /// SQL parse matches this AST, filter members left BARE.
+    /// SQL parse matches this AST.
+    ///
+    /// Each reference is spelled bare (`ftd`) or qualified by its own table
+    /// (`t.ftd`) according to the generated flag — see [`member_ref`]. A filter
+    /// member is still emitted as a name rather than expanded, which is the
+    /// substitution/precedence surface; EXP-14 added the spelling axis on top.
     fn to_member_sql(&self) -> String {
         match self {
             Pred::Cmp(m, op, k, q) => format!("{} {op} {k}", member_ref(*m, *q)),
