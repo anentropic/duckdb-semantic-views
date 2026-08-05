@@ -34,7 +34,7 @@
 use proptest::prelude::*;
 use semantic_views::expand::{expand, DimensionName, MetricName, QueryRequest};
 use semantic_views::model::{
-    AccessModifier, Cardinality, Dimension, Join, Metric, SemanticViewDefinition, TableRef,
+    AccessModifier, Cardinality, Dimension, Fact, Join, Metric, SemanticViewDefinition, TableRef,
 };
 
 /// A generated star-schema instance: `n_u` parent rows and a list of child
@@ -52,7 +52,14 @@ struct Instance {
 
 /// The queryable objects, referenced by these stable names in every case.
 const DIMS: [&str; 2] = ["td", "ucat"];
-const METS: [&str; 3] = ["sv", "ct", "sw"];
+/// `svf` (PAR-6) is a CHILD-grain metric whose expression reaches a fact
+/// declared on the PARENT: `sum(t.v - u.uw1)` where `uw1 = u.w + 1` lives on
+/// `u`. Before PAR-6 the fact was inlined but `u` was never joined, so this
+/// metric could not be generated at all — the emitted SQL did not bind. The
+/// fact expression is deliberately compound so a splice that loses its
+/// parentheses (`t.v - u.w + 1`) computes a different number than the oracle's
+/// `t.v - (u.w + 1)`.
+const METS: [&str; 4] = ["sv", "ct", "sw", "svf"];
 
 /// Members a generated `where_clause` may name (PBT-6), and which side of the
 /// join each lives on. `ftd` / `fucat` are `LABELS = (FILTER)` members whose
@@ -322,6 +329,10 @@ fn build_def() -> SemanticViewDefinition {
         base_metric("sv", "sum(t.v)", Some("t")),
         base_metric("ct", "count(*)", None),
         base_metric("sw", "sum(u.w)", Some("u")),
+        // PAR-6: a child-grain metric reaching a fact on the parent table. The
+        // parent is the "one" side, so the join does not fan `t` and the
+        // aggregate stays at the child grain.
+        base_metric("svf", "sum(t.v - u.uw1)", Some("t")),
     ];
     let joins = vec![Join {
         from_alias: "t".to_string(),
@@ -336,7 +347,16 @@ fn build_def() -> SemanticViewDefinition {
         dimensions,
         metrics,
         joins,
-        facts: vec![],
+        facts: vec![Fact {
+            name: "uw1".to_string(),
+            expr: "u.w + 1".to_string(),
+            source_table: Some("u".to_string()),
+            output_type: None,
+            comment: None,
+            synonyms: vec![],
+            is_filter: false,
+            access: AccessModifier::Public,
+        }],
         materializations: vec![],
         created_on: None,
         database_name: None,
@@ -403,6 +423,12 @@ fn child_grain_sql(case: &Case) -> String {
         .map(|&i| match METS[i] {
             "sv" => "sum(t.v) AS sv".to_string(),
             "ct" => "count(*) AS ct".to_string(),
+            // PAR-6: the cross-table fact reference, written out independently
+            // — the fact's own expression `u.w + 1`, parenthesized at the
+            // reference site, aggregated at the child grain through the same
+            // LEFT JOIN. A NULL or dangling `fk` makes `u.w + 1` NULL, which
+            // `sum` skips, exactly as it does in the expansion.
+            "svf" => "sum(t.v - (u.w + 1)) AS svf".to_string(),
             other => unreachable!("unexpected child-grain metric {other}"),
         })
         .collect();

@@ -283,23 +283,25 @@ and that they "cannot refer to base table columns from other tables". To reach
 another table you declare a relationship, define a fact on the source table, and
 refer to *that fact* from the connected table. The rule here is the same.
 
-What differs is **when the rule is enforced**. Snowflake rejects an offending
-expression at ``CREATE``. This extension accepts the DDL and the reference
-surfaces later:
+A **named fact on another table** -- Snowflake's supported cross-table form --
+is at parity: the fact's expression is inlined at its reference site and its
+table is joined, so ``o.net_total AS SUM(o.amount - c.cust_discount)`` computes
+over the joined relation. One safety rule is added on top of Snowflake's, for a
+hazard its single-grain model does not face here: if the fact's table *fans* the
+referencing member's -- a fact on a child table, reached across a one-to-many
+edge -- joining it would multiply the member's rows, so the query is rejected
+with a fan-trap error rather than answered with an inflated aggregate. See
+:ref:`howto-facts-cross-table`.
 
-- A **raw column of another table** (``o.margin AS o.amount - c.discount``) is
-  emitted verbatim into the query, and joins are collected from each member's
-  declared table alone -- so ``customers`` is never joined and DuckDB raises a
-  binder error for the unknown alias ``c`` at query time. The number is never
-  silently wrong, but the error names DuckDB's missing alias rather than the
-  semantic-layer rule that was broken. Adding the ``CREATE``-time validation is
-  tracked as TECH-DEBT #52.
-- A **named fact on another table** -- Snowflake's supported cross-table form --
-  is inlined at its reference site, but its table is likewise not joined, so the
-  same binder error results. This is a defect rather than a missing diagnostic,
-  and is tracked as TECH-DEBT #53. Until it is fixed, the working cross-table
-  form is to **query the fact directly** (``facts := ['cust_discount']``), which
-  does pull the join.
+For a **raw column of another table**, what differs is **when the rule is
+enforced**. Snowflake rejects the expression at ``CREATE``; this extension
+accepts the DDL and the reference surfaces later. ``o.margin AS o.amount -
+c.discount`` is emitted verbatim into the query, and joins are collected from
+each member's declared table and its fact references alone -- so ``customers``
+is never joined and DuckDB raises a binder error for the unknown alias ``c`` at
+query time. The number is never silently wrong, but the error names DuckDB's
+missing alias rather than the semantic-layer rule that was broken. Adding the
+``CREATE``-time validation is tracked as TECH-DEBT #52.
 
 Derived metrics are unaffected: a metric that references metrics on other tables
 (``m AS t1.metric_1 + t2.metric_2``) is supported in both systems, and is
