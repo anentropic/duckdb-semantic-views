@@ -495,6 +495,24 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Resolution:** select `schema_name` alongside and stamp `WHERE schema_name = ? AND name = ?`.
 - **Coverage:** `catalog::tests::upgrade_stamps_only_the_row_it_verified_not_its_namesakes_in_other_schemas` — two schemas holding a view of the same name, one upgradeable and one not; the verified row is stamped and the namesake is not. The pre-existing `upgrade_stamps_complete_rows_and_skips_incomplete` is retained unchanged as the single-schema control.
 
+### 47. ✅ `where_clause` bypassed PRIVATE and never resolved qualified member references (EXP-13 / EXP-14) — RESOLVED 2026-08-04
+
+- **Origin:** code review 2026-08-03 (`_notes/code-review-2026-08-03.md`, EXP-13, EXP-14). Both filed LOW; EXP-14 is materially worse than filed — see below.
+- **EXP-13 was:** `resolve_where_clause` built its member lookup from *all* of `def.dimensions` / `def.facts` with no `AccessModifier` check, so a PRIVATE fact that `resolve_names` refuses to let you select could still be named in a predicate — and its values probed by varying the filter and watching the result move. The queried-member path has enforced PRIVATE since Phase 43; the predicate path did not. Only facts are affected: `PRIVATE` on a dimension is rejected at CREATE (`body_parser::entries`), which is why `sql_gen`'s `Resolvable` impl carries `unreachable!("dimensions cannot be private")` — see PAR-4 for that divergence.
+- **EXP-14 was:** `scan_references` keys a dotted chain by the whole chain (`o.order_date`), but the member lookup was keyed by bare name only. A qualified reference therefore matched **nothing**.
+- **EXP-14's real severity — a fan-trap fence bypass, not just an unsubstituted reference.** The finding predicted a raw column that "fails loud at bind". It does worse. `ResolvedWhere::source_tables` is what feeds the predicate's tables into the fan-out check, and it is populated *only* for references that resolve. An unresolved qualified reference therefore removes its member from the fence's input entirely, so a predicate that reaches a fanning grain is silently accepted. Caught by the extended oracle, whose minimal counterexample is unambiguous:
+
+  ```sql
+  SELECT sum(u.uw) AS "su"
+  FROM "u" AS "u"
+  WHERE ((u.ucat) <= 1 AND t.ftd)
+  ```
+
+  `t.ftd` names a filter member on `t`. Pre-fix it resolved to nothing, `t` never entered `source_tables`, the fence never learned the predicate reached `t`, and the query was **accepted** with `t` not even joined. This is the same class as EXP-10, which was rated HIGH. It happens to bind-fail here only because `t.ftd` is not a real column; where a member name coincides with a real column on its own table, it binds and returns a wrong number with no error.
+- **Resolution:** every member is keyed both bare and by its own `source_table.name`, mirroring `expand::facts::insert_fact_keys` and the dotted-reference handling at the NA-dim and window sites (#28/#30). Keying by the member's **own** table is what keeps a *foreign* qualifier (`c.order_date`) an ordinary column per E-3. Metrics are keyed both ways too, so `o.revenue > 5` now raises `WhereClauseReferencesMetric` instead of slipping through. PRIVATE facts are deliberately kept *out* of the lookup and recorded separately, so a reference to one raises `PrivateFact` rather than falling through to "unknown reference" — which would have left it in the SQL as a raw column and leaked the very member PRIVATE withholds.
+- **Coverage:** seven unit tests, each confirmed red before the fix, plus controls (`a_public_fact_still_resolves_in_the_predicate`, `a_foreign_qualified_reference_is_left_as_a_raw_column` — the latter guarding against over-eager substitution). Randomized: `multi_hop_join_proptest`'s predicate generator now varies each member reference between bare and `<table>.<name>` spellings, with the oracle rendering unchanged so the comparison stays differential. Verified by reverting only the fix and watching the harness go red on the case above. `generator_reaches_both_where_clause_branches` gained an assertion that both spellings occur, so the flag cannot be silently pinned to `false` — the `where_clause: None` mistake (PBT-6) one level down.
+- **Not covered:** `differential_proptest` cannot host this — its members carry `source_table: None`, so a qualified spelling does not exist there. Left alone rather than restructured.
+
 ### 46. ✅ Three quote scanners each tracked a different subset of the quoting rules (EXP-16 / EXP-17 / PARSE-4) — RESOLVED 2026-08-04
 
 - **Origin:** code review 2026-08-03 (`_notes/code-review-2026-08-03.md`, EXP-16, EXP-17, PARSE-4).

@@ -208,7 +208,7 @@ inner reference loses its grain in `metric_grain_tables` → `RootGrainFanTrap` 
 base-anchored `__sv_agg` CTE silently inflates while `window.rs` happily computes it. **These
 sites must migrate together.**
 
-### EXP-13 — LOW: `where_clause` bypasses access modifiers
+### EXP-13 — LOW: `where_clause` bypasses access modifiers — RESOLVED 2026-08-04 (TECH-DEBT #47)
 
 `src/expand/where_clause.rs:89-106`. `resolve_where_clause` builds its lookup from *all*
 `def.dimensions`/`def.facts` with no `AccessModifier` check, so a PRIVATE member that
@@ -216,7 +216,12 @@ sites must migrate together.**
 `where_clause := 'private_member = …'`. The queried-member path enforces PRIVATE (Phase 43); the
 predicate path does not.
 
-### EXP-14 — LOW: dotted member references in `where_clause` fall through to raw columns, unlike every other member-reference site
+### EXP-14 — LOW → **should have been HIGH**: dotted member references in `where_clause` fall through to raw columns, unlike every other member-reference site — RESOLVED 2026-08-04 (TECH-DEBT #47)
+
+**Severity correction (2026-08-04).** This entry predicted "fails loud at bind". It also silently bypasses the
+fan-trap fence: `source_tables` is populated only for references that *resolve*, so an unresolved
+qualified reference removes its member from the fence's input and a predicate reaching a fanning
+grain is accepted. Same class as EXP-10 (HIGH). See TECH-DEBT #47 for the counterexample.
 
 `src/expand/where_clause.rs:116-138`. `scan_references` keys a dotted chain as `"o.order_date"`
 (`expr_tokens.rs:38`), but the member lookup is keyed by bare name only, so
