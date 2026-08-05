@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::model::{Cardinality, Metric, SemanticViewDefinition};
 
-use super::facts::collect_derived_metric_source_tables;
+use super::facts::collect_derived_metric_grain;
 use super::types::{ExpandError, FanTrapError, MetricFanTrapError};
 
 /// Cardinality map: `(from_lower, to_lower)` -> (worst-case cardinality,
@@ -74,10 +74,7 @@ pub(super) fn check_fan_traps(
         // same substitution the EXP-1 root-grain and metric x metric loops make.
         // Without it the inner loop below never runs, and a root-grain base
         // metric paired with a fanning child dimension slips through the check.
-        let mut met_tables = metric_grain_tables(met, def);
-        if met_tables.is_empty() {
-            met_tables.push(root.clone());
-        }
+        let met_tables = metric_grain(met, def).anchored(&root);
 
         for dim in resolved_dims {
             let Some(ref dim_table_raw) = dim.source_table else {
@@ -138,10 +135,7 @@ pub(super) fn check_fan_traps(
         super::semi_additive::na_dim_fence_members(view_name, def, resolved_mets, &queried_dim_keys)
     {
         let met = resolved_mets[na.metric_idx];
-        let mut met_tables = metric_grain_tables(met, def);
-        if met_tables.is_empty() {
-            met_tables.push(root.clone());
-        }
+        let met_tables = metric_grain(met, def).anchored(&root);
         for met_table in &met_tables {
             if *met_table == na.source_table_key {
                 continue; // Same table, no fan-out possible.
@@ -189,13 +183,7 @@ pub(super) fn check_fan_traps(
     // itself, or a child on the FK/"many" side) traverses only safe forward
     // edges, so this never fires for it (nor for OneToOne edges).
     for met in resolved_mets {
-        let mut met_tables = metric_grain_tables(met, def);
-        // EXP-8: an empty grain set (a base metric with no source table and no
-        // base-metric refs) sits at the root grain, the same substitution the
-        // metric x dimension and metric x metric loops make.
-        if met_tables.is_empty() {
-            met_tables.push(root.clone());
-        }
+        let met_tables = metric_grain(met, def).anchored(&root);
         for met_table in &met_tables {
             if *met_table == root {
                 continue; // At the root grain: nothing fans it.
@@ -226,14 +214,7 @@ pub(super) fn check_fan_traps(
     // and participate — they are the ones inflated by joins to child tables.
     let grains: Vec<Vec<String>> = resolved_mets
         .iter()
-        .map(|m| {
-            let tables = metric_grain_tables(m, def);
-            if tables.is_empty() {
-                vec![root.clone()]
-            } else {
-                tables
-            }
-        })
+        .map(|m| metric_grain(m, def).anchored(&root))
         .collect();
 
     // EXP-2 (code-review 2026-07-18): a SINGLE metric whose OWN grain set spans
@@ -462,12 +443,21 @@ impl GrainGraph {
 ///   aggregate is what is computed over the joined row set (the window
 ///   function itself runs over the pre-aggregated CTE), so the inner metric's
 ///   grain is what fan-out inflates.
-pub(super) fn metric_grain_tables(met: &Metric, def: &SemanticViewDefinition) -> Vec<String> {
+///
+/// The list names only the tables metrics *declare*. A component that
+/// aggregates at the root grain without naming it declares nothing, and shows
+/// up in [`MetricGrain::at_root`] instead — see [`MetricGrain::anchored`],
+/// which is what nearly every caller wants.
+pub(super) fn metric_grain(met: &Metric, def: &SemanticViewDefinition) -> MetricGrain {
+    let mut at_root = false;
     let mut tables: Vec<String> = if let Some(ref st) = met.source_table {
         vec![st.to_ascii_lowercase()]
     } else {
         // Derived metric: walk dependency graph to find transitive base metric source tables
-        collect_derived_metric_source_tables(met, &def.metrics)
+        let grain = collect_derived_metric_grain(met, &def.metrics);
+        at_root = grain.at_root;
+        grain
+            .tables
             .into_iter()
             .map(|s| s.to_ascii_lowercase())
             .collect()
@@ -489,18 +479,52 @@ pub(super) fn metric_grain_tables(met: &Metric, def: &SemanticViewDefinition) ->
                 if let Some(ref st) = inner.source_table {
                     tables.push(st.to_ascii_lowercase());
                 } else {
-                    tables.extend(
-                        collect_derived_metric_source_tables(inner, &def.metrics)
-                            .into_iter()
-                            .map(|s| s.to_ascii_lowercase()),
-                    );
+                    let grain = collect_derived_metric_grain(inner, &def.metrics);
+                    at_root |= grain.at_root;
+                    tables.extend(grain.tables.into_iter().map(|s| s.to_ascii_lowercase()));
                 }
             }
         }
     }
     tables.sort_unstable();
     tables.dedup();
-    tables
+    MetricGrain { tables, at_root }
+}
+
+/// Where a metric aggregates: the tables its components name, plus whether one
+/// of those components sits at the root grain without naming a table.
+pub(super) struct MetricGrain {
+    tables: Vec<String>,
+    at_root: bool,
+}
+
+impl MetricGrain {
+    /// The grain as a table list, with `root` standing in for a component that
+    /// names no table.
+    ///
+    /// EXP-8 (code-review 2026-07-18) made this substitution for a metric whose
+    /// grain set was *entirely* empty — a base metric with no source table and
+    /// no base-metric references. EXP-11 (code-review 2026-08-03) generalised
+    /// it: the substitution is per *component*, so a derived metric that mixes
+    /// a source-less aggregate with a real-table component is at BOTH grains.
+    /// Under the narrower rule the root component vanished whenever anything
+    /// else contributed a table, and the fence's root-grain check and the
+    /// per-grain planner both anchored the whole expression at the survivor.
+    pub(super) fn anchored(&self, root: &str) -> Vec<String> {
+        let mut tables = self.tables.clone();
+        if (self.at_root || tables.is_empty()) && !tables.iter().any(|t| t == root) {
+            tables.push(root.to_string());
+            tables.sort_unstable();
+        }
+        tables
+    }
+
+    /// The tables the metric's components actually name, with no root
+    /// substitution — for callers asking "which tables does this touch?"
+    /// rather than "at what grain does this aggregate?".
+    pub(super) fn named_tables(&self) -> &[String] {
+        &self.tables
+    }
 }
 
 /// Undirected adjacency over relationship edges (lowercased aliases), built
@@ -645,10 +669,7 @@ pub(super) fn check_where_clause_fan_traps(
     let root = graph.root.clone();
 
     for met in resolved_mets {
-        let mut met_tables = metric_grain_tables(met, def);
-        if met_tables.is_empty() {
-            met_tables.push(root.clone());
-        }
+        let met_tables = metric_grain(met, def).anchored(&root);
         for (member_name, member_table) in where_members {
             let Some(member_table) = member_table else {
                 continue; // Unqualified member: base-table grain, nothing to fan.
