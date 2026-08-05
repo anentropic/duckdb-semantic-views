@@ -308,7 +308,7 @@ Declares named grouping expressions available for queries.
 
 **Parameters:**
 
-- ``PUBLIC``, optional. Accepted as an explicit no-op (dimensions are always public). ``PRIVATE`` is **not** allowed on a dimension and is rejected rather than silently downgraded.
+- ``PUBLIC``, optional. Accepted as an explicit no-op (dimensions are always public). ``PRIVATE`` is **not** allowed on a dimension and is rejected rather than silently downgraded. This matches Snowflake, whose grammar lists ``{ PRIVATE | PUBLIC }`` on a dimension but whose rule is that `"You cannot mark a dimension as private. Dimensions are always public." <https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view>`_
 - ``<alias>.<dim_name>``, the table alias and dimension name. The alias indicates which table the dimension comes from (used for join dependency resolution).
 - ``<expression>``, any SQL expression. Can be a simple column reference (``o.region``) or a computed expression (``date_trunc('month', o.ordered_at)``).
 - ``COMMENT = '<text>'``, optional. A human-readable description.

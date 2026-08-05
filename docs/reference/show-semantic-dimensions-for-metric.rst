@@ -59,7 +59,7 @@ Optional Filtering Clauses
    Filters the returned dimensions to those whose name begins with the prefix. Matching is **case-sensitive**. The prefix must be enclosed in single quotes. ``STARTS WITH`` must appear after ``FOR METRIC``.
 
 ``LIMIT <rows>``
-   Restricts the output to the first *rows* results. Must be a positive integer. ``LIMIT`` must appear last.
+   Restricts the output to the first *rows* results. Must be a non-negative integer; ``LIMIT 0`` is accepted and returns no rows. ``LIMIT`` must appear last.
 
 When ``LIKE`` and ``STARTS WITH`` are both present, a dimension must satisfy both conditions (they are combined with ``AND``). These filtering clauses are applied after fan trap filtering, so only dimensions that are safe for the specified metric are candidates for name matching.
 

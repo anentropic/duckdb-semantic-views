@@ -57,7 +57,7 @@ Returns one row per queryable column with 8 columns:
      - The dimension, fact, or metric name.
    * - ``data_type``
      - VARCHAR
-     - The inferred data type. Empty string if not resolved.
+     - The **declared** output type. Empty string unless the definition declares one, which only a :ref:`YAML <ref-yaml-format>` definition can do -- nothing infers a type. See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``kind``
      - VARCHAR
      - The column kind: ``DIMENSION``, ``FACT``, ``METRIC``, or ``DERIVED_METRIC``.
@@ -129,11 +129,13 @@ Examples
    ┌───────────────┬─────────────┬────────────────────┬─────────────┬───────────┬────────────────┬───────────────────────────┬────────────┐
    │ database_name │ schema_name │ semantic_view_name │ column_name │ data_type │ kind           │ expression                │ comment    │
    ├───────────────┼─────────────┼────────────────────┼─────────────┼───────────┼────────────────┼───────────────────────────┼────────────┤
-   │ memory        │ main        │ shop               │ avg_order   │ DOUBLE    │ DERIVED_METRIC │ revenue / COUNT(*)        │            │
-   │ memory        │ main        │ shop               │ region      │ VARCHAR   │ DIMENSION      │ o.region                  │            │
-   │ memory        │ main        │ shop               │ raw_amount  │ DOUBLE    │ FACT           │ o.quantity * o.price      │ Line total │
-   │ memory        │ main        │ shop               │ revenue     │ BIGINT    │ METRIC         │ SUM(o.quantity * o.price) │            │
+   │ memory        │ main        │ shop               │ avg_order   │           │ DERIVED_METRIC │ revenue / COUNT(*)        │            │
+   │ memory        │ main        │ shop               │ region      │           │ DIMENSION      │ o.region                  │            │
+   │ memory        │ main        │ shop               │ raw_amount  │           │ FACT           │ o.quantity * o.price      │ Line total │
+   │ memory        │ main        │ shop               │ revenue     │           │ METRIC         │ SUM(o.quantity * o.price) │            │
    └───────────────┴─────────────┴────────────────────┴─────────────┴───────────┴────────────────┴───────────────────────────┴────────────┘
+
+``data_type`` is empty for every row here: the view was created through SQL DDL, which has no way to declare an output type, and nothing infers one.
 
 **Error: view does not exist:**
 

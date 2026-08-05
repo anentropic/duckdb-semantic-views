@@ -139,7 +139,7 @@ Rows appear in definition order: ``SEMANTIC_VIEW`` (when comment is set), then `
       * - ``EXPRESSION``
         - The row-level SQL expression defining the fact.
       * - ``DATA_TYPE``
-        - The inferred data type. Empty string if not resolved. Populated when the table contains data.
+        - The **declared** output type. Empty string unless the definition declares one, which only a :ref:`YAML <ref-yaml-format>` definition can do -- nothing infers a type. See :ref:`Reported Data Types <explanation-sf-data-types>`.
       * - ``COMMENT``
         - The fact comment text. Only emitted when a comment is set.
       * - ``SYNONYMS``
@@ -163,7 +163,7 @@ Rows appear in definition order: ``SEMANTIC_VIEW`` (when comment is set), then `
       * - ``EXPRESSION``
         - The SQL expression defining the dimension.
       * - ``DATA_TYPE``
-        - The inferred data type. Empty string if not resolved.
+        - The **declared** output type. Empty string unless the definition declares one, which only a :ref:`YAML <ref-yaml-format>` definition can do -- nothing infers a type. See :ref:`Reported Data Types <explanation-sf-data-types>`.
       * - ``COMMENT``
         - The dimension comment text. Only emitted when a comment is set.
       * - ``SYNONYMS``
@@ -185,7 +185,7 @@ Rows appear in definition order: ``SEMANTIC_VIEW`` (when comment is set), then `
       * - ``EXPRESSION``
         - The aggregate SQL expression defining the metric.
       * - ``DATA_TYPE``
-        - The inferred data type. Empty string if not resolved.
+        - The **declared** output type. Empty string unless the definition declares one, which only a :ref:`YAML <ref-yaml-format>` definition can do -- nothing infers a type. See :ref:`Reported Data Types <explanation-sf-data-types>`.
       * - ``COMMENT``
         - The metric comment text. Only emitted when a comment is set.
       * - ``SYNONYMS``
@@ -209,7 +209,7 @@ Rows appear in definition order: ``SEMANTIC_VIEW`` (when comment is set), then `
       * - ``EXPRESSION``
         - The expression composing other metrics.
       * - ``DATA_TYPE``
-        - The inferred data type. Empty string if not resolved.
+        - The **declared** output type. Empty string unless the definition declares one, which only a :ref:`YAML <ref-yaml-format>` definition can do -- nothing infers a type. See :ref:`Reported Data Types <explanation-sf-data-types>`.
       * - ``COMMENT``
         - The derived metric comment text. Only emitted when a comment is set.
       * - ``SYNONYMS``
@@ -276,10 +276,10 @@ Examples
    │ TABLE       │ orders      │               │ PRIMARY_KEY              │ ["id"]           │
    │ DIMENSION   │ region      │ orders        │ TABLE                    │ orders           │
    │ DIMENSION   │ region      │ orders        │ EXPRESSION               │ o.region         │
-   │ DIMENSION   │ region      │ orders        │ DATA_TYPE                │ VARCHAR          │
+   │ DIMENSION   │ region      │ orders        │ DATA_TYPE                │                  │
    │ METRIC      │ total       │ orders        │ TABLE                    │ orders           │
    │ METRIC      │ total       │ orders        │ EXPRESSION               │ SUM(o.amount)    │
-   │ METRIC      │ total       │ orders        │ DATA_TYPE                │ BIGINT           │
+   │ METRIC      │ total       │ orders        │ DATA_TYPE                │                  │
    │ METRIC      │ total       │ orders        │ ACCESS_MODIFIER          │ PUBLIC           │
    └─────────────┴─────────────┴───────────────┴──────────────────────────┴──────────────────┘
 
@@ -315,12 +315,12 @@ Examples
    │ TABLE         │ orders      │               │ COMMENT                  │ Order data           │
    │ DIMENSION     │ region      │ orders        │ TABLE                    │ orders               │
    │ DIMENSION     │ region      │ orders        │ EXPRESSION               │ o.region             │
-   │ DIMENSION     │ region      │ orders        │ DATA_TYPE                │ VARCHAR              │
+   │ DIMENSION     │ region      │ orders        │ DATA_TYPE                │                      │
    │ DIMENSION     │ region      │ orders        │ COMMENT                  │ Sales region         │
    │ DIMENSION     │ region      │ orders        │ SYNONYMS                 │ ["territory"]        │
    │ METRIC        │ revenue     │ orders        │ TABLE                    │ orders               │
    │ METRIC        │ revenue     │ orders        │ EXPRESSION               │ SUM(o.amount)        │
-   │ METRIC        │ revenue     │ orders        │ DATA_TYPE                │ DOUBLE               │
+   │ METRIC        │ revenue     │ orders        │ DATA_TYPE                │                      │
    │ METRIC        │ revenue     │ orders        │ COMMENT                  │ Total revenue        │
    │ METRIC        │ revenue     │ orders        │ ACCESS_MODIFIER          │ PUBLIC               │
    └───────────────┴─────────────┴───────────────┴──────────────────────────┴──────────────────────┘

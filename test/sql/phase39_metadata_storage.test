@@ -94,13 +94,17 @@ SELECT * FROM semantic_view('p39_sv', dimensions := ['order_id'], metrics := ['t
 2	200.00
 
 # ============================================================
-# Test 4: SHOW SEMANTIC FACTS -- data_type stays empty under Plan 03.
-# Phase 65 (v0.10.0) D-16/D-17: CREATE-time fact type inference
-# (typeof(expr)) is removed from `enrich_definition_for_create`. The
-# read-side bind callbacks under the C++ Catalog API shim (Plan 05)
-# probe on demand at SHOW / DESCRIBE bind time. Until Plan 05 lands,
-# SHOW SEMANTIC FACTS returns "(empty)" for the data_type column
-# rather than the v0.9.0 CREATE-time-inferred DOUBLE.
+# Test 4: SHOW SEMANTIC FACTS -- data_type is empty.
+# Phase 65 (v0.10.0) D-16/D-17 removed CREATE-time fact type inference
+# (typeof(expr)) from `enrich_definition_for_create` on the promise that
+# read-side bind callbacks would probe on demand at SHOW / DESCRIBE bind
+# time ("Plan 05"). Plan 05 never landed, so SHOW SEMANTIC FACTS returns
+# "(empty)" rather than the v0.9.0 CREATE-time-inferred DOUBLE.
+#
+# This assertion pins a DEGRADED interim state, not intended behaviour:
+# see TECH-DEBT #51 (PAR-2) for what is missing and what would finish it.
+# Snowflake populates this column. Replace this expectation -- do not
+# delete it -- when the read-side probe lands.
 # ============================================================
 
 query TTTTTTTT
@@ -127,7 +131,8 @@ SHOW SEMANTIC METRICS IN p39_sv;
 memory	main	p39_sv	p39_orders	total_amount	(empty)	[]	(empty)
 
 # ============================================================
-# Test 7: DESCRIBE shows actual table names and fact data_type
+# Test 7: DESCRIBE shows actual table names; DATA_TYPE rows are empty
+# for the same reason as Test 4 (TECH-DEBT #51 / PAR-2).
 # ============================================================
 
 query TTTTT

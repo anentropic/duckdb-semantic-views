@@ -64,7 +64,7 @@ Optional Filtering Clauses
    Filters views to those whose name begins with the prefix. Matching is **case-sensitive**. The prefix must be enclosed in single quotes.
 
 ``LIMIT <rows>``
-   Restricts the output to the first *rows* results. Must be a positive integer.
+   Restricts the output to the first *rows* results. Must be a non-negative integer; ``LIMIT 0`` is accepted and returns no rows.
 
 When ``LIKE`` and ``STARTS WITH`` are both present, a view must satisfy both conditions (they are combined with ``AND``).
 

@@ -78,7 +78,7 @@ Optional Filtering Clauses
    Filters metrics to those whose name begins with the prefix. Matching is **case-sensitive**. The prefix must be enclosed in single quotes.
 
 ``LIMIT <rows>``
-   Restricts the output to the first *rows* results. Must be a positive integer.
+   Restricts the output to the first *rows* results. Must be a non-negative integer; ``LIMIT 0`` is accepted and returns no rows.
 
 When ``LIKE`` and ``STARTS WITH`` are both present, a metric must satisfy both conditions (they are combined with ``AND``).
 
@@ -118,7 +118,7 @@ Returns one row per metric with 8 columns:
      - The metric name as declared in the ``METRICS`` clause.
    * - ``data_type``
      - VARCHAR
-     - The inferred data type. Empty string if not resolved.
+     - The **declared** output type. Empty string unless the definition declares one, which only a :ref:`YAML <ref-yaml-format>` definition can do -- nothing infers a type. See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``synonyms``
      - VARCHAR
      - JSON array of synonym strings (e.g., ``["total_sales","gmv"]``). Empty string if no synonyms are set.
@@ -145,8 +145,8 @@ Given a semantic view ``orders_sv`` with two base metrics:
    ┌───────────────┬─────────────┬────────────────────┬────────────┬──────────────┬───────────┬──────────┬─────────┐
    │ database_name │ schema_name │ semantic_view_name │ table_name │ name         │ data_type │ synonyms │ comment │
    ├───────────────┼─────────────┼────────────────────┼────────────┼──────────────┼───────────┼──────────┼─────────┤
-   │ memory        │ main        │ orders_sv          │ orders     │ order_count  │ BIGINT    │          │         │
-   │ memory        │ main        │ orders_sv          │ orders     │ total_amount │ DOUBLE    │          │         │
+   │ memory        │ main        │ orders_sv          │ orders     │ order_count  │           │          │         │
+   │ memory        │ main        │ orders_sv          │ orders     │ total_amount │           │          │         │
    └───────────────┴─────────────┴────────────────────┴────────────┴──────────────┴───────────┴──────────┴─────────┘
 
 **List metrics across all views:**
@@ -186,13 +186,13 @@ Derived metrics reference other metrics rather than a specific physical table. T
    ┌───────────────┬─────────────┬────────────────────┬────────────┬─────────┬───────────┬──────────┬─────────┐
    │ database_name │ schema_name │ semantic_view_name │ table_name │ name    │ data_type │ synonyms │ comment │
    ├───────────────┼─────────────┼────────────────────┼────────────┼─────────┼───────────┼──────────┼─────────┤
-   │ memory        │ main        │ profit_analysis    │ line_items │ cost    │ DOUBLE    │          │         │
-   │ memory        │ main        │ profit_analysis    │            │ margin  │ DOUBLE    │          │         │
-   │ memory        │ main        │ profit_analysis    │            │ profit  │ DOUBLE    │          │         │
-   │ memory        │ main        │ profit_analysis    │ line_items │ revenue │ DOUBLE    │          │         │
+   │ memory        │ main        │ profit_analysis    │ line_items │ cost    │           │          │         │
+   │ memory        │ main        │ profit_analysis    │            │ margin  │           │          │         │
+   │ memory        │ main        │ profit_analysis    │            │ profit  │           │          │         │
+   │ memory        │ main        │ profit_analysis    │ line_items │ revenue │           │          │         │
    └───────────────┴─────────────┴────────────────────┴────────────┴─────────┴───────────┴──────────┴─────────┘
 
-Base metrics (``revenue``, ``cost``) show their physical table name. Derived metrics (``profit``, ``margin``) show an empty ``table_name`` because they reference other metrics rather than a specific table.
+Base metrics (``revenue``, ``cost``) show their physical table name. Derived metrics (``profit``, ``margin``) show an empty ``table_name`` because they reference other metrics rather than a specific table. ``data_type`` is empty for all four: the view was created through SQL DDL, which has no way to declare an output type, and nothing infers one.
 
 **Error: view does not exist:**
 

@@ -110,6 +110,30 @@ Facts are scoped to their table alias. In a multi-table view, each fact referenc
 
 The facts are still scoped to ``li`` (line_items), but the dimensions come from ``o`` (orders) and ``c`` (customers). The extension joins all necessary tables based on what the query requests.
 
+.. warning::
+
+   **An expression may only reference columns of its own table.** A fact,
+   dimension, or metric expression that names a raw column of *another* logical
+   table -- ``li.margin AS li.extended_price - c.discount`` -- is not supported.
+   Joins are collected from each member's declared table alias, never by
+   scanning the expression for foreign aliases, so ``c`` is not joined and
+   DuckDB reports an unknown-alias binder error when the member is queried. The
+   ``CREATE`` succeeds; the failure comes later, at query time.
+
+   Snowflake applies the `same rule
+   <https://docs.snowflake.com/en/user-guide/views-semantic/validation-rules>`_
+   ("Expressions cannot refer to base table columns from other tables"), but
+   rejects the definition at ``CREATE``. Adding that validation here is tracked
+   as TECH-DEBT #52.
+
+   Referencing a *named fact* declared on another table is Snowflake's supported
+   way to cross tables, and it is accepted here -- but its table is currently
+   not joined either, so it fails the same way (TECH-DEBT #53). Until that is
+   fixed, cross-table facts work when :ref:`queried directly
+   <howto-facts-query>` (``facts := ['...']``), which does pull the join.
+   Composing *metrics* across tables (``m AS t1.metric_a + t2.metric_b``) is
+   unaffected and fully supported.
+
 
 .. _howto-facts-query:
 

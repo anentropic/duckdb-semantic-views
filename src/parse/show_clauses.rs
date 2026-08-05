@@ -457,8 +457,13 @@ pub(crate) fn parse_show_filter_clauses<'a>(
         rest = rest[5..].trim_start();
         let token_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
         let token = &rest[..token_end];
+        // PARSE-3 (code-review 2026-08-03): the range is `u64`, so `LIMIT 0`
+        // parses and yields a zero-row listing — DuckDB's reading of `LIMIT 0`,
+        // and the clause is emitted verbatim into the catalog query. The
+        // message used to promise a *positive* integer while accepting zero;
+        // it now describes what the parse actually enforces.
         let n: u64 = token.parse().map_err(|_| ParseError {
-            message: format!("LIMIT must be a positive integer, got: '{token}'"),
+            message: format!("LIMIT must be a non-negative integer, got: '{token}'"),
             position: Some(abs(rest)),
         })?;
         limit = Some(n);
@@ -497,7 +502,49 @@ pub(crate) fn parse_show_filter_clauses<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_filter_suffix, ScopeName};
+    use super::{build_filter_suffix, parse_show_filter_clauses, ScopeName};
+    use crate::parse::DdlKind;
+
+    /// PARSE-3 (code-review 2026-08-03): `LIMIT 0` is accepted — a zero-row
+    /// listing is what `LIMIT 0` means in DuckDB, and the clause is emitted
+    /// verbatim into the catalog query. The error text used to promise a
+    /// *positive* integer, so the message and the accepted range disagreed.
+    /// This pins the accepted value; `limit_rejects_negative_with_non_negative_message`
+    /// pins the message that now describes it.
+    #[test]
+    fn limit_zero_is_accepted() {
+        let clauses = parse_show_filter_clauses("LIMIT 0", DdlKind::ShowMetrics, 0)
+            .expect("LIMIT 0 parses — it is a zero-row listing, not an error");
+        assert_eq!(clauses.limit, Some(0));
+        assert_eq!(
+            build_filter_suffix(None, None, clauses.limit, None, None),
+            " LIMIT 0"
+        );
+    }
+
+    /// The values the parse genuinely rejects — a negative number and a
+    /// non-numeric token — must describe the range the parser actually
+    /// enforces (`u64`), not a narrower one it does not.
+    #[test]
+    fn limit_rejects_negative_with_non_negative_message() {
+        for token in ["-1", "abc"] {
+            let Err(err) =
+                parse_show_filter_clauses(&format!("LIMIT {token}"), DdlKind::ShowMetrics, 0)
+            else {
+                panic!("a negative or non-numeric LIMIT is rejected: {token}");
+            };
+            assert!(
+                err.message.contains("LIMIT must be a non-negative integer"),
+                "message must describe the accepted range, got: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(token),
+                "message must quote the offending token, got: {}",
+                err.message
+            );
+        }
+    }
 
     // R-1 (code-review 2026-07-11): every user-supplied filter value is
     // embedded in a single-quoted SQL literal via `SqlLit`, so `'` doubles to

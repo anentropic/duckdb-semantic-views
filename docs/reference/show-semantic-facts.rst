@@ -78,7 +78,7 @@ Optional Filtering Clauses
    Filters facts to those whose name begins with the prefix. Matching is **case-sensitive**. The prefix must be enclosed in single quotes.
 
 ``LIMIT <rows>``
-   Restricts the output to the first *rows* results. Must be a positive integer.
+   Restricts the output to the first *rows* results. Must be a non-negative integer; ``LIMIT 0`` is accepted and returns no rows.
 
 When ``LIKE`` and ``STARTS WITH`` are both present, a fact must satisfy both conditions (they are combined with ``AND``).
 
@@ -118,7 +118,7 @@ Returns one row per fact with 8 columns:
      - The fact name as declared in the ``FACTS`` clause.
    * - ``data_type``
      - VARCHAR
-     - The inferred data type (via ``typeof`` when the underlying table contains data). Empty string if the type has not been resolved.
+     - The **declared** output type. Empty string unless the definition declares one, which only a :ref:`YAML <ref-yaml-format>` definition can do -- nothing infers a type. See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``synonyms``
      - VARCHAR
      - JSON array of synonym strings (e.g., ``["discounted_price"]``). Empty string if no synonyms are set.
@@ -134,7 +134,7 @@ Examples
 
 **List facts for a single view:**
 
-Given a semantic view ``orders_sv`` with one fact on a table that contains data:
+Given a semantic view ``orders_sv`` with one fact:
 
 .. code-block:: sql
 
@@ -145,10 +145,10 @@ Given a semantic view ``orders_sv`` with one fact on a table that contains data:
    ┌───────────────┬─────────────┬──────────────────────┬────────────┬────────────┬────────────────┬──────────┬─────────┐
    │ database_name │ schema_name │ semantic_view_name   │ table_name │ name       │ data_type      │ synonyms │ comment │
    ├───────────────┼─────────────┼──────────────────────┼────────────┼────────────┼────────────────┼──────────┼─────────┤
-   │ memory        │ main        │ orders_sv            │ orders     │ raw_amount │ DECIMAL(10,2)  │          │         │
+   │ memory        │ main        │ orders_sv            │ orders     │ raw_amount │                │          │         │
    └───────────────┴─────────────┴──────────────────────┴────────────┴────────────┴────────────────┴──────────┴─────────┘
 
-The ``data_type`` column is inferred at define time using DuckDB's ``typeof`` function on the underlying table. When the table contains data, the type is resolved from the expression (e.g. ``DECIMAL(10,2)``). When the table is empty at define time, ``data_type`` is an empty string.
+The ``data_type`` column reports the declared output type only. A fact created through SQL DDL has none -- v0.10.0 removed the CREATE-time ``typeof`` pass and the read side does not probe -- so the column is empty. It is populated for a fact whose :ref:`YAML <ref-yaml-format>` definition sets ``output_type``.
 
 **List facts across all views:**
 
@@ -202,11 +202,11 @@ Facts can reference other facts. Consider a view with two chained facts:
    ┌───────────────┬─────────────┬──────────────────────┬────────────┬────────────┬────────────────┬──────────┬─────────┐
    │ database_name │ schema_name │ semantic_view_name   │ table_name │ name       │ data_type      │ synonyms │ comment │
    ├───────────────┼─────────────┼──────────────────────┼────────────┼────────────┼────────────────┼──────────┼─────────┤
-   │ memory        │ main        │ tpch_analysis        │ line_items │ net_price  │ DECIMAL(18,4)  │          │         │
+   │ memory        │ main        │ tpch_analysis        │ line_items │ net_price  │                │          │         │
    │ memory        │ main        │ tpch_analysis        │ line_items │ tax_amount │                │          │         │
    └───────────────┴─────────────┴──────────────────────┴────────────┴────────────┴────────────────┴──────────┴─────────┘
 
-``net_price`` has an inferred ``data_type`` because its expression (``li.extended_price * (1 - li.discount)``) uses physical columns. ``tax_amount`` is blank because its expression references another fact (``li.net_price``), which ``typeof`` cannot resolve from a table scan. The extension resolves chained references at query expansion time.
+Both facts show an empty ``data_type``, including ``net_price``, whose expression uses only physical columns: no type is inferred for either. Chained references (``tax_amount`` references ``li.net_price``) are resolved at query expansion time regardless.
 
 **Error: view does not exist:**
 
