@@ -61,8 +61,8 @@ Concept Mapping
      - ``COMMENT``, ``WITH SYNONYMS``
      - ``COMMENT``, ``WITH SYNONYMS`` (see :ref:`howto-metadata-annotations`)
    * - Access modifiers
-     - ``PRIVATE`` / ``PUBLIC``
-     - ``PRIVATE`` / ``PUBLIC`` on metrics and facts; ``PUBLIC`` also accepted (as a no-op) on dimensions, ``PRIVATE`` rejected on dimensions
+     - ``PRIVATE`` / ``PUBLIC`` on metrics and facts; `"You cannot mark a dimension as private. Dimensions are always public." <https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view>`_
+     - Same rule: ``PRIVATE`` / ``PUBLIC`` on metrics and facts, ``PRIVATE`` rejected on dimensions. ``PUBLIC`` is accepted on a dimension as an explicit no-op, since it asserts what is already true
    * - Materializations / pre-aggregation
      - Not part of Snowflake's ``CREATE SEMANTIC VIEW`` DDL
      - ``MATERIALIZATIONS`` clause for routing to pre-aggregated tables (see :ref:`howto-materializations`)
@@ -268,6 +268,59 @@ Both systems infer cardinality from constraints. In DuckDB Semantic Views, cardi
 - Otherwise, the relationship is many-to-one (the default).
 
 The extension uses inferred cardinality for :ref:`fan trap detection <howto-fan-traps>`.
+
+
+.. _explanation-sf-expression-scope:
+
+What an Expression May Reference
+--------------------------------
+
+Both systems scope a member expression to its **own** logical table. Snowflake's
+validation rules state that `expressions can refer to base table columns or
+other expressions on the same logical table
+<https://docs.snowflake.com/en/user-guide/views-semantic/validation-rules>`_,
+and that they "cannot refer to base table columns from other tables". To reach
+another table you declare a relationship, define a fact on the source table, and
+refer to *that fact* from the connected table. The rule here is the same.
+
+What differs is **when the rule is enforced**. Snowflake rejects an offending
+expression at ``CREATE``. This extension accepts the DDL and the reference
+surfaces later:
+
+- A **raw column of another table** (``o.margin AS o.amount - c.discount``) is
+  emitted verbatim into the query, and joins are collected from each member's
+  declared table alone -- so ``customers`` is never joined and DuckDB raises a
+  binder error for the unknown alias ``c`` at query time. The number is never
+  silently wrong, but the error names DuckDB's missing alias rather than the
+  semantic-layer rule that was broken. Adding the ``CREATE``-time validation is
+  tracked as TECH-DEBT #52.
+- A **named fact on another table** -- Snowflake's supported cross-table form --
+  is inlined at its reference site, but its table is likewise not joined, so the
+  same binder error results. This is a defect rather than a missing diagnostic,
+  and is tracked as TECH-DEBT #53. Until it is fixed, the working cross-table
+  form is to **query the fact directly** (``facts := ['cust_discount']``), which
+  does pull the join.
+
+Derived metrics are unaffected: a metric that references metrics on other tables
+(``m AS t1.metric_1 + t2.metric_2``) is supported in both systems, and is
+computed per grain -- see `Metric Grain`_ below.
+
+
+.. _explanation-sf-data-types:
+
+Reported Data Types
+-------------------
+
+Snowflake populates the ``data_type`` column of ``SHOW SEMANTIC DIMENSIONS`` /
+``METRICS`` / ``FACTS`` (and the ``DATA_TYPE`` rows of ``DESCRIBE``) with the
+member's actual data type.
+
+Here the column reports the **declared** output type and nothing else. There is
+no type inference: ``CREATE`` no longer probes the underlying tables (v0.10.0
+removed the ``typeof`` pass), and the read side does not probe either. Only a
+:ref:`YAML <ref-yaml-format>` definition can declare an ``output_type``, so for
+a view created through SQL DDL the column is always empty. Populating it needs a
+bind-time probe on the read path; that work is tracked as TECH-DEBT #51.
 
 
 Metric Grain

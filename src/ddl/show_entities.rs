@@ -9,9 +9,16 @@
 //! [`crate::ddl::read_ffi::run_dispatcher`] scaffold.
 //!
 //! 8 Snowflake-aligned columns: `database_name, schema_name,
-//! semantic_view_name, table_name, name, data_type, synonyms, comment`.
-//! `data_type` is whatever was persisted in the JSON definition (empty on
-//! v0.10.0+ CREATEs — Plan 03 removed CREATE-time type inference).
+//! semantic_view_name, table_name, name, data_type, synonyms, comment` — the
+//! same list, in the same order, that Snowflake's `SHOW SEMANTIC …` commands
+//! return.
+//!
+//! `data_type` is whatever was persisted in the JSON definition, which since
+//! v0.10.0 means the **declared** output type and nothing else: CREATE-time
+//! inference was removed and no SQL DDL surface can declare a type, so only a
+//! YAML definition setting `output_type` produces a non-empty value. Snowflake
+//! populates this column with the member's actual type — see TECH-DEBT #51
+//! (PAR-2) for the read-side probe that would close the gap.
 //!
 //! Materializations (7 columns, different tail) and the two-arg
 //! `dimensions_for_metric` variant keep their own modules; both route through

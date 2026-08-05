@@ -78,7 +78,7 @@ Optional Filtering Clauses
    Filters dimensions to those whose name begins with the prefix. Matching is **case-sensitive**. The prefix must be enclosed in single quotes.
 
 ``LIMIT <rows>``
-   Restricts the output to the first *rows* results. Must be a positive integer.
+   Restricts the output to the first *rows* results. Must be a non-negative integer; ``LIMIT 0`` is accepted and returns no rows.
 
 When ``LIKE`` and ``STARTS WITH`` are both present, a dimension must satisfy both conditions (they are combined with ``AND``).
 
@@ -118,7 +118,7 @@ Returns one row per dimension with 8 columns:
      - The dimension name as declared in the ``DIMENSIONS`` clause.
    * - ``data_type``
      - VARCHAR
-     - The inferred data type. Empty string if not resolved.
+     - The **declared** output type. Empty string unless the definition declares one, which only a :ref:`YAML <ref-yaml-format>` definition can do -- nothing infers a type. See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``synonyms``
      - VARCHAR
      - JSON array of synonym strings (e.g., ``["territory","sales_region"]``). Empty string if no synonyms are set.
@@ -145,12 +145,14 @@ Given a semantic view ``orders_sv`` with three dimensions:
    ┌───────────────┬─────────────┬────────────────────┬────────────┬───────────────┬───────────┬──────────┬─────────┐
    │ database_name │ schema_name │ semantic_view_name │ table_name │ name          │ data_type │ synonyms │ comment │
    ├───────────────┼─────────────┼────────────────────┼────────────┼───────────────┼───────────┼──────────┼─────────┤
-   │ memory        │ main        │ orders_sv          │ customers  │ customer_name │ VARCHAR   │          │         │
-   │ memory        │ main        │ orders_sv          │ orders     │ order_date    │ DATE      │          │         │
-   │ memory        │ main        │ orders_sv          │ customers  │ region        │ VARCHAR   │          │         │
+   │ memory        │ main        │ orders_sv          │ customers  │ customer_name │           │          │         │
+   │ memory        │ main        │ orders_sv          │ orders     │ order_date    │           │          │         │
+   │ memory        │ main        │ orders_sv          │ customers  │ region        │           │          │         │
    └───────────────┴─────────────┴────────────────────┴────────────┴───────────────┴───────────┴──────────┴─────────┘
 
 The ``table_name`` column shows the actual physical table name, not the alias used in the DDL.
+
+``data_type`` is empty here because the view was created through SQL DDL, which has no way to declare an output type. It is populated only for members whose YAML definition sets ``output_type``.
 
 **List dimensions across all views:**
 

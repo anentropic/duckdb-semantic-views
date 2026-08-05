@@ -314,6 +314,22 @@ SHOW SEMANTIC VIEWS FOR METRIC m
 FOR METRIC is only valid
 
 # ============================================================
+# PARSE-3: LIMIT 0 is a zero-row listing, not an error.
+# `LIMIT 0` means "no rows" everywhere else in DuckDB and the clause
+# reaches the catalog query verbatim, so it is accepted; the rejection
+# message describes that range rather than promising a positive integer.
+# ============================================================
+
+query TTTTTTTT
+SHOW SEMANTIC METRICS IN filter_sv LIMIT 0
+----
+
+statement error
+SHOW SEMANTIC METRICS IN filter_sv LIMIT -1
+----
+LIMIT must be a non-negative integer
+
+# ============================================================
 # Cleanup
 # ============================================================
 

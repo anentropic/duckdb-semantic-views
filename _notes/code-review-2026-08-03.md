@@ -373,10 +373,19 @@ another database's data silently. The bind bodies should reject a mismatched `vi
 
 ## 4. Parsing / SHOW-surface findings
 
-### PARSE-3 — LOW: `SHOW … LIMIT 0` accepted despite "must be a positive integer"
+### PARSE-3 — LOW: `SHOW … LIMIT 0` accepted despite "must be a positive integer" — RESOLVED 2026-08-05
 
 `src/parse/show_clauses.rs:454-464`. The error message promises a positive integer; `0` parses and
 is passed through. Cosmetic inconsistency — pick one.
+
+**Resolved by keeping the value and fixing the message.** `LIMIT 0` is a zero-row listing in
+DuckDB and the clause is emitted verbatim into the catalog query, so rejecting it would be a
+gratuitous divergence from the host dialect (CLAUDE.md: dialect questions go to DuckDB); Snowflake
+documents no lower bound either, only a 10000 upper one we do not impose. The parse accepts `u64`,
+and the message now says `must be a non-negative integer`. The five reference pages that repeated
+"Must be a positive integer" were corrected with it. Covered by
+`show_clauses::tests::limit_zero_is_accepted` (pins the value) and
+`limit_rejects_negative_with_non_negative_message` (pins the message; confirmed red first).
 
 ### PARSE-4 — LOW: `matching_close_paren` in search-path injection skips single-quoted and `$tag$` literals but not double-quoted identifiers — RESOLVED 2026-08-04 (TECH-DEBT #46)
 
@@ -458,7 +467,7 @@ read-side inference, and the bind body runs a single unconditional probe. So the
 is itself PAR-1-class drift, and reading it instead of the code reproduced the very failure this
 finding is about. Both the module comment and the docs page are now fixed against the code.
 
-### PAR-2 — MEDIUM: `SHOW SEMANTIC DIMENSIONS/METRICS/FACTS` returns an empty `data_type` for all views created ≥ v0.10.0 — a *pinned interim state whose follow-up never landed*
+### PAR-2 — MEDIUM: `SHOW SEMANTIC DIMENSIONS/METRICS/FACTS` returns an empty `data_type` for all views created ≥ v0.10.0 — a *pinned interim state whose follow-up never landed* — RECORDED 2026-08-05 (TECH-DEBT #51)
 
 `src/ddl/show_entities.rs:11-15`. CREATE-time type inference (`typeof(expr)`) was removed in
 v0.10.0 Phase 65 (D-16/D-17, milestone squash 1da5ab6); unless the user declared an explicit output
@@ -478,7 +487,7 @@ knowingly-degraded interim behaviour needs a TECH-DEBT entry created in the same
 promise outlives the test comment. *(Verify Snowflake's exact SHOW column list against current
 docs; then either land the Plan 05 probe or record the divergence as accepted.)*
 
-### PAR-3 — MEDIUM: cross-table column references in member expressions unsupported and undocumented
+### PAR-3 — MEDIUM: cross-table column references in member expressions unsupported and undocumented — RECORDED 2026-08-05 (TECH-DEBT #52), premise partly refuted
 
 `src/expand/join_resolver.rs:267-318`. Required joins are collected exclusively from each member's
 declared `source_table` — never by scanning expression text for foreign aliases. Named *facts*
@@ -490,11 +499,50 @@ tables. The docs gesture at the rule ("each fact references columns from its own
 entry. **Undocumented divergence — record it (or implement it).** *(Verify the precise Snowflake
 cross-table-reference rule.)*
 
-### PAR-4 — LOW: `PRIVATE` rejected on dimensions, presented as fact rather than as a divergence
+**Verification result (2026-08-05): the rule is at parity; only its enforcement point differs.**
+Snowflake's validation rules say "Expressions cannot refer to base table columns from other tables
+or expressions from unrelated logical tables" — so a raw foreign column is rejected there too, not
+permitted as this finding assumed. Snowflake rejects it at CREATE; here the CREATE succeeds
+(confirmed by running the CREATE funnel's validator set over a body-parsed definition) and the
+member fails at query time as a DuckDB unknown-alias binder error, since `join_resolver` collects
+joins from `source_table` alone. No wrong numbers — the alias is qualified, so nothing binds.
+Recorded as TECH-DEBT #52 with the CREATE-time validator as the finish line, documented in
+`how-to/facts.rst` and `snowflake-comparison.rst`, and pinned by
+`par3_cross_table_column_reference_pulls_no_join`.
+
+### PAR-4 — LOW: `PRIVATE` rejected on dimensions, presented as fact rather than as a divergence — NOT A DIVERGENCE, closed 2026-08-05
 
 `snowflake-comparison.rst:63-65`; rejection in `body_parser/entries.rs`. Snowflake's grammar allows
 `PRIVATE` on facts, dimensions, and metrics; here it is allowed only on facts/metrics. Documented,
 but with no rationale and no TECH-DEBT entry. *(Verify current Snowflake docs.)*
+
+**Verification result: the finding's premise is wrong.** `CREATE SEMANTIC VIEW` does list
+`{ PRIVATE | PUBLIC }` in the `dimensionExpression` grammar, which is what the finding read, but
+the prose immediately restricts it: "You cannot mark a dimension as private. Dimensions are always
+public." Rejecting `PRIVATE` on a dimension is therefore **parity**, not a narrowing, and needs no
+TECH-DEBT entry. The comparison-table row now states the Snowflake rule alongside ours instead of
+listing our behaviour as a difference, and TECH-DEBT #47's "see PAR-4 for that divergence" pointer
+is corrected. A lesson for the audit method rather than for the code: reading a grammar block
+without its prose produced a divergence that does not exist — the mirror image of PAR-1, where
+reading a stale doc comment instead of the code produced the same kind of error.
+
+### PAR-6 — NEW (2026-08-05), MEDIUM: a metric referencing a named fact on another table inlines the fact but never joins its table
+
+Found while verifying PAR-3, and **not** something this review caught the first time — PAR-3's own
+text records cross-table named-fact references as working, citing `src/expand/facts.rs:168-195`.
+That citation covers the inlining, which does work. The join does not: `join_resolver` collects
+aliases from each member's declared `source_table` and, on the facts path, from *queried* facts —
+never from a fact a metric merely references. So `o.mixed_margin AS SUM(o.amount - c.cust_discount)`
+expands to `SUM(o.amount - (c.discount)) FROM "orders" AS "o"` with `customers` absent, and DuckDB
+raises an unknown-alias error at query time.
+
+This is the form Snowflake documents as *the* way to cross tables ("define facts on source tables,
+and finally refer to these expressions from connected logical tables"), and the workaround PAR-3
+would otherwise point users at. Fully DDL-reachable; loud rather than silent. Filed as TECH-DEBT
+#53 and pinned by `par6_cross_table_fact_reference_inlines_but_pulls_no_join`, which asserts the
+broken output so the defect shows in CI. Not fixed in the pass that found it: teaching
+`join_resolver` about referenced facts turns a query-time error into a returned number, which needs
+the fan-trap fence to see the referenced fact's grain and needs numeric-oracle coverage.
 
 ### PAR-5 — documented residual: window metrics whose inner aggregates sit at different grains still error
 
@@ -836,6 +884,10 @@ Status as of 2026-08-04. ✅ = landed on `main`; ⏳ = in review; ❌ = withdraw
    substitution is now per component, and `decompose` declines a source-less aggregate dependency.
    It stands alone as expected, but *not* for the anticipated reason: it needs no numeric-oracle
    work, because the shape is unreachable through DDL and the fix restores an error rather than
-   changing a number. Still open: PAR-2/3/4 + PARSE-3 (divergences to document or implement).
+   changing a number. ✅ **PAR-2/3/4 + PARSE-3** — the parity pass (2026-08-05). PARSE-3 fixed by
+   keeping `LIMIT 0` and correcting the message; PAR-2 and PAR-3 recorded as TECH-DEBT #51/#52 with
+   the docs they had drifted from corrected; **PAR-4 closed as not-a-divergence** — Snowflake also
+   forbids `PRIVATE` on dimensions. Verifying PAR-3 turned up **PAR-6** (TECH-DEBT #53), a real
+   defect on the supported cross-table path, filed rather than fixed.
 6. Structural debt as capacity allows: ARCH-6 (crate-level `QuoteState`), ARCH-7 (`expand()`
    planner), ARCH-8/9/10/11/12, TC-1, TC-2, TC-3, TC-4, CI-6.

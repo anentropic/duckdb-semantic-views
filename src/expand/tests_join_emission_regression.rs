@@ -225,3 +225,123 @@ fn sg12_role_playing_scoped_alias_format_preserved() {
         "ON clause must use the scoped alias on the PK side: {sql}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PAR-3: joins come from declared `source_table`, never from scanning an
+// expression for foreign aliases
+// ---------------------------------------------------------------------------
+
+/// PAR-3 (code-review 2026-08-03), **pinning a documented limitation — see
+/// TECH-DEBT #52**, not behaviour to preserve.
+///
+/// A member expression may reference base-table columns of its own logical
+/// table only; a raw column of *another* logical table (`c.discount` on a
+/// metric declared `source_table = o`) is not a supported reference. Snowflake
+/// rejects the same shape — "Expressions cannot refer to base table columns
+/// from other tables" — but rejects it at CREATE time, while here the DDL is
+/// accepted and the expression is emitted verbatim, pulling no join for `c`.
+/// DuckDB then raises a binder error for the unknown alias at query time.
+///
+/// The number is never wrong: `c` is alias-qualified, so with no `c` in scope
+/// the query cannot bind, and the failure is loud. What is missing is the
+/// CREATE-time validation that would name the real problem. TECH-DEBT #52
+/// records that; this test exists so the interim behaviour is visible rather
+/// than merely absent, and must be *replaced* — not deleted — when the
+/// validator lands.
+#[test]
+fn par3_cross_table_column_reference_pulls_no_join() {
+    let def = SemanticViewDefinition::default()
+        .with_table("o", "orders", &["id"])
+        .with_table("c", "customers", &["id"])
+        .with_dimension("order_status", "o.status", Some("o"))
+        .with_metric("mixed_margin", "SUM(o.amount - c.discount)", Some("o"))
+        .with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"]);
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![DimensionName::new("order_status")],
+        metrics: vec![MetricName::new("mixed_margin")],
+    };
+    let sql = expand("test", &def, &req).expect("the DDL and the query are both accepted today");
+    assert!(
+        !sql.contains("customers"),
+        "the `c.discount` reference must not pull a join — joins come from \
+         `source_table` alone (TECH-DEBT #52): {sql}"
+    );
+    assert!(
+        sql.contains("SUM(o.amount - c.discount)"),
+        "the expression is emitted verbatim, leaving `c` unbound: {sql}"
+    );
+}
+
+/// PAR-6 (found while verifying PAR-3), **pinning a defect — see TECH-DEBT
+/// #53.** The *named-fact* cross-table form is the one Snowflake supports
+/// ("define facts on source tables, then refer to these expressions from
+/// connected logical tables") and the one this codebase built deliberately:
+/// `fact_replacement_map` keys each fact by its own `source_table.name` so
+/// that "a fact referenced across tables in its own-qualified form is then
+/// actually inlined, not just detected".
+///
+/// The inlining half works. The join half does not: `join_resolver` collects
+/// aliases from each member's declared `source_table` and from *queried* facts
+/// (`fact_source_tables`), never from facts a metric merely references. So
+/// `c.discount` is spliced into a metric on `o` and `customers` is still not
+/// joined — the same unbindable SQL as the raw-column case above, on the path
+/// documented as the workaround for it.
+///
+/// This test pins the broken output rather than the intended one so the defect
+/// is visible in CI. Replace it — do not delete it — when #53 is fixed; the
+/// assertions then become `LEFT JOIN "customers" AS "c"` and a fan-trap check
+/// for a fact on a fanning table.
+#[test]
+fn par6_cross_table_fact_reference_inlines_but_pulls_no_join() {
+    let def = SemanticViewDefinition::default()
+        .with_table("o", "orders", &["id"])
+        .with_table("c", "customers", &["id"])
+        .with_fact("cust_discount", "c.discount", "c")
+        .with_dimension("order_status", "o.status", Some("o"))
+        .with_metric("mixed_margin", "SUM(o.amount - c.cust_discount)", Some("o"))
+        .with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"]);
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![DimensionName::new("order_status")],
+        metrics: vec![MetricName::new("mixed_margin")],
+    };
+    let sql = expand("test", &def, &req).expect("the DDL and the query are both accepted today");
+    assert!(
+        sql.contains("(c.discount)"),
+        "the referenced fact must be inlined at its reference site: {sql}"
+    );
+    assert!(
+        !sql.contains("LEFT JOIN"),
+        "TECH-DEBT #53: the fact's own table is not joined, so the emitted SQL \
+         cannot bind. This assertion pins the defect and must be inverted when \
+         #53 is fixed: {sql}"
+    );
+}
+
+/// The form that *does* work today, and therefore the only cross-table
+/// workaround worth documenting: query the fact directly. `fact_source_tables`
+/// feeds `join_resolver`, so the fact's table is joined. Pinned next to #53 so
+/// that a regression here would not leave the limitation without any escape.
+#[test]
+fn queried_cross_table_fact_pulls_its_join() {
+    let def = SemanticViewDefinition::default()
+        .with_table("o", "orders", &["id"])
+        .with_table("c", "customers", &["id"])
+        .with_fact("cust_discount", "c.discount", "c")
+        .with_dimension("order_status", "o.status", Some("o"))
+        .with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"]);
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![FactName::new("cust_discount")],
+        dimensions: vec![DimensionName::new("order_status")],
+        metrics: vec![],
+    };
+    let sql = expand("test", &def, &req).expect("a queried cross-table fact is supported");
+    assert!(
+        sql.contains("LEFT JOIN \"customers\" AS \"c\""),
+        "a queried fact must pull its own table's join: {sql}"
+    );
+}
