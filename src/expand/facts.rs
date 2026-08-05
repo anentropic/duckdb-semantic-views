@@ -739,6 +739,122 @@ mod tests {
         }
     }
 
+    fn make_fact_on(name: &str, expr: &str, source_table: Option<&str>) -> Fact {
+        Fact {
+            name: name.to_string(),
+            expr: expr.to_string(),
+            source_table: source_table.map(std::string::ToString::to_string),
+            output_type: None,
+            comment: None,
+            synonyms: vec![],
+            is_filter: false,
+            access: AccessModifier::Public,
+        }
+    }
+
+    /// PAR-6: the reference has to be *own-qualified* to count. `c.discount`
+    /// names a column on `c`; `c.cust_discount` names the fact `cust_discount`
+    /// declared on `c`. Only the latter reaches the fact — and reaching it is
+    /// what puts `c` in the join set.
+    #[test]
+    fn referenced_facts_finds_an_own_qualified_cross_table_reference() {
+        let facts = vec![make_fact_on("cust_discount", "c.discount", Some("c"))];
+        assert_eq!(
+            collect_referenced_facts("SUM(o.amount - c.cust_discount)", &facts),
+            vec![("cust_discount".to_string(), "c".to_string())]
+        );
+    }
+
+    /// A bare reference resolves too — the same rule `toposort_facts` and
+    /// `inline_facts` apply, so the join set cannot disagree with what was
+    /// actually inlined.
+    #[test]
+    fn referenced_facts_finds_a_bare_reference() {
+        let facts = vec![make_fact_on("cust_discount", "c.discount", Some("c"))];
+        assert_eq!(
+            collect_referenced_facts("SUM(o.amount - cust_discount)", &facts),
+            vec![("cust_discount".to_string(), "c".to_string())]
+        );
+    }
+
+    /// A *foreign* qualifier is a column on another relation, not a fact
+    /// reference (E-3) — so it must not drag that table into the join set.
+    #[test]
+    fn referenced_facts_ignores_a_foreign_qualified_name() {
+        let facts = vec![make_fact_on("discount", "c.raw_discount", Some("c"))];
+        assert!(
+            collect_referenced_facts("SUM(o.amount - x.discount)", &facts).is_empty(),
+            "x.discount is a column on x, not the fact `discount` declared on c"
+        );
+    }
+
+    /// Facts chain, so the walk is transitive: reaching `a` on `t1` through
+    /// `b` on `t2` has to put BOTH tables in the set, or whichever expression
+    /// got inlined second names an alias that is not in scope.
+    #[test]
+    fn referenced_facts_walks_transitively() {
+        let facts = vec![
+            make_fact_on("outer", "t1.x + t2.middle", Some("t1")),
+            make_fact_on("middle", "t2.y", Some("t2")),
+        ];
+        let reached = collect_referenced_facts("SUM(t0.v - t1.outer)", &facts);
+        assert_eq!(
+            reached,
+            vec![
+                ("outer".to_string(), "t1".to_string()),
+                ("middle".to_string(), "t2".to_string()),
+            ]
+        );
+    }
+
+    /// A fact that declares no source table contributes no join: it resolves
+    /// against the host expression's own scope. It is still walked through, so
+    /// a table reached *beyond* it is not lost.
+    #[test]
+    fn referenced_facts_skips_a_source_less_fact_but_walks_through_it() {
+        let facts = vec![
+            make_fact_on("plain", "raw + u.parent", None),
+            make_fact_on("parent", "u.w", Some("u")),
+        ];
+        assert_eq!(
+            collect_referenced_facts("SUM(plain)", &facts),
+            vec![("parent".to_string(), "u".to_string())]
+        );
+    }
+
+    /// `validate_facts` rejects a cycle at CREATE, but the expander must not
+    /// hang if one ever reaches it — `seen` bounds the walk.
+    #[test]
+    fn referenced_facts_terminates_on_a_cycle() {
+        let facts = vec![
+            make_fact_on("a", "t1.x + t2.b", Some("t1")),
+            make_fact_on("b", "t2.y + t1.a", Some("t2")),
+        ];
+        assert_eq!(
+            collect_referenced_facts("SUM(t1.a)", &facts),
+            vec![
+                ("a".to_string(), "t1".to_string()),
+                ("b".to_string(), "t2".to_string()),
+            ],
+            "both tables reached, and the walk back into `a` stops rather than looping"
+        );
+    }
+
+    /// Two facts on the SAME table collapse to one join: the set is keyed by
+    /// alias, because joining a table twice for two references would be wrong,
+    /// not merely redundant.
+    #[test]
+    fn referenced_facts_dedupes_two_facts_on_one_table() {
+        let facts = vec![
+            make_fact_on("lo", "c.floor", Some("c")),
+            make_fact_on("hi", "c.ceiling", Some("c")),
+        ];
+        assert_eq!(
+            collect_referenced_fact_tables("SUM(o.v - c.lo + c.hi)", &facts),
+            vec!["c".to_string()]
+        );
+    }
+
     #[test]
     fn toposort_derived_detects_cycle() {
         let met_a = make_metric("a", "b + 1", None);

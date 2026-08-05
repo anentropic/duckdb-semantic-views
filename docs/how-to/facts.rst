@@ -127,12 +127,67 @@ The facts are still scoped to ``li`` (line_items), but the dimensions come from 
    as TECH-DEBT #52.
 
    Referencing a *named fact* declared on another table is Snowflake's supported
-   way to cross tables, and it is accepted here -- but its table is currently
-   not joined either, so it fails the same way (TECH-DEBT #53). Until that is
-   fixed, cross-table facts work when :ref:`queried directly
-   <howto-facts-query>` (``facts := ['...']``), which does pull the join.
-   Composing *metrics* across tables (``m AS t1.metric_a + t2.metric_b``) is
-   unaffected and fully supported.
+   way to cross tables, and it **is** supported here -- see
+   :ref:`howto-facts-cross-table` below. Composing *metrics* across tables
+   (``m AS t1.metric_a + t2.metric_b``) is likewise fully supported. It is only
+   the raw foreign *column* that has no join behind it.
+
+
+.. _howto-facts-cross-table:
+
+Reference a Fact on Another Table
+=================================
+
+.. versionadded:: 0.12.0
+
+A member expression may reference a **named fact declared on another logical
+table**, provided a relationship connects them. This is Snowflake's documented
+way to cross tables, and the only one: define the fact where its columns live,
+then refer to it from the connected table.
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW order_margin AS
+     TABLES (
+       o AS orders PRIMARY KEY (id),
+       c AS customers PRIMARY KEY (id)
+     )
+     RELATIONSHIPS (
+       o_to_c AS o(customer_id) REFERENCES c(id)
+     )
+     FACTS (
+       c.cust_discount AS c.discount
+     )
+     METRICS (
+       o.net_total AS SUM(o.amount - c.cust_discount)
+     );
+
+The fact's expression is inlined at the reference site and its table is joined
+for you, so ``net_total`` computes over ``orders LEFT JOIN customers``. The
+reference must be to the fact **by name** -- bare (``cust_discount``) or
+qualified by the fact's own table (``c.cust_discount``). A qualifier naming any
+other relation is read as a raw column of that relation, which is the
+unsupported form in the warning above.
+
+.. warning::
+
+   **The fact's table must not fan the member's.** Reaching a fact requires
+   joining its table, and if that join multiplies the member's rows -- a fact
+   on a *child* table, reached across a one-to-many edge -- the aggregate would
+   count each row once per child. There is no correct number to return, so the
+   query is rejected:
+
+   .. code-block:: text
+
+      semantic view 'v': fan trap detected -- 'bad_margin' (table 'o')
+      references the fact 'item_cost' on table 'li', and relationship 'li_to_o'
+      fans out on the way there, so joining it would multiply 'bad_margin's
+      rows. Reference a fact on a table reachable without fanning out, or
+      define the fact on 'o'.
+
+   Facts on the *parent* side (many-to-one, one row per member row) join safely
+   and are the usual case -- a customer's discount, a product's list price, a
+   region's tax rate.
 
 
 .. _howto-facts-query:

@@ -1,0 +1,176 @@
+# PAR-6 (code review 2026-08-03, TECH-DEBT #53) — a member's expression
+# referencing a named fact declared on ANOTHER logical table, end to end.
+#
+# This is the form Snowflake documents as the way to cross tables ("define
+# facts on source tables, then refer to these expressions from connected
+# logical tables"), and the one `fact_replacement_map` was deliberately built
+# for: it keys each fact by its own `source_table.name` so the cross-table
+# reference resolves and is inlined at its reference site.
+#
+# Only that half was wired up. `join_resolver` collected aliases from each
+# member's declared `source_table` and from QUERIED facts, never from facts a
+# metric merely references -- so the fact's expression was spliced in while its
+# table stayed out of the FROM clause, and DuckDB reported an unknown alias.
+#
+# Joining that table turns a bind error into a returned NUMBER, so these cases
+# pin the numbers, not just that the query runs.
+#
+# The fact deliberately lives on `p`, a table NO queried dimension names. An
+# earlier draft of this file grouped by a dimension on the fact's own table,
+# which pulled the join incidentally and left cases 1 and 3 passing against the
+# unfixed code -- green for a reason that had nothing to do with the fix. Each
+# case below was confirmed red individually at the pre-fix commit (per
+# CLAUDE.md: the runner stops a file at its first failing statement, so the set
+# was verified by reverting the fix and running one case per file). Case 4 is a
+# control and is green on both sides, which is noted where it sits.
+
+require semantic_views
+
+# ============================================================
+# Setup: orders on the FK side of BOTH parents. The markup lives
+# on the product, the discount on the customer; the margin metric
+# lives on the order and reaches across to the product for it.
+# ============================================================
+
+statement ok
+CREATE TABLE par6_customers (id INTEGER, region VARCHAR, discount DECIMAL(10,2));
+
+statement ok
+CREATE TABLE par6_products (id INTEGER, markup DECIMAL(10,2));
+
+statement ok
+CREATE TABLE par6_orders (id INTEGER, customer_id INTEGER, product_id INTEGER, amount DECIMAL(10,2));
+
+statement ok
+INSERT INTO par6_customers VALUES (1, 'EU', 5.00), (2, 'US', 2.00);
+
+statement ok
+INSERT INTO par6_products VALUES (100, 7.00), (200, 1.00);
+
+statement ok
+INSERT INTO par6_orders VALUES (10, 1, 100, 100.00), (11, 1, 200, 50.00), (12, 2, 100, 30.00);
+
+statement ok
+CREATE SEMANTIC VIEW par6_margin AS
+  TABLES (
+    o AS par6_orders PRIMARY KEY (id),
+    c AS par6_customers PRIMARY KEY (id),
+    p AS par6_products PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    o_to_c AS o(customer_id) REFERENCES c(id),
+    o_to_p AS o(product_id) REFERENCES p(id)
+  )
+  FACTS (
+    p.prod_markup AS p.markup
+  )
+  DIMENSIONS (
+    c.region AS c.region,
+    o.order_id AS o.id
+  )
+  METRICS (
+    o.net_total AS SUM(o.amount - p.prod_markup),
+    c.total_discount AS SUM(c.discount)
+  );
+
+# Case 1: the cross-table reference. `region` is on `c`, so nothing in the
+# query names `p` -- the join for it comes from the metric's fact reference
+# alone. Before the fix: "Referenced table "p" not found".
+#   EU: (100.00 - 7.00) + (50.00 - 1.00) = 142.00
+#   US: (30.00 - 7.00)                   =  23.00
+query TT
+SELECT region, net_total
+FROM semantic_view('par6_margin', metrics := ['net_total'], dimensions := ['region'])
+ORDER BY region;
+----
+EU	142.00
+US	23.00
+
+# Case 2: the same metric with no dimension at all -- one row, the whole total.
+# 142.00 + 23.00 = 165.00.
+query T
+SELECT net_total FROM semantic_view('par6_margin', metrics := ['net_total']);
+----
+165.00
+
+# Case 3: the PER-GRAIN topology. `total_discount` aggregates at the customer's
+# own grain and `net_total` at the order's, so the plan emits one CTE per grain
+# and joins them -- and the grain CTE computing `net_total` has to join `p` for
+# itself. The base-anchored fix alone left this path emitting an unbindable
+# alias; the star-schema differential proptest is what surfaced it.
+#   EU: net 142.00, discount 5.00 (ONE customer, counted once -- not once per order)
+#   US: net  23.00, discount 2.00
+query TTT
+SELECT region, net_total, total_discount
+FROM semantic_view('par6_margin', metrics := ['net_total', 'total_discount'], dimensions := ['region'])
+ORDER BY region;
+----
+EU	142.00	5.00
+US	23.00	2.00
+
+# Case 4 (CONTROL -- green before the fix as well as after): querying the fact
+# directly was the one cross-table form that already worked, because
+# `fact_source_tables` fed the resolver. It must keep working: the fix must not
+# have replaced one collection path with another. A fact query is row-level, so
+# this is one row per ORDER, each carrying its product's markup. Grouped by a
+# dimension on `o` rather than on `c`: a fact query naming `p` alongside a
+# dimension on `c` is rejected by `validate_fact_table_path` (two siblings, each
+# reachable only through `o`), which is pre-existing behaviour and a different
+# rule from the one under test here.
+query TT
+SELECT order_id, prod_markup
+FROM semantic_view('par6_margin', facts := ['prod_markup'], dimensions := ['order_id'])
+ORDER BY order_id;
+----
+10	7.00
+11	1.00
+12	7.00
+
+# ============================================================
+# The fanning direction: the fact sits on a CHILD table, so
+# joining it multiplies the metric's rows.
+# ============================================================
+
+statement ok
+CREATE TABLE par6_line_items (id INTEGER, order_id INTEGER, cost DECIMAL(10,2));
+
+statement ok
+INSERT INTO par6_line_items VALUES (100, 10, 7.00), (101, 10, 3.00);
+
+statement ok
+CREATE SEMANTIC VIEW par6_fanning AS
+  TABLES (
+    o AS par6_orders PRIMARY KEY (id),
+    li AS par6_line_items PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_o AS li(order_id) REFERENCES o(id)
+  )
+  FACTS (
+    li.item_cost AS li.cost
+  )
+  DIMENSIONS (
+    o.order_id AS o.id
+  )
+  METRICS (
+    o.bad_margin AS SUM(o.amount - li.item_cost)
+  );
+
+# Case 5: order 10 has two line items, so the join duplicates its row and
+# `SUM(o.amount - ...)` would count the order's 100.00 twice. There is no
+# correct number to return, so the fence rejects it. Before PAR-6 this raised
+# no error only because the join was missing entirely -- fixing the join
+# without the fence would have turned a bind error into a silent wrong number,
+# which is the failure this project fences hardest against.
+statement error
+SELECT * FROM semantic_view('par6_fanning', metrics := ['bad_margin'], dimensions := ['order_id']);
+----
+fan trap detected
+
+# Case 6 (control): the message has to name the fact and the fanning
+# relationship, not just report "a" fan trap -- the user's next move is to move
+# the fact or pick another one.
+statement error
+SELECT * FROM semantic_view('par6_fanning', metrics := ['bad_margin']);
+----
+item_cost
