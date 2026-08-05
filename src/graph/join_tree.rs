@@ -272,8 +272,10 @@ mod tests {
         );
 
         // The walk from a node whose chain never reaches a given ancestor is
-        // the shape that looped forever: `ancestors_to_root` covers it above,
-        // and the end-to-end guard is
-        // `expand::tests_fan_trap::cyclic_relationships_do_not_hang_expand`.
+        // the shape that looped forever, and `ancestors_to_root` covers it
+        // above. This test is now the ONLY guard on that termination: EXP-15
+        // made `build_relationship_graph` reject cyclic definitions, so
+        // `expand::tests_fan_trap::cyclic_relationships_are_rejected_by_expand`
+        // errors at the fence and no longer reaches these walks.
     }
 }

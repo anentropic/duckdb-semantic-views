@@ -324,6 +324,21 @@ pub(super) fn check_fan_traps(
 /// fan-trap check passes vacuously. Reject such definitions up front so an
 /// un-upgradeable legacy row (which the `init_catalog` upgrade pass leaves at
 /// `schema_version` 0) fails loudly here instead of under-checking.
+///
+/// EXP-15 (code review 2026-08-04): the same reasoning applied once more, to
+/// CYCLES. Cycle detection is a CREATE-time check — `graph::validate_graph` runs
+/// `toposort` — that this query-time rebuild never repeated;
+/// `RelationshipGraph::from_definition` rejects only self-references. A stored
+/// cyclic definition (parser-reachable, per #141/d48abee, which proved the shape
+/// reaches `expand`) therefore arrived at [`fanning_edge_on_path`] intact, and
+/// that function tests the FORWARD key `(a, b)` first and declares the hop safe
+/// on finding it — never looking at the reverse `ManyToOne` edge `(b, a)` that
+/// fans. The definition passed the fence.
+///
+/// d48abee fixed the resulting hang and deliberately left the Ok/Err outcome
+/// unspecified. This specifies it: a cycle asserts "many `a` per `b`" and "many
+/// `b` per `a`" at once, which is not a topology with a correct answer, so the
+/// fence declines to certify rather than picking a direction.
 fn build_relationship_graph(
     view_name: &str,
     def: &SemanticViewDefinition,
@@ -336,12 +351,15 @@ fn build_relationship_graph(
                 .to_string(),
         });
     }
-    crate::graph::RelationshipGraph::from_definition(def).map_err(|reason| {
-        ExpandError::UncheckableDefinition {
-            view_name: view_name.to_string(),
-            reason,
-        }
-    })
+    let uncheckable = |reason: String| ExpandError::UncheckableDefinition {
+        view_name: view_name.to_string(),
+        reason,
+    };
+    let graph = crate::graph::RelationshipGraph::from_definition(def).map_err(&uncheckable)?;
+    // EXP-15: re-run the CREATE-time cycle check. `toposort`'s error names the
+    // cycle path, which is what makes the message actionable.
+    graph.toposort().map_err(&uncheckable)?;
+    Ok(graph)
 }
 
 /// Build the cardinality map keyed by `(from_lower, to_lower)`.
@@ -558,6 +576,24 @@ fn find_path(
 /// (many rows -> one row: safe). Traversing when the stored edge is `(b, a)`
 /// goes from the PK side to the FK side, which multiplies rows when the edge
 /// is `ManyToOne`. `OneToOne` edges are safe in both directions.
+///
+/// **Precondition: the graph is acyclic.** The forward key is tested first and
+/// wins, so if BOTH `(a, b)` and `(b, a)` are present this reports the hop safe
+/// on the strength of the forward edge alone. That pair of edges is a two-cycle,
+/// and no cyclic definition survives to a *verdict*: both fence entry points
+/// ([`check_fan_traps`], [`validate_fact_table_path`]) build the graph via
+/// [`build_relationship_graph`], which rejects cycles outright (EXP-15).
+///
+/// [`GrainGraph`] is the one caller that does not — it builds from
+/// `RelationshipGraph::from_definition` directly, so the per-grain PLANNER can
+/// ask a cyclic graph for a fan verdict and get this optimistic answer. That is
+/// contained: `sql_gen` runs [`check_fan_traps`] before handing off to
+/// `expand_per_grain`, so the routing decision is discarded and the query errors
+/// before any SQL is emitted.
+///
+/// Deliberately not "fixed" by also testing the reverse key — mutually
+/// contradictory cardinalities have no correct fan verdict to return, so the
+/// answer is to decline the definition upstream, not to invent a direction here.
 fn fanning_edge_on_path(path: &[String], card_map: &CardMap) -> Option<String> {
     for window in path.windows(2) {
         let a = &window[0];
@@ -1366,6 +1402,79 @@ mod tests {
             }
             other => panic!("Expected UncheckableDefinition, got: {other:?}"),
         }
+    }
+
+    /// EXP-15 (code review 2026-08-04): cycle detection is a CREATE-time check
+    /// (`graph::validate_graph` runs `toposort`), and the query-time fence never
+    /// repeated it — `RelationshipGraph::from_definition` rejects only
+    /// self-references. A stored two-cycle therefore reached
+    /// `fanning_edge_on_path`, which tests the FORWARD key `(a, b)` first and
+    /// declares the hop safe on finding it, never looking at the reverse
+    /// `ManyToOne` edge `(b, a)` that fans. The pair passed the fence.
+    ///
+    /// Two mutually-referencing `ManyToOne` joins are not a topology with a
+    /// right answer — they assert "many a per b" and "many b per a" at once —
+    /// so the fence must decline to certify rather than pick a direction.
+    #[test]
+    fn test_check_fan_traps_cyclic_definition_errors() {
+        // o -> c AND c -> o, both ManyToOne (the `with_pkfk_join` default).
+        let def = minimal_def("o", "region", "region", "total", "sum(o.amount)")
+            .clear_dimensions()
+            .with_table("c", "customers", &["id"])
+            .with_dimension("region", "c.region", Some("c"))
+            .with_pkfk_join("o_c", "o", "c", &["customer_id"], &["id"])
+            .with_pkfk_join("c_o", "c", "o", &["primary_order_id"], &["id"]);
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        match check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false) {
+            Err(ExpandError::UncheckableDefinition { view_name, reason }) => {
+                assert_eq!(view_name, "test");
+                assert!(
+                    reason.contains("cycle"),
+                    "reason should name the cycle: {reason}"
+                );
+            }
+            other => panic!("Expected UncheckableDefinition, got: {other:?}"),
+        }
+    }
+
+    /// EXP-15, second entry point: the fact-path validator builds the same graph
+    /// and must decline the same definition. Separate test so the two report
+    /// independently rather than the first failure masking the second.
+    #[test]
+    fn test_validate_fact_table_path_cyclic_definition_errors() {
+        let def = minimal_def("o", "region", "region", "total", "sum(o.amount)")
+            .with_table("c", "customers", &["id"])
+            .with_pkfk_join("o_c", "o", "c", &["customer_id"], &["id"])
+            .with_pkfk_join("c_o", "c", "o", &["primary_order_id"], &["id"]);
+        let result = validate_fact_table_path("test", &def, &["o".to_string()], &["c".to_string()]);
+        match result {
+            Err(ExpandError::UncheckableDefinition { reason, .. }) => {
+                assert!(
+                    reason.contains("cycle"),
+                    "reason should name the cycle: {reason}"
+                );
+            }
+            other => panic!("Expected UncheckableDefinition, got: {other:?}"),
+        }
+    }
+
+    /// EXP-15 control: an ordinary ACYCLIC two-table definition must still be
+    /// certified. Guards the cycle check against over-rejection — a check that
+    /// refuses everything would make the two tests above pass vacuously.
+    #[test]
+    fn test_check_fan_traps_acyclic_definition_still_allowed() {
+        let def = minimal_def("o", "region", "region", "total", "sum(o.amount)")
+            .clear_dimensions()
+            .with_table("c", "customers", &["id"])
+            .with_dimension("region", "c.region", Some("c"))
+            .with_pkfk_join("o_c", "o", "c", &["customer_id"], &["id"]);
+        let resolved_dims: Vec<&_> = def.dimensions.iter().collect();
+        let resolved_mets: Vec<&_> = def.metrics.iter().collect();
+        assert!(
+            check_fan_traps("test", &def, &resolved_dims, &resolved_mets, false).is_ok(),
+            "an acyclic o -> c definition must remain checkable"
+        );
     }
 
     /// SG-16: two named relationships between the same table pair with
