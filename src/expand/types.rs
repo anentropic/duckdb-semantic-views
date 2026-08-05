@@ -319,6 +319,19 @@ pub struct FanTrapError {
     pub relationship_name: String,
 }
 
+/// Detail payload for [`ExpandError::ReferencedFactFanTrap`], boxed for the
+/// same reason as its two neighbours (R-9): six `String` fields would put
+/// `ExpandError` over clippy's `result_large_err` threshold on their own.
+#[derive(Debug)]
+pub struct ReferencedFactFanTrapError {
+    pub view_name: String,
+    pub member_name: String,
+    pub member_table: String,
+    pub fact_name: String,
+    pub fact_table: String,
+    pub relationship_name: String,
+}
+
 /// Detail payload for [`ExpandError::MetricFanTrap`], boxed so the enum stays
 /// small (R-9, code-review 2026-07-11 — the other fat variant).
 #[derive(Debug)]
@@ -466,6 +479,16 @@ pub enum ExpandError {
         member_name: String,
         member_table: String,
         relationship_name: String,
+    },
+    /// A member's expression references a named fact declared on a table that
+    /// **fans** relative to the member's own. Reaching the fact requires
+    /// joining its table, and that join multiplies the member's rows — for a
+    /// metric that inflates the aggregate, for a dimension it duplicates the
+    /// output rows. PAR-6 / TECH-DEBT #53: before the referenced fact's table
+    /// was joined at all, this shape failed as a `DuckDB` unknown-alias error, so
+    /// no query is losing an answer it used to get.
+    ReferencedFactFanTrap {
+        detail: Box<ReferencedFactFanTrapError>,
     },
     /// Window function metrics cannot be mixed with aggregate metrics.
     WindowAggregateMixing {
@@ -812,6 +835,25 @@ impl fmt::Display for ExpandError {
                      relationship '{relationship_name}' fans out along the way, so metric \
                      '{metric_name}' would be aggregated over multiplied rows. Filter on a \
                      member reachable from the metric's table without fanning out."
+                )
+            }
+            Self::ReferencedFactFanTrap { detail } => {
+                let ReferencedFactFanTrapError {
+                    view_name,
+                    member_name,
+                    member_table,
+                    fact_name,
+                    fact_table,
+                    relationship_name,
+                } = &**detail;
+                write!(
+                    f,
+                    "semantic view '{view_name}': fan trap detected -- '{member_name}' (table \
+                     '{member_table}') references the fact '{fact_name}' on table \
+                     '{fact_table}', and relationship '{relationship_name}' fans out on the way \
+                     there, so joining it would multiply '{member_name}'s rows. Reference a fact \
+                     on a table reachable without fanning out, or define the fact on \
+                     '{member_table}'."
                 )
             }
             Self::WindowAggregateMixing {

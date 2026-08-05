@@ -3,7 +3,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::graph::RelationshipGraph;
 use crate::model::{Join, SemanticViewDefinition, TableRef};
 
-use super::facts::{collect_derived_metric_source_tables, collect_derived_metric_using};
+use super::facts::{
+    collect_derived_metric_source_tables, collect_derived_metric_using,
+    collect_referenced_fact_tables, collect_transitive_metric_names,
+};
 use super::resolution::{qualify_and_quote_table_ref, quote_ident};
 
 /// Build a role-playing scoped alias in the documented `{table}__{rel}` format.
@@ -303,6 +306,41 @@ pub(super) fn resolve_joins_pkfk<'a>(
                 let alias = st.to_ascii_lowercase();
                 if alias != *root {
                     needed.insert(alias);
+                }
+            }
+        }
+    }
+
+    // PAR-6 (TECH-DEBT #53): a member's *expression* may reference a fact
+    // declared on another logical table — Snowflake's supported way to cross
+    // tables. `inline_facts` splices that fact's expression in at the reference
+    // site, so its table has to be joined too or the emitted SQL names an alias
+    // that is not in scope. Collected from the expression rather than from
+    // `source_table`, which by construction only ever names the member's own
+    // table.
+    let add_referenced_fact_tables = |expr: &str, needed: &mut HashSet<String>| {
+        for alias in collect_referenced_fact_tables(expr, &def.facts) {
+            if alias != *root && !role_playing_bare_aliases.contains(&alias) {
+                needed.insert(alias);
+            }
+        }
+    };
+    for dim in resolved_dims {
+        add_referenced_fact_tables(&dim.expr, &mut needed);
+    }
+    for met in resolved_mets {
+        add_referenced_fact_tables(&met.expr, &mut needed);
+        // A derived metric's own expression names metrics, not facts; the fact
+        // references live in the base metrics it resolves to, whose expressions
+        // are inlined into it before the facts pass runs.
+        if met.source_table.is_none() {
+            for name in collect_transitive_metric_names(met, &def.metrics) {
+                if let Some(base) = def
+                    .metrics
+                    .iter()
+                    .find(|m| crate::ident::normalize_ident_part(&m.name) == name)
+                {
+                    add_referenced_fact_tables(&base.expr, &mut needed);
                 }
             }
         }

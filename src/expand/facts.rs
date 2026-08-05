@@ -126,6 +126,65 @@ pub(super) fn toposort_facts(facts: &[Fact]) -> Result<Vec<usize>, String> {
     Ok(order)
 }
 
+/// The `source_table` aliases of every fact `expr` references, transitively.
+///
+/// PAR-6 (code-review 2026-08-03, TECH-DEBT #53). [`inline_facts`] splices a
+/// referenced fact's expression into the host expression wherever it appears,
+/// including a fact declared on *another* logical table —
+/// [`fact_replacement_map`] keys each fact by its own `source_table.name`
+/// precisely so that cross-table reference resolves. Nothing told
+/// `join_resolver` about it, so the spliced expression named an alias that was
+/// never joined and the emitted SQL could not bind. This is the missing half:
+/// the tables a member's expression reaches *through* its fact references,
+/// which the caller adds to the set it joins.
+///
+/// The walk is transitive because facts chain — a fact on `o` may reference one
+/// on `c`, and both tables have to be in scope. `seen` guards against
+/// re-visiting a fact (and so against a cycle, which `validate_facts` rejects
+/// at CREATE but which must not hang the expander regardless). Facts with no
+/// `source_table` contribute no table: they resolve against the host
+/// expression's own scope.
+///
+/// Returns `(fact name, lowercased alias)` pairs in first-reached order, one
+/// per reached fact that declares a table. The fact name is carried because the
+/// fan-trap fence names it when the reached table cannot be joined safely.
+pub(super) fn collect_referenced_facts(expr: &str, facts: &[Fact]) -> Vec<(String, String)> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut reached: Vec<(String, String)> = Vec::new();
+    let mut pending: Vec<String> = vec![expr.to_string()];
+
+    while let Some(current) = pending.pop() {
+        for fact in facts {
+            let key = fact.name.to_ascii_lowercase();
+            if seen.contains(&key) {
+                continue;
+            }
+            if !references_ref(&current, &fact.name, fact.source_table.as_deref()) {
+                continue;
+            }
+            seen.insert(key);
+            if let Some(ref src) = fact.source_table {
+                let alias = src.to_ascii_lowercase();
+                if !reached.iter().any(|(_, a)| *a == alias) {
+                    reached.push((fact.name.clone(), alias));
+                }
+            }
+            pending.push(fact.expr.clone());
+        }
+    }
+
+    reached
+}
+
+/// The reached tables alone — [`collect_referenced_facts`] without the names,
+/// for the join resolver, which only needs to know what to join.
+pub(super) fn collect_referenced_fact_tables(expr: &str, facts: &[Fact]) -> Vec<String> {
+    collect_referenced_facts(expr, facts)
+        .into_iter()
+        .map(|(_, alias)| alias)
+        .collect()
+}
+
 /// Inline fact expressions into a metric expression.
 ///
 /// Processes facts in topological order (leaf facts first), resolving each fact's

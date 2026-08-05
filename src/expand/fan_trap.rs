@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::model::{Cardinality, Metric, SemanticViewDefinition};
 
-use super::facts::collect_derived_metric_grain;
-use super::types::{ExpandError, FanTrapError, MetricFanTrapError};
+use super::facts::{collect_derived_metric_grain, collect_referenced_facts};
+use super::types::{ExpandError, FanTrapError, MetricFanTrapError, ReferencedFactFanTrapError};
 
 /// Cardinality map: `(from_lower, to_lower)` -> (worst-case cardinality,
 /// name of a relationship carrying that cardinality).
@@ -688,6 +688,84 @@ pub(super) fn check_where_clause_fan_traps(
                         member_name: member_name.clone(),
                         member_table: member_table.clone(),
                         relationship_name: rel_name,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject a member whose expression reaches a fact on a **fanning** table.
+///
+/// PAR-6 (code-review 2026-08-03, TECH-DEBT #53). Referencing a named fact
+/// declared on another logical table is Snowflake's supported way to cross
+/// tables, and `join_resolver` now joins that table so the inlined expression
+/// binds. Joining is only sound when the path from the member's own table to
+/// the fact's does not fan: a fact on a *child* table multiplies the member's
+/// rows, which inflates a metric's aggregate (an order counted once per line
+/// item) and duplicates a dimension's output rows.
+///
+/// This is the same condition [`check_where_clause_fan_traps`] applies to a
+/// predicate member and [`check_fan_traps`] applies to a queried dimension,
+/// over the same adjacency + cardinality machinery; only the reason for
+/// needing the join differs.
+///
+/// Runs on every emission path. Unlike the base-anchored checks it is not
+/// skipped in per-grain mode: a referenced fact is inlined *inside* its
+/// member's expression, so per-grain aggregation does not separate the two the
+/// way it separates two metrics at different grains — the fanning join would
+/// land inside the grain CTE just the same.
+pub(super) fn check_referenced_fact_fan_traps(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    resolved_dims: &[&crate::model::Dimension],
+    resolved_mets: &[&Metric],
+) -> Result<(), ExpandError> {
+    if def.joins.is_empty() || def.facts.is_empty() {
+        return Ok(());
+    }
+    let graph = build_relationship_graph(view_name, def)?;
+    let card_map = build_card_map(def);
+    let adjacency = build_adjacency(def);
+    let root = graph.root.clone();
+
+    // (member name, the tables the member itself sits at, its expression).
+    let mut members: Vec<(&str, Vec<String>, &str)> = Vec::new();
+    for dim in resolved_dims {
+        let tables = dim
+            .source_table
+            .as_ref()
+            .map_or_else(|| vec![root.clone()], |st| vec![st.to_ascii_lowercase()]);
+        members.push((dim.name.as_str(), tables, dim.expr.as_str()));
+    }
+    for met in resolved_mets {
+        members.push((
+            met.name.as_str(),
+            metric_grain(met, def).anchored(&root),
+            met.expr.as_str(),
+        ));
+    }
+
+    for (member_name, member_tables, expr) in members {
+        for (fact_name, fact_table) in collect_referenced_facts(expr, &def.facts) {
+            for member_table in &member_tables {
+                if *member_table == fact_table {
+                    continue;
+                }
+                let Some(path) = find_path(member_table, &fact_table, &adjacency) else {
+                    continue; // Not connected (legacy joins carrying no FK metadata).
+                };
+                if let Some(rel_name) = fanning_edge_on_path(&path, &card_map) {
+                    return Err(ExpandError::ReferencedFactFanTrap {
+                        detail: Box::new(ReferencedFactFanTrapError {
+                            view_name: view_name.to_string(),
+                            member_name: member_name.to_string(),
+                            member_table: member_table.clone(),
+                            fact_name: fact_name.clone(),
+                            fact_table: fact_table.clone(),
+                            relationship_name: rel_name,
+                        }),
                     });
                 }
             }

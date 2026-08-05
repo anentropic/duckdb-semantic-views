@@ -109,6 +109,36 @@ fn metric_column(index: usize) -> String {
     format!("__sv_m{index}")
 }
 
+/// The tables a grain's metrics reach through fact references (PAR-6).
+///
+/// A metric's expression may name a fact declared on another logical table;
+/// `inline_facts` splices that fact's expression into the aggregate this CTE
+/// computes, so the fact's table has to be joined here exactly as it is on the
+/// base-anchored path. Resolved from the group's `metric_names` rather than
+/// from its `exprs`, which are post-inlining and no longer name the fact.
+///
+/// The planner has already established the anchor is not fanned by the paths it
+/// emits, and `check_referenced_fact_fan_traps` has already rejected a fact on
+/// a table that fans its member — so nothing joined here multiplies the anchor.
+fn group_fact_tables(def: &SemanticViewDefinition, group: &Group) -> Vec<String> {
+    let mut tables: Vec<String> = Vec::new();
+    for name in &group.metric_names {
+        let Some(met) = def
+            .metrics
+            .iter()
+            .find(|m| crate::ident::normalize_ident_part(&m.name) == *name)
+        else {
+            continue;
+        };
+        for alias in super::facts::collect_referenced_fact_tables(&met.expr, &def.facts) {
+            if !tables.contains(&alias) {
+                tables.push(alias);
+            }
+        }
+    }
+    tables
+}
+
 /// One grain: the table its CTE is anchored at, and the aggregate columns
 /// computed there.
 struct Group {
@@ -925,7 +955,13 @@ fn render_plain_group(
     push_from_anchor(&mut sql, def, &group.anchor, "\n    ");
     push_join_clauses(
         &mut sql,
-        &anchor_joins(def, &group.anchor, resolved_dims, where_tables, roles),
+        &anchor_joins(
+            def,
+            &group.anchor,
+            resolved_dims,
+            &[where_tables, &group_fact_tables(def, group)].concat(),
+            roles,
+        ),
         def,
         "\n    LEFT JOIN ",
     );
@@ -1069,7 +1105,13 @@ fn render_single_grain(
         from: FromSource::AnchorTable {
             def,
             anchor: group.anchor.clone(),
-            joins: anchor_joins(def, &group.anchor, resolved_dims, &where_tables, roles),
+            joins: anchor_joins(
+                def,
+                &group.anchor,
+                resolved_dims,
+                &[where_tables.clone(), group_fact_tables(def, group)].concat(),
+                roles,
+            ),
         },
         group_by,
     }
@@ -1193,7 +1235,7 @@ fn coalesced_key(groups: usize, d: usize) -> String {
 }
 
 /// The `LEFT JOIN`s a grain CTE anchored at `anchor` needs to reach every
-/// queried dimension's table.
+/// queried dimension's table, plus any table named in `extra_tables`.
 ///
 /// Each hop on the tree path from the anchor to a dimension's table is emitted
 /// once, in path order, so every ON clause references only the table it
@@ -1204,7 +1246,7 @@ pub(super) fn anchor_joins<'a>(
     def: &'a SemanticViewDefinition,
     anchor: &str,
     resolved_dims: &[&Dimension],
-    where_tables: &[String],
+    extra_tables: &[String],
     roles: &HashMap<String, String>,
 ) -> Vec<ResolvedJoin<'a>> {
     let Some(graph) = GrainGraph::build(def) else {
@@ -1213,12 +1255,15 @@ pub(super) fn anchor_joins<'a>(
     let mut joins: Vec<ResolvedJoin<'a>> = Vec::new();
     let mut emitted: HashSet<String> = HashSet::new();
     emitted.insert(anchor.to_string());
-    // A `where_clause` member's table has to be reachable from THIS grain's
-    // anchor, exactly like a dimension's — the predicate is injected into every
-    // grain CTE, so every one of them must join what the predicate names or the
-    // filter would reference an alias absent from that CTE's FROM.
+    // `extra_tables` carries the tables this CTE must reach for reasons other
+    // than a queried dimension, and they are all the same reason underneath:
+    // something inside this SELECT names an alias, so the alias has to be in
+    // this FROM. Two contribute today — a `where_clause` member's table, since
+    // the predicate is injected into every grain CTE, and (PAR-6) the table of
+    // a fact a grain's metric references, since the fact's expression is
+    // inlined into the aggregate this CTE computes.
     let dim_sources = resolved_dims.iter().filter_map(|d| d.source_table.clone());
-    let sources: Vec<String> = dim_sources.chain(where_tables.iter().cloned()).collect();
+    let sources: Vec<String> = dim_sources.chain(extra_tables.iter().cloned()).collect();
     for source in &sources {
         let Some(path) = graph.path(anchor, &source.to_ascii_lowercase()) else {
             continue;

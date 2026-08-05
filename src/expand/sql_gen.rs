@@ -517,6 +517,16 @@ pub fn expand(
         &resolved_mets,
         grain_plan.is_some() || window_anchor.is_some() || snapshot_anchor.is_some(),
     )?;
+    // PAR-6 (TECH-DEBT #53): a member reaching a fact on another table now
+    // pulls that table's join, so the fence has to rule out a fanning one.
+    // Runs on every emission path — the referenced fact is inlined inside its
+    // member's expression, so per-grain aggregation does not separate them.
+    super::fan_trap::check_referenced_fact_fan_traps(
+        view_name,
+        def,
+        &resolved_dims,
+        &resolved_mets,
+    )?;
     if let Some(rw) = &resolved_where {
         super::fan_trap::check_where_clause_fan_traps(view_name, def, &rw.members, &resolved_mets)?;
         // EXP-10: and the role-playing seam the fan-trap check does not cover —
