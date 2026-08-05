@@ -307,13 +307,24 @@ fn fan_trap_error_message_format() {
 }
 
 #[test]
-fn cyclic_relationships_do_not_hang_expand() {
+fn cyclic_relationships_are_rejected_by_expand() {
     // #141 (fuzz_sql_expand OOM): relationships forming a cycle (a -> b via r1,
     // b -> a via r2) are parser-reachable and previously drove
     // `check_fan_traps`' JoinTree parent-walk into an infinite loop, allocating
-    // until OOM. `expand` must now TERMINATE — this test hangs (→ CI timeout) if
-    // the JoinTree cycle guard regresses. The exact Ok/Err outcome for a
-    // malformed cyclic definition is unspecified; only termination is asserted.
+    // until OOM. d48abee made the walks terminate and left the Ok/Err outcome
+    // deliberately unspecified — so `expand` returned Ok, and the fence CERTIFIED
+    // the cyclic definition (EXP-15): `fanning_edge_on_path` sees the forward
+    // edge `(a, b)` and calls the hop safe without considering the reverse
+    // `ManyToOne` edge `(b, a)` that fans.
+    //
+    // EXP-15 specifies the outcome: `build_relationship_graph` re-runs the
+    // CREATE-time cycle check, so this is now `UncheckableDefinition`.
+    //
+    // Note what this test no longer proves: the fence short-circuits BEFORE the
+    // JoinTree parent-walk, so it is not the #141 termination guard any more.
+    // That guard's direct coverage is
+    // `graph::join_tree::tests::walks_terminate_on_cyclic_parent_map`, which
+    // exercises the walk on a cyclic parent map without going through the fence.
     let def = SemanticViewDefinition {
         tables: vec![
             TableRef {
@@ -367,7 +378,16 @@ fn cyclic_relationships_do_not_hang_expand() {
         metrics: vec!["m".into()],
         facts: vec![],
     };
-    let _ = expand("v", &def, &req);
+    match expand("v", &def, &req) {
+        Err(ExpandError::UncheckableDefinition { view_name, reason }) => {
+            assert_eq!(view_name, "v");
+            assert!(
+                reason.contains("cycle"),
+                "reason should name the cycle: {reason}"
+            );
+        }
+        other => panic!("Expected UncheckableDefinition, got: {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

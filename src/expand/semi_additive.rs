@@ -304,13 +304,15 @@ pub(super) fn build_snapshot_block(
         .enumerate()
         .map(|(met_idx, met)| {
             outer_metric_expr(
+                view_name,
+                met,
                 met_idx,
                 &decomposed[met_idx].0,
                 is_active_semi(met),
                 &na_groups,
             )
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(SnapshotBlock {
         inner_sql: sql,
@@ -652,16 +654,20 @@ fn na_order_item(
 /// snapshot callers share. An active semi-additive metric re-aggregates only its
 /// rank-1 rows; everything else re-aggregates every captured row.
 fn outer_metric_expr(
+    view_name: &str,
+    met: &Metric,
     met_idx: usize,
     agg_func: &str,
     is_active_semi: bool,
     na_groups: &[NaGroup],
-) -> String {
+) -> Result<String, ExpandError> {
     if is_active_semi {
-        let rn_col = get_rn_column_for_metric(met_idx, na_groups);
-        format!("{agg_func}(CASE WHEN \"{rn_col}\" = 1 THEN \"__sv_semi_{met_idx}\" END)")
+        let rn_col = get_rn_column_for_metric(view_name, &met.name, met_idx, na_groups)?;
+        Ok(format!(
+            "{agg_func}(CASE WHEN \"{rn_col}\" = 1 THEN \"__sv_semi_{met_idx}\" END)"
+        ))
     } else {
-        format!("{agg_func}(\"__sv_reg_{met_idx}\")")
+        Ok(format!("{agg_func}(\"__sv_reg_{met_idx}\")"))
     }
 }
 
@@ -998,17 +1004,45 @@ fn starts_with_distinct_keyword(inner: &str) -> bool {
 }
 
 /// Get the snapshot rank column name (`__sv_rn` / `__sv_rn_N`) for a given
-/// metric index.
-fn get_rn_column_for_metric(met_idx: usize, na_groups: &[NaGroup]) -> String {
-    if na_groups.len() == 1 {
-        return "__sv_rn".to_string();
-    }
+/// metric index, erroring when the metric is in no group.
+///
+/// The naming must agree with the aliases `build_snapshot_block` emits for the
+/// `RANK()` columns: unsuffixed when there is a single group, `_N` (1-based)
+/// otherwise.
+///
+/// EXP-18 (code review 2026-08-04): a metric index in NO group used to return
+/// `"__sv_rn"` under a bare `// fallback` comment — group 1's rank column. The
+/// metric would then be snapshotted at another group's NA ordering and return a
+/// wrong number with no error, which is the exact failure #129/#32 were filed
+/// for; `collect_na_groups` folds polarity and role into the group key precisely
+/// to keep two metrics off one rank column. The `na_groups.len() == 1` shortcut
+/// was the wider hole of the two: it returned before testing membership at all,
+/// so in the common single-group case ANY stray index was aliased.
+///
+/// A caller cannot provoke this — `collect_na_groups` and the `is_active_semi`
+/// closure share `is_active_semi_additive` over the same `resolved_mets` index
+/// space, so an active semi-additive metric always has a group. The error exists
+/// so a future divergence between those two sides fails loudly rather than
+/// silently changing a number.
+fn get_rn_column_for_metric(
+    view_name: &str,
+    met_name: &str,
+    met_idx: usize,
+    na_groups: &[NaGroup],
+) -> Result<String, ExpandError> {
     for (group_idx, group) in na_groups.iter().enumerate() {
         if group.metric_indices.contains(&met_idx) {
-            return format!("__sv_rn_{}", group_idx + 1);
+            return Ok(if na_groups.len() == 1 {
+                "__sv_rn".to_string()
+            } else {
+                format!("__sv_rn_{}", group_idx + 1)
+            });
         }
     }
-    "__sv_rn".to_string() // fallback
+    Err(ExpandError::SemiAdditiveRankColumnUnresolved {
+        view_name: view_name.to_string(),
+        metric_name: met_name.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -1017,7 +1051,76 @@ mod tests {
     use crate::expand::{expand, DimensionName, ExpandError, MetricName, QueryRequest};
     use crate::model::{NullsOrder, SortOrder};
 
-    use super::{find_matching_paren, parse_snapshot_aggregate};
+    use super::{find_matching_paren, get_rn_column_for_metric, parse_snapshot_aggregate, NaGroup};
+
+    /// EXP-18 (code review 2026-08-04): a metric index belonging to NO NA group
+    /// used to get `"__sv_rn"` back under a bare `// fallback` comment — group
+    /// 1's rank column. The metric is then snapshotted at another group's NA
+    /// ordering and returns a wrong number with no error, which is exactly the
+    /// failure #129/#32 were filed for; the group key carries polarity and role
+    /// precisely to keep two metrics off one rank column.
+    ///
+    /// The invariant holds today — `collect_na_groups` and the `is_active_semi`
+    /// closure share `is_active_semi_additive` over the same `resolved_mets`
+    /// index space, so every metric reaching here has a group — so this is a
+    /// guard on a *currently unreachable* state, not a live wrong-number bug.
+    /// Its value is that a future divergence between those two sides fails loud
+    /// instead of silently aliasing rank columns.
+    /// The two silent-alias paths get one test each, so a break in either
+    /// reports on its own instead of the first halting the run before the
+    /// second is reached.
+    fn na_group(indices: Vec<usize>) -> NaGroup {
+        NaGroup {
+            na_dims: vec![],
+            na_dim_scoped: vec![],
+            metric_indices: indices,
+        }
+    }
+
+    /// EXP-18, the wider of the two holes: `na_groups.len() == 1` returned
+    /// `"__sv_rn"` BEFORE testing membership, so in the common single-group case
+    /// any stray index was aliased onto that group's rank column without ever
+    /// reaching the `// fallback` line.
+    #[test]
+    fn test_get_rn_column_single_group_rejects_non_member() {
+        let one = vec![na_group(vec![0])];
+        // Control: the actual member still gets the unsuffixed name, which is
+        // what `build_snapshot_block` aliases the lone RANK() column to.
+        assert_eq!(
+            get_rn_column_for_metric("v", "m0", 0, &one).unwrap(),
+            "__sv_rn"
+        );
+        assert!(
+            matches!(
+                get_rn_column_for_metric("v", "m1", 1, &one),
+                Err(ExpandError::SemiAdditiveRankColumnUnresolved { .. })
+            ),
+            "a metric in no NA group must not alias onto the group's rank column"
+        );
+    }
+
+    /// EXP-18, the `// fallback` line itself: with several groups, an index in
+    /// none of them fell off the loop and took group 1's column.
+    #[test]
+    fn test_get_rn_column_multi_group_rejects_non_member() {
+        let two = vec![na_group(vec![0]), na_group(vec![1])];
+        // Controls: members keep their own 1-based suffixed columns.
+        assert_eq!(
+            get_rn_column_for_metric("v", "m0", 0, &two).unwrap(),
+            "__sv_rn_1"
+        );
+        assert_eq!(
+            get_rn_column_for_metric("v", "m1", 1, &two).unwrap(),
+            "__sv_rn_2"
+        );
+        assert!(
+            matches!(
+                get_rn_column_for_metric("v", "m2", 2, &two),
+                Err(ExpandError::SemiAdditiveRankColumnUnresolved { .. })
+            ),
+            "the post-loop fallback must error, not return __sv_rn"
+        );
+    }
 
     /// EXP-17: this matcher knew `'…'` and `"…"` but not `$tag$…$tag$`, so a
     /// `)` inside a dollar-quoted literal closed the match early and

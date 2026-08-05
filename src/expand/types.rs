@@ -524,6 +524,20 @@ pub enum ExpandError {
         metric_name: String,
         table_alias: String,
     },
+    /// An active semi-additive metric reached the snapshot's outer
+    /// re-aggregation without belonging to any `NON ADDITIVE BY` group, so no
+    /// rank column can be named for it (EXP-18).
+    ///
+    /// Not reachable from any query: `collect_na_groups` and the routing
+    /// predicate share `is_active_semi_additive` over the same `resolved_mets`
+    /// index space. It exists so a future divergence between those two sides
+    /// fails loudly instead of aliasing the metric onto the first group's rank
+    /// column — snapshotting it at another group's ordering and returning a
+    /// wrong number silently (the #129/#32 failure shape).
+    SemiAdditiveRankColumnUnresolved {
+        view_name: String,
+        metric_name: String,
+    },
 }
 
 impl fmt::Display for ExpandError {
@@ -647,7 +661,7 @@ impl fmt::Display for ExpandError {
                 write!(
                     f,
                     "semantic view '{view_name}': cannot verify the query is safe from fan traps \
-                     -- the stored definition's relationship graph could not be built: {reason}. \
+                     -- the stored definition's relationship graph is unusable: {reason}. \
                      The definition likely predates current validation rules; re-create it with \
                      CREATE OR REPLACE SEMANTIC VIEW."
                 )
@@ -898,6 +912,18 @@ impl fmt::Display for ExpandError {
                      for non-base tables, but table '{table_alias}' has no PRIMARY KEY declared \
                      in the TABLES clause. Add PRIMARY KEY (cols) to '{table_alias}' or use an \
                      explicit column: COUNT({table_alias}.<column>)."
+                )
+            }
+            Self::SemiAdditiveRankColumnUnresolved {
+                view_name,
+                metric_name,
+            } => {
+                write!(
+                    f,
+                    "semantic view '{view_name}': internal error -- semi-additive metric \
+                     '{metric_name}' is not in any NON ADDITIVE BY group, so its snapshot rank \
+                     column cannot be determined. This is a bug in the expansion planner, not a \
+                     problem with the query or the view; please report it."
                 )
             }
         }

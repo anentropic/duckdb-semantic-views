@@ -232,7 +232,7 @@ site diverges. Where the dimension's expression differs from a same-named physic
 filter silently uses different semantics than the member; otherwise it fails loud at bind. Either
 resolve dotted refs like #30 or document the divergence.
 
-### EXP-15 — LOW: a stored cyclic definition passes the fence rather than erroring
+### EXP-15 — LOW: a stored cyclic definition passes the fence rather than erroring — RESOLVED 2026-08-05 (TECH-DEBT #48)
 
 `src/expand/fan_trap.rs:499-515`. `fanning_edge_on_path` checks the forward key `(a,b)` first and
 declares the hop safe even if a *reverse* ManyToOne edge `(b,a)` also exists. Unreachable through a
@@ -262,7 +262,7 @@ matcher used by `build_snapshot_block`'s SG-5 decomposition. A `)` inside a doll
 terminates the match early, mis-slicing the aggregate's argument. Same unrecorded asymmetry as
 EXP-16: parse-side scanners learned `$tag$` in PARSE-1; expansion-side scanners never did.
 
-### EXP-18 — LOW: `get_rn_column_for_metric` silent fallback can mask a grouping bug
+### EXP-18 — LOW: `get_rn_column_for_metric` silent fallback can mask a grouping bug — RESOLVED 2026-08-05 (TECH-DEBT #48)
 
 `src/expand/semi_additive.rs:936-946`. If a metric index is in *no* NA group, the function returns
 `"__sv_rn"` with a bare `// fallback` comment instead of erroring. Given the #129/#32 history (two
