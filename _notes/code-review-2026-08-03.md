@@ -155,7 +155,7 @@ pins this: every `tests_role_playing.rs` case uses `where_clause: None` and
 **Fix direction:** run the same role-reachability test over where-member tables that queried
 dimensions get; error absent a disambiguating `USING`, matching the per-grain path's posture.
 
-### EXP-11 — MEDIUM: per-grain planner mis-anchors root-grain components of a derived metric (EXP-8 class)
+### EXP-11 — MEDIUM: per-grain planner mis-anchors root-grain components of a derived metric (EXP-8 class) — RESOLVED 2026-08-05 (TECH-DEBT #50)
 
 `src/expand/per_grain.rs:221-240` (single-grain fast path), `:339-341` (`decompose` skips
 source-less metric as "Derived: inlined"), `:407-412` (`rebuild_expr` inlines the raw aggregate);
@@ -830,9 +830,12 @@ Status as of 2026-08-04. ✅ = landed on `main`; ⏳ = in review; ❌ = withdraw
 5. Remaining mediums, batched into reviewable PRs (2026-08-04):
    ✅ **EXP-16/EXP-17/PARSE-4** — the three divergent quote scanners, collapsed onto `QuoteState`
    (TECH-DEBT #46). Delivers ARCH-6's substance for those sites; ARCH-6 stays open for the rest.
-   Then: EXP-13/14 (`where_clause` resolution), EXP-15/18 (silent fallbacks that should fail
-   loud), CAT-3/CAT-4 (catalog + read-path scoping), EXP-11 (per-grain derived anchoring — needs
-   numeric-oracle coverage, so it stands alone), PAR-2/3/4 + PARSE-3 (divergences to document or
-   implement).
+   ✅ **EXP-13/14** (`where_clause` resolution, TECH-DEBT #47). ✅ **EXP-15/18** (silent fallbacks
+   that should fail loud, TECH-DEBT #48). ✅ **CAT-3/CAT-4** (catalog + read-path scoping,
+   TECH-DEBT #49). ✅ **EXP-11** (per-grain derived anchoring, TECH-DEBT #50) — the empty→root
+   substitution is now per component, and `decompose` declines a source-less aggregate dependency.
+   It stands alone as expected, but *not* for the anticipated reason: it needs no numeric-oracle
+   work, because the shape is unreachable through DDL and the fix restores an error rather than
+   changing a number. Still open: PAR-2/3/4 + PARSE-3 (divergences to document or implement).
 6. Structural debt as capacity allows: ARCH-6 (crate-level `QuoteState`), ARCH-7 (`expand()`
    planner), ARCH-8/9/10/11/12, TC-1, TC-2, TC-3, TC-4, CI-6.

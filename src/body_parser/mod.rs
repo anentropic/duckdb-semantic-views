@@ -3687,7 +3687,7 @@ mod tests {
     // `ident::ident_matches`, not raw `eq_ignore_ascii_case`, which compares
     // the quote characters as data).
     //
-    // These two sites, the fan-trap fence's `metric_grain_tables`, and
+    // These two sites, the fan-trap fence's `metric_grain`, and
     // `per_grain::window_cte_anchor` all resolve the SAME reference and must
     // agree. `expand::window` already used the canonical key, so the CREATE
     // side was the stricter one -- it rejected definitions the emitter could

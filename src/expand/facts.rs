@@ -563,13 +563,41 @@ pub(super) fn collect_transitive_metric_names(
     visited
 }
 
+/// What a walk of the metric dependency graph found about where a metric
+/// aggregates.
+pub(crate) struct DerivedMetricGrain {
+    /// The source tables of the base metrics reached, lowercased.
+    pub(crate) tables: Vec<String>,
+    /// Whether some metric on the walk aggregates at the ROOT grain without
+    /// naming a table: no `source_table`, but an aggregate in its expression.
+    ///
+    /// EXP-11 (code-review 2026-08-03): such a metric contributes no entry to
+    /// `tables`, so a derived metric mixing one with a real-table component
+    /// used to report only the other component's grain — the root component
+    /// vanished, and callers anchored the whole expression at the survivor.
+    /// Reported separately rather than pushed into `tables` because the root
+    /// alias is the *caller's* to supply (`GrainGraph::root`); the walk sees
+    /// only the metric list.
+    pub(crate) at_root: bool,
+}
+
 /// Collect source tables needed by a derived metric by walking the metric
 /// dependency graph transitively.
 pub(crate) fn collect_derived_metric_source_tables(
     met: &crate::model::Metric,
     all_metrics: &[crate::model::Metric],
 ) -> Vec<String> {
+    collect_derived_metric_grain(met, all_metrics).tables
+}
+
+/// [`collect_derived_metric_source_tables`], keeping the root-grain component
+/// the table list cannot express. See [`DerivedMetricGrain::at_root`].
+pub(crate) fn collect_derived_metric_grain(
+    met: &crate::model::Metric,
+    all_metrics: &[crate::model::Metric],
+) -> DerivedMetricGrain {
     let mut sources: HashSet<String> = HashSet::new();
+    let mut at_root = false;
     let mut visited: HashSet<String> = HashSet::new();
     let mut stack: Vec<String> = vec![met.name.to_ascii_lowercase()];
 
@@ -597,6 +625,24 @@ pub(crate) fn collect_derived_metric_source_tables(
             // Base metric: add its source table
             sources.insert(st.to_ascii_lowercase());
         } else {
+            // A source-less metric that AGGREGATES is not a pure composition of
+            // other metrics: it reads columns of its own, and with no alias to
+            // name them it reads the root table's (EXP-8). That is a grain, and
+            // it is invisible in `sources` — record it (EXP-11).
+            //
+            // A WINDOW metric is exempt: its expression is `<fn>(<inner>) OVER
+            // (…)`, an aggregate over a *metric reference*, and the row set it
+            // runs over is the inner metric's pre-aggregated CTE rather than
+            // any table of its own. Its grain is the inner metric's, which
+            // `metric_grain` adds separately — counting the outer window
+            // function here would put every window metric at the root grain on
+            // top of that, and a window metric over a child-table aggregate
+            // would then fan-trap against its own dimension.
+            if current_met.window_spec.is_none()
+                && crate::graph::contains_aggregate_function(&current_met.expr).is_some()
+            {
+                at_root = true;
+            }
             // Derived metric: find referenced metric names and push to stack.
             // A base metric may be referenced bare or by its own source table.
             for name in &all_names {
@@ -608,7 +654,10 @@ pub(crate) fn collect_derived_metric_source_tables(
         }
     }
 
-    sources.into_iter().collect()
+    DerivedMetricGrain {
+        tables: sources.into_iter().collect(),
+        at_root,
+    }
 }
 
 #[cfg(test)]
@@ -1386,6 +1435,69 @@ mod tests {
         assert!(
             result.is_empty(),
             "Cycle with no base metrics should return empty, got: {result:?}"
+        );
+    }
+
+    // --- collect_derived_metric_grain: the root-grain component (EXP-11) ---
+
+    /// A dependency that aggregates but names no table contributes no entry to
+    /// the table list — it reads the ROOT table's columns. The walk reports it
+    /// separately so callers can substitute their own root alias; without that
+    /// the grain of `mixed` below is `{customers}` alone and the `sum(amount)`
+    /// half silently rides whatever anchor `customers` gets.
+    #[test]
+    fn test_collect_grain_rootless_aggregate_dependency_reports_at_root() {
+        let rootless = make_metric("rootless_total", "sum(amount)", None);
+        let balance = make_metric("balance", "sum(c.balance)", Some("customers"));
+        let mixed = make_metric("mixed", "balance - rootless_total", None);
+        let all = vec![rootless, balance, mixed.clone()];
+        let grain = collect_derived_metric_grain(&mixed, &all);
+        assert!(
+            grain.at_root,
+            "the source-less aggregate dependency sits at the root grain"
+        );
+        assert_eq!(
+            grain.tables,
+            vec!["customers".to_string()],
+            "the named half is unchanged, got: {:?}",
+            grain.tables
+        );
+    }
+
+    /// The flag is about *aggregation without a table*, not about being
+    /// source-less: an ordinary derived metric composing two base metrics
+    /// carries no grain of its own and must not be pushed to the root, or every
+    /// derived metric would fan-trap against the root's own dimensions.
+    #[test]
+    fn test_collect_grain_plain_derived_metric_is_not_at_root() {
+        let base = make_metric("revenue", "sum(amount)", Some("orders"));
+        let cost = make_metric("cost", "sum(unit_cost)", Some("orders"));
+        let derived = make_metric("margin", "revenue - cost", None);
+        let all = vec![base, cost, derived.clone()];
+        assert!(
+            !collect_derived_metric_grain(&derived, &all).at_root,
+            "a pure composition of base metrics reads no columns of its own"
+        );
+    }
+
+    /// A WINDOW metric's expression is an aggregate over a metric *reference*,
+    /// evaluated on the inner metric's pre-aggregated row set — not a read of
+    /// the root table. `metric_grain` accounts for the inner metric's own grain
+    /// separately; counting the outer window function here too would put every
+    /// window metric at the root grain on top of its real one.
+    #[test]
+    fn test_collect_grain_window_metric_outer_aggregate_is_not_at_root() {
+        let inner = make_metric("item_count", "count(*)", Some("line_items"));
+        let mut window = make_metric("rolling_items", "avg(item_count)", None);
+        window.window_spec = Some(crate::model::WindowSpec {
+            window_function: "AVG".to_string(),
+            inner_metric: "item_count".to_string(),
+            ..Default::default()
+        });
+        let all = vec![inner, window.clone()];
+        assert!(
+            !collect_derived_metric_grain(&window, &all).at_root,
+            "the window function is not a root-grain read"
         );
     }
 }

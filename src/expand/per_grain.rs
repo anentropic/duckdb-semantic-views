@@ -78,7 +78,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::model::{Dimension, Join, Metric, SemanticViewDefinition};
 
-use super::fan_trap::{metric_grain_tables, GrainGraph};
+use super::fan_trap::{metric_grain, GrainGraph};
 use super::join_resolver::{push_join_clauses, ResolvedJoin};
 use super::resolution::{quote_ident, quote_stored_ident};
 use super::select_spec::{
@@ -219,10 +219,13 @@ pub(super) fn plan(
     let mut partition = Partition::new();
     let mut outputs: Vec<Output> = Vec::with_capacity(resolved_mets.len());
     for met in resolved_mets {
-        let mut grains = metric_grain_tables(met, def);
-        if grains.is_empty() {
-            grains.push(root.clone()); // A metric with no source table sits at the root grain.
-        }
+        // `anchored` supplies the root for any component that names no table —
+        // both a metric with no source table at all and (EXP-11) a source-less
+        // aggregate reached through a derived metric's dependency graph. The
+        // latter is why this cannot read the table list directly: it would see
+        // one grain for a metric that has two, and the fast path below would
+        // anchor the root component at the other one.
+        let grains = metric_grain(met, def).anchored(&root);
         if grains.len() == 1 {
             let expr = resolved_exprs
                 .get(&crate::ident::normalize_ident_part(&met.name))
@@ -337,7 +340,18 @@ fn decompose(
             continue;
         }
         let Some(ref source) = base.source_table else {
-            continue; // Derived: inlined by the reference walk below, not a component.
+            // EXP-11: a source-less dependency is normally an intermediate
+            // DERIVED metric — no grain of its own, inlined by the reference
+            // walk below. One that AGGREGATES is not: it reads columns at the
+            // root grain (EXP-8), and inlining it would splice a raw aggregate
+            // into the OUTER select over the grain CTEs, where its table is not
+            // in scope. It needs a component CTE of its own, which nothing here
+            // can build without a table to anchor it — decline, and let the
+            // base-anchored path answer the query or the full fence reject it.
+            if crate::graph::contains_aggregate_function(&base.expr).is_some() {
+                return None;
+            }
+            continue;
         };
         if base.window_spec.is_some() || !base.non_additive_by.is_empty() {
             return None; // Component strategies that are base-anchored — not eligible.
@@ -519,7 +533,10 @@ fn role_playing_affects_query(
         .map(|t| t.to_ascii_lowercase())
         .collect();
     for met in resolved_mets {
-        strict.extend(metric_grain_tables(met, def));
+        // Named tables only: this asks which tables the query touches, so a
+        // root-grain component contributes nothing — the root is the anchor and
+        // is never the role-played table whose path is ambiguous.
+        strict.extend(metric_grain(met, def).named_tables().iter().cloned());
     }
     if strict.iter().any(|t| ambiguity(t).is_some()) {
         return true;
@@ -620,9 +637,9 @@ pub(super) fn snapshot_cte_anchor(
     // is the multi-grain case, which belongs to the per-grain planner.
     let mut anchor: Option<String> = None;
     for met in resolved_mets {
-        let grains = metric_grain_tables(met, def);
+        let grains = metric_grain(met, def).anchored(&root);
         let [only] = grains.as_slice() else {
-            return None; // No grain, or one metric spanning several.
+            return None; // One metric spanning several grains.
         };
         match &anchor {
             None => anchor = Some(only.clone()),
@@ -691,7 +708,7 @@ pub(super) fn window_cte_anchor(
     // The inner metric is deliberately what is measured, not the window metric
     // itself: DDL qualifies a window metric with a source alias
     // (`o.running_balance AS SUM(total_balance) OVER (…)`), and
-    // `metric_grain_tables` unions that alias with the inner's for its own
+    // `metric_grain` unions that alias with the inner's for its own
     // conservative fan-trap purpose. Here that union would report two grains for
     // every DDL-declared window metric and decline unconditionally. The alias on
     // a window metric is declarative — emission never references it, because the
@@ -712,9 +729,9 @@ pub(super) fn window_cte_anchor(
             .metrics
             .iter()
             .find(|m| crate::ident::ident_matches(&m.name, &ws.inner_metric))?;
-        let grains = metric_grain_tables(inner, def);
+        let grains = metric_grain(inner, def).anchored(&root);
         let [only] = grains.as_slice() else {
-            return None; // No grain, or an inner spanning several — decline.
+            return None; // An inner aggregate spanning several grains — decline.
         };
         match &anchor {
             None => anchor = Some(only.clone()),

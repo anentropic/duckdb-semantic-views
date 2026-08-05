@@ -591,7 +591,7 @@ fn multi_grain_semi_additive_with_a_shared_dimension() {
 /// the CTE exactly as before: only the inner aggregate is grain-sensitive.
 ///
 /// The window metric is declared QUALIFIED (`o.running_balance`), the shape real
-/// DDL always produces — `metric_grain_tables` unions that alias with the
+/// DDL always produces — `metric_grain` unions that alias with the
 /// inner's, so an anchor derived from it would see two grains and decline for
 /// every DDL-declared window metric. Using `source_table: None` here would have
 /// passed while the feature did nothing through actual DDL.
@@ -1572,5 +1572,95 @@ fn role_played_dimension_with_a_semi_additive_metric_stays_ineligible() {
                 | ExpandError::FanTrap { .. }
         ),
         "expected the base-anchored fence's error, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// EXP-11: a derived metric with a root-grain component that names no table
+// ---------------------------------------------------------------------------
+
+/// A metric with **no** `source_table` whose expression *aggregates* sits at the
+/// root grain — the substitution EXP-8 added to the fence for the same shape.
+/// It contributes no table to `collect_derived_metric_source_tables`, so a
+/// derived metric that mixes one with a real-table component reports only the
+/// other component's grain.
+///
+/// Current DDL cannot declare this metric (`alias.name` qualification is
+/// mandatory, and `validate_derived_metrics` rejects an aggregate in an
+/// unqualified entry), so the fixture is built directly — the same population
+/// of legacy stored rows and constructed definitions EXP-8 was added to
+/// protect.
+fn orders_with_rootless_aggregate() -> SemanticViewDefinition {
+    orders_with_parent_customers()
+        .with_metric("rootless_total", "SUM(amount)", None)
+        .with_metric("mixed", "total_balance - rootless_total", None)
+}
+
+/// EXP-11: `mixed`'s grain set is `{customers}` alone — the root component
+/// vanishes — so the planner takes its single-grain fast path and anchors the
+/// WHOLE resolved expression, `SUM(amount)` included, at `customers`. The fence
+/// then runs in per-grain mode, which skips the EXP-1 root-grain check that
+/// would have caught it. `SUM(amount)` binds against `customers`: silently wrong
+/// if that table has an `amount` column, a confusing binder error if not.
+///
+/// v0.11.0 raised `RootGrainFanTrap` for this query, and that is the right
+/// answer until the root component can be given a CTE of its own. This asserts
+/// an ERROR where a fuller per-grain implementation would compute a number —
+/// TECH-DEBT #50 records what "fuller" means and why no DDL-reachable query
+/// needs it.
+#[test]
+fn derived_metric_with_rootless_aggregate_component_errors() {
+    let def = orders_with_rootless_aggregate();
+    let err = expand("sales", &def, &req(&[], &["mixed"]))
+        .expect_err("a root-grain component under a parent-grain anchor must not be emitted");
+    assert!(
+        matches!(err, ExpandError::RootGrainFanTrap { .. }),
+        "expected the root-grain fence error, got: {err}"
+    );
+}
+
+/// EXP-11, multi-grain variant: with two real grains the planner reaches
+/// `decompose`, which treats every source-less dependency as "derived, inlined
+/// by the reference walk". For an *aggregate* one that splices the raw
+/// `SUM(amount)` into the OUTER select over the grain CTEs, where no such column
+/// exists. Decline instead.
+#[test]
+fn multi_grain_derived_metric_with_rootless_aggregate_component_errors() {
+    let def = orders_with_parent_customers()
+        .with_table("li", "line_items", &["id"])
+        .with_metric("item_count", "COUNT(li.id)", Some("li"))
+        .with_metric("rootless_total", "SUM(amount)", None)
+        .with_metric("mixed", "total_balance + item_count + rootless_total", None)
+        .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"]);
+    let err = expand("sales", &def, &req(&[], &["mixed"]))
+        .expect_err("a raw aggregate cannot be spliced into the outer select");
+    assert!(
+        matches!(err, ExpandError::RootGrainFanTrap { .. }),
+        "expected the root-grain fence error, got: {err}"
+    );
+}
+
+/// EXP-11: the root-grain component must survive into the grain set even when
+/// the query is otherwise answerable per-grain — a metric that mixes a
+/// rootless aggregate with a component on the root's own table is at the root
+/// grain and nowhere else.
+#[test]
+fn rootless_aggregate_mixed_with_root_table_component_stays_at_root() {
+    let def = orders_with_parent_customers()
+        .with_metric("rootless_total", "SUM(amount)", None)
+        .with_metric("mixed", "order_count + rootless_total", None);
+    let sql = expand("sales", &def, &req(&[], &["mixed"]))
+        .expect("both components sit at the root grain, so the query is answerable");
+    assert!(
+        sql.contains(r#"FROM "orders" AS "o""#),
+        "must be anchored at the root table, got:\n{sql}"
+    );
+    assert!(
+        sql.contains("(COUNT(*)) + (SUM(amount))"),
+        "both components must be computed over the root table's rows, got:\n{sql}"
+    );
+    assert!(
+        !sql.contains("__sv_grain"),
+        "one grain needs no per-grain CTEs, got:\n{sql}"
     );
 }

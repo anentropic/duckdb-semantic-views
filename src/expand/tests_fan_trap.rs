@@ -596,7 +596,7 @@ fn semi_additive_na_dim_fan_trap_reports_declared_table_spelling() {
 // behave exactly like its unquoted spelling.
 //
 // Four sites resolve `WindowSpec::inner_metric`: the CREATE-time validator
-// (`body_parser`), the fan-trap fence's `metric_grain_tables`, the per-grain
+// (`body_parser`), the fan-trap fence's `metric_grain`, the per-grain
 // planner's `window_cte_anchor`, and the emitter (`expand::window`). Only the
 // emitter used the canonical identifier key; the other three compared raw
 // spellings, so `"total"` did not match a metric stored as `total`.
@@ -748,7 +748,7 @@ fn window_quoted_inner_metric_contributes_its_grain_to_the_fence() {
             .iter()
             .find(|m| m.name == "w")
             .expect("window metric");
-        let grains = crate::expand::fan_trap::metric_grain_tables(met, &def);
+        let grains = crate::expand::fan_trap::metric_grain(met, &def).anchored("b");
         assert!(
             grains.iter().any(|t| t == "p"),
             "inner aggregate's table `p` must be in the grain set for reference \
