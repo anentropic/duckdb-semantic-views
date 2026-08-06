@@ -114,7 +114,16 @@ pub(super) fn resolve_where_clause(
         // impl has `unreachable!("dimensions cannot be private")`. So there is no
         // access check to make here, only on facts below.
         for key in keys_for(dim.source_table.as_deref(), &dim.name) {
-            dim_exprs.insert(key.clone(), format!("({})", dim.expr));
+            // TECH-DEBT #54: a predicate member's dimension expression is
+            // spliced into the WHERE clause, so it needs its facts inlined on
+            // the same footing as the SELECT-list copy.
+            dim_exprs.insert(
+                key.clone(),
+                format!(
+                    "({})",
+                    super::facts::inline_dimension_facts(&dim.expr, &def.facts)
+                ),
+            );
             member_tables.insert(key, dim.source_table.as_deref());
         }
     }

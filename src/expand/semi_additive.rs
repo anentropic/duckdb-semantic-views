@@ -221,7 +221,7 @@ pub(super) fn build_snapshot_block(
     // Dimension columns (returns the rendered dimension EXPRESSIONS the RANK()
     // window clauses must repeat, never the aliases — E-1).
     let dim_cte_exprs =
-        push_cte_dimension_columns(resolved_dims, dim_aliases, &mut cte_select_items);
+        push_cte_dimension_columns(resolved_dims, dim_aliases, &mut cte_select_items, def);
 
     // Metric raw columns -- the validated inner expression of each metric's
     // aggregate call (decomposed above).
@@ -468,11 +468,12 @@ fn push_cte_dimension_columns(
     resolved_dims: &[ResolvedDim],
     dim_aliases: &[String],
     cte_select_items: &mut Vec<String>,
+    def: &SemanticViewDefinition,
 ) -> Vec<String> {
     let mut dim_cte_exprs: Vec<String> = Vec::with_capacity(resolved_dims.len());
     for (idx, rd) in resolved_dims.iter().enumerate() {
         let dim = rd.dim;
-        let mut base_expr = dim.expr.clone();
+        let mut base_expr = super::facts::inline_dimension_facts(&dim.expr, &def.facts);
         if let Some(ref scoped) = rd.scoped_alias {
             if let Some(ref st) = dim.source_table {
                 base_expr = crate::expr_tokens::rewrite_qualifier(&base_expr, st, scoped);
@@ -608,7 +609,12 @@ fn na_order_item(
                         // ignoring USING — a silent wrong-role snapshot.
                         // Non-role-playing dims resolve to `None` and
                         // keep the raw expression (unchanged path).
-                        let mut e = d.expr.clone();
+                        // TECH-DEBT #54: an UNQUERIED NA dim renders its
+                        // declared expression here rather than a CTE column, so
+                        // it needs the same fact inlining every other dimension
+                        // emitter applies — otherwise the snapshot orders by an
+                        // un-inlined fact name.
+                        let mut e = super::facts::inline_dimension_facts(&d.expr, &def.facts);
                         if let (Some(sc), Some(st)) = (scoped, d.source_table.as_ref()) {
                             e = crate::expr_tokens::rewrite_qualifier(&e, st, sc);
                         }

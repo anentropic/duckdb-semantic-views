@@ -114,23 +114,30 @@ The facts are still scoped to ``li`` (line_items), but the dimensions come from 
 
    **An expression may only reference columns of its own table.** A fact,
    dimension, or metric expression that names a raw column of *another* logical
-   table -- ``li.margin AS li.extended_price - c.discount`` -- is not supported.
-   Joins are collected from each member's declared table alias, never by
-   scanning the expression for foreign aliases, so ``c`` is not joined and
-   DuckDB reports an unknown-alias binder error when the member is queried. The
-   ``CREATE`` succeeds; the failure comes later, at query time.
+   table -- ``li.margin AS li.extended_price - c.discount`` -- is rejected at
+   ``CREATE``:
+
+   .. code-block:: text
+
+      semantic view: metric 'margin' references 'c.discount', a column of table
+      'c', but a metric expression may only reference columns of its own table
+      ('li'). To use a value from another table, define a FACT on that table and
+      reference the fact by name (e.g. 'c.<fact_name>').
 
    Snowflake applies the `same rule
    <https://docs.snowflake.com/en/user-guide/views-semantic/validation-rules>`_
-   ("Expressions cannot refer to base table columns from other tables"), but
-   rejects the definition at ``CREATE``. Adding that validation here is tracked
-   as TECH-DEBT #52.
+   ("Expressions cannot refer to base table columns from other tables") and
+   rejects at definition time as well.
 
-   Referencing a *named fact* declared on another table is Snowflake's supported
-   way to cross tables, and it **is** supported here -- see
+   .. versionchanged:: 0.12.0
+      Previously the ``CREATE`` succeeded and the reference surfaced at query
+      time as a DuckDB unknown-alias error.
+
+   Referencing a *named fact* -- on its own table or, given a relationship, on
+   another -- is fully supported for facts, dimensions and metrics alike; see
    :ref:`howto-facts-cross-table` below. Composing *metrics* across tables
-   (``m AS t1.metric_a + t2.metric_b``) is likewise fully supported. It is only
-   the raw foreign *column* that has no join behind it.
+   (``m AS t1.metric_a + t2.metric_b``) is likewise supported. It is only the
+   raw foreign *column* that is rejected.
 
 
 .. _howto-facts-cross-table:
@@ -140,10 +147,16 @@ Reference a Fact on Another Table
 
 .. versionadded:: 0.12.0
 
-A member expression may reference a **named fact declared on another logical
-table**, provided a relationship connects them. This is Snowflake's documented
-way to cross tables, and the only one: define the fact where its columns live,
-then refer to it from the connected table.
+A fact, dimension or metric expression may reference a **declared fact** — on
+its own table, or on another one given a relationship. This is Snowflake's
+documented way to cross tables, and the only one: define the fact where its
+columns live, then refer to it from the connected table.
+
+.. versionchanged:: 0.12.0
+   Dimension expressions reference facts on the same footing as metrics. Before,
+   facts were inlined only into metric and fact expressions, so a fact named in
+   a dimension was emitted verbatim and failed on the unknown column — including
+   when the fact was declared on the dimension's *own* table.
 
 .. code-block:: sql
 
