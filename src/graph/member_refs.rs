@@ -14,6 +14,8 @@
 //! naming an unknown alias — an error about the generated SQL rather than about
 //! the semantic-layer rule that was broken. This module closes that gap.
 
+use std::collections::HashSet;
+
 use crate::errors::ParseError;
 use crate::expr_tokens::scan_references;
 use crate::ident::normalize_ident_part;
@@ -48,25 +50,27 @@ pub fn validate_member_references(def: &SemanticViewDefinition) -> Result<(), Pa
         return Ok(());
     }
 
-    let table_aliases: Vec<String> = def
+    // Membership sets: every reference chain in every member expression is
+    // tested against both, so they are hashed rather than scanned.
+    let base_alias = def.tables.first().map(|t| normalize_ident_part(&t.alias));
+    let table_aliases: HashSet<String> = def
         .tables
         .iter()
         .map(|t| normalize_ident_part(&t.alias))
         .collect();
-    let base_alias = table_aliases.first().cloned();
 
     // Keys that a qualified chain may legitimately resolve to: every declared
     // fact and metric under its own-qualified spelling (`c.cust_discount`).
     // A bare reference needs no entry — bare chains are not checked at all.
-    let mut member_keys: Vec<String> = Vec::new();
+    let mut member_keys: HashSet<String> = HashSet::new();
     for fact in &def.facts {
         if let Some(ref src) = fact.source_table {
-            member_keys.push(normalize_ident_part(&format!("{src}.{}", fact.name)));
+            member_keys.insert(normalize_ident_part(&format!("{src}.{}", fact.name)));
         }
     }
     for met in &def.metrics {
         if let Some(ref src) = met.source_table {
-            member_keys.push(normalize_ident_part(&format!("{src}.{}", met.name)));
+            member_keys.insert(normalize_ident_part(&format!("{src}.{}", met.name)));
         }
     }
 
