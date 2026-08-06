@@ -430,12 +430,20 @@ pub fn expand(
         .as_ref()
         .map(|w| w.source_tables.clone())
         .unwrap_or_default();
+    // EXP-22: a member the predicate names that declares NO source table is an
+    // unqualified expression, exactly like the dimensions all three deciders
+    // already refuse to re-anchor — it contributes no entry to `where_tables`,
+    // so without this the deciders could not see it at all.
+    let where_has_unqualified_member = resolved_where
+        .as_ref()
+        .is_some_and(|w| w.members.iter().any(|(_, table)| table.is_none()));
     let grain_plan = super::per_grain::plan(
         def,
         &resolved_dims,
         &resolved_mets,
         &resolved.exprs,
         &where_tables,
+        where_has_unqualified_member,
     );
 
     // An all-window query whose inner aggregate lives at a non-root grain is
@@ -443,8 +451,13 @@ pub fn expand(
     // (TECH-DEBT #36). Decided BEFORE the checks below, because the checks the
     // anchor supersedes are the ones that would otherwise reject this shape —
     // the same reason `grain_plan` is decided before them.
-    let window_anchor =
-        super::per_grain::window_cte_anchor(def, &resolved_dims, &resolved_mets, &where_tables);
+    let window_anchor = super::per_grain::window_cte_anchor(
+        def,
+        &resolved_dims,
+        &resolved_mets,
+        &where_tables,
+        where_has_unqualified_member,
+    );
 
     // An ACTIVE semi-additive metric at a non-root grain is answered by
     // anchoring `__sv_snapshot` there instead of at the base table (TECH-DEBT
@@ -461,6 +474,51 @@ pub fn expand(
     let has_active_semi_additive = resolved_mets
         .iter()
         .any(|m| super::semi_additive::is_active_semi_additive(def, m, &queried_dim_keys));
+    // EXP-19/EXP-20 (code-review 2026-08-06): `is_active_semi_additive` asks
+    // only about a metric's OWN `non_additive_by`, so a metric that merely
+    // DEPENDS on an active semi-additive one — a derived metric referencing it,
+    // or a window metric naming it as its inner aggregate — routed to the
+    // regular path and inlined the dependency's raw aggregate, evaluating it
+    // over every row and silently dropping `NON ADDITIVE BY`. The result did
+    // not even agree with the same snapshot queried directly (`double_balance`
+    // != 2 x `balance`).
+    //
+    // Checked here, before any dispatch, because every emission path shares the
+    // defect: the base-anchored path inlines the raw aggregate, the window path
+    // feeds it to `__sv_agg`, and per-grain's `is_snapshot_group` classifies by
+    // the group's own metrics so the dependent metric lands in a PLAIN group.
+    //
+    // Composing a snapshot with an outer expression is a feature, not a patch
+    // (TECH-DEBT #55); until it lands this errors, the same call SG-5 makes for
+    // co-queried shapes its CTE cannot decompose. Iteration is over `def.metrics`
+    // rather than the dependency `HashSet` so the metric named in the error is
+    // deterministic (declaration order) when a metric reaches two of them.
+    for met in &resolved_mets {
+        if super::semi_additive::is_active_semi_additive(def, met, &queried_dim_keys) {
+            continue; // Takes the snapshot path itself; SG-5 governs the rest.
+        }
+        let met_key = crate::ident::normalize_ident_part(&met.name);
+        let deps = collect_transitive_metric_names(met, &def.metrics);
+        for dep in &def.metrics {
+            let dep_key = crate::ident::normalize_ident_part(&dep.name);
+            if dep_key == met_key || !deps.contains(&dep_key) {
+                continue;
+            }
+            if super::semi_additive::is_active_semi_additive(def, dep, &queried_dim_keys) {
+                return Err(ExpandError::SemiAdditiveThroughDependency {
+                    view_name: view_name.to_string(),
+                    metric_name: met.name.clone(),
+                    semi_metric_name: dep.name.clone(),
+                    non_additive_by: dep
+                        .non_additive_by
+                        .iter()
+                        .map(|na| na.dimension.clone())
+                        .collect(),
+                });
+            }
+        }
+    }
+
     let snapshot_anchor = if has_active_semi_additive {
         let mut extra = super::semi_additive::na_dim_source_tables(
             view_name,
@@ -469,7 +527,13 @@ pub fn expand(
             &queried_dim_keys,
         );
         extra.extend(where_tables.iter().cloned());
-        super::per_grain::snapshot_cte_anchor(def, &resolved_dims, &resolved_mets, &extra)
+        super::per_grain::snapshot_cte_anchor(
+            def,
+            &resolved_dims,
+            &resolved_mets,
+            &extra,
+            where_has_unqualified_member,
+        )
     } else {
         None
     };

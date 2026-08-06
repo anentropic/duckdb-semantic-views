@@ -86,7 +86,7 @@ CREATE SEMANTIC VIEW sg8_nopk AS
 statement error
 SELECT * FROM semantic_view('sg8_nopk', metrics := ['item_count']);
 ----
-COUNT(*) on joined table 'li'
+or a constant argument (COUNT(1), SUM(1), ...) on joined table 'li'
 
 # ============================================================
 # Test 4: base-table COUNT(*) is untouched (the base table is never

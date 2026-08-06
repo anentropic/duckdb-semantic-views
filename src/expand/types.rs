@@ -547,6 +547,31 @@ pub enum ExpandError {
         metric_name: String,
         table_alias: String,
     },
+    /// A requested metric DEPENDS on an active semi-additive metric — a
+    /// derived metric referencing it, or a window metric naming it as its
+    /// inner aggregate (EXP-19/EXP-20, code-review 2026-08-06).
+    ///
+    /// The routing predicate `is_active_semi_additive` inspects only a
+    /// metric's own `non_additive_by`, so such a metric classified as regular
+    /// and the dependency's raw aggregate was inlined and evaluated over every
+    /// row — silently discarding `NON ADDITIVE BY` and returning a number that
+    /// did not even agree with the same snapshot queried directly.
+    ///
+    /// Composing a snapshot with an outer expression is a feature, not a
+    /// defect to patch (TECH-DEBT #55); until it lands the fence errors, the
+    /// same call the SG-5 co-query guard makes for shapes its CTE cannot
+    /// decompose.
+    SemiAdditiveThroughDependency {
+        view_name: String,
+        /// The requested metric that reaches the semi-additive one.
+        metric_name: String,
+        /// The active semi-additive metric it depends on.
+        semi_metric_name: String,
+        /// That metric's `NON ADDITIVE BY` dimensions, so the message can name
+        /// the ones which — if queried — make it effectively regular and the
+        /// query legal.
+        non_additive_by: Vec<String>,
+    },
     /// An active semi-additive metric reached the snapshot's outer
     /// re-aggregation without belonging to any `NON ADDITIVE BY` group, so no
     /// rank column can be named for it (EXP-18).
@@ -926,6 +951,24 @@ impl fmt::Display for ExpandError {
                      expression text. Query '{metric_name}' and '{semi_metric_name}' separately."
                 )
             }
+            Self::SemiAdditiveThroughDependency {
+                view_name,
+                metric_name,
+                semi_metric_name,
+                non_additive_by,
+            } => {
+                let dims = non_additive_by.join(", ");
+                write!(
+                    f,
+                    "semantic view '{view_name}': metric '{metric_name}' depends on \
+                     semi-additive metric '{semi_metric_name}', whose NON ADDITIVE BY \
+                     ({dims}) cannot be honoured through the dependency — the snapshot \
+                     would be discarded and the result would not agree with \
+                     '{semi_metric_name}' queried on its own. Query '{semi_metric_name}' \
+                     directly, or add its NON ADDITIVE BY dimension(s) ({dims}) to the \
+                     query, which makes it effectively regular."
+                )
+            }
             Self::SemiAdditiveUnsupportedExpression {
                 view_name,
                 metric_name,
@@ -947,11 +990,13 @@ impl fmt::Display for ExpandError {
             } => {
                 write!(
                     f,
-                    "semantic view '{view_name}': metric '{metric_name}' uses COUNT(*) on joined \
-                     table '{table_alias}'. The generated LEFT JOIN produces one NULL-extended \
-                     row per base-table row with no match in '{table_alias}', which COUNT(*) \
-                     would count -- so the expansion rewrites COUNT(*) to COUNT(<primary key>) \
-                     for non-base tables, but table '{table_alias}' has no PRIMARY KEY declared \
+                    "semantic view '{view_name}': metric '{metric_name}' aggregates over COUNT(*) \
+                     or a constant argument (COUNT(1), SUM(1), ...) on joined table \
+                     '{table_alias}'. The generated LEFT JOIN produces one NULL-extended \
+                     row per base-table row with no match in '{table_alias}', and neither \
+                     COUNT(*) nor an aggregate over a constant can tell that row apart from a \
+                     real one -- so the expansion rewrites them against '{table_alias}'s primary \
+                     key, but table '{table_alias}' has no PRIMARY KEY declared \
                      in the TABLES clause. Add PRIMARY KEY (cols) to '{table_alias}' or use an \
                      explicit column: COUNT({table_alias}.<column>)."
                 )

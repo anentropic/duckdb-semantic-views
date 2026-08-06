@@ -1,0 +1,259 @@
+# Code review 2026-08-06, tier 1: four silent wrong-number paths, end to end
+# through the extension-load -> DDL -> query pipeline.
+#
+# Each defect also has an independent unit test (sqllogictest stops a file at
+# its first failing statement, so N cases here yield only one observed red):
+#   EXP-19/20  src/expand/tests_semi_additive_dependency.rs
+#   EXP-21     src/expand/tests_count_star_rewrite.rs
+#   EXP-22     src/expand/tests_per_grain.rs
+# plus randomized coverage in tests/child_grain_proptest.rs and the new
+# dependency property in tests/semi_additive_proptest.rs.
+
+require semantic_views
+
+# ============================================================
+# EXP-21: COUNT(1) escapes the SG-8 count-star fence.
+#
+# Order 3 is CHILDLESS, so the synthesized LEFT JOIN NULL-extends it into one
+# phantom line-item row. COUNT(*) has been rewritten to COUNT(<pk>) since SG-8;
+# COUNT(1) was not, and counted the phantom -- returning 4 where 3 is correct,
+# in the same result row as the correct COUNT(*).
+# ============================================================
+
+statement ok
+CREATE TABLE cr0806_orders (id INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO cr0806_orders VALUES (1, 'East'), (2, 'West'), (3, 'East');
+
+statement ok
+CREATE TABLE cr0806_items (id INTEGER, order_id INTEGER, qty INTEGER);
+
+statement ok
+INSERT INTO cr0806_items VALUES (1, 1, 2), (2, 1, 3), (3, 2, 5);
+
+statement ok
+CREATE SEMANTIC VIEW cr0806_sales AS
+  TABLES (
+    o AS cr0806_orders PRIMARY KEY (id),
+    li AS cr0806_items PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    li.n_star AS COUNT(*),
+    li.n_one AS COUNT(1),
+    li.s_one AS SUM(1),
+    li.n_str AS COUNT('x'),
+    li.n_paren AS COUNT((1))
+  );
+
+# All five spellings count the same three real line items. Before the fix
+# n_one, s_one and n_str each returned 4; n_paren -- the redundantly
+# parenthesized literal raised by review on #203 -- returned 4 after it.
+query IIIII
+SELECT * FROM semantic_view(
+  'cr0806_sales',
+  metrics := ['n_star', 'n_one', 's_one', 'n_str', 'n_paren']
+);
+----
+3	3	3	3	3
+
+# Grouped: East = order 1 (2 items) + order 3 (childless, contributes none).
+# The childless order previously added one to every constant-argument metric.
+query TIIIII rowsort
+SELECT * FROM semantic_view(
+  'cr0806_sales',
+  dimensions := ['region'],
+  metrics := ['n_star', 'n_one', 's_one', 'n_str', 'n_paren']
+);
+----
+East	2	2	2	2	2
+West	1	1	1	1	1
+
+# A group whose orders are ALL childless: COUNT-family metrics are 0 and
+# SUM(1) is NULL -- the empty-aggregate semantics the phantom row destroyed.
+statement ok
+INSERT INTO cr0806_orders VALUES (4, 'North');
+
+query TII
+SELECT * FROM semantic_view(
+  'cr0806_sales',
+  dimensions := ['region'],
+  metrics := ['n_one', 's_one']
+) WHERE region = 'North';
+----
+North	0	NULL
+
+# Control: a column argument was never affected -- it is already NULL on the
+# phantom row, so the aggregate skipped it unaided.
+query I
+SELECT * FROM semantic_view('cr0806_sales', metrics := ['n_star']);
+----
+3
+
+# ============================================================
+# EXP-19: a derived metric over a semi-additive base silently discarded
+# NON ADDITIVE BY, so `double_balance` was not twice `balance`.
+# ============================================================
+
+statement ok
+CREATE TABLE cr0806_accounts (id INTEGER, customer_id INTEGER, report_date DATE, balance INTEGER);
+
+statement ok
+INSERT INTO cr0806_accounts VALUES
+  (1, 1, DATE '2026-01-31', 100), (2, 1, DATE '2026-02-28', 150),
+  (3, 2, DATE '2026-01-31', 50),  (4, 2, DATE '2026-02-28', 70);
+
+statement ok
+CREATE SEMANTIC VIEW cr0806_bal AS
+  TABLES (
+    a AS cr0806_accounts PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    a.customer_id AS a.customer_id,
+    a.report_date AS a.report_date
+  )
+  METRICS (
+    a.balance NON ADDITIVE BY (report_date) AS SUM(a.balance),
+    double_balance AS balance * 2
+  );
+
+# The snapshot itself is unchanged: the latest report_date per customer.
+query II rowsort
+SELECT * FROM semantic_view(
+  'cr0806_bal',
+  dimensions := ['customer_id'],
+  metrics := ['balance']
+);
+----
+1	150
+2	70
+
+# The derived metric used to return 500 / 240 here -- every report_date summed
+# and doubled, which is not twice the snapshot above. Composing a snapshot with
+# an outer expression is not yet supported (TECH-DEBT #55), so it errors.
+statement error
+SELECT * FROM semantic_view(
+  'cr0806_bal',
+  dimensions := ['customer_id'],
+  metrics := ['double_balance']
+);
+----
+depends on semi-additive metric
+
+# Control: with the NON ADDITIVE BY dimension queried, the base metric is
+# effectively regular (Snowflake semantics) and the derived metric expands.
+query TII rowsort
+SELECT report_date, customer_id, double_balance FROM semantic_view(
+  'cr0806_bal',
+  dimensions := ['customer_id', 'report_date'],
+  metrics := ['double_balance']
+);
+----
+2026-01-31	1	200
+2026-01-31	2	100
+2026-02-28	1	300
+2026-02-28	2	140
+
+# ============================================================
+# EXP-20: a window metric whose INNER metric is semi-additive took the same
+# path -- __sv_agg was built from the raw aggregate, not the snapshot.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW cr0806_win AS
+  TABLES (
+    a AS cr0806_accounts PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    a.customer_id AS a.customer_id,
+    a.report_date AS a.report_date
+  )
+  METRICS (
+    a.balance NON ADDITIVE BY (report_date) AS SUM(a.balance),
+    a.rolling AS SUM(balance) OVER (PARTITION BY customer_id)
+  );
+
+statement error
+SELECT * FROM semantic_view(
+  'cr0806_win',
+  dimensions := ['customer_id'],
+  metrics := ['rolling']
+);
+----
+depends on semi-additive metric
+
+# ============================================================
+# EXP-22: an UNQUALIFIED where_clause member was spliced into a re-anchored
+# CTE and bound against the anchor table instead of the base table.
+#
+# Both tables carry a `status` column, and the dimension is declared without a
+# source table. The metric lives on the PARENT, so the planner re-anchors the
+# CTE at `customers` -- where `status` silently became customers.status, and
+# the query returned the active CUSTOMER's balance instead of filtering orders.
+# Re-anchoring is now declined for unqualified members, so the predicate stays
+# on the base-anchored path where an unqualified expression is defined.
+# ============================================================
+
+statement ok
+CREATE TABLE cr0806_c (id INTEGER, region VARCHAR, balance INTEGER, status VARCHAR);
+
+statement ok
+INSERT INTO cr0806_c VALUES (1, 'East', 50, 'active'), (2, 'West', 900, 'dormant');
+
+statement ok
+CREATE TABLE cr0806_o (id INTEGER, customer_id INTEGER, status VARCHAR);
+
+statement ok
+INSERT INTO cr0806_o VALUES (1, 1, 'open'), (2, 2, 'open');
+
+statement ok
+CREATE SEMANTIC VIEW cr0806_unqual AS
+  TABLES (
+    o AS cr0806_o PRIMARY KEY (id),
+    c AS cr0806_c PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    o_to_c AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.region AS c.region,
+    o.status AS status
+  )
+  METRICS (
+    c.total_balance AS SUM(c.balance)
+  );
+
+# `status` names a column on BOTH tables, so once the query is no longer
+# re-anchored onto `customers` the reference is genuinely ambiguous and DuckDB
+# says so. A loud error is the correct outcome: previously this returned 50 --
+# the balance of the 'active' CUSTOMER -- for a predicate the user wrote
+# against orders.
+statement error
+SELECT * FROM semantic_view(
+  'cr0806_unqual',
+  dimensions := ['region'],
+  metrics := ['total_balance'],
+  where_clause := 'status = ''active'''
+);
+----
+status
+
+# Control: the same query with a QUALIFIED member still re-anchors and answers
+# normally, so the guard keys on the missing source table, not on the presence
+# of a predicate.
+query TI rowsort
+SELECT * FROM semantic_view(
+  'cr0806_unqual',
+  dimensions := ['region'],
+  metrics := ['total_balance'],
+  where_clause := 'region <> ''Nowhere'''
+);
+----
+East	50
+West	900
