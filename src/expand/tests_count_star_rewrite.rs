@@ -311,3 +311,134 @@ fn test_semi_additive_co_query_uses_rewritten_count() {
         "outer select must re-aggregate the captured PK column: {sql}"
     );
 }
+
+// EXP-21 (code-review 2026-08-06): the SG-8 rewrite matched only the literal
+// `*` argument, so `COUNT(1)` — the same idiom spelled differently — walked
+// straight past every guard and counted the NULL-extended LEFT JOIN row that
+// `COUNT(*)` is rewritten precisely to exclude. Verified against DuckDB with
+// one childless order: `COUNT(1)` returned 2 next to `COUNT(*)`'s 1, in the
+// same result row.
+//
+// The correction generalizes: an aggregate over a CONSTANT never sees a NULL
+// argument, so nothing tells it a NULL-extended row is not a real one. Guarding
+// the constant with the source table's PK restores the empty-group semantics
+// the aggregate would have had on its own rows (`SUM(1)`/`LIST(1)` alike, and
+// NULL rather than 0/1 for a childless parent).
+
+/// `orders` (base) + `line_items` child with a declared PK, metrics spelled
+/// with constant arguments instead of `*`.
+fn constant_arg_def(expr: &str) -> crate::model::SemanticViewDefinition {
+    orders_view()
+        .clear_dimensions()
+        .clear_metrics()
+        .with_dimension("region", "region", None)
+        .with_table("li", "line_items", &["id"])
+        .with_metric("item_count", expr, Some("li"))
+        .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"])
+}
+
+fn count_req() -> QueryRequest {
+    QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![],
+        metrics: vec![MetricName::new("item_count")],
+    }
+}
+
+#[test]
+fn test_child_count_one_is_guarded_by_the_pk() {
+    let sql = expand("orders", &constant_arg_def("COUNT(1)"), &count_req()).unwrap();
+    assert!(
+        sql.contains("COUNT(CASE WHEN \"li\".\"id\" IS NOT NULL THEN 1 END)"),
+        "COUNT(1) on a LEFT-JOINed child must not count NULL-extended rows: {sql}"
+    );
+}
+
+#[test]
+fn test_child_sum_of_a_constant_is_guarded_by_the_pk() {
+    let sql = expand("orders", &constant_arg_def("SUM(1)"), &count_req()).unwrap();
+    assert!(
+        sql.contains("SUM(CASE WHEN \"li\".\"id\" IS NOT NULL THEN 1 END)"),
+        "SUM(<constant>) inflates by one per childless parent just as COUNT(1) does: {sql}"
+    );
+}
+
+#[test]
+fn test_child_count_of_a_string_constant_is_guarded_by_the_pk() {
+    let sql = expand("orders", &constant_arg_def("COUNT('x')"), &count_req()).unwrap();
+    assert!(
+        sql.contains("COUNT(CASE WHEN \"li\".\"id\" IS NOT NULL THEN 'x' END)"),
+        "a string constant is as NULL-insensitive as a numeric one: {sql}"
+    );
+}
+
+#[test]
+fn test_child_count_one_without_a_pk_errors() {
+    // Same fate as COUNT(*) with no PK: the rewrite is impossible, so the
+    // query must fail loudly rather than over-count (SG-8).
+    let def = orders_view()
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("li", "line_items", &[]) // no PK declared
+        .with_metric("item_count", "COUNT(1)", Some("li"))
+        .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
+    let err = expand("orders", &def, &count_req()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ExpandError::CountStarRequiresPrimaryKey {
+                ref metric_name,
+                ref table_alias,
+                ..
+            } if metric_name == "item_count" && table_alias == "li"
+        ),
+        "expected CountStarRequiresPrimaryKey, got: {err:?}"
+    );
+}
+
+// Controls: the guard must fire on the constant-argument-on-a-joined-table
+// shape only. Each of these would break if the rewrite were applied bluntly.
+
+#[test]
+fn test_base_table_count_one_unchanged() {
+    // The base table is never NULL-extended, so there is nothing to guard.
+    let def = orders_view()
+        .clear_dimensions()
+        .clear_metrics()
+        .with_metric("n", "COUNT(1)", Some("orders"));
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![],
+        metrics: vec![MetricName::new("n")],
+    };
+    let sql = expand("orders", &def, &req).unwrap();
+    assert!(
+        sql.contains("COUNT(1) AS \"n\"") && !sql.contains("CASE WHEN"),
+        "a base-table constant aggregate must be left alone: {sql}"
+    );
+}
+
+#[test]
+fn test_child_count_of_a_column_unchanged() {
+    // A column argument is already NULL on a NULL-extended row — the
+    // aggregate excludes it unaided, and wrapping would be noise.
+    let sql = expand("orders", &constant_arg_def("COUNT(li.sku)"), &count_req()).unwrap();
+    assert!(
+        sql.contains("COUNT(li.sku)") && !sql.contains("CASE WHEN"),
+        "a column argument needs no guard: {sql}"
+    );
+}
+
+#[test]
+fn test_child_min_of_a_constant_unchanged() {
+    // MIN/MAX/AVG over a constant are multiplicity-invariant, so they are
+    // deliberately outside the rewrite's list — keeping it to the aggregates
+    // where duplicate rows actually change the number.
+    let sql = expand("orders", &constant_arg_def("MIN(1)"), &count_req()).unwrap();
+    assert!(
+        !sql.contains("CASE WHEN"),
+        "MIN(<constant>) is unaffected by row multiplicity: {sql}"
+    );
+}

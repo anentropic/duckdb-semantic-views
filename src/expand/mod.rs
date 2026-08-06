@@ -56,6 +56,8 @@ mod tests_qualified_name_resolution;
 mod tests_qualified_refs;
 #[cfg(test)]
 mod tests_role_playing;
+#[cfg(test)]
+mod tests_semi_additive_dependency;
 
 // Public API (the pre-split expand.rs surface, plus the boxed fan-trap detail
 // structs re-exported for R-9).

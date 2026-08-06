@@ -61,7 +61,7 @@ use proptest::prelude::*;
 use semantic_views::expand::{expand, DimensionName, MetricName, QueryRequest};
 use semantic_views::model::{
     AccessModifier, Dimension, Metric, NonAdditiveDim, NullsOrder, SemanticViewDefinition,
-    SortOrder, TableRef,
+    SortOrder, TableRef, WindowSpec,
 };
 
 /// Members a generated `where_clause` may name (PBT-6).
@@ -723,4 +723,135 @@ fn predicate_is_applied_before_the_snapshot_not_after() {
         got, want_before,
         "the extension must filter BEFORE the snapshot is picked.\n--- emitted:\n{expanded}"
     );
+}
+
+// EXP-19 / EXP-20 (code-review 2026-08-06): a metric that DEPENDS on the
+// semi-additive one.
+//
+// The routing predicate `is_active_semi_additive` asks only about a metric's
+// OWN `non_additive_by`, so a derived metric referencing `bal`, or a window
+// metric naming it as its inner aggregate, classified as regular: the raw
+// `SUM(s.balance)` was inlined and evaluated over every row, silently
+// discarding NON ADDITIVE BY. `dbal` did not even come out at twice `bal`.
+//
+// This harness generated no derived and no window metrics at all — the
+// blind spot the coverage audit flagged and these two bugs then occupied. The
+// property below is a dichotomy over the same generated data the numeric
+// oracle uses:
+//
+//   * NA dimension NOT queried  => the snapshot is live and cannot be composed
+//                                  through the dependency, so expansion MUST
+//                                  error (and name the dependency).
+//   * NA dimension queried      => the metric is "effectively regular"
+//                                  (Snowflake semantics), so expansion MUST
+//                                  succeed AND agree with an independent
+//                                  oracle numerically.
+//
+// The second branch is what stops the first from being satisfiable by erroring
+// on everything.
+
+/// [`build_def`] plus the two dependent metrics: `dbal = bal * 2` (derived) and
+/// `wbal = SUM(bal) OVER (PARTITION BY ent)` (window over the same inner).
+fn build_def_with_dependents(order: SortOrder) -> SemanticViewDefinition {
+    let mut def = build_def(order);
+    let dependent = |name: &str, expr: &str, window: Option<WindowSpec>| Metric {
+        name: name.to_string(),
+        expr: expr.to_string(),
+        source_table: None,
+        output_type: None,
+        using_relationships: vec![],
+        comment: None,
+        synonyms: vec![],
+        access: AccessModifier::Public,
+        non_additive_by: vec![],
+        window_spec: window,
+    };
+    def.metrics.push(dependent("dbal", "bal * 2", None));
+    def.metrics.push(dependent(
+        "wbal",
+        "",
+        Some(WindowSpec {
+            window_function: "SUM".to_string(),
+            inner_metric: "bal".to_string(),
+            extra_args: vec![],
+            excluding_dims: vec![],
+            partition_dims: vec!["ent".to_string()],
+            order_by: vec![],
+            frame_clause: None,
+        }),
+    ));
+    def
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+
+    #[test]
+    fn a_dependent_metric_never_silently_drops_the_snapshot(
+        inst in arb_instance(),
+        order in prop_oneof![Just(SortOrder::Asc), Just(SortOrder::Desc)],
+        na_dim_queried in any::<bool>(),
+        pick_window in any::<bool>(),
+    ) {
+        let def = build_def_with_dependents(order);
+        let metric = if pick_window { "wbal" } else { "dbal" };
+        let dims: Vec<&str> = if na_dim_queried { vec!["ent", "ts"] } else { vec!["ent"] };
+        let req = QueryRequest {
+            where_clause: None,
+            dimensions: dims.iter().map(|d| DimensionName::new(*d)).collect(),
+            metrics: vec![MetricName::new(metric)],
+            facts: vec![],
+        };
+
+        match expand("semi", &def, &req) {
+            Err(e) => {
+                let msg = e.to_string();
+                prop_assert!(
+                    !na_dim_queried,
+                    "with the NA dimension queried '{metric}' is effectively regular \
+                     and must expand, got error: {msg}"
+                );
+                prop_assert!(
+                    msg.contains("depends on semi-additive metric"),
+                    "rejected, but not as a semi-additive dependency: {msg}"
+                );
+            }
+            Ok(sql) => {
+                prop_assert!(
+                    na_dim_queried,
+                    "without the NA dimension the snapshot cannot be composed through \
+                     '{metric}' and must not be silently dropped, got SQL:\n{sql}"
+                );
+                // Effectively-regular branch: check the number, not just the
+                // absence of an error. Only the derived metric has a
+                // formulation simple enough to oracle independently here; the
+                // window metric's numeric coverage lives in
+                // `window_metric_proptest`.
+                if pick_window {
+                    return Ok(());
+                }
+                let oracle = "SELECT s.entity AS ent, s.ts AS ts, \
+                              sum(s.balance) * 2 AS dbal FROM s GROUP BY 1, 2";
+                let cmp = format!(
+                    "SELECT \
+                       (SELECT count(*) FROM (SELECT dbal, ent, ts FROM ({sql}) qa \
+                                              EXCEPT ALL \
+                                              SELECT dbal, ent, ts FROM ({oracle}) qb) e1) \
+                     + (SELECT count(*) FROM (SELECT dbal, ent, ts FROM ({oracle}) qc \
+                                              EXCEPT ALL \
+                                              SELECT dbal, ent, ts FROM ({sql}) qd) e2) AS diff"
+                );
+                let conn = make_db(&inst);
+                let diff: i64 = conn.query_row(&cmp, [], |r| r.get(0)).unwrap_or_else(|e| {
+                    panic!("comparison failed: {e}\n--- expanded:\n{sql}\n--- oracle:\n{oracle}")
+                });
+                prop_assert_eq!(
+                    diff, 0,
+                    "an effectively-regular derived metric disagrees with the oracle\
+                     \n--- expanded:\n{}\n--- oracle:\n{}",
+                    sql, oracle
+                );
+            }
+        }
+    }
 }

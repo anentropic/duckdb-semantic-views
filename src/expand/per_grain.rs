@@ -261,11 +261,18 @@ pub(super) fn plan(
     resolved_mets: &[&Metric],
     resolved_exprs: &HashMap<String, String>,
     where_tables: &[String],
+    where_has_unqualified_member: bool,
 ) -> Option<Plan> {
     if def.joins.is_empty() || resolved_mets.is_empty() {
         return None; // Single-table view, or a dimensions-only query.
     }
-    if !is_eligible(def, resolved_dims, resolved_mets, where_tables) {
+    if !is_eligible(
+        def,
+        resolved_dims,
+        resolved_mets,
+        where_tables,
+        where_has_unqualified_member,
+    ) {
         return None;
     }
     let graph = GrainGraph::build(def)?;
@@ -674,8 +681,13 @@ pub(super) fn snapshot_cte_anchor(
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
     extra_tables: &[String],
+    where_has_unqualified_member: bool,
 ) -> Option<String> {
     if def.joins.is_empty() || resolved_mets.is_empty() {
+        return None;
+    }
+    // EXP-22: an unqualified `where_clause` member rebinds with the anchor.
+    if where_has_unqualified_member {
         return None;
     }
     if resolved_dims.iter().any(|d| d.source_table.is_none())
@@ -742,8 +754,13 @@ pub(super) fn window_cte_anchor(
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
     where_tables: &[String],
+    where_has_unqualified_member: bool,
 ) -> Option<String> {
     if def.joins.is_empty() || resolved_mets.is_empty() {
+        return None;
+    }
+    // EXP-22: an unqualified `where_clause` member rebinds with the anchor.
+    if where_has_unqualified_member {
         return None;
     }
     // Only an all-window query reaches the window emitter — mixing window and
@@ -843,12 +860,21 @@ fn is_eligible(
     resolved_dims: &[&Dimension],
     resolved_mets: &[&Metric],
     where_tables: &[String],
+    where_has_unqualified_member: bool,
 ) -> bool {
     // A dimension with no source table is an unqualified expression, resolved
     // against whatever the FROM happens to expose. That is well defined only
     // when the anchor is the base table (the case per-grain never rewrites), so
     // decline rather than re-anchor an expression whose binding would move.
     if resolved_dims.iter().any(|d| d.source_table.is_none()) {
+        return false;
+    }
+    // EXP-22: and a `where_clause` member with no source table is the same
+    // expression in a different slot. It is spliced into every grain CTE, so a
+    // re-anchored FROM rebinds it — silently, whenever the anchor table happens
+    // to carry a column of that name, and into two DIFFERENT tables at once in
+    // a multi-grain plan.
+    if where_has_unqualified_member {
         return false;
     }
     // A snapshot group cannot honour a role: `render_snapshot_group` builds its

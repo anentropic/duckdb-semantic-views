@@ -373,6 +373,172 @@ pub(super) fn rewrite_count_star(expr: &str, replacement_arg: &str) -> Option<St
     Some(out)
 }
 
+/// Aggregates whose value changes when a row is duplicated or a phantom row is
+/// added, and which therefore cannot be left alone over a constant argument on
+/// a NULL-extended (LEFT-JOINed) table.
+///
+/// MIN/MAX/AVG are deliberately absent: over a constant they return that
+/// constant no matter how many rows they see, so the NULL-extended row cannot
+/// move them. `STRING_AGG` and friends take a second argument and are excluded
+/// by the top-level-comma check in [`constant_aggregate_arg`] rather than by
+/// this list — see TECH-DEBT #56.
+const MULTIPLICITY_SENSITIVE_AGGS: [&str; 5] = ["COUNT", "SUM", "PRODUCT", "LIST", "ARRAY_AGG"];
+
+/// Whether `arg` is a SQL constant: a numeric literal, a single-quoted string
+/// literal, or `TRUE`/`FALSE`/`NULL`.
+///
+/// Deliberately conservative — a false negative leaves an expression alone
+/// (the status quo), while a false positive would wrap something row-dependent
+/// in a `CASE` and change what it means.
+fn is_constant_literal(arg: &str) -> bool {
+    let t = arg.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.eq_ignore_ascii_case("TRUE")
+        || t.eq_ignore_ascii_case("FALSE")
+        || t.eq_ignore_ascii_case("NULL")
+    {
+        return true;
+    }
+    // A single-quoted string literal, whole and entire: an argument that merely
+    // starts and ends with a quote but re-enters live code in between (`'a' ||
+    // o.col` cannot, but `'a' || 'b'` can) is still constant, so accepting it
+    // is safe; anything ending outside a literal is rejected.
+    if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
+        return true;
+    }
+    // A numeric literal: digits with at most one decimal point and an optional
+    // exponent. Hand-rolled rather than `parse::<f64>()` so SQL spellings that
+    // Rust rejects (a trailing `.`) and Rust spellings SQL rejects (`inf`,
+    // `1_000`) both classify the SQL way.
+    let bytes = t.as_bytes();
+    let mut i = 0;
+    if bytes[i] == b'+' || bytes[i] == b'-' {
+        i += 1;
+    }
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0'..=b'9' => seen_digit = true,
+            b'.' if !seen_dot => seen_dot = true,
+            b'e' | b'E' if seen_digit => {
+                // Exponent: optional sign then at least one digit, then end.
+                i += 1;
+                if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return false;
+                }
+                return bytes[i..].iter().all(u8::is_ascii_digit);
+            }
+            _ => return false,
+        }
+        i += 1;
+    }
+    seen_digit
+}
+
+/// The argument text of the aggregate call opening at `open` in `expr`, when
+/// that call is one of [`MULTIPLICITY_SENSITIVE_AGGS`] over a single constant.
+///
+/// Returns `(close_paren_index, argument_text)`. A top-level comma disqualifies
+/// the call: a second argument means the constant is not the whole argument
+/// list, and wrapping the lot in one `CASE` would produce invalid SQL.
+fn constant_aggregate_arg(expr: &str, open: usize) -> Option<(usize, &str)> {
+    let close = super::semi_additive::find_matching_paren(expr, open)?;
+    let inner = &expr[open + 1..close];
+    // Top-level comma check, quote-aware so a comma inside a string literal
+    // does not disqualify a genuine single-argument call.
+    let bytes = inner.as_bytes();
+    let mut quotes = crate::util::QuoteState::default();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        let (next, is_live_code) = quotes.step(bytes, i);
+        if is_live_code {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b',' if depth == 0 => return None,
+                _ => {}
+            }
+        }
+        i = next;
+    }
+    is_constant_literal(inner).then_some((close, inner.trim()))
+}
+
+/// Guard every multiplicity-sensitive aggregate over a constant in `expr` with
+/// `pk_ref`, so a NULL-extended LEFT JOIN row contributes nothing (EXP-21).
+///
+/// `COUNT(1)` becomes `COUNT(CASE WHEN <pk> IS NOT NULL THEN 1 END)`: the
+/// argument evaluates to NULL exactly on the phantom row, and every standard
+/// aggregate ignores NULL arguments. This also restores empty-group semantics
+/// a childless parent should have had — `NULL` for `SUM(1)`, `0` for
+/// `COUNT(1)` — instead of the count of phantom rows.
+///
+/// Returns `None` when the expression contains no such call, matching
+/// [`rewrite_count_star`]'s contract. Quoted regions are inert throughout
+/// ([`crate::util::QuoteState`]), so `'count(1)'` and `"sum(1) col"` are left
+/// alone.
+pub(super) fn guard_constant_arg_aggregates(expr: &str, pk_ref: &str) -> Option<String> {
+    let bytes = expr.as_bytes();
+    let mut out = String::with_capacity(expr.len() + pk_ref.len() + 32);
+    let mut copied = 0usize;
+    let mut pos = 0usize;
+    let mut quotes = crate::util::QuoteState::default();
+    let mut changed = false;
+
+    while pos < bytes.len() {
+        let (next, is_live_code) = quotes.step(bytes, pos);
+        if !is_live_code {
+            pos = next;
+            continue;
+        }
+        let Some(name) = MULTIPLICITY_SENSITIVE_AGGS.iter().find(|agg| {
+            let end = pos + agg.len();
+            end <= bytes.len()
+                && bytes[pos..end].eq_ignore_ascii_case(agg.as_bytes())
+                && (pos == 0 || is_word_boundary_char(bytes[pos - 1]))
+        }) else {
+            pos += 1;
+            continue;
+        };
+        let mut open = pos + name.len();
+        while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+            open += 1;
+        }
+        if open >= bytes.len() || bytes[open] != b'(' {
+            pos += 1;
+            continue;
+        }
+        let Some((close, arg)) = constant_aggregate_arg(expr, open) else {
+            pos += 1;
+            continue;
+        };
+        // Every scanned offset sits on an ASCII byte, so slicing is
+        // char-boundary safe.
+        out.push_str(&expr[copied..=open]);
+        out.push_str("CASE WHEN ");
+        out.push_str(pk_ref);
+        out.push_str(" IS NOT NULL THEN ");
+        out.push_str(arg);
+        out.push_str(" END)");
+        copied = close + 1;
+        pos = close + 1;
+        changed = true;
+    }
+
+    if !changed {
+        return None;
+    }
+    out.push_str(&expr[copied..]);
+    Some(out)
+}
+
 /// Resolved metric expressions plus SG-8 rewrite failures.
 ///
 /// Produced by [`inline_derived_metrics`]. Both maps are keyed by the metric's
@@ -533,7 +699,16 @@ pub(super) fn inline_derived_metrics(
                     if let Some(rewritten) = rewrite_count_star(&expr, &qualified_pk) {
                         expr = rewritten;
                     }
-                } else if rewrite_count_star(&expr, "*").is_some() {
+                    // EXP-21: `COUNT(*)` is only the best-known spelling of the
+                    // hazard. Run after the star rewrite, which has by now
+                    // turned any `COUNT(*)` into `COUNT(<pk>)` — a column
+                    // argument, so this pass leaves it alone.
+                    if let Some(rewritten) = guard_constant_arg_aggregates(&expr, &qualified_pk) {
+                        expr = rewritten;
+                    }
+                } else if rewrite_count_star(&expr, "*").is_some()
+                    || guard_constant_arg_aggregates(&expr, "*").is_some()
+                {
                     // No PK declared (or unknown alias): rewrite impossible.
                     count_star_no_pk.insert(normalize_ident_part(&met.name), st_lower);
                 }

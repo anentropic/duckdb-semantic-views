@@ -1664,3 +1664,169 @@ fn rootless_aggregate_mixed_with_root_table_component_stays_at_root() {
         "one grain needs no per-grain CTEs, got:\n{sql}"
     );
 }
+
+// EXP-22 (code-review 2026-08-06): an UNQUALIFIED `where_clause` member and
+// re-anchoring.
+//
+// All three deciders decline a queried DIMENSION with no source table, on the
+// stated grounds that an unqualified expression "is resolved against whatever
+// the FROM happens to expose", so its binding would move with the anchor. A
+// `where_clause` member is spliced into exactly the same CTEs and has exactly
+// the same problem — but contributed no source table to `where_tables` and got
+// no such check, so its predicate text was carried into a CTE whose FROM is
+// the anchor table and bound against THAT table's columns.
+//
+// Verified against DuckDB: with `status` declared unqualified and both tables
+// carrying a `status` column, `where_clause := 'status = ''active'''` filtered
+// `customers.status` inside the re-anchored CTE and returned the balance of
+// the *active customer* where base-table semantics required the empty set. In
+// the multi-grain shape the same predicate text lands in two CTEs anchored at
+// different tables — two bindings for one predicate, in one statement.
+//
+// The fix mirrors the dimension rule exactly: decline, and let the query take
+// the base-anchored path where an unqualified expression is well defined (or
+// keep that path's fan-trap error, which is what an unanswerable shape is
+// supposed to produce).
+
+/// [`orders_with_parent_customers`] plus an unqualified `status` dimension —
+/// the shape whose binding moves with the anchor.
+fn parent_customers_with_unqualified_status() -> SemanticViewDefinition {
+    orders_with_parent_customers().with_dimension("status", "status", None)
+}
+
+#[test]
+fn an_unqualified_where_clause_member_declines_the_single_grain_re_anchor() {
+    let def = parent_customers_with_unqualified_status();
+    let req = QueryRequest {
+        dimensions: vec![DimensionName::new("segment")],
+        metrics: vec![MetricName::new("total_balance")],
+        facts: vec![],
+        where_clause: Some("status = 'ACTIVE'".to_string()),
+    };
+    match expand("test_view", &def, &req) {
+        // Base-anchored: the predicate binds where the user wrote it against.
+        Ok(sql) => assert!(
+            !sql.contains(r#"FROM "customers" AS "c""#),
+            "an unqualified predicate must not be re-anchored onto customers: {sql}"
+        ),
+        // Or the base-anchored path's own fan-trap error for this shape.
+        // Either is correct; binding `status` to `customers` silently is not.
+        Err(e) => assert!(
+            matches!(
+                e,
+                ExpandError::MetricFanTrap { .. } | ExpandError::RootGrainFanTrap { .. }
+            ),
+            "expected base-anchored SQL or a fan-trap error, got: {e:?}"
+        ),
+    }
+}
+
+#[test]
+fn an_unqualified_where_clause_member_declines_the_window_re_anchor() {
+    let def = parent_customers_with_unqualified_status()
+        .with_metric("running_balance", "SUM(total_balance)", Some("o"))
+        .with_window_spec(
+            "running_balance",
+            WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "total_balance".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec![],
+                partition_dims: vec!["segment".to_string()],
+                order_by: vec![],
+                frame_clause: None,
+            },
+        );
+    let req = QueryRequest {
+        dimensions: vec![DimensionName::new("segment")],
+        metrics: vec![MetricName::new("running_balance")],
+        facts: vec![],
+        where_clause: Some("status = 'ACTIVE'".to_string()),
+    };
+    match expand("sales", &def, &req) {
+        Ok(sql) => assert!(
+            !sql.contains(r#"FROM "customers" AS "c""#),
+            "__sv_agg must not anchor at customers with an unqualified predicate: {sql}"
+        ),
+        Err(e) => assert!(
+            matches!(
+                e,
+                ExpandError::MetricFanTrap { .. } | ExpandError::RootGrainFanTrap { .. }
+            ),
+            "expected base-anchored SQL or a fan-trap error, got: {e:?}"
+        ),
+    }
+}
+
+#[test]
+fn an_unqualified_where_clause_member_declines_the_snapshot_re_anchor() {
+    let def = accounts_snapshot_fixture().with_dimension("status", "status", None);
+    let req = QueryRequest {
+        dimensions: vec![DimensionName::new("account_type")],
+        metrics: vec![MetricName::new("total_balance")],
+        facts: vec![],
+        where_clause: Some("status = 'ACTIVE'".to_string()),
+    };
+    match expand("sv", &def, &req) {
+        Ok(sql) => assert!(
+            !sql.contains(r#"FROM "accounts" AS "a""#),
+            "the snapshot must not anchor at accounts with an unqualified predicate: {sql}"
+        ),
+        Err(e) => assert!(
+            matches!(
+                e,
+                ExpandError::MetricFanTrap { .. } | ExpandError::RootGrainFanTrap { .. }
+            ),
+            "expected base-anchored SQL or a fan-trap error, got: {e:?}"
+        ),
+    }
+}
+
+// Controls: a QUALIFIED `where_clause` member must still re-anchor exactly as
+// before — the guard keys on the missing source table, not on the presence of
+// a predicate. Without these, declining unconditionally would pass.
+
+#[test]
+fn control_a_qualified_where_clause_member_still_re_anchors_the_window_cte() {
+    let def = orders_with_parent_customers()
+        .with_metric("running_balance", "SUM(total_balance)", Some("o"))
+        .with_window_spec(
+            "running_balance",
+            WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "total_balance".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec![],
+                partition_dims: vec!["segment".to_string()],
+                order_by: vec![],
+                frame_clause: None,
+            },
+        );
+    let req = QueryRequest {
+        dimensions: vec![DimensionName::new("segment")],
+        metrics: vec![MetricName::new("running_balance")],
+        facts: vec![],
+        where_clause: Some("segment <> 'CHURNED'".to_string()),
+    };
+    let sql = expand("sales", &def, &req).expect("a qualified predicate is unaffected");
+    assert!(
+        sql.contains(r#"FROM "customers" AS "c""#),
+        "a qualified member must still anchor at its own grain: {sql}"
+    );
+}
+
+#[test]
+fn control_a_qualified_where_clause_member_still_re_anchors_the_snapshot() {
+    let def = accounts_snapshot_fixture();
+    let req = QueryRequest {
+        dimensions: vec![DimensionName::new("account_type")],
+        metrics: vec![MetricName::new("total_balance")],
+        facts: vec![],
+        where_clause: Some("account_type <> 'CLOSED'".to_string()),
+    };
+    let sql = expand("sv", &def, &req).expect("a qualified predicate is unaffected");
+    assert!(
+        sql.contains(r#"FROM "accounts" AS "a""#),
+        "a qualified member must still anchor at its own grain: {sql}"
+    );
+}

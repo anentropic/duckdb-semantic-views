@@ -971,7 +971,7 @@ fn parse_snapshot_aggregate(expr: &str) -> Result<(String, String), String> {
 /// PARSE-1), so a `)` inside a dollar-quoted literal closed the match early and
 /// mis-sliced the aggregate's argument. It now defers to [`QuoteState`], the
 /// crate's one scanner.
-fn find_matching_paren(s: &str, open: usize) -> Option<usize> {
+pub(super) fn find_matching_paren(s: &str, open: usize) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut quotes = crate::util::QuoteState::default();
     let mut depth = 0usize;
