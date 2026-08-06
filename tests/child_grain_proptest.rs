@@ -52,10 +52,12 @@ struct Instance {
 
 /// Queryable objects, by stable name.
 const DIMS: [&str; 1] = ["region"];
-/// `n_star` is the spelling SG-8 always handled; `n_one`, `s_one` and `n_str`
-/// are the constant-argument spellings it did not. `s_amt` is an ordinary
-/// column aggregate — the control that must stay untouched by the rewrite.
-const METS: [&str; 5] = ["n_star", "n_one", "s_one", "n_str", "s_amt"];
+/// `n_star` is the spelling SG-8 always handled; `n_one`, `s_one`, `n_str` and
+/// `n_paren` are the constant-argument spellings it did not — `n_paren` is the
+/// redundantly-parenthesized literal raised by review on #203, which the first
+/// cut of the constant check still let through. `s_amt` is an ordinary column
+/// aggregate — the control that must stay untouched by the rewrite.
+const METS: [&str; 6] = ["n_star", "n_one", "s_one", "n_str", "n_paren", "s_amt"];
 
 #[derive(Debug, Clone)]
 struct Case {
@@ -155,6 +157,7 @@ fn build_def() -> SemanticViewDefinition {
         base_metric("n_one", "COUNT(1)", Some("li")),
         base_metric("s_one", "SUM(1)", Some("li")),
         base_metric("n_str", "COUNT('x')", Some("li")),
+        base_metric("n_paren", "COUNT((1))", Some("li")),
         base_metric("s_amt", "SUM(li.amount)", Some("li")),
     ];
     let joins = vec![Join {
@@ -223,7 +226,7 @@ fn make_db(inst: &Instance) -> duckdb::Connection {
 fn oracle_sql(case: &Case) -> String {
     let per_order = |i: usize| -> String {
         match METS[i] {
-            "n_star" | "n_one" | "n_str" => {
+            "n_star" | "n_one" | "n_str" | "n_paren" => {
                 "(SELECT count(*) FROM li WHERE li.order_id = o.id)".to_string()
             }
             "s_one" => "(SELECT sum(1) FROM li WHERE li.order_id = o.id)".to_string(),

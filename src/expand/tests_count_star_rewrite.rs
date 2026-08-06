@@ -373,6 +373,54 @@ fn test_child_count_of_a_string_constant_is_guarded_by_the_pk() {
     );
 }
 
+// A parenthesized literal is the same constant wearing a hat. `is_constant_literal`
+// scanned the argument text as-is, so `COUNT((1))` failed the numeric check on the
+// leading `(` and fell through unguarded — the identical over-count `COUNT(1)` had,
+// reachable by anyone who writes a redundant paren. Raised by review on #203.
+//
+// Redundant parens are stripped only when the opening paren's match IS the final
+// character: `(1)+(2)` also starts with `(` and ends with `)`, but its outer parens
+// are not a pair, and blindly peeling them would hand the literal check the garbage
+// `1)+(2`.
+#[test]
+fn test_child_count_of_a_parenthesized_constant_is_guarded_by_the_pk() {
+    let sql = expand("orders", &constant_arg_def("COUNT((1))"), &count_req()).unwrap();
+    assert!(
+        sql.contains("COUNT(CASE WHEN \"li\".\"id\" IS NOT NULL THEN (1) END)"),
+        "a parenthesized literal is as constant as a bare one: {sql}"
+    );
+}
+
+#[test]
+fn test_child_count_of_a_doubly_parenthesized_constant_is_guarded_by_the_pk() {
+    let sql = expand(
+        "orders",
+        &constant_arg_def("COUNT(( ( 1 ) ))"),
+        &count_req(),
+    )
+    .unwrap();
+    assert!(
+        sql.contains("CASE WHEN \"li\".\"id\" IS NOT NULL THEN ( ( 1 ) ) END"),
+        "paren-stripping must iterate, and whitespace between them is not significant: {sql}"
+    );
+}
+
+// The control that keeps the stripping honest: a non-pair `(`...`)` must stay
+// unguarded rather than be peeled into nonsense and misread as constant.
+#[test]
+fn test_child_sum_of_a_non_constant_paren_expression_is_left_alone() {
+    let sql = expand(
+        "orders",
+        &constant_arg_def("SUM((\"li\".\"qty\") + (1))"),
+        &count_req(),
+    )
+    .unwrap();
+    assert!(
+        !sql.contains("CASE WHEN \"li\".\"id\" IS NOT NULL"),
+        "an expression reading a real column is row-dependent and must not be guarded: {sql}"
+    );
+}
+
 #[test]
 fn test_child_count_one_without_a_pk_errors() {
     // Same fate as COUNT(*) with no PK: the rewrite is impossible, so the

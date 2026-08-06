@@ -48,30 +48,32 @@ CREATE SEMANTIC VIEW cr0806_sales AS
     li.n_star AS COUNT(*),
     li.n_one AS COUNT(1),
     li.s_one AS SUM(1),
-    li.n_str AS COUNT('x')
+    li.n_str AS COUNT('x'),
+    li.n_paren AS COUNT((1))
   );
 
-# All four spellings count the same three real line items. Before the fix
-# n_one, s_one and n_str each returned 4.
-query IIII
+# All five spellings count the same three real line items. Before the fix
+# n_one, s_one and n_str each returned 4; n_paren -- the redundantly
+# parenthesized literal raised by review on #203 -- returned 4 after it.
+query IIIII
 SELECT * FROM semantic_view(
   'cr0806_sales',
-  metrics := ['n_star', 'n_one', 's_one', 'n_str']
+  metrics := ['n_star', 'n_one', 's_one', 'n_str', 'n_paren']
 );
 ----
-3	3	3	3
+3	3	3	3	3
 
 # Grouped: East = order 1 (2 items) + order 3 (childless, contributes none).
 # The childless order previously added one to every constant-argument metric.
-query TIIII rowsort
+query TIIIII rowsort
 SELECT * FROM semantic_view(
   'cr0806_sales',
   dimensions := ['region'],
-  metrics := ['n_star', 'n_one', 's_one', 'n_str']
+  metrics := ['n_star', 'n_one', 's_one', 'n_str', 'n_paren']
 );
 ----
-East	2	2	2	2
-West	1	1	1	1
+East	2	2	2	2	2
+West	1	1	1	1	1
 
 # A group whose orders are ALL childless: COUNT-family metrics are 0 and
 # SUM(1) is NULL -- the empty-aggregate semantics the phantom row destroyed.

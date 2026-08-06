@@ -385,13 +385,28 @@ pub(super) fn rewrite_count_star(expr: &str, replacement_arg: &str) -> Option<St
 const MULTIPLICITY_SENSITIVE_AGGS: [&str; 5] = ["COUNT", "SUM", "PRODUCT", "LIST", "ARRAY_AGG"];
 
 /// Whether `arg` is a SQL constant: a numeric literal, a single-quoted string
-/// literal, or `TRUE`/`FALSE`/`NULL`.
+/// literal, or `TRUE`/`FALSE`/`NULL` — each optionally wrapped in redundant
+/// parentheses.
 ///
 /// Deliberately conservative — a false negative leaves an expression alone
 /// (the status quo), while a false positive would wrap something row-dependent
 /// in a `CASE` and change what it means.
 fn is_constant_literal(arg: &str) -> bool {
-    let t = arg.trim();
+    let mut t = arg.trim();
+    // Peel redundant outer parentheses: `(1)` is the same constant as `1`, and
+    // left unpeeled it fails every check below on the leading `(`.
+    //
+    // Only when the opening paren's match IS the final character. `(1)+(2)` also
+    // starts with `(` and ends with `)` without those two being a pair, and
+    // peeling them blindly would hand the checks below the garbage `1)+(2` —
+    // harmless for a numeric literal, but `('a')||('b')` would peel to
+    // `'a')||('b'` and pass the starts-and-ends-with-quote test by accident.
+    while t.starts_with('(') {
+        match super::semi_additive::find_matching_paren(t, 0) {
+            Some(close) if close == t.len() - 1 => t = t[1..close].trim(),
+            _ => break,
+        }
+    }
     if t.is_empty() {
         return false;
     }
