@@ -1782,6 +1782,59 @@ mod tests {
         assert_eq!(entries[0].comment, None);
     }
 
+    // PARSE-6: the annotation scanner's word-boundary check treated `.` as a
+    // boundary, so the `comment` in a QUALIFIED column reference started the
+    // annotation region — leaving the dangling `o.` as the stored expression.
+    // `graph/member_refs.rs` skips bare chains, so CREATE succeeded and the
+    // user's predicate was silently discarded; the corruption surfaced only as
+    // a query-time syntax error, and GET_DDL round-tripped the wreckage.
+    //
+    // DuckDB accepts unquoted `comment`/`labels` as column names, so by this
+    // project's dialect rule (Snowflake decides semantics, DuckDB decides the
+    // host language) the unquoted qualified form has to work.
+    #[test]
+    fn test_unquoted_qualified_comment_column_is_not_an_annotation() {
+        let entries =
+            parse_qualified_entries("o.d AS o.comment = 'x'", 0, false, "dimensions").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].expr, "o.comment = 'x'",
+            "a qualified column named `comment` is part of the expression, not an annotation"
+        );
+        assert_eq!(entries[0].comment, None);
+    }
+
+    #[test]
+    fn test_unquoted_qualified_labels_column_is_not_an_annotation() {
+        let entries =
+            parse_qualified_entries("o.d AS o.labels IS NOT NULL", 0, false, "dimensions").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].expr, "o.labels IS NOT NULL");
+    }
+
+    // DuckDB accepts whitespace around the qualifier dot, so the boundary walks
+    // back over it rather than looking only at the immediately preceding byte.
+    #[test]
+    fn test_spaced_qualified_comment_column_is_not_an_annotation() {
+        let entries =
+            parse_qualified_entries("o.d AS o . comment = 'x'", 0, false, "dimensions").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].expr, "o . comment = 'x'");
+        assert_eq!(entries[0].comment, None);
+    }
+
+    // The bare (unqualified) keyword must still be read as an annotation — the
+    // fix narrows the boundary, it must not disable detection.
+    #[test]
+    fn test_bare_comment_keyword_still_parses_as_annotation() {
+        let entries =
+            parse_qualified_entries("o.d AS o.region COMMENT = 'hi'", 0, false, "dimensions")
+                .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].expr, "o.region");
+        assert_eq!(entries[0].comment.as_deref(), Some("hi"));
+    }
+
     #[test]
     fn test_quoted_comment_column_usable_in_expression() {
         // PA-9 companion: a column literally named `comment` is usable at

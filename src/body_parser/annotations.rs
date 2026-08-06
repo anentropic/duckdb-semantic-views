@@ -5,6 +5,32 @@ use super::split_at_depth0_commas;
 use crate::errors::ParseError;
 use crate::model::AccessModifier;
 
+/// Whether a keyword starting at `i` sits on a boundary that can legitimately
+/// begin a trailing annotation.
+///
+/// An identifier character before it disqualifies it (`my_comment`), and so
+/// does a `.` — `o.comment` is a QUALIFIED COLUMN REFERENCE, not the COMMENT
+/// keyword (PARSE-6, code-review 2026-08-06). Treating `.` as a word boundary
+/// made the scanner start the annotation region mid-reference, leaving the
+/// dangling `o.` as the stored expression and silently discarding the rest of
+/// the user's predicate.
+///
+/// Whitespace between the qualifier and the member is skipped, because `o .
+/// comment` is as qualified as `o.comment` and `DuckDB` accepts both.
+fn annotation_boundary_before(bytes: &[u8], i: usize) -> bool {
+    if i == 0 {
+        return true;
+    }
+    if is_ident_continuation(bytes[i - 1]) {
+        return false;
+    }
+    let mut j = i;
+    while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    j == 0 || bytes[j - 1] != b'.'
+}
+
 /// Trailing metadata annotations parsed from a DDL entry.
 /// Used internally to collect COMMENT and SYNONYMS from entry text.
 #[derive(Debug, Default)]
@@ -164,7 +190,7 @@ pub(super) fn parse_trailing_annotations(
             if depth == 0 {
                 // Check for COMMENT keyword with word boundaries
                 if i + 7 <= bytes.len() && &upper_bytes[i..i + 7] == b"COMMENT" {
-                    let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
+                    let before_ok = annotation_boundary_before(bytes, i);
                     let after_ok = i + 7 == bytes.len() || !is_ident_continuation(bytes[i + 7]);
                     if before_ok && after_ok && annotation_start.is_none() {
                         annotation_start = Some(i);
@@ -172,7 +198,7 @@ pub(super) fn parse_trailing_annotations(
                 }
                 // Check for LABELS keyword (LABELS = (FILTER))
                 if i + 6 <= bytes.len() && &upper_bytes[i..i + 6] == b"LABELS" {
-                    let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
+                    let before_ok = annotation_boundary_before(bytes, i);
                     let after_ok = i + 6 == bytes.len() || !is_ident_continuation(bytes[i + 6]);
                     if before_ok && after_ok && annotation_start.is_none() {
                         annotation_start = Some(i);
@@ -180,7 +206,7 @@ pub(super) fn parse_trailing_annotations(
                 }
                 // Check for WITH keyword (for WITH SYNONYMS)
                 if i + 4 <= bytes.len() && &upper_bytes[i..i + 4] == b"WITH" {
-                    let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
+                    let before_ok = annotation_boundary_before(bytes, i);
                     let after_ok = i + 4 == bytes.len() || !is_ident_continuation(bytes[i + 4]);
                     if before_ok && after_ok {
                         // Verify it's WITH SYNONYMS, not just any WITH

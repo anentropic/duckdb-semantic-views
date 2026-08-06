@@ -151,19 +151,35 @@ fn has_search_path_argument(args: &str) -> bool {
 /// explicit one the caller wrote wins and re-running this is idempotent — the
 /// override can see the same text twice (`plan_rewrite` is invoked a second
 /// time to recover error positions, AR-5).
+///
+/// Every scan below runs against a COMMENT-BLANKED copy, never the raw text.
+/// `expr_tokens.rs` states the precondition its tokenizer relies on —
+/// "expressions reaching this layer are already comment-blanked" — and the
+/// write path (`plan_rewrite`) honours it while this read path did not, so an
+/// ordinary comment could disable injection or splice the argument inside the
+/// comment (PARSE-5, code-review 2026-08-06). `blank_sql_comments` is
+/// length-preserving, so offsets found in the blanked copy index the original
+/// text unchanged and the splice below can use them directly.
 pub(crate) fn inject_search_path(sql: &str) -> Cow<'_, str> {
     if !might_contain_read_call(sql) {
         return Cow::Borrowed(sql);
     }
+    let blanked = crate::util::blank_sql_comments(sql);
+    let scan = blanked.as_ref();
+    debug_assert_eq!(
+        scan.len(),
+        sql.len(),
+        "blank_sql_comments must preserve byte offsets"
+    );
     // Collect insertion points first: rewriting as we scan would invalidate the
     // offsets the scanner reports.
     let mut insert_at: Vec<usize> = Vec::new();
-    for head in crate::expr_tokens::scan_function_heads(sql) {
+    for head in crate::expr_tokens::scan_function_heads(scan) {
         let name = crate::ident::normalize_ident_part(head.raw);
         if !RESOLVING_READ_FUNCTIONS.contains(&name.as_str()) {
             continue;
         }
-        let bytes = sql.as_bytes();
+        let bytes = scan.as_bytes();
         let mut open = head.end;
         while open < bytes.len() && bytes[open].is_ascii_whitespace() {
             open += 1;
@@ -171,12 +187,13 @@ pub(crate) fn inject_search_path(sql: &str) -> Cow<'_, str> {
         if bytes.get(open) != Some(&b'(') {
             continue;
         }
-        let Some(close) = matching_close_paren(sql, open) else {
+        let Some(close) = matching_close_paren(scan, open) else {
             continue;
         };
         // An explicit `search_path` named argument in this call's own list
-        // means the caller (or an earlier pass) already supplied one.
-        if has_search_path_argument(&sql[open..close]) {
+        // means the caller (or an earlier pass) already supplied one. Read from
+        // the blanked copy so a commented-out one cannot forge an opt-out.
+        if has_search_path_argument(&scan[open..close]) {
             continue;
         }
         insert_at.push(close);
@@ -405,6 +422,92 @@ mod tests {
         assert!(
             SEARCH_PATH_SQL.contains("current_schema()"),
             "{SEARCH_PATH_SQL}"
+        );
+    }
+
+    // PARSE-5: the read-side injector scanned the RAW statement, while
+    // `expr_tokens.rs` documents the opposite precondition ("expressions
+    // reaching this layer are already comment-blanked"). Every scanner it uses
+    // is therefore comment-blind, and a single ordinary comment could disable
+    // or corrupt injection. dbt-duckdb prepends a comment to EVERY statement
+    // and survived only because its JSON annotation happens to contain
+    // balanced apostrophes and no `)`.
+    //
+    // Downstream (catalog resolution) a missing path is not an error but a
+    // fallback to "unique match, else ambiguous", so these were silent: adding
+    // a comment above a working query could flip it to an ambiguity error, or
+    // resolve a view DuckDB's own search-path rule calls nonexistent.
+
+    #[test]
+    fn a_leading_line_comment_containing_an_apostrophe_does_not_defeat_injection() {
+        // The apostrophe in `don't` opened a phantom string literal that
+        // swallowed the function head, so nothing was injected at all.
+        let sql = "-- don't touch\nSELECT * FROM semantic_view('v')";
+        let got = inject_search_path(sql);
+        assert_eq!(
+            got,
+            format!(
+                "-- don't touch\nSELECT * FROM semantic_view('v'{})",
+                suffix()
+            ),
+            "a comment must not suppress injection"
+        );
+    }
+
+    #[test]
+    fn a_leading_block_comment_containing_an_apostrophe_does_not_defeat_injection() {
+        let sql = "/* it's fine */ SELECT * FROM semantic_view('v')";
+        let got = inject_search_path(sql);
+        assert_eq!(
+            got,
+            format!(
+                "/* it's fine */ SELECT * FROM semantic_view('v'{})",
+                suffix()
+            )
+        );
+    }
+
+    #[test]
+    fn a_close_paren_inside_a_block_comment_does_not_end_the_call() {
+        // Worst case: the `)` inside the comment was taken as the call's close,
+        // so the argument was spliced INSIDE the comment and vanished --
+        // the query then ran with no path at all.
+        let sql = "SELECT * FROM semantic_view('v' /* x) */)";
+        let got = inject_search_path(sql);
+        assert_eq!(
+            got,
+            format!("SELECT * FROM semantic_view('v' /* x) */{})", suffix()),
+            "the argument must land after the comment, inside the real call"
+        );
+    }
+
+    #[test]
+    fn a_comment_between_the_function_head_and_its_paren_does_not_defeat_injection() {
+        // Only whitespace was skipped between head and `(`.
+        let sql = "SELECT * FROM semantic_view /* c */ ('v')";
+        let got = inject_search_path(sql);
+        assert_eq!(
+            got,
+            format!("SELECT * FROM semantic_view /* c */ ('v'{})", suffix())
+        );
+    }
+
+    #[test]
+    fn a_read_call_named_only_inside_a_comment_is_not_injected() {
+        // The mirror of the above: commented-out code is not a call site.
+        let sql = "-- SELECT * FROM semantic_view('v')\nSELECT 1";
+        assert!(matches!(inject_search_path(sql), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn an_explicit_search_path_inside_a_comment_does_not_suppress_injection() {
+        // The already-has-an-argument check must read the blanked argument
+        // list too, or a comment could forge an opt-out.
+        let sql = "SELECT * FROM semantic_view('v' /* search_path := 'x' */)";
+        let got = inject_search_path(sql);
+        assert!(
+            got.contains("search_path := list_concat"),
+            "a commented-out argument is not a real one: {got}"
         );
     }
 }
