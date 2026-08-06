@@ -293,15 +293,15 @@ edge -- joining it would multiply the member's rows, so the query is rejected
 with a fan-trap error rather than answered with an inflated aggregate. See
 :ref:`howto-facts-cross-table`.
 
-For a **raw column of another table**, what differs is **when the rule is
-enforced**. Snowflake rejects the expression at ``CREATE``; this extension
-accepts the DDL and the reference surfaces later. ``o.margin AS o.amount -
-c.discount`` is emitted verbatim into the query, and joins are collected from
-each member's declared table and its fact references alone -- so ``customers``
-is never joined and DuckDB raises a binder error for the unknown alias ``c`` at
-query time. The number is never silently wrong, but the error names DuckDB's
-missing alias rather than the semantic-layer rule that was broken. Adding the
-``CREATE``-time validation is tracked as TECH-DEBT #52.
+A **raw column of another table** (``o.margin AS o.amount - c.discount``) is
+rejected at ``CREATE`` in both systems, with an error naming the rule and
+pointing at the fact-based alternative. A qualifier that names no declared table
+at all is left to DuckDB, which is the right place for a struct path, a bound
+parameter, or a typo to be resolved.
+
+.. versionchanged:: 0.12.0
+   Before, the definition was accepted and the reference surfaced at query time
+   as a DuckDB unknown-alias error — the same rule, enforced later.
 
 Derived metrics are unaffected: a metric that references metrics on other tables
 (``m AS t1.metric_1 + t2.metric_2``) is supported in both systems, and is

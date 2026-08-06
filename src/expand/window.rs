@@ -174,7 +174,7 @@ pub(super) fn expand_window_metrics(
     // Dimension columns in CTE
     for rd in resolved_dims {
         let dim = rd.dim;
-        let mut base_expr = dim.expr.clone();
+        let mut base_expr = super::facts::inline_dimension_facts(&dim.expr, &def.facts);
         if let Some(ref scoped) = rd.scoped_alias {
             if let Some(ref st) = dim.source_table {
                 base_expr = crate::expr_tokens::rewrite_qualifier(&base_expr, st, scoped);

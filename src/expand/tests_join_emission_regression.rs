@@ -262,11 +262,11 @@ fn par3_cross_table_column_reference_pulls_no_join() {
         dimensions: vec![DimensionName::new("order_status")],
         metrics: vec![MetricName::new("mixed_margin")],
     };
-    let sql = expand("test", &def, &req).expect("the DDL and the query are both accepted today");
+    let sql = expand("test", &def, &req).expect("the expander itself does not police scoping");
     assert!(
         !sql.contains("customers"),
         "the `c.discount` reference must not pull a join — joins come from \
-         `source_table` alone (TECH-DEBT #52): {sql}"
+         `source_table` and fact references, never from a raw foreign column: {sql}"
     );
     assert!(
         sql.contains("SUM(o.amount - c.discount)"),
@@ -442,18 +442,63 @@ fn par6_queried_fact_chaining_to_another_table_pulls_its_join() {
     );
 }
 
-/// The asymmetry PAR-6 does NOT cover, pinned so it is not mistaken for
-/// support: `inline_facts` runs on metric and fact expressions, never on a
-/// DIMENSION's. A fact name inside a dimension expression is therefore emitted
-/// verbatim as a column reference (`c.cust_tier`, a column that does not
-/// exist) and the query fails on the unknown column whether or not `c` is
-/// joined. Collecting a join for it would attach a relation to satisfy a
-/// reference that is never substituted, so the collection is metric-only.
-///
-/// TECH-DEBT #54 holds what would finish it. Replace this pin -- do not delete
-/// it -- if dimension expressions gain fact inlining.
+/// The same reference on the FACTS query path, which builds its SELECT list
+/// from a separate site.
 #[test]
-fn dimension_fact_reference_is_not_inlined() {
+fn td54_dimension_fact_reference_is_inlined_on_the_facts_path() {
+    let def = SemanticViewDefinition::default()
+        .with_table("o", "orders", &["id"])
+        .with_fact("net_line", "o.amount - o.discount", "o")
+        .with_fact("raw_amount", "o.amount", "o")
+        .with_dimension("band", "o.net_line", Some("o"))
+        .with_metric("total", "SUM(o.amount)", Some("o"));
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![FactName::new("raw_amount")],
+        dimensions: vec![DimensionName::new("band")],
+        metrics: vec![],
+    };
+    let sql = expand("test", &def, &req).expect("a fact query with such a dimension is answerable");
+    assert!(
+        sql.contains("(o.amount - o.discount) AS \"band\""),
+        "the facts path must inline the dimension's fact too: {sql}"
+    );
+}
+
+/// And inside a `where_clause` predicate, whose member expressions are spliced
+/// into the WHERE rather than the SELECT list.
+#[test]
+fn td54_dimension_fact_reference_is_inlined_in_a_where_clause() {
+    let def = SemanticViewDefinition::default()
+        .with_table("o", "orders", &["id"])
+        .with_fact("net_line", "o.amount - o.discount", "o")
+        .with_dimension("band", "o.net_line", Some("o"))
+        .with_dimension("status", "o.status", Some("o"))
+        .with_metric("total", "SUM(o.amount)", Some("o"));
+    let req = QueryRequest {
+        where_clause: Some("band > 10".to_string()),
+        facts: vec![],
+        dimensions: vec![DimensionName::new("status")],
+        metrics: vec![MetricName::new("total")],
+    };
+    let sql = expand("test", &def, &req).expect("a predicate over such a dimension is answerable");
+    assert!(
+        sql.contains("(o.amount - o.discount)") && sql.contains("WHERE"),
+        "the predicate must carry the inlined expression: {sql}"
+    );
+    assert!(
+        !sql.contains("o.net_line"),
+        "no un-inlined fact name may survive into the predicate: {sql}"
+    );
+}
+
+/// TECH-DEBT #54, cross-table half: with dimension expressions now fact-inlined,
+/// a dimension reaching a fact on ANOTHER table needs that table joined, exactly
+/// as a metric does (PAR-6). This is the collection #200 removed as premature —
+/// it joined a relation for a reference that was never substituted — restored
+/// now that the substitution happens.
+#[test]
+fn td54_cross_table_fact_reference_in_a_dimension_pulls_its_join() {
     let def = SemanticViewDefinition::default()
         .with_table("o", "orders", &["id"])
         .with_table("c", "customers", &["id"])
@@ -467,14 +512,62 @@ fn dimension_fact_reference_is_not_inlined() {
         dimensions: vec![DimensionName::new("tier_label")],
         metrics: vec![MetricName::new("total")],
     };
-    let sql = expand("test", &def, &req).expect("the DDL and the query are both accepted");
+    let sql = expand("test", &def, &req).expect("a cross-table fact in a dimension is answerable");
     assert!(
-        sql.contains("c.cust_tier AS \"tier_label\""),
-        "TECH-DEBT #54: the reference is emitted verbatim, not inlined -- \
-         DuckDB then fails on the unknown column: {sql}"
+        sql.contains("(c.tier) AS \"tier_label\""),
+        "the fact must be inlined into the dimension: {sql}"
     );
     assert!(
-        !sql.contains("(c.tier)"),
-        "a dimension expression is not fact-inlined: {sql}"
+        sql.contains(r#"LEFT JOIN "customers" AS "c""#),
+        "the reached fact's table must be joined: {sql}"
+    );
+}
+
+/// The same, inside a grain CTE: the per-grain planner projects dimension
+/// expressions as its group keys, so each CTE must join what those expressions
+/// reach. Copilot flagged this call site while reviewing #200 — correctly about
+/// where it was heading, though it was unreachable until dimensions inlined.
+///
+/// Topology matters here. An earlier draft put the dimension on the base table
+/// with a parent-table metric, which the metric x dimension fence rejects for a
+/// reason that has nothing to do with facts — the test passed through its error
+/// branch and proved nothing. The chain below (`o` -> `c` -> `seg`, all
+/// many-to-one) keeps every grain able to reach the dimension without fanning,
+/// so the query really is answered and the assertions really run.
+#[test]
+fn td54_cross_table_dimension_fact_joins_inside_the_grain_cte() {
+    let def = SemanticViewDefinition::default()
+        .with_table("o", "orders", &["id"])
+        .with_table("c", "customers", &["id"])
+        .with_table("seg", "segments", &["id"])
+        .with_fact("seg_name", "seg.name", "seg")
+        .with_dimension("seg_label", "seg.seg_name", Some("c"))
+        .with_metric("order_total", "SUM(o.amount)", Some("o"))
+        .with_metric("cust_total", "SUM(c.balance)", Some("c"))
+        .with_pkfk_join("o_to_c", "o", "c", &["customer_id"], &["id"])
+        .with_pkfk_join("c_to_seg", "c", "seg", &["segment_id"], &["id"]);
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![DimensionName::new("seg_label")],
+        metrics: vec![
+            MetricName::new("order_total"),
+            MetricName::new("cust_total"),
+        ],
+    };
+    let sql = expand("test", &def, &req)
+        .expect("two grains, both reaching the dimension without fanning");
+    assert!(
+        sql.contains("__sv_grain_1"),
+        "this must be the per-grain path, or the test is not exercising it: {sql}"
+    );
+    assert!(
+        sql.contains("(seg.name)"),
+        "the dimension's fact must be inlined in the grain CTEs: {sql}"
+    );
+    assert_eq!(
+        sql.matches(r#"LEFT JOIN "segments" AS "seg""#).count(),
+        2,
+        "BOTH grain CTEs project the dimension, so both must join its fact's table: {sql}"
     );
 }

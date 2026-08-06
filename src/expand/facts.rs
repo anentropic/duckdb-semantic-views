@@ -176,6 +176,38 @@ pub(super) fn collect_referenced_facts(expr: &str, facts: &[Fact]) -> Vec<(Strin
     reached
 }
 
+/// A dimension's expression with the facts it references inlined.
+///
+/// TECH-DEBT #54. `inline_facts` was applied to metric expressions and to other
+/// facts' expressions, never to a dimension's — so a dimension declared
+/// `band AS CASE WHEN o.net_line > 100 …`, over a fact `net_line` on its own
+/// table, emitted `o.net_line` verbatim and `DuckDB` failed on the unknown
+/// column. Snowflake's validation rules permit exactly this ("expressions can
+/// refer to base table columns **or other expressions** on the same logical
+/// table"), so the gap was a parity defect rather than an unsupported
+/// extension, and it applied to the plain same-table case — not just to the
+/// cross-table form PAR-6 dealt with for metrics.
+///
+/// Every emitter that renders a dimension expression goes through here, so the
+/// inlined form reaches the base-anchored SELECT, the grain CTEs, the facts
+/// path, the semi-additive snapshot and its `ORDER BY`, the window CTE, and
+/// `where_clause` members alike. Role-playing alias rewriting is applied by the
+/// callers *after* this, which is the correct order: the fact's expression is
+/// spliced in first, then the qualifier it carries is rewritten along with the
+/// rest.
+///
+/// A cyclic fact set (rejected at CREATE by `validate_facts`) leaves the
+/// expression untouched rather than panicking.
+pub(super) fn inline_dimension_facts(expr: &str, facts: &[Fact]) -> String {
+    if facts.is_empty() {
+        return expr.to_string();
+    }
+    let Ok(topo) = toposort_facts(facts) else {
+        return expr.to_string();
+    };
+    inline_facts(expr, facts, &topo)
+}
+
 /// The reached tables alone — [`collect_referenced_facts`] without the names,
 /// for the join resolver, which only needs to know what to join.
 pub(super) fn collect_referenced_fact_tables(expr: &str, facts: &[Fact]) -> Vec<String> {

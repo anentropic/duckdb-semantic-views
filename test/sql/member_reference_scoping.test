@@ -1,0 +1,204 @@
+# Member-expression reference scoping, end to end.
+#
+# TECH-DEBT #52 (PAR-3) -- a RAW column of another logical table is now rejected
+# at CREATE with a message naming the semantic-layer rule, instead of being
+# accepted and surfacing later as a DuckDB binder error about an unknown alias.
+# Snowflake applies the same rule; only the enforcement point differed.
+#
+# TECH-DEBT #54 -- a dimension expression may reference a declared FACT, which
+# Snowflake's validation rules permit explicitly ("expressions can refer to base
+# table columns OR OTHER EXPRESSIONS on the same logical table"). Facts were
+# inlined into metric and fact expressions but never into a dimension's, so the
+# fact name was emitted verbatim as a column that does not exist. That applied
+# to the plain same-table case, not just the cross-table one.
+#
+# The two are one change because they are the same question asked twice: what
+# may a member expression name? A column of its own table, or a declared member.
+# #54 makes the second half work for dimensions; #52 rejects everything else.
+#
+# Each case below was confirmed red individually against the pre-fix commit
+# (the runner stops a file at its first failing statement, so the set was
+# verified one case per run).
+
+require semantic_views
+
+statement ok
+CREATE TABLE mrs_customers (id INTEGER, region VARCHAR, tier VARCHAR, discount DECIMAL(10,2));
+
+statement ok
+CREATE TABLE mrs_orders (id INTEGER, customer_id INTEGER, amount DECIMAL(10,2), rebate DECIMAL(10,2));
+
+statement ok
+INSERT INTO mrs_customers VALUES (1, 'EU', 'gold', 5.00), (2, 'US', 'bronze', 2.00);
+
+statement ok
+INSERT INTO mrs_orders VALUES (10, 1, 100.00, 1.00), (11, 1, 50.00, 2.00), (12, 2, 30.00, 3.00);
+
+# ============================================================
+# TECH-DEBT #54 -- a dimension referencing a fact.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW mrs_dims AS
+  TABLES (
+    o AS mrs_orders PRIMARY KEY (id),
+    c AS mrs_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    o_to_c AS o(customer_id) REFERENCES c(id)
+  )
+  FACTS (
+    o.net_line AS o.amount - o.rebate,
+    c.cust_tier AS c.tier
+  )
+  DIMENSIONS (
+    o.size_band AS CASE WHEN o.net_line >= 49 THEN 'big' ELSE 'small' END,
+    o.tier_label AS c.cust_tier
+  )
+  METRICS (
+    o.order_count AS COUNT(o.id),
+    o.net_total AS SUM(o.net_line)
+  );
+
+# Case 1: a dimension referencing a fact on its OWN table. `net_line` is
+# `amount - rebate`, so the bands are: order 10 -> 99.00 big, order 11 ->
+# 48.00 small, order 12 -> 27.00 small. Before the fix `o.net_line` reached
+# DuckDB verbatim and the query failed on the unknown column.
+query TT
+SELECT size_band, order_count
+FROM semantic_view('mrs_dims', metrics := ['order_count'], dimensions := ['size_band'])
+ORDER BY size_band;
+----
+big	1
+small	2
+
+# Case 2: a dimension referencing a fact on ANOTHER table. The fact's table is
+# joined for the dimension exactly as it is for a metric (PAR-6), and the
+# grouping key is the inlined `c.tier`.
+query TT
+SELECT tier_label, order_count
+FROM semantic_view('mrs_dims', metrics := ['order_count'], dimensions := ['tier_label'])
+ORDER BY tier_label;
+----
+bronze	1
+gold	2
+
+# Case 3: the same dimension used as a grouping key alongside a metric that
+# also inlines a fact -- both members resolve through the same pass.
+#   gold  (orders 10, 11): 99.00 + 48.00 = 147.00
+#   bronze(order 12):                        27.00
+query TT
+SELECT tier_label, net_total
+FROM semantic_view('mrs_dims', metrics := ['net_total'], dimensions := ['tier_label'])
+ORDER BY tier_label;
+----
+bronze	27.00
+gold	147.00
+
+# Case 4: and inside a pre-aggregation predicate, whose member expressions are
+# spliced into the WHERE rather than the SELECT list. Only order 10 is 'big',
+# so the count is 1 and the total is its own net line.
+query TT
+SELECT tier_label, net_total
+FROM semantic_view(
+  'mrs_dims',
+  metrics := ['net_total'],
+  dimensions := ['tier_label'],
+  where_clause := 'size_band = ''big'''
+)
+ORDER BY tier_label;
+----
+gold	99.00
+
+# ============================================================
+# TECH-DEBT #52 -- a raw column of another table, rejected at CREATE.
+# ============================================================
+
+# Case 5: the defect PAR-3 filed. `c.discount` is a raw column of another
+# logical table; the DDL used to be accepted and the query then failed on the
+# unbound alias `c`. The error now names the rule and the fix.
+statement error
+CREATE SEMANTIC VIEW mrs_bad AS
+  TABLES (
+    o AS mrs_orders PRIMARY KEY (id),
+    c AS mrs_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    o_to_c AS o(customer_id) REFERENCES c(id)
+  )
+  METRICS (
+    o.mixed_margin AS SUM(o.amount - c.discount)
+  );
+----
+may only reference columns of its own table
+
+# Case 6: the message has to point at the supported alternative, not just
+# refuse -- defining a FACT on the other table is the documented way across.
+statement error
+CREATE SEMANTIC VIEW mrs_bad2 AS
+  TABLES (
+    o AS mrs_orders PRIMARY KEY (id),
+    c AS mrs_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    o_to_c AS o(customer_id) REFERENCES c(id)
+  )
+  DIMENSIONS (
+    o.region AS c.region
+  )
+  METRICS (
+    o.total AS SUM(o.amount)
+  );
+----
+define a FACT on that table
+
+# Case 7 (control): the legal cross-table form must still be accepted. This is
+# the same shape as case 5 with the foreign column replaced by a named fact --
+# the one-line difference between rejected and supported.
+statement ok
+CREATE SEMANTIC VIEW mrs_good AS
+  TABLES (
+    o AS mrs_orders PRIMARY KEY (id),
+    c AS mrs_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    o_to_c AS o(customer_id) REFERENCES c(id)
+  )
+  FACTS (
+    c.cust_discount AS c.discount
+  )
+  METRICS (
+    o.mixed_margin AS SUM(o.amount - c.cust_discount)
+  );
+
+# ... and answers: (100-5) + (50-5) + (30-2) = 168.00
+query T
+SELECT mixed_margin FROM semantic_view('mrs_good', metrics := ['mixed_margin']);
+----
+168.00
+
+# Case 8 (control): a derived metric composing metrics that live on different
+# tables is legal in both systems and is computed per grain. A derived metric is
+# declared WITHOUT a table prefix and references its components bare, so the
+# validator sees no qualified chain here at all -- the control that matters is
+# that the per-grain composition still works with the validator in the funnel.
+statement ok
+CREATE SEMANTIC VIEW mrs_derived AS
+  TABLES (
+    o AS mrs_orders PRIMARY KEY (id),
+    c AS mrs_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    o_to_c AS o(customer_id) REFERENCES c(id)
+  )
+  METRICS (
+    o.order_total AS SUM(o.amount),
+    c.cust_discount_total AS SUM(c.discount),
+    ratio AS order_total - cust_discount_total
+  );
+
+# 180.00 - 7.00 = 173.00, each aggregate at its own grain.
+query T
+SELECT ratio FROM semantic_view('mrs_derived', metrics := ['ratio']);
+----
+173.00

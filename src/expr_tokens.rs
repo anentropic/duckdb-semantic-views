@@ -95,6 +95,17 @@ impl IdentRef<'_> {
     /// [`crate::ident::parse_qualified_identifier_with_quoting`].
     ///
     /// [`key`]: IdentRef::key
+    /// The normalized key of the chain's **first** part — the qualifier:
+    /// `o.amount` → `o`, `o.address.city` → `o`, and `"My Tbl".c` → `my tbl`.
+    /// A bare chain returns its whole key.
+    ///
+    /// The mirror of [`last_part_key`](Self::last_part_key), and quote-aware
+    /// for the same reason: a dot inside a quoted part does not separate
+    /// qualifiers, so splitting the joined key on `.` would be wrong.
+    pub(crate) fn first_part_key(&self) -> String {
+        crate::ident::normalize_ident_part(&self.raw[..first_part_len(self.raw)])
+    }
+
     pub(crate) fn last_part_key(&self) -> String {
         match crate::ident::parse_qualified_identifier_with_quoting(self.raw.trim()) {
             Ok(parts) => parts

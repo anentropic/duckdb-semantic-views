@@ -120,7 +120,11 @@ fn metric_column(index: usize) -> String {
 /// The planner has already established the anchor is not fanned by the paths it
 /// emits, and `check_referenced_fact_fan_traps` has already rejected a fact on
 /// a table that fans its member — so nothing joined here multiplies the anchor.
-fn group_fact_tables(def: &SemanticViewDefinition, group: &Group) -> Vec<String> {
+fn group_fact_tables(
+    def: &SemanticViewDefinition,
+    group: &Group,
+    resolved_dims: &[&Dimension],
+) -> Vec<String> {
     let mut tables: Vec<String> = Vec::new();
     let push = |expr: &str, tables: &mut Vec<String>| {
         for alias in super::facts::collect_referenced_fact_tables(expr, &def.facts) {
@@ -156,6 +160,15 @@ fn group_fact_tables(def: &SemanticViewDefinition, group: &Group) -> Vec<String>
                 }
             }
         }
+    }
+    // TECH-DEBT #54: a grain CTE projects the queried dimension expressions as
+    // its group keys, and those are now fact-inlined too -- so a fact a
+    // dimension reaches on another table has to be joined inside this CTE, not
+    // just in the base-anchored SELECT. Copilot flagged this gap while
+    // reviewing #200; it was not yet reachable then, because dimensions were
+    // not inlined, and inlining them is what makes it real.
+    for dim in resolved_dims {
+        push(&dim.expr, &mut tables);
     }
     tables
 }
@@ -959,7 +972,7 @@ fn render_plain_group(
     let mut items: Vec<String> = Vec::new();
     for (d, dim) in resolved_dims.iter().enumerate() {
         let item = SelectItem::new(
-            dim_expr(dim, roles),
+            dim_expr(dim, roles, def),
             dim.output_type.clone(),
             quote_ident(&dim_column(d)),
         );
@@ -980,7 +993,7 @@ fn render_plain_group(
             def,
             &group.anchor,
             resolved_dims,
-            &[where_tables, &group_fact_tables(def, group)].concat(),
+            &[where_tables, &group_fact_tables(def, group, resolved_dims)].concat(),
             roles,
         ),
         def,
@@ -1096,7 +1109,7 @@ fn render_single_grain(
         .iter()
         .map(|dim| {
             SelectItem::new(
-                dim_expr(dim, roles),
+                dim_expr(dim, roles, def),
                 dim.output_type.clone(),
                 quote_stored_ident(&dim.name),
             )
@@ -1130,7 +1143,11 @@ fn render_single_grain(
                 def,
                 &group.anchor,
                 resolved_dims,
-                &[where_tables.clone(), group_fact_tables(def, group)].concat(),
+                &[
+                    where_tables.clone(),
+                    group_fact_tables(def, group, resolved_dims),
+                ]
+                .concat(),
                 roles,
             ),
         },
@@ -1336,17 +1353,24 @@ pub(super) fn anchor_joins<'a>(
 ///
 /// Mirrors what the base-anchored path does with [`ResolvedDim::scoped_alias`],
 /// so both paths emit `a__dep.city` for the same query.
-fn dim_expr(dim: &Dimension, roles: &HashMap<String, String>) -> String {
+fn dim_expr(
+    dim: &Dimension,
+    roles: &HashMap<String, String>,
+    def: &SemanticViewDefinition,
+) -> String {
+    // TECH-DEBT #54: facts first, then the role-playing qualifier rewrite, so a
+    // fact's own qualifier is rewritten along with the rest of the expression.
+    let expr = super::facts::inline_dimension_facts(&dim.expr, &def.facts);
     let Some(table) = dim.source_table.as_ref().map(|t| t.to_ascii_lowercase()) else {
-        return dim.expr.clone();
+        return expr;
     };
     match roles.get(&table) {
         Some(rel) => crate::expr_tokens::rewrite_qualifier(
-            &dim.expr,
+            &expr,
             &table,
             &super::join_resolver::scoped_join_alias(&table, rel),
         ),
-        None => dim.expr.clone(),
+        None => expr,
     }
 }
 

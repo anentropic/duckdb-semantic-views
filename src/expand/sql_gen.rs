@@ -273,7 +273,7 @@ fn expand_facts(
     // Dimensions first
     for dim in &resolved_dims {
         items.push(SelectItem::new(
-            dim.expr.clone(),
+            super::facts::inline_dimension_facts(&dim.expr, &def.facts),
             dim.output_type.clone(),
             quote_stored_ident(&dim.name),
         ));
@@ -530,7 +530,12 @@ pub fn expand(
     // pulls that table's join, so the fence has to rule out a fanning one.
     // Runs on every emission path — the referenced fact is inlined inside its
     // member's expression, so per-grain aggregation does not separate them.
-    super::fan_trap::check_referenced_fact_fan_traps(view_name, def, &resolved_mets)?;
+    super::fan_trap::check_referenced_fact_fan_traps(
+        view_name,
+        def,
+        &resolved_dims,
+        &resolved_mets,
+    )?;
     if let Some(rw) = &resolved_where {
         super::fan_trap::check_where_clause_fan_traps(view_name, def, &rw.members, &resolved_mets)?;
         // EXP-10: and the role-playing seam the fan-trap check does not cover —
@@ -623,7 +628,7 @@ pub fn expand(
     let mut items: Vec<SelectItem> = Vec::new();
     for rd in &resolved {
         let dim = rd.dim;
-        let mut base_expr = dim.expr.clone();
+        let mut base_expr = super::facts::inline_dimension_facts(&dim.expr, &def.facts);
         // Phase 32: If this dimension has a scoped alias, rewrite the expression.
         if let Some(ref scoped) = rd.scoped_alias {
             if let Some(ref st) = dim.source_table {

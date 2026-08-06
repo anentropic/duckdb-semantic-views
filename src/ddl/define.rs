@@ -132,6 +132,11 @@ pub fn enrich_definition_for_create(
     crate::graph::validate_facts(&def)?;
     crate::graph::validate_derived_metrics(&def)?;
     crate::graph::validate_using_relationships(&def)?;
+    // TECH-DEBT #52 (PAR-3): last of the graph checks, because it needs the
+    // fact and metric name sets the earlier ones validated -- a member
+    // expression may legitimately reference those across tables, and only a
+    // RAW column of another table is out of scope.
+    crate::graph::validate_member_references(&def)?;
 
     // 4. Serialize. Metadata (created_on, database_name, schema_name) is
     //    populated by SQL inside the rewritten INSERT — not here. Column

@@ -51,7 +51,13 @@ struct Instance {
 }
 
 /// The queryable objects, referenced by these stable names in every case.
-const DIMS: [&str; 2] = ["td", "ucat"];
+/// `uwd` (TECH-DEBT #54) is a PARENT-side dimension whose expression is the
+/// fact `uw1` rather than a raw column: `u.uw1`, inlining to `u.w + 1`.
+/// Dimensions were the one member kind facts were never inlined into, so this
+/// grouped by an unbindable `u.uw1` before the fix. Grouping by it also puts
+/// the inlined expression in a GROUP BY key rather than only a SELECT item,
+/// which is where a mis-splice changes which rows collapse together.
+const DIMS: [&str; 3] = ["td", "ucat", "uwd"];
 /// `svf` (PAR-6) is a CHILD-grain metric whose expression reaches a fact
 /// declared on the PARENT: `sum(t.v - u.uw1)` where `uw1 = u.w + 1` lives on
 /// `u`. Before PAR-6 the fact was inlined but `u` was never joined, so this
@@ -291,6 +297,17 @@ fn build_def() -> SemanticViewDefinition {
             synonyms: vec![],
             is_filter: false,
         },
+        // TECH-DEBT #54: a dimension whose expression names a FACT on its own
+        // table, the form Snowflake's validation rules explicitly permit.
+        Dimension {
+            name: "uwd".to_string(),
+            expr: "u.uw1".to_string(),
+            source_table: Some("u".to_string()),
+            output_type: None,
+            comment: None,
+            synonyms: vec![],
+            is_filter: false,
+        },
         // PBT-6 filter members: never selected as output, named only by a
         // generated `where_clause`. Compound expressions, so a splice that
         // loses its parentheses changes the answer.
@@ -413,6 +430,10 @@ fn child_grain_sql(case: &Case) -> String {
         .map(|&i| match DIMS[i] {
             "td" => "t.d AS td".to_string(),
             "ucat" => "u.ucat AS ucat".to_string(),
+            // TECH-DEBT #54: the fact written out independently. A dangling or
+            // NULL `fk` leaves `u.w` NULL, so the key is NULL -- which the
+            // NULL-safe grouping below has to keep as its own group.
+            "uwd" => "u.w + 1 AS uwd".to_string(),
             other => unreachable!("unexpected dim {other}"),
         })
         .collect();
@@ -463,8 +484,9 @@ fn child_grain_sql(case: &Case) -> String {
 /// the root-anchored `FROM t LEFT JOIN u` got wrong (each parent row counted
 /// once per child row, childless parents dropped entirely).
 ///
-/// Only `ucat` can be selected alongside it: `td` lives below `u`'s grain and
-/// the query is rejected before it gets here.
+/// Only PARENT-side dimensions can be selected alongside it (`ucat`, and since
+/// TECH-DEBT #54 the fact-valued `uwd`): `td` lives below `u`'s grain and the
+/// query is rejected before it gets here.
 /// PBT-6: the predicate is applied inside THIS grain too, before its
 /// aggregate. Only parent-side members can appear — a predicate touching the
 /// child is rejected before it reaches the oracle (see the fence branch in the
@@ -475,11 +497,43 @@ fn parent_grain_sql(case: &Case) -> String {
         .where_pred
         .as_ref()
         .map_or_else(String::new, |p| format!(" WHERE {}", p.to_raw_sql()));
-    if case.sel_dims.is_empty() {
+    let keys = parent_dim_items(case);
+    if keys.is_empty() {
         format!("SELECT sum(u.w) AS sw FROM u{where_sql}")
     } else {
-        format!("SELECT u.ucat AS ucat, sum(u.w) AS sw FROM u{where_sql} GROUP BY 1")
+        let group_by = (1..=keys.len())
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT {}, sum(u.w) AS sw FROM u{where_sql} GROUP BY {group_by}",
+            keys.join(", ")
+        )
     }
+}
+
+/// The queried dimensions that live on the PARENT, written against `u` alone —
+/// the projection the parent-grain aggregate groups by. `uwd` is the #54 case:
+/// the fact `uw1` written out independently as `u.w + 1`.
+fn parent_dim_items(case: &Case) -> Vec<String> {
+    case.sel_dims
+        .iter()
+        .filter_map(|&i| match DIMS[i] {
+            "ucat" => Some("u.ucat AS ucat".to_string()),
+            "uwd" => Some("u.w + 1 AS uwd".to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The names of those dimensions, in the same order — the keys the two grains
+/// are combined on.
+fn parent_dim_names(case: &Case) -> Vec<&'static str> {
+    case.sel_dims
+        .iter()
+        .map(|&i| DIMS[i])
+        .filter(|d| matches!(*d, "ucat" | "uwd"))
+        .collect()
 }
 
 /// Independent oracle SQL for a query `expand` should accept.
@@ -516,15 +570,25 @@ fn oracle_sql(case: &Case) -> String {
             items.join(", ")
         );
     }
-    items.push("COALESCE(a.ucat, b.ucat) AS ucat".to_string());
+    // Every parent-side dimension is a combine key, not just `ucat` (#54 added
+    // a second). A group present at only one grain must survive, so the keys
+    // are COALESCEd and matched NULL-safely.
+    let keys = parent_dim_names(case);
+    for k in &keys {
+        items.push(format!("COALESCE(a.{k}, b.{k}) AS {k}"));
+    }
     for m in &child_metrics {
         items.push(format!("a.{m}"));
     }
     items.push("b.sw".to_string());
     let child = child_grain_sql(case);
+    let on = keys
+        .iter()
+        .map(|k| format!("a.{k} IS NOT DISTINCT FROM b.{k}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
     format!(
-        "SELECT {} FROM ({child}) a FULL OUTER JOIN ({parent}) b \
-         ON a.ucat IS NOT DISTINCT FROM b.ucat",
+        "SELECT {} FROM ({child}) a FULL OUTER JOIN ({parent}) b ON {on}",
         items.join(", ")
     )
 }
