@@ -1,0 +1,180 @@
+# Code review 2026-08-06, PARSE-5 and PARSE-6: two silent parser defects,
+# both reachable from ordinary SQL, through the real extension.
+#
+# PARSE-5 -- the read-side search-path injector scanned the RAW statement,
+# while every scanner it uses documents the opposite precondition
+# ("expressions reaching this layer are already comment-blanked"). So an
+# ordinary comment could suppress injection outright, or splice the argument
+# INSIDE the comment. With no path supplied, catalog resolution falls back to
+# "unique match, else ambiguous" -- so with `sales` in two schemas, adding a
+# comment above a working query turned it into an ambiguity error.
+#
+# This is the dbt-duckdb shape: dbt prepends `/* {"app": "dbt", ...} */` to
+# EVERY statement (see quick_260430_vdz_leading_comments.test, which pins the
+# DDL half). It survived only because that JSON happens to hold balanced
+# apostrophes and no `)`.
+#
+# PARSE-6 -- the annotation scanner treated `.` as a word boundary, so the
+# `comment` in a qualified column reference started the annotation region and
+# the dangling `o.` was stored as the expression. CREATE succeeded (bare
+# chains are skipped by member-ref validation) and the corruption surfaced
+# only later, as a query-time syntax error.
+#
+# The runner halts a file at its first failing statement, so the per-case red
+# proof lives at the unit layer (`parse::search_path::tests`,
+# `body_parser::tests`). This file covers what those cannot: the whole
+# extension-load -> DDL -> query path.
+
+require semantic_views
+
+statement ok
+CREATE SCHEMA analytics;
+
+statement ok
+CREATE SCHEMA staging;
+
+statement ok
+CREATE TABLE orders (id INTEGER PRIMARY KEY, amount INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO orders VALUES (1, 100, 'north'), (2, 250, 'south');
+
+# `analytics.sales` totals 350; `staging.sales` counts 2 rows. The two exist
+# so that resolution NEEDS the search path -- without an injected path these
+# queries error as ambiguous rather than answering.
+statement ok
+CREATE SEMANTIC VIEW analytics.sales AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS SUM(o.amount));
+
+statement ok
+CREATE SEMANTIC VIEW staging.sales AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.total AS COUNT(*));
+
+statement ok
+SET search_path = 'analytics';
+
+# Control: no comment, injection works. This passed before the fix too.
+query I
+SELECT total FROM semantic_view('sales', metrics := ['total'])
+----
+350
+
+# PARSE-5 repro 1: a leading line comment containing an apostrophe. The `'`
+# in "don't" opened a phantom string literal that swallowed the function
+# head, so nothing was injected and this errored as ambiguous.
+query I
+-- don't touch this
+SELECT total FROM semantic_view('sales', metrics := ['total'])
+----
+350
+
+# PARSE-5 repro 2: the same shape as a block comment.
+query I
+/* it's fine */ SELECT total FROM semantic_view('sales', metrics := ['total'])
+----
+350
+
+# PARSE-5 repro 3: a `)` inside a block comment was taken as the call's close
+# paren, so the argument was spliced INSIDE the comment and disappeared.
+query I
+SELECT total FROM semantic_view('sales' /* x) */, metrics := ['total'])
+----
+350
+
+# PARSE-5 repro 4: a comment between the function head and its `(` -- only
+# whitespace was skipped there.
+query I
+SELECT total FROM semantic_view /* c */ ('sales', metrics := ['total'])
+----
+350
+
+# The dbt-duckdb annotation itself, on the read path.
+query I
+/* {"app": "dbt", "node_id": "model.sales"} */ SELECT total FROM semantic_view('sales', metrics := ['total'])
+----
+350
+
+# The path still decides which view answers -- injection is not hardcoding
+# one schema. `staging.sales` counts rows (2), it does not sum amounts.
+statement ok
+SET search_path = 'staging';
+
+query I
+-- don't touch this
+SELECT total FROM semantic_view('sales', metrics := ['total'])
+----
+2
+
+statement ok
+SET search_path = 'main';
+
+# ============================================================
+# PARSE-6: `o.comment` is a column reference, not an annotation.
+# ============================================================
+
+statement ok
+CREATE TABLE notes (id INTEGER PRIMARY KEY, comment VARCHAR, labels VARCHAR);
+
+statement ok
+INSERT INTO notes VALUES (1, 'keep', 'a'), (2, 'drop', 'b'), (3, 'keep', NULL);
+
+# Before the fix this CREATE "succeeded" with the dimension expression stored
+# as the dangling `n.`, and the predicate silently discarded.
+statement ok
+CREATE SEMANTIC VIEW notes_view AS
+  TABLES (n AS notes PRIMARY KEY (id))
+  DIMENSIONS (
+    n.is_keep AS n.comment = 'keep',
+    n.has_label AS n.labels IS NOT NULL
+  )
+  METRICS (n.cnt AS COUNT(*));
+
+# The stored expression is the user's predicate, whole -- GET_DDL round-trips
+# what was stored, so a truncated `n.` would show up here.
+query T
+SELECT GET_DDL('SEMANTIC_VIEW', 'notes_view') LIKE '%n.comment = ''keep''%'
+----
+true
+
+# And it computes: two rows say 'keep', one says 'drop'. With the expression
+# stored as the dangling `n.`, this failed with a query-time syntax error.
+query TI rowsort
+SELECT * FROM semantic_view('notes_view', dimensions := ['is_keep'], metrics := ['cnt'])
+----
+0	1
+1	2
+
+query TI rowsort
+SELECT * FROM semantic_view('notes_view', dimensions := ['has_label'], metrics := ['cnt'])
+----
+0	1
+1	2
+
+# The bare keyword must still be read as an annotation -- the boundary was
+# narrowed, not disabled.
+statement ok
+CREATE SEMANTIC VIEW annotated AS
+  TABLES (n AS notes PRIMARY KEY (id))
+  DIMENSIONS (n.lbl AS n.labels COMMENT = 'the label column')
+  METRICS (n.cnt AS COUNT(*));
+
+query TTTTTTTT
+SHOW SEMANTIC DIMENSIONS IN annotated
+----
+memory	main	annotated	notes	lbl	(empty)	[]	the label column
+
+statement ok
+DROP SEMANTIC VIEW annotated
+
+statement ok
+DROP SEMANTIC VIEW notes_view
+
+statement ok
+DROP SEMANTIC VIEW analytics.sales
+
+statement ok
+DROP SEMANTIC VIEW staging.sales
