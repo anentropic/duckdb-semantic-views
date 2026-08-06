@@ -76,6 +76,24 @@ pub fn opens_escape_string(bytes: &[u8], quote: usize) -> bool {
     quote < 2 || !is_ident_byte(bytes[quote - 2])
 }
 
+/// Byte offset just past a backslash escape at `i` inside an escape string, or
+/// `None` when `i` is not such an escape.
+///
+/// `in_escape_string` is the caller's [`opens_escape_string`] verdict for the
+/// literal currently open — in an ORDINARY literal a backslash is data, so this
+/// must not fire there.
+///
+/// The result is CLAMPED to `bytes.len()`: an input whose last byte is the
+/// backslash (`e'\`) has nothing to escape, and an unclamped `i + 2` lands one
+/// past the buffer. Every scanner shares this one advance precisely so that
+/// bound cannot drift between them — when the four loops each carried their own
+/// copy, the lexer's was the one that forgot to clamp and produced a token
+/// whose `end` could not be sliced (raised by review on #205).
+#[must_use]
+pub fn escaped_pair_end(bytes: &[u8], i: usize, in_escape_string: bool) -> Option<usize> {
+    (in_escape_string && bytes[i] == b'\\').then(|| (i + 2).min(bytes.len()))
+}
+
 /// Byte offset of the subslice `inner` within `outer`.
 ///
 /// `inner` MUST be a subslice of `outer` (borrowed from the same allocation,
@@ -222,8 +240,8 @@ impl QuoteState {
             // is — including a quote that would otherwise close the literal, and
             // including another backslash (so `\\` is one escaped backslash and
             // does not escape a quote after it).
-            if self.string_is_escape && b == b'\\' {
-                return ((i + 2).min(bytes.len()), false);
+            if let Some(next) = escaped_pair_end(bytes, i, self.string_is_escape) {
+                return (next, false);
             }
             if b == b'\'' {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
@@ -326,8 +344,8 @@ pub fn blank_sql_comments(input: &str) -> std::borrow::Cow<'_, str> {
         match st {
             St::InString => {
                 // `\\` escapes the next byte inside an escape string (PARSE-7).
-                if string_is_escape && bytes[i] == b'\\' {
-                    i = (i + 2).min(bytes.len());
+                if let Some(next) = escaped_pair_end(bytes, i, string_is_escape) {
+                    i = next;
                     continue;
                 }
                 if bytes[i] == b'\'' {

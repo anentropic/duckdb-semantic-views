@@ -131,8 +131,8 @@ pub(super) fn lex(src: &str) -> Vec<Token> {
                 i += 1;
                 let mut terminated = false;
                 while i < bytes.len() {
-                    if is_escape && bytes[i] == b'\\' {
-                        i += 2;
+                    if let Some(next) = crate::util::escaped_pair_end(bytes, i, is_escape) {
+                        i = next;
                         continue;
                     }
                     if bytes[i] == b'\'' {
@@ -218,6 +218,7 @@ fn lex_dollar_string(bytes: &[u8], start: usize) -> Token {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn kinds(src: &str) -> Vec<TokenKind> {
         lex(src).into_iter().map(|t| t.kind).collect()
@@ -392,6 +393,41 @@ mod tests {
         );
     }
 
+    // An escape string whose LAST byte is the backslash has nothing to escape.
+    // The two-byte advance must clamp, or the token's `end` lands one past the
+    // buffer and any later `src[start..end]` panics. Raised by review on #205;
+    // `skip_single_quoted` is safe by construction (it returns `len` after its
+    // loop) and the other two scanners already clamped, so the lexer was the
+    // one place the divergence bit.
+    #[test]
+    fn unterminated_escape_string_ending_in_a_backslash_stays_in_bounds() {
+        let src = "e'\\";
+        for t in lex(src) {
+            assert!(
+                t.end <= src.len(),
+                "token {t:?} ends past the buffer (len {})",
+                src.len()
+            );
+            // The span must also be sliceable, which is the actual failure mode.
+            let _ = &src[t.start..t.end];
+        }
+    }
+
+    // Same shape one byte further in, where the backslash escapes the quote and
+    // the literal is genuinely unterminated.
+    #[test]
+    fn escape_string_with_escaped_final_quote_is_unterminated_and_in_bounds() {
+        let src = "e'\\'";
+        let toks = lex(src);
+        assert_eq!(
+            toks.last().map(|t| t.kind),
+            Some(TokenKind::Unterminated { ident: false })
+        );
+        for t in toks {
+            assert!(t.end <= src.len(), "token {t:?} ends past the buffer");
+        }
+    }
+
     // Control: `\\` escapes the backslash, so the next `'` still closes.
     #[test]
     fn escape_string_with_escaped_backslash_is_terminated() {
@@ -478,6 +514,37 @@ mod tests {
             #[test]
             fn tiling_holds_over_arbitrary_unicode(s in r"[\s\S]{0,32}") {
                 assert_well_formed(&s);
+            }
+        }
+    }
+
+    proptest! {
+        /// Every token span must be sliceable, for ANY input.
+        ///
+        /// The escape-string advance (PARSE-7) is the second two-byte step in
+        /// this lexer and the first that could run off the end: the `''` step
+        /// is guarded by `i + 1 < len`, while the escape step needed an
+        /// explicit clamp it did not originally have (raised by review on
+        /// #205). Pinning the invariant covers the whole token stream rather
+        /// than the one shape that happened to break it — a `.get()` rather
+        /// than a length check, so a span landing inside a multi-byte
+        /// codepoint fails here too.
+        ///
+        /// The alphabet is deliberately TINY and quote-heavy. A general
+        /// `".{0,64}"` generator passes this property even with the clamp
+        /// removed — it essentially never emits an escape string ending in a
+        /// backslash, so it would have been a vacuous guard that merely looked
+        /// like coverage. Verified: with the clamp reverted this generator
+        /// fails, that one does not.
+        #[test]
+        fn every_token_span_is_sliceable(src in "[eE'\\\\\"$,a\u{e9}]{0,24}") {
+            for t in lex(&src) {
+                prop_assert!(t.start <= t.end, "inverted span {t:?}");
+                prop_assert!(
+                    src.get(t.start..t.end).is_some(),
+                    "span {t:?} is not sliceable from {src:?} (len {})",
+                    src.len()
+                );
             }
         }
     }

@@ -227,8 +227,8 @@ pub(crate) fn skip_single_quoted(bytes: &[u8], i: usize) -> usize {
     let is_escape = crate::util::opens_escape_string(bytes, i);
     let mut j = i + 1;
     while j < len {
-        if is_escape && bytes[j] == b'\\' {
-            j += 2;
+        if let Some(next) = crate::util::escaped_pair_end(bytes, j, is_escape) {
+            j = next;
             continue;
         }
         if bytes[j] == b'\'' {
