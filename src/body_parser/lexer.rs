@@ -126,9 +126,15 @@ pub(super) fn lex(src: &str) -> Vec<Token> {
             }
             b'\'' => {
                 let start = i;
+                // `E'…'` — a backslash escapes the next byte (PARSE-7).
+                let is_escape = crate::util::opens_escape_string(bytes, start);
                 i += 1;
                 let mut terminated = false;
                 while i < bytes.len() {
+                    if is_escape && bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
                     if bytes[i] == b'\'' {
                         // `''` is an escape — stay inside the string.
                         if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
@@ -369,6 +375,42 @@ mod tests {
             lex("\"a\"\"b").first().map(|t| t.kind),
             Some(TokenKind::Unterminated { ident: true })
         );
+    }
+
+    // PARSE-7: `\'` inside a DuckDB escape string (`E'...'`) is an escaped
+    // quote, so `e'\''` is a TERMINATED one-character literal. Reading `\`
+    // as an ordinary byte made the middle and closing quotes look like one
+    // `''` escape pair, so the token ran to EOF as Unterminated.
+    #[test]
+    fn escape_string_with_backslash_escaped_quote_is_terminated() {
+        let toks = lex("e'\\''");
+        // `e` lexes as a bare ident, then the string.
+        assert_eq!(
+            toks.last().map(|t| t.kind),
+            Some(TokenKind::String),
+            "tokens: {toks:?}"
+        );
+    }
+
+    // Control: `\\` escapes the backslash, so the next `'` still closes.
+    #[test]
+    fn escape_string_with_escaped_backslash_is_terminated() {
+        assert_eq!(
+            lex("e'\\\\'").last().map(|t| t.kind),
+            Some(TokenKind::String)
+        );
+    }
+
+    // Control: a typed literal's `E` belongs to the type name, so ordinary
+    // string rules apply and a trailing backslash does not escape the close.
+    #[test]
+    fn typed_literal_is_not_an_escape_string() {
+        assert_eq!(
+            lex("DATE'2020-01-01'").last().map(|t| t.kind),
+            Some(TokenKind::String)
+        );
+        // `'a\'` is a complete ordinary literal; nothing may follow it inside.
+        assert_eq!(lex("'a\\'").last().map(|t| t.kind), Some(TokenKind::String));
     }
 
     #[test]

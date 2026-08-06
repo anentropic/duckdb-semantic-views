@@ -71,6 +71,7 @@ pub fn arb_payload() -> impl Strategy<Value = String> {
         "[a-zéàçΩ東京☕' ]{0,10}",
         Just("the PRIMARY KEY (id) lives here".to_string()),
         Just("has -- and /* inside */".to_string()),
+        Just("back\\slash and ' quote".to_string()),
     ]
 }
 
@@ -82,6 +83,12 @@ pub fn arb_expr(aliases: Vec<String>) -> impl Strategy<Value = String> {
         (alias, arb_bare_ident()).prop_map(|(a, c)| format!("{a}.{c}")),
         arb_bare_ident(),
         arb_payload().prop_map(|p| format!("'{}'", p.replace('\'', "''"))),
+        // A `DuckDB` escape string (`E'…'`), in which `\` escapes the next byte
+        // — so both `\` and `'` in the payload must themselves be escaped.
+        // This is PARSE-7's shape: before the escape-aware scanners landed, a
+        // `\'` here ran the literal to end-of-buffer, and a comma later in the
+        // payload silently split one entry into two garbage ones.
+        arb_payload().prop_map(|p| format!("e'{}'", p.replace('\\', "\\\\").replace('\'', "\\'"))),
         "[0-9]{1,4}",
     ];
     atom.prop_recursive(2, 8, 3, |inner| {
