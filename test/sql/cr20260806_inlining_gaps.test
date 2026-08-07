@@ -51,11 +51,11 @@ INSERT INTO cr0806i_orders VALUES
 statement ok
 CREATE SEMANTIC VIEW cr0806i_chain AS
 TABLES (o AS cr0806i_orders PRIMARY KEY (id))
-DIMENSIONS (o.region AS o.region)
 FACTS (
     o.base_price AS o.price * (1 - o.discount),
     o.total AS base_price * o.quantity
 )
+DIMENSIONS (o.region AS o.region)
 METRICS (o.revenue AS SUM(total));
 
 # base_price/total per row: 100/200, 25/25, 200/200.
@@ -127,11 +127,11 @@ TABLES (
     c AS cr0806i_cust PRIMARY KEY (id)
 )
 RELATIONSHIPS (s_to_c AS s(cust_id) REFERENCES c)
-DIMENSIONS (s.sid AS s.id)
 FACTS (
     c.cust_rate AS c.rate,
     s.weighted AS s.amount * cust_rate
 )
+DIMENSIONS (s.sid AS s.id)
 METRICS (s.total AS SUM(s.amount));
 
 # weighted per row: 10*1=10, 20*2=40, 30*1=30. Filtering weighted > 25 keeps
@@ -166,8 +166,8 @@ RELATIONSHIPS (li_to_o AS li(order_id) REFERENCES o)
 DIMENSIONS (o.region AS o.region)
 METRICS (
     li.item_rev AS SUM(li.price),
-    li.double_rev AS li.item_rev * 2,
-    li.bare_double AS item_rev * 2
+    double_rev AS li.item_rev * 2,
+    bare_double AS item_rev * 2
 );
 
 # item_rev = 10 + 20 + 30 = 60, so both doubles are 120. Before the fix the
