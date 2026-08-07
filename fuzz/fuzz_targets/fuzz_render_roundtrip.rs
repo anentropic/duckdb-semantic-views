@@ -67,6 +67,25 @@ fn kb_to_def(kb: KeywordBody) -> SemanticViewDefinition {
 }
 
 fuzz_target!(|def: SemanticViewDefinition| {
+    // --- Precondition, applied UP FRONT ---
+    //
+    // RT-5 made this rule explicit but consulted it LAZILY — only in the
+    // stage-1 parse-failure branch below. That was inconsistent, and the
+    // inconsistency had teeth: when stage 1 happened to parse, the target went
+    // on to assert against a chain rooted in a definition no entry point can
+    // store, and reported the resulting stage-2 failure as render/parse drift.
+    // (Observed 2026-08-07: an input whose `pk_columns` contained `""`, which
+    // the precondition already rejects, reached the stage-2 panic.)
+    //
+    // A definition that fails `validate_ddl_representable` cannot be stored by
+    // any real entry point — the DDL grammar rejects it, and YAML import now
+    // rejects it too — so nothing downstream of it is a contract this project
+    // owes anyone. Skipping it is a stated rule; skipping it CONSISTENTLY is
+    // what makes the two assertions below mean what they say.
+    if validate_ddl_representable(&def).is_err() {
+        return;
+    }
+
     // --- Normalize once into the parser's image ---
     let Ok(rendered0) = render_create_ddl("fuzz_view", &def) else {
         return; // legacy-format defs (empty tables) don't render
@@ -74,27 +93,20 @@ fuzz_target!(|def: SemanticViewDefinition| {
     let Some(body0) = body_of(&rendered0) else {
         return;
     };
-    let Ok(kb1) = parse_keyword_body(body0, 0) else {
-        // RT-5: this used to be an unconditional escape — "arbitrary content the
-        // parser can't accept". That is what let the GET_DDL contract break
-        // exactly where the oracle stopped looking: `Arbitrary` produced
-        // `name: None` / `source_table: None`, render emitted DDL this parser
-        // rejects, and the target classified its own finding as unreachable
-        // input and stayed green.
-        //
-        // The precondition is now EXPLICIT. A definition that fails
-        // `validate_ddl_representable` cannot be stored by any real entry point
-        // (the DDL grammar rejects it; YAML import now rejects it too), so
-        // skipping it is a stated rule rather than a shrug. A definition that
-        // PASSES it and still fails to re-parse is a genuine contract break.
-        if validate_ddl_representable(&def).is_err() {
-            return;
-        }
+    // RT-5: this used to be an unconditional escape — "arbitrary content the
+    // parser can't accept". That is what let the GET_DDL contract break exactly
+    // where the oracle stopped looking: `Arbitrary` produced `name: None` /
+    // `source_table: None`, render emitted DDL this parser rejects, and the
+    // target classified its own finding as unreachable input and stayed green.
+    // With the precondition above already applied, a parse failure here is a
+    // genuine contract break, with no escape left.
+    let kb1 = parse_keyword_body(body0, 0).unwrap_or_else(|e| {
         panic!(
             "render produced DDL the parser rejects, for a definition every entry \
-             point would accept:\n{rendered0}"
-        );
-    };
+             point would accept: {}\n{rendered0}",
+            e.message
+        )
+    });
     let d1 = kb_to_def(kb1); // parser-produced (canonical)
 
     // --- Assert render is idempotent on the parser-produced def ---

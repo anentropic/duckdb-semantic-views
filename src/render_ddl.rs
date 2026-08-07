@@ -111,6 +111,28 @@ fn emit_table(s: &str) -> String {
     }
 }
 
+/// Emit a member's `alias.` qualifier and its name.
+///
+/// Both are single-identifier slots read as one token each, exactly like a
+/// table alias, so they get the same quote-if-it-would-not-round-trip treatment
+/// via [`emit_alias`]. Emitting them RAW was a render-side gap of the same
+/// family as RT-5/RT-6, found by `fuzz_render_roundtrip` once its escapes were
+/// removed: a metric named `bli]ound` renders as `bli]ound AS sum(t.a)`, and
+/// the entry parser — which tracks bracket depth — never sees the `AS` at depth
+/// zero, so `GET_DDL` emits DDL this project cannot read back. Quoted, the
+/// bracket is inert and the entry parses (probed both spellings).
+///
+/// Idempotent for the same reason `emit_alias` is: re-parsing a quoted name
+/// stores it WITH its quotes, and a well-formed `"..."` round-trips verbatim,
+/// so the second render emits it unchanged.
+fn emit_member_name(out: &mut String, source_table: Option<&String>, name: &str) {
+    if let Some(src) = source_table {
+        out.push_str(&emit_alias(src));
+        out.push('.');
+    }
+    out.push_str(&emit_alias(name));
+}
+
 /// Emit TABLES clause entries.
 fn emit_tables(out: &mut String, def: &SemanticViewDefinition) {
     out.push_str("TABLES (\n");
@@ -220,11 +242,7 @@ fn emit_facts(out: &mut String, def: &SemanticViewDefinition) {
         if matches!(fact.access, AccessModifier::Private) {
             out.push_str("PRIVATE ");
         }
-        if let Some(ref src) = fact.source_table {
-            out.push_str(src);
-            out.push('.');
-        }
-        out.push_str(&fact.name);
+        emit_member_name(out, fact.source_table.as_ref(), &fact.name);
         out.push_str(" AS ");
         out.push_str(&fact.expr);
         emit_comment(out, fact.comment.as_deref());
@@ -243,11 +261,7 @@ fn emit_dimensions(out: &mut String, def: &SemanticViewDefinition) {
     out.push_str("DIMENSIONS (\n");
     for (i, dim) in def.dimensions.iter().enumerate() {
         out.push_str("    ");
-        if let Some(ref src) = dim.source_table {
-            out.push_str(src);
-            out.push('.');
-        }
-        out.push_str(&dim.name);
+        emit_member_name(out, dim.source_table.as_ref(), &dim.name);
         out.push_str(" AS ");
         out.push_str(&dim.expr);
         emit_comment(out, dim.comment.as_deref());
@@ -364,11 +378,7 @@ fn emit_metrics(out: &mut String, def: &SemanticViewDefinition) {
         if matches!(metric.access, AccessModifier::Private) {
             out.push_str("PRIVATE ");
         }
-        if let Some(ref src) = metric.source_table {
-            out.push_str(src);
-            out.push('.');
-        }
-        out.push_str(&metric.name);
+        emit_member_name(out, metric.source_table.as_ref(), &metric.name);
         if !metric.using_relationships.is_empty() {
             out.push_str(" USING (");
             out.push_str(&metric.using_relationships.join(", "));
@@ -1344,23 +1354,30 @@ mod tests {
                 ..Default::default()
             }
         }
+        // RT-5: the escape is an EXPLICIT precondition, applied UP FRONT and
+        // mirroring the fuzz target exactly. A definition that fails
+        // `validate_ddl_representable` cannot be stored by any entry point, so
+        // nothing downstream of it is a contract this project owes anyone.
+        // Consulting it lazily — only on a stage-1 parse failure, as this did
+        // originally — let a chain rooted in an unstorable definition reach the
+        // stage-2 assertion and be reported as render/parse drift.
+        if crate::model::validate_ddl_representable(def).is_err() {
+            return;
+        }
         // Normalize once into the parser's image.
         let rendered0 = render_create_ddl("fuzz_view", def).expect("def renders");
         let Some(body0) = body_of(&rendered0) else {
             panic!("rendered DDL lost its AS body:\n{rendered0}");
         };
-        // RT-5: the escape is now an EXPLICIT precondition, mirroring the fuzz
-        // target. A definition that fails `validate_ddl_representable` cannot be
-        // stored by any entry point; one that passes it and still fails to
-        // re-parse is a genuine contract break.
-        let Ok(kb1) = parse_keyword_body(body0, 0) else {
-            assert!(
-                crate::model::validate_ddl_representable(def).is_err(),
+        // One that passes the precondition and still fails to re-parse is a
+        // genuine contract break, with no escape left.
+        let kb1 = parse_keyword_body(body0, 0).unwrap_or_else(|e| {
+            panic!(
                 "render produced DDL the parser rejects, for a definition every \
-                 entry point would accept:\n{rendered0}"
-            );
-            return;
-        };
+                 entry point would accept: {}\n{rendered0}",
+                e.message
+            )
+        });
         let d1 = kb_to_def(kb1);
         // Assert render is idempotent on the parser-produced def.
         let rendered1 =

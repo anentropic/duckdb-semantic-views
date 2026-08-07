@@ -730,9 +730,54 @@ fn validate_yaml_joins(def: &SemanticViewDefinition) -> Result<(), String> {
 /// `source_table` is a DERIVED metric, and `profit AS revenue - cost` is
 /// accepted unqualified. Sweeping metrics into the same rule would reject every
 /// YAML-imported derived metric.
+/// Every member is `name AS expr`, and the clause parsers reject an entry whose
+/// expression is missing ("Missing expression after 'AS'"). A blank one renders
+/// as exactly that — `e.p AS ` — so `GET_DDL` emits DDL it cannot read back.
+///
+/// Whitespace-only counts as blank: the parser trims before deciding, so
+/// `e.p AS    ` fails the same way. Found by `fuzz_render_roundtrip`; bisecting
+/// its crash cleared every other field in the definition (a NUL-bearing alias,
+/// a table name full of spaces, a trailing-space member name — the renderer
+/// quotes all of those and they round-trip).
+///
+/// Deliberately narrow: it is the *expression* that the grammar requires, not
+/// the rest of a member's payload. Comments, synonyms and `output_type` were
+/// probed with quotes, newlines, parens and empty values, and all round-trip,
+/// so none of them is checked here.
+fn member_expr(kind: &str, name: &str, expr: &str) -> Result<(), String> {
+    if expr.trim().is_empty() {
+        return Err(format!(
+            "{kind} '{name}' has an empty expression; a {kind} is '{name} AS <expr>'"
+        ));
+    }
+    // An expression is free-form SQL, so unlike an identifier it CANNOT be
+    // quote-protected on the way out — the renderer must emit it verbatim, and
+    // whatever structure it carries is structure the clause parser will read.
+    // The fuzz target's own header has always said as much ("a free-form `expr`
+    // cannot be quote-protected"); what was missing was the matching
+    // precondition, so an expression the grammar cannot carry looked like
+    // render/parse drift instead of an unstorable definition.
+    //
+    // `column_roundtrips_verbatim` is exactly the rule that matters here, for
+    // the same reason it matters for a column: balanced quotes and brackets
+    // that never dip negative (an unbalanced `)` closes the CLAUSE early — the
+    // shape the fuzzer found, `AS )   P ; rip`), no depth-0 comma (which would
+    // split one member into two), and no surrounding whitespace (which the
+    // parser trims, silently storing a different expression than the one given).
+    if !crate::body_parser::column_roundtrips_verbatim(expr) {
+        return Err(format!(
+            "{kind} '{name}' has an expression the DDL grammar cannot carry \
+             ('{expr}'); an expression must have balanced quotes and brackets, \
+             no top-level comma, and no surrounding whitespace"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_yaml_members(def: &SemanticViewDefinition) -> Result<(), String> {
     for d in &def.dimensions {
         slot_single("dimension", "name", &d.name)?;
+        member_expr("dimension", &d.name, &d.expr)?;
         let Some(src) = d.source_table.as_deref() else {
             return Err(format!(
                 "dimension '{}' has no source_table; a dimension must name its table \
@@ -744,6 +789,7 @@ fn validate_yaml_members(def: &SemanticViewDefinition) -> Result<(), String> {
     }
     for f in &def.facts {
         slot_single("fact", "name", &f.name)?;
+        member_expr("fact", &f.name, &f.expr)?;
         let Some(src) = f.source_table.as_deref() else {
             return Err(format!(
                 "fact '{}' has no source_table; a fact must name its table \
@@ -755,8 +801,33 @@ fn validate_yaml_members(def: &SemanticViewDefinition) -> Result<(), String> {
     }
     for m in &def.metrics {
         slot_single("metric", "name", &m.name)?;
+        member_expr("metric", &m.name, &m.expr)?;
         if let Some(src) = m.source_table.as_deref() {
             slot_single("metric", "source_table", src)?;
+        } else {
+            // A metric with no source table is a DERIVED metric, and
+            // `body_parser/metrics.rs` refuses three clauses on that form —
+            // each with its own error. YAML could set all three anyway, and
+            // `GET_DDL` then rendered e.g. `ZZZZ NON ADDITIVE BY (v) AS ZZZZ`,
+            // which this project's own parser rejects. Found by
+            // `fuzz_render_roundtrip`; the three are listed together because
+            // they are one rule in the grammar ("only qualified metrics may
+            // use these"), and fixing them one at a time would just mean three
+            // more red CI runs.
+            for (present, clause) in [
+                (!m.using_relationships.is_empty(), "USING"),
+                (!m.non_additive_by.is_empty(), "NON ADDITIVE BY"),
+                (m.window_spec.is_some(), "OVER"),
+            ] {
+                if present {
+                    return Err(format!(
+                        "metric '{}' has no source_table, making it a derived metric, \
+                         but carries a {clause} clause; only a qualified metric \
+                         ('alias.name AS expr') may use {clause}",
+                        m.name
+                    ));
+                }
+            }
         }
         for r in &m.using_relationships {
             slot_reference("metric", "USING relationship", r)?;
@@ -1001,6 +1072,129 @@ mod tests {
             "it fails for the reason the parser fails on it -- a missing \
              DIMENSIONS/METRICS clause, not its table name: {e}"
         );
+    }
+
+    // Round two of the same fuzz oracle (2026-08-07). The shrunk definition
+    // rendered `e.p  AS ` -- a metric with an EMPTY expression. Bisecting the
+    // crash field-by-field cleared every other suspect in it: a NUL-bearing
+    // alias, a table name full of spaces, and a trailing-space member name all
+    // round-trip (the renderer quotes them). Only the blank expression breaks,
+    // and it breaks identically for all three member kinds, so all three are
+    // pinned here rather than just the one the fuzzer happened to reach.
+    //
+    // Every other payload field that reaches the renderer was probed in the
+    // same batch and is fine: comments containing quotes / newlines / nothing,
+    // synonyms containing quotes / parens / nothing, and `output_type` empty,
+    // spacey or malformed.
+
+    #[test]
+    fn yaml_derived_metric_carrying_a_qualified_only_clause_is_rejected() {
+        // `body_parser/metrics.rs` refuses USING / NON ADDITIVE BY / OVER on an
+        // unqualified metric. All three are checked here because they are one
+        // rule in the grammar; the fuzzer only ever reached NON ADDITIVE BY.
+        for (field, clause) in [
+            ("using_relationships: [r]", "USING"),
+            ("non_additive_by:\n      - dimension: d", "NON ADDITIVE BY"),
+        ] {
+            let yaml = format!(
+                "{VALID_TABLES}dimensions: []\n\
+                 metrics:\n  - name: derived\n    expr: base * 2\n    {field}\n"
+            );
+            let e = yaml_err(&yaml);
+            assert!(
+                e.contains("derived") && e.contains(clause),
+                "the error must name the metric and the offending clause ({clause}): {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_member_expression_the_grammar_cannot_carry_is_rejected() {
+        // An expression is free-form SQL and CANNOT be quote-protected on the
+        // way out, so the precondition has to refuse the shapes that would
+        // re-parse as something else. The unbalanced `)` is the one the fuzzer
+        // found: it closes the DIMENSIONS clause early.
+        for expr in [
+            "')'",        // fine -- inside a string literal (control, below)
+            ")  P ; rip", // unbalanced close paren: ends the clause
+            "a, b",       // depth-0 comma: splits one member into two
+            "sum(o.a) ",  // trailing space: the parser trims, storing a different expr
+            "sum((o.a)",  // unbalanced open paren: swallows the rest of the clause
+        ]
+        .iter()
+        .skip(1)
+        {
+            let yaml = format!(
+                "{VALID_TABLES}dimensions: []\n\
+                 metrics:\n  - name: total\n    expr: '{}'\n    source_table: o\n",
+                expr.replace('\'', "''")
+            );
+            let e = yaml_err(&yaml);
+            assert!(
+                e.contains("total"),
+                "the error must name the offending metric (expr {expr:?}): {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_expression_with_punctuation_inside_a_literal_still_imports() {
+        // Control: parens and commas inside a string literal are inert, and a
+        // nested call is ordinary. Neither may be swept up by the rule above.
+        let yaml = format!(
+            "{VALID_TABLES}dimensions: []\n\
+             metrics:\n  - name: total\n    expr: \"coalesce(sum(o.amount), 0) || ')'\"\n    source_table: o\n"
+        );
+        SemanticViewDefinition::from_yaml_with_size_cap("v", &yaml)
+            .expect("balanced nesting and quoted punctuation are ordinary SQL");
+    }
+
+    #[test]
+    fn yaml_metric_with_an_empty_expression_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions: []\n\
+             metrics:\n  - name: total\n    expr: ''\n    source_table: o\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("metric") && e.contains("total"), "{e}");
+    }
+
+    #[test]
+    fn yaml_dimension_with_an_empty_expression_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: region\n    expr: ''\n    source_table: o\n\
+             metrics: []\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("dimension") && e.contains("region"), "{e}");
+    }
+
+    #[test]
+    fn yaml_fact_with_a_blank_expression_is_rejected() {
+        // Whitespace-only, not empty: the parser trims before deciding, so
+        // `f AS    ` is the same "Missing expression after 'AS'" as `f AS `.
+        let yaml = format!(
+            "{VALID_TABLES}facts:\n  - name: net\n    expr: '   '\n    source_table: o\n\
+             dimensions: []\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("fact") && e.contains("net"), "{e}");
+    }
+
+    #[test]
+    fn yaml_member_payloads_that_do_round_trip_still_import() {
+        // Control for the three above: the renderer handles quotes, newlines
+        // and parens in comments / synonyms / types, so none of those may be
+        // swept up by an over-broad "payload must be tame" rule.
+        let yaml = "tables:\n  - alias: o\n    table: orders\n    pk_columns: [id]\n\
+                    dimensions: []\n\
+                    metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n\
+                    \x20   comment: \"it's a metric\"\n\
+                    \x20   synonyms: [\"a)\", \"it's\"]\n\
+                    \x20   output_type: 'DECIMAL(10, 2)'\n";
+        SemanticViewDefinition::from_yaml_with_size_cap("v", yaml)
+            .expect("comments, synonyms and types with punctuation all round-trip");
     }
 
     #[test]

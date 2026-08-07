@@ -44,6 +44,24 @@ $$
 ----
 neither dimensions nor metrics
 
+# A member with no expression. Every member is `name AS expr`, and this
+# rendered as a bare `o.total AS ` -- "Missing expression after 'AS'". Also
+# found by the fuzzer, on the run after the one above.
+statement error
+CREATE SEMANTIC VIEW cr0806y_noexpr FROM YAML $$
+tables:
+  - alias: o
+    table: cr0806y_orders
+    pk_columns: [id]
+dimensions: []
+metrics:
+  - name: total
+    expr: ''
+    source_table: o
+$$
+----
+empty expression
+
 # ============================================================
 # Identifier slots (RT-5/RT-6).
 # ============================================================
