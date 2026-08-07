@@ -25,7 +25,7 @@
 // parseable, identical DDL" property this target deliberately does not re-assert.
 use libfuzzer_sys::fuzz_target;
 use semantic_views::body_parser::{parse_keyword_body, KeywordBody};
-use semantic_views::model::{validate_identifier_slots, SemanticViewDefinition};
+use semantic_views::model::{validate_ddl_representable, SemanticViewDefinition};
 use semantic_views::render_ddl::render_create_ddl;
 
 /// Strip the rendered header (`CREATE OR REPLACE SEMANTIC VIEW <name>
@@ -83,11 +83,11 @@ fuzz_target!(|def: SemanticViewDefinition| {
         // input and stayed green.
         //
         // The precondition is now EXPLICIT. A definition that fails
-        // `validate_identifier_slots` cannot be stored by any real entry point
+        // `validate_ddl_representable` cannot be stored by any real entry point
         // (the DDL grammar rejects it; YAML import now rejects it too), so
         // skipping it is a stated rule rather than a shrug. A definition that
         // PASSES it and still fails to re-parse is a genuine contract break.
-        if validate_identifier_slots(&def).is_err() {
+        if validate_ddl_representable(&def).is_err() {
             return;
         }
         panic!(

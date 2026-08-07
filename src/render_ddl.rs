@@ -1350,12 +1350,12 @@ mod tests {
             panic!("rendered DDL lost its AS body:\n{rendered0}");
         };
         // RT-5: the escape is now an EXPLICIT precondition, mirroring the fuzz
-        // target. A definition that fails `validate_identifier_slots` cannot be
+        // target. A definition that fails `validate_ddl_representable` cannot be
         // stored by any entry point; one that passes it and still fails to
         // re-parse is a genuine contract break.
         let Ok(kb1) = parse_keyword_body(body0, 0) else {
             assert!(
-                crate::model::validate_identifier_slots(def).is_err(),
+                crate::model::validate_ddl_representable(def).is_err(),
                 "render produced DDL the parser rejects, for a definition every \
                  entry point would accept:\n{rendered0}"
             );
