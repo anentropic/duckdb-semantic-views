@@ -49,6 +49,99 @@ pub(super) struct ResolvedWhere {
     pub(super) members: Vec<(String, Option<String>)>,
 }
 
+/// The member lookup tables a predicate is resolved against.
+///
+/// Extracted from [`resolve_where_clause`] so that function stays inside the
+/// pedantic line budget; the construction is one cohesive step (build every
+/// name -> expression / table mapping, then scan the predicate against them).
+struct MemberMaps<'a> {
+    /// Member name key -> its PARENTHESIZED, fact-inlined expression.
+    dim_exprs: HashMap<String, String>,
+    /// Member name key -> the table it is declared on.
+    member_tables: HashMap<String, Option<&'a str>>,
+    /// Member name key -> tables reached THROUGH its fact references (EXP-23).
+    member_fact_tables: HashMap<String, Vec<String>>,
+    /// PRIVATE facts, kept out of the lookup so a reference is rejected by name
+    /// rather than leaking the member (EXP-13).
+    private_facts: HashMap<String, &'a str>,
+}
+
+fn build_member_maps<'a>(
+    def: &'a SemanticViewDefinition,
+    keys_for: &impl Fn(Option<&str>, &str) -> Vec<String>,
+) -> MemberMaps<'a> {
+    let mut dim_exprs: HashMap<String, String> = HashMap::new();
+    let mut member_tables: HashMap<String, Option<&str>> = HashMap::new();
+    // EXP-23: tables reached THROUGH a member's fact references, keyed the same
+    // way. Collected from each member's ORIGINAL expression, because by the time
+    // it lands in `dim_exprs` the fact names have been inlined away. Without
+    // this, a predicate member whose expression reaches a fact on another table
+    // splices in that table's columns while the query never joins it.
+    let mut member_fact_tables: HashMap<String, Vec<String>> = HashMap::new();
+    for dim in &def.dimensions {
+        // Dimensions are never PRIVATE — `PRIVATE` on a dimension is rejected at
+        // CREATE (`body_parser::entries`), which is why `sql_gen`'s `Resolvable`
+        // impl has `unreachable!("dimensions cannot be private")`. So there is no
+        // access check to make here, only on facts below.
+        for key in keys_for(dim.source_table.as_deref(), &dim.name) {
+            // TECH-DEBT #54: a predicate member's dimension expression is
+            // spliced into the WHERE clause, so it needs its facts inlined on
+            // the same footing as the SELECT-list copy.
+            dim_exprs.insert(
+                key.clone(),
+                format!(
+                    "({})",
+                    super::facts::inline_dimension_facts(&dim.expr, &def.facts)
+                ),
+            );
+            member_fact_tables.insert(
+                key.clone(),
+                super::facts::collect_referenced_fact_tables(&dim.expr, &def.facts),
+            );
+            member_tables.insert(key, dim.source_table.as_deref());
+        }
+    }
+    // EXP-13: a PRIVATE fact is deliberately NOT added to the lookup. It is
+    // recorded separately so a reference to one is rejected by name rather than
+    // falling through to "unknown reference", which would leave it in the SQL as
+    // a raw column and leak the very member PRIVATE withholds.
+    let mut private_facts: HashMap<String, &str> = HashMap::new();
+    for fact in &def.facts {
+        for key in keys_for(fact.source_table.as_deref(), &fact.name) {
+            if fact.access == crate::model::AccessModifier::Private {
+                private_facts.entry(key).or_insert(fact.name.as_str());
+                continue;
+            }
+            // A dimension and a fact may share a name; the dimension wins,
+            // matching the precedence the select-list resolution already uses.
+            //
+            // EXP-23: inline this fact's OWN fact references first, on the same
+            // footing as the dimension branch above. A fact chaining to another
+            // fact otherwise left the inner fact's name in the emitted WHERE as
+            // a bare column — a binder error, or worse a silent bind to a
+            // physical column of that name.
+            dim_exprs.entry(key.clone()).or_insert_with(|| {
+                format!(
+                    "({})",
+                    super::facts::inline_dimension_facts(&fact.expr, &def.facts)
+                )
+            });
+            member_fact_tables.entry(key.clone()).or_insert_with(|| {
+                super::facts::collect_referenced_fact_tables(&fact.expr, &def.facts)
+            });
+            member_tables
+                .entry(key)
+                .or_insert(fact.source_table.as_deref());
+        }
+    }
+    MemberMaps {
+        dim_exprs,
+        member_tables,
+        member_fact_tables,
+        private_facts,
+    }
+}
+
 /// Resolve `raw` against the view's declared members.
 ///
 /// Every identifier chain in the predicate is looked up as a dimension name,
@@ -68,6 +161,10 @@ pub(super) struct ResolvedWhere {
 /// rather than this layer guessing. A raw column on a table the query does not
 /// otherwise join fails loudly at bind time; one on a table already joined
 /// filters correctly, since that table's grain is already accounted for.
+///
+/// The member lookup tables are built by [`build_member_maps`]; see
+/// [`MemberMaps`] for what each one holds.
+///
 pub(super) fn resolve_where_clause(
     view_name: &str,
     def: &SemanticViewDefinition,
@@ -106,48 +203,12 @@ pub(super) fn resolve_where_clause(
         keys
     };
 
-    let mut dim_exprs: HashMap<String, String> = HashMap::new();
-    let mut member_tables: HashMap<String, Option<&str>> = HashMap::new();
-    for dim in &def.dimensions {
-        // Dimensions are never PRIVATE — `PRIVATE` on a dimension is rejected at
-        // CREATE (`body_parser::entries`), which is why `sql_gen`'s `Resolvable`
-        // impl has `unreachable!("dimensions cannot be private")`. So there is no
-        // access check to make here, only on facts below.
-        for key in keys_for(dim.source_table.as_deref(), &dim.name) {
-            // TECH-DEBT #54: a predicate member's dimension expression is
-            // spliced into the WHERE clause, so it needs its facts inlined on
-            // the same footing as the SELECT-list copy.
-            dim_exprs.insert(
-                key.clone(),
-                format!(
-                    "({})",
-                    super::facts::inline_dimension_facts(&dim.expr, &def.facts)
-                ),
-            );
-            member_tables.insert(key, dim.source_table.as_deref());
-        }
-    }
-    // EXP-13: a PRIVATE fact is deliberately NOT added to the lookup. It is
-    // recorded separately so a reference to one is rejected by name rather than
-    // falling through to "unknown reference", which would leave it in the SQL as
-    // a raw column and leak the very member PRIVATE withholds.
-    let mut private_facts: HashMap<String, &str> = HashMap::new();
-    for fact in &def.facts {
-        for key in keys_for(fact.source_table.as_deref(), &fact.name) {
-            if fact.access == crate::model::AccessModifier::Private {
-                private_facts.entry(key).or_insert(fact.name.as_str());
-                continue;
-            }
-            // A dimension and a fact may share a name; the dimension wins,
-            // matching the precedence the select-list resolution already uses.
-            dim_exprs
-                .entry(key.clone())
-                .or_insert_with(|| format!("({})", fact.expr));
-            member_tables
-                .entry(key)
-                .or_insert(fact.source_table.as_deref());
-        }
-    }
+    let MemberMaps {
+        dim_exprs,
+        member_tables,
+        member_fact_tables,
+        private_facts,
+    } = build_member_maps(def, &keys_for);
     let mut metric_names: HashMap<String, &str> = HashMap::new();
     for m in &def.metrics {
         for key in keys_for(m.source_table.as_deref(), &m.name) {
@@ -165,6 +226,17 @@ pub(super) fn resolve_where_clause(
                 let lowered = t.to_ascii_lowercase();
                 if !source_tables.contains(&lowered) {
                     source_tables.push(lowered);
+                }
+            }
+            // EXP-23: plus every table the member reaches through a fact
+            // reference, so the join resolver sees what the spliced expression
+            // will actually name.
+            if let Some(reached) = member_fact_tables.get(&key) {
+                for t in reached {
+                    let lowered = t.to_ascii_lowercase();
+                    if !source_tables.contains(&lowered) {
+                        source_tables.push(lowered);
+                    }
                 }
             }
             if seen_members.insert(key.clone()) {
@@ -230,6 +302,79 @@ mod tests {
     fn substitutes_a_fact_expression() {
         let r = resolve_where_clause("v", &def(), "net_price > 100").unwrap();
         assert_eq!(r.sql, "(o.price * (1 - o.discount)) > 100");
+    }
+
+    // EXP-23 (code-review 2026-08-06): the fact branch of `resolve_where_clause`
+    // inserted `fact.expr` VERBATIM, while the dimension branch two lines above
+    // runs `inline_dimension_facts` (TECH-DEBT #54). So a fact that chains to
+    // another fact left the inner fact's NAME in the emitted WHERE as a bare
+    // column. Verified against the expander: with facts `base_price` and
+    // `total AS base_price * o.quantity`, the SELECT list correctly emitted
+    // `SUM(((o.price * (1 - o.discount)) * o.quantity))` while the WHERE emitted
+    // `(base_price * o.quantity) > 100`.
+    //
+    // Three consequences, worst last: a binder error on a valid query; an
+    // unjoined table when the inner fact lives on another table; and — if the
+    // base table happens to have a physical column of that name — a filter that
+    // silently binds to it and returns the wrong rows.
+
+    fn chained_def() -> SemanticViewDefinition {
+        def().with_fact("total", "net_price * o.quantity", "o")
+    }
+
+    #[test]
+    fn a_fact_chaining_to_another_fact_is_fully_inlined() {
+        let r = resolve_where_clause("v", &chained_def(), "total > 100").unwrap();
+        assert_eq!(
+            r.sql, "((o.price * (1 - o.discount)) * o.quantity) > 100",
+            "the inner fact must be inlined, not left as a bare column"
+        );
+    }
+
+    #[test]
+    fn a_fact_chain_three_deep_is_fully_inlined() {
+        // The pass must be topological, not one-shot: `grand` -> `total` ->
+        // `net_price`. A single substitution round would leave `net_price`.
+        let def = chained_def().with_fact("grand", "total * 2", "o");
+        let r = resolve_where_clause("v", &def, "grand > 100").unwrap();
+        assert!(
+            !r.sql.contains("net_price") && !r.sql.contains("total"),
+            "no fact NAME may survive into the emitted predicate: {}",
+            r.sql
+        );
+        assert_eq!(
+            r.sql,
+            "(((o.price * (1 - o.discount)) * o.quantity) * 2) > 100"
+        );
+    }
+
+    #[test]
+    fn a_fact_reaching_another_table_contributes_that_table() {
+        // `source_tables` drives the join resolver. A fact reference reaching a
+        // fact on ANOTHER table left that table unjoined, so the inlined
+        // expression referenced an alias the query never joined.
+        let def = def()
+            .with_fact("cust_disc", "c.discount_rate", "c")
+            .with_fact("adjusted", "o.price * cust_disc", "o");
+        let r = resolve_where_clause("v", &def, "adjusted > 100").unwrap();
+        assert_eq!(
+            r.sql, "(o.price * (c.discount_rate)) > 100",
+            "the cross-table fact must be inlined: {}",
+            r.sql
+        );
+        assert!(
+            r.source_tables.contains(&"c".to_string()),
+            "the table reached THROUGH the fact reference must be joined: {:?}",
+            r.source_tables
+        );
+    }
+
+    // Control: a single-level fact was already correct and must stay so.
+    #[test]
+    fn a_single_level_fact_is_unchanged_by_the_inlining_pass() {
+        let r = resolve_where_clause("v", &chained_def(), "net_price > 100").unwrap();
+        assert_eq!(r.sql, "(o.price * (1 - o.discount)) > 100");
+        assert_eq!(r.source_tables, vec!["o"]);
     }
 
     // EXP-13: the member lookup was built from *all* facts with no

@@ -65,7 +65,14 @@ const DIMS: [&str; 3] = ["td", "ucat", "uwd"];
 /// fact expression is deliberately compound so a splice that loses its
 /// parentheses (`t.v - u.w + 1`) computes a different number than the oracle's
 /// `t.v - (u.w + 1)`.
-const METS: [&str; 4] = ["sv", "ct", "sw", "svf"];
+/// `dsv` (EXP-24) is a DERIVED metric whose expression references the base
+/// metric `sv` by its OWN-QUALIFIED name — `t.sv * 2`. The derived-metric
+/// replacement map was keyed by bare canonical names only, while every
+/// detection site matched the qualified spelling too, so the reference
+/// contributed `t` to grain/join resolution and was then emitted verbatim as a
+/// raw, unaggregated column. `graph/member_refs.rs` documents the qualified
+/// cross-table form as legal, so this spelling has to work.
+const METS: [&str; 5] = ["sv", "ct", "sw", "svf", "dsv"];
 
 /// Members a generated `where_clause` may name (PBT-6), and which side of the
 /// join each lives on. `ftd` / `fucat` are `LABELS = (FILTER)` members whose
@@ -350,6 +357,8 @@ fn build_def() -> SemanticViewDefinition {
         // parent is the "one" side, so the join does not fan `t` and the
         // aggregate stays at the child grain.
         base_metric("svf", "sum(t.v - u.uw1)", Some("t")),
+        // EXP-24: derived (no source_table), referencing `sv` OWN-QUALIFIED.
+        base_metric("dsv", "t.sv * 2", None),
     ];
     let joins = vec![Join {
         from_alias: "t".to_string(),
@@ -450,6 +459,10 @@ fn child_grain_sql(case: &Case) -> String {
             // LEFT JOIN. A NULL or dangling `fk` makes `u.w + 1` NULL, which
             // `sum` skips, exactly as it does in the expansion.
             "svf" => "sum(t.v - (u.w + 1)) AS svf".to_string(),
+            // EXP-24: the oracle writes the derived metric out independently —
+            // the base aggregate, doubled. The expansion must inline `t.sv`
+            // to the same thing rather than leaving the reference in the SQL.
+            "dsv" => "sum(t.v) * 2 AS dsv".to_string(),
             other => unreachable!("unexpected child-grain metric {other}"),
         })
         .collect();
