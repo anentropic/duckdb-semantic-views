@@ -118,7 +118,7 @@ type TableSpec = (
     Vec<String>,
 );
 /// Raw material for one join: (has_join, fk_columns, explicit ref_columns?).
-type JoinSpec = (bool, Vec<String>, Option<Vec<String>>);
+type JoinSpec = (bool, Vec<String>, Option<Vec<String>>, String);
 /// Raw material for one dimension/fact entry.
 type EntrySpec = (usize, String, String, bool, Option<String>, Vec<String>);
 /// Raw material for one metric: entry + (wants USING, wants NAB(order,nulls)).
@@ -143,10 +143,16 @@ pub fn arb_canonical_def() -> impl Strategy<Value = SemanticViewDefinition> {
         prop::option::of(arb_payload()),
         prop::collection::vec(arb_payload(), 0..=2),
     );
+    // RT-5: the relationship NAME is generated, not pinned to `rel{i}`. It was
+    // the pinned `Some(...)` here — together with the fuzz oracle's parse-fail
+    // escape — that made the GET_DDL contract break structurally unreachable:
+    // the escape deferred to this harness, and this harness could not produce
+    // the shape. A quoted or hostile name must still round-trip verbatim.
     let join_spec = (
         any::<bool>(),
         prop::collection::vec(arb_bare_ident(), 1..=2),
         prop::option::of(prop::collection::vec(arb_bare_ident(), 1..=2)),
+        arb_stored_ident(),
     );
     let entry_spec = |aliases_max: usize| {
         (
@@ -225,7 +231,7 @@ pub fn arb_canonical_def() -> impl Strategy<Value = SemanticViewDefinition> {
                         .into_iter()
                         .take(n_tables.saturating_sub(1))
                         .enumerate()
-                        .filter_map(|(i, (has, _fk, ref_opt)): (usize, JoinSpec)| {
+                        .filter_map(|(i, (has, _fk, ref_opt, rel_name)): (usize, JoinSpec)| {
                             if !has {
                                 return None;
                             }
@@ -241,7 +247,7 @@ pub fn arb_canonical_def() -> impl Strategy<Value = SemanticViewDefinition> {
                                 Vec::new()
                             };
                             Some(Join {
-                                name: Some(format!("rel{i}")),
+                                name: Some(rel_name),
                                 from_alias: format!("t{}", i + 1),
                                 table: "t0".to_string(),
                                 fk_columns,

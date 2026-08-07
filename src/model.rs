@@ -574,7 +574,7 @@ impl SemanticViewDefinition {
         // the clause parsers, so the identifier rules they enforce are applied
         // here instead. Without this, GET_DDL can render a definition its own
         // parser rejects — or, worse, one that re-parses to a different model.
-        validate_yaml_identifier_slots(&def)
+        validate_identifier_slots(&def)
             .map_err(|e| format!("invalid YAML definition for semantic view '{name}': {e}"))?;
         Ok(def)
     }
@@ -736,8 +736,15 @@ fn validate_yaml_materializations(def: &SemanticViewDefinition) -> Result<(), St
     Ok(())
 }
 
-/// Reject a YAML-imported definition whose identifier slots the DDL grammar
-/// could not have produced (RT-5 / RT-6, code-review 2026-08-06).
+/// Reject a definition whose identifier slots the DDL grammar could not have
+/// produced (RT-5 / RT-6, code-review 2026-08-06).
+///
+/// This is the reachability rule for a stored definition: the DDL path enforces
+/// it through the clause grammar, and YAML — the one surface that reaches
+/// `SemanticViewDefinition` without going through the clause parsers — enforces
+/// it by calling this. `fuzz_render_roundtrip` uses it as its PRECONDITION, so
+/// that a parse failure after it is a genuine render-contract break rather than
+/// something to shrug at.
 ///
 /// YAML is the one surface that reaches `SemanticViewDefinition` without going
 /// through the clause parsers, so it was the one surface with no
@@ -752,7 +759,7 @@ fn validate_yaml_materializations(def: &SemanticViewDefinition) -> Result<(), St
 ///   as source table `a` and name `b.region` — a DIFFERENT model, no error;
 /// - `pk_columns: ["a--b"]` rendered `PRIMARY KEY (a--b)`, which the front
 ///   door's comment-blanking pre-pass truncates to end-of-line.
-fn validate_yaml_identifier_slots(def: &SemanticViewDefinition) -> Result<(), String> {
+pub fn validate_identifier_slots(def: &SemanticViewDefinition) -> Result<(), String> {
     validate_yaml_tables(def)?;
     validate_yaml_joins(def)?;
     validate_yaml_members(def)?;

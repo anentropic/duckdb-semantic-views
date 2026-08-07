@@ -25,7 +25,7 @@
 // parseable, identical DDL" property this target deliberately does not re-assert.
 use libfuzzer_sys::fuzz_target;
 use semantic_views::body_parser::{parse_keyword_body, KeywordBody};
-use semantic_views::model::SemanticViewDefinition;
+use semantic_views::model::{validate_identifier_slots, SemanticViewDefinition};
 use semantic_views::render_ddl::render_create_ddl;
 
 /// Strip the rendered header (`CREATE OR REPLACE SEMANTIC VIEW <name>
@@ -75,7 +75,25 @@ fuzz_target!(|def: SemanticViewDefinition| {
         return;
     };
     let Ok(kb1) = parse_keyword_body(body0, 0) else {
-        return; // arbitrary content the parser can't accept — not a reachable def
+        // RT-5: this used to be an unconditional escape — "arbitrary content the
+        // parser can't accept". That is what let the GET_DDL contract break
+        // exactly where the oracle stopped looking: `Arbitrary` produced
+        // `name: None` / `source_table: None`, render emitted DDL this parser
+        // rejects, and the target classified its own finding as unreachable
+        // input and stayed green.
+        //
+        // The precondition is now EXPLICIT. A definition that fails
+        // `validate_identifier_slots` cannot be stored by any real entry point
+        // (the DDL grammar rejects it; YAML import now rejects it too), so
+        // skipping it is a stated rule rather than a shrug. A definition that
+        // PASSES it and still fails to re-parse is a genuine contract break.
+        if validate_identifier_slots(&def).is_err() {
+            return;
+        }
+        panic!(
+            "render produced DDL the parser rejects, for a definition every entry \
+             point would accept:\n{rendered0}"
+        );
     };
     let d1 = kb_to_def(kb1); // parser-produced (canonical)
 
@@ -85,12 +103,17 @@ fuzz_target!(|def: SemanticViewDefinition| {
     let Some(body1) = body_of(&rendered1) else {
         panic!("rendered DDL lost its AS body: {rendered1}");
     };
-    let Ok(kb2) = parse_keyword_body(body1, 0) else {
-        // Re-parse of freshly-rendered canonical DDL failed. The strict
-        // "canonical def renders to parseable, identical DDL" property is
-        // covered by tests/roundtrip_proptest.rs; tolerated here.
-        return;
-    };
+    // RT-5: no escape here at all. `d1` came FROM the parser, so
+    // `render(d1)` failing to re-parse is a contract break by definition. The
+    // old comment deferred to `tests/roundtrip_proptest.rs` — whose generators
+    // pin `name: Some(...)` and `source_table: Some(...)`, so it structurally
+    // could not reach these shapes. Each half pointed at the other.
+    let kb2 = parse_keyword_body(body1, 0).unwrap_or_else(|e| {
+        panic!(
+            "freshly-rendered canonical DDL no longer re-parses: {}\n{rendered1}",
+            e.message
+        )
+    });
     let d2 = kb_to_def(kb2);
     let rendered2 = render_create_ddl("fuzz_view", &d2).expect("re-parsed definition must render");
     let Some(body2) = body_of(&rendered2) else {
