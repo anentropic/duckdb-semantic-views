@@ -1,0 +1,203 @@
+# Code review 2026-08-06, EXP-23 and EXP-24: two inlining gaps that reach
+# DuckDB as malformed SQL, each with a silent wrong-answer corner.
+#
+# EXP-23 -- the fact branch of `resolve_where_clause` spliced a fact's
+# expression in VERBATIM, with no inlining pass, while the dimension branch two
+# lines above ran `inline_dimension_facts` (TECH-DEBT #54). A fact chaining to
+# another fact left the inner fact's NAME in the emitted WHERE as a bare
+# column. Verified before the fix: the SELECT list emitted
+# `SUM(((o.price * (1 - o.discount)) * o.quantity))` while the WHERE emitted
+# `(base_price * o.quantity) > 100`. Consequences, worst last: a binder error;
+# an unjoined table when the inner fact lives elsewhere; and -- if the base
+# table has a physical column of that name -- a filter that silently binds to
+# it and returns the wrong rows.
+#
+# EXP-24 -- the derived-metric replacement map was keyed by BARE names only,
+# while every detection site matches the qualified spelling too and
+# `graph/member_refs.rs` documents `t1.metric_a + t2.metric_b` as one of "the
+# legal cross-table forms, which must keep working". So `double_rev AS
+# li.item_rev * 2` contributed `li` to grain/join resolution and was then
+# emitted verbatim: `SELECT li.item_rev * 2` -- a raw, unaggregated,
+# unresolvable column.
+#
+# The runner halts a file at its first failing statement, so the per-case red
+# proof lives at the unit layer (`where_clause::tests`,
+# `tests_derived_metric`). The randomized proof is in the differential
+# harnesses: differential_proptest gained a chained-fact `where_clause` member
+# and star_schema_proptest gained an own-qualified derived metric, both
+# verified to fail with their fix reverted.
+
+require semantic_views
+
+statement ok
+CREATE TABLE cr0806i_orders (
+    id INTEGER PRIMARY KEY,
+    price INTEGER,
+    discount DOUBLE,
+    quantity INTEGER,
+    region VARCHAR
+);
+
+statement ok
+INSERT INTO cr0806i_orders VALUES
+    (1, 100, 0.0, 2, 'east'),
+    (2,  50, 0.5, 1, 'east'),
+    (3, 200, 0.0, 1, 'west');
+
+# ============================================================
+# EXP-23: a chained fact named in a where_clause.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW cr0806i_chain AS
+TABLES (o AS cr0806i_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+FACTS (
+    o.base_price AS o.price * (1 - o.discount),
+    o.total AS base_price * o.quantity
+)
+METRICS (o.revenue AS SUM(total));
+
+# base_price/total per row: 100/200, 25/25, 200/200.
+# No filter: 200 + 25 + 200 = 425.
+query I
+SELECT revenue FROM semantic_view('cr0806i_chain', metrics := ['revenue']);
+----
+425
+
+# Filtering on the CHAINED fact. Before the fix the emitted WHERE was
+# `(base_price * o.quantity) > 100`, so `base_price` reached DuckDB as a bare
+# column and the query failed to bind. Rows with total > 100: 200 and 200.
+query I
+SELECT revenue FROM semantic_view(
+  'cr0806i_chain',
+  metrics := ['revenue'],
+  where_clause := 'total > 100'
+);
+----
+400
+
+# The leaf fact still filters correctly -- the single-level case was already
+# right and must stay so.
+query I
+SELECT revenue FROM semantic_view(
+  'cr0806i_chain',
+  metrics := ['revenue'],
+  where_clause := 'base_price > 50'
+);
+----
+400
+
+# Grouped, so the predicate interacts with GROUP BY as well.
+query TI rowsort
+SELECT * FROM semantic_view(
+  'cr0806i_chain',
+  dimensions := ['region'],
+  metrics := ['revenue'],
+  where_clause := 'total > 100'
+);
+----
+east	200
+west	200
+
+# ============================================================
+# EXP-23: a fact chain that reaches ANOTHER table -- the join must follow.
+# ============================================================
+
+statement ok
+CREATE TABLE cr0806i_cust (id INTEGER PRIMARY KEY, rate DOUBLE);
+
+statement ok
+INSERT INTO cr0806i_cust VALUES (1, 1.0), (2, 2.0);
+
+statement ok
+CREATE TABLE cr0806i_sales (
+    id INTEGER PRIMARY KEY,
+    cust_id INTEGER,
+    amount INTEGER
+);
+
+statement ok
+INSERT INTO cr0806i_sales VALUES (1, 1, 10), (2, 2, 20), (3, 1, 30);
+
+statement ok
+CREATE SEMANTIC VIEW cr0806i_cross AS
+TABLES (
+    s AS cr0806i_sales PRIMARY KEY (id),
+    c AS cr0806i_cust PRIMARY KEY (id)
+)
+RELATIONSHIPS (s_to_c AS s(cust_id) REFERENCES c)
+DIMENSIONS (s.sid AS s.id)
+FACTS (
+    c.cust_rate AS c.rate,
+    s.weighted AS s.amount * cust_rate
+)
+METRICS (s.total AS SUM(s.amount));
+
+# weighted per row: 10*1=10, 20*2=40, 30*1=30. Filtering weighted > 25 keeps
+# rows 2 and 3, so total = 20 + 30 = 50. Before the fix the predicate named
+# `cust_rate` as a bare column AND `c` was never joined.
+query I
+SELECT total FROM semantic_view(
+  'cr0806i_cross',
+  metrics := ['total'],
+  where_clause := 'weighted > 25'
+);
+----
+50
+
+# ============================================================
+# EXP-24: an own-qualified derived-metric reference.
+# ============================================================
+
+statement ok
+CREATE TABLE cr0806i_li (id INTEGER PRIMARY KEY, order_id INTEGER, price INTEGER);
+
+statement ok
+INSERT INTO cr0806i_li VALUES (1, 1, 10), (2, 1, 20), (3, 3, 30);
+
+statement ok
+CREATE SEMANTIC VIEW cr0806i_qual AS
+TABLES (
+    o AS cr0806i_orders PRIMARY KEY (id),
+    li AS cr0806i_li PRIMARY KEY (id)
+)
+RELATIONSHIPS (li_to_o AS li(order_id) REFERENCES o)
+DIMENSIONS (o.region AS o.region)
+METRICS (
+    li.item_rev AS SUM(li.price),
+    li.double_rev AS li.item_rev * 2,
+    li.bare_double AS item_rev * 2
+);
+
+# item_rev = 10 + 20 + 30 = 60, so both doubles are 120. Before the fix the
+# qualified spelling emitted `li.item_rev * 2` as a raw column and failed to
+# bind, while the bare spelling emitted `(SUM(li.price)) * 2` correctly.
+query II
+SELECT double_rev, bare_double FROM semantic_view(
+  'cr0806i_qual',
+  metrics := ['double_rev', 'bare_double']
+);
+----
+120	120
+
+# Grouped: east has orders 1 and 2 (line items 10 + 20 = 30), west has order 3
+# (30). The two spellings must agree row for row.
+query TII rowsort
+SELECT * FROM semantic_view(
+  'cr0806i_qual',
+  dimensions := ['region'],
+  metrics := ['double_rev', 'bare_double']
+);
+----
+east	60	60
+west	60	60
+
+statement ok
+DROP SEMANTIC VIEW cr0806i_qual
+
+statement ok
+DROP SEMANTIC VIEW cr0806i_cross
+
+statement ok
+DROP SEMANTIC VIEW cr0806i_chain

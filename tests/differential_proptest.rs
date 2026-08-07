@@ -52,7 +52,9 @@
 
 use proptest::prelude::*;
 use semantic_views::expand::{expand, DimensionName, MetricName, QueryRequest};
-use semantic_views::model::{AccessModifier, Dimension, Metric, SemanticViewDefinition, TableRef};
+use semantic_views::model::{
+    AccessModifier, Dimension, Fact, Metric, SemanticViewDefinition, TableRef,
+};
 
 /// Comparison operators used by generated predicates.
 #[derive(Debug, Clone, Copy)]
@@ -93,6 +95,11 @@ enum Pred {
     IsNotNull(usize),
     /// A reference to filter member `f{i}` — the substitution under test.
     Filter(usize),
+    /// A reference to CHAINED fact `fb{i}`, whose expression names another fact
+    /// (`fa{i}`). EXP-23: the `where_clause` fact branch spliced a fact's
+    /// expression in VERBATIM, with no inlining pass, so the inner fact's name
+    /// survived into the emitted SQL as a bare column.
+    ChainedFact(usize),
     And(Box<Pred>, Box<Pred>),
     Or(Box<Pred>, Box<Pred>),
     Not(Box<Pred>),
@@ -105,6 +112,18 @@ fn filter_expr(i: usize) -> String {
     format!("d{i} = 0 OR d{i} = 2")
 }
 
+/// Leaf fact `fa{i}` — an ordinary column expression.
+fn leaf_fact_expr(i: usize) -> String {
+    format!("d{i} + 1")
+}
+
+/// Chained fact `fb{i}` — references the leaf fact BY NAME, so resolving it
+/// needs a topological inlining pass rather than one substitution round
+/// (EXP-23).
+fn chained_fact_expr(i: usize) -> String {
+    format!("fa{i} * 2")
+}
+
 impl Pred {
     /// The `where_clause` text: member **names**, with composites parenthesized
     /// so the SQL parse matches this AST. A filter member is emitted BARE —
@@ -115,6 +134,7 @@ impl Pred {
             Pred::IsNull(i) => format!("d{i} IS NULL"),
             Pred::IsNotNull(i) => format!("d{i} IS NOT NULL"),
             Pred::Filter(i) => format!("f{i}"),
+            Pred::ChainedFact(i) => format!("fb{i} > 0"),
             Pred::And(a, b) => format!("({} AND {})", a.to_member_sql(), b.to_member_sql()),
             Pred::Or(a, b) => format!("({} OR {})", a.to_member_sql(), b.to_member_sql()),
             Pred::Not(a) => format!("(NOT {})", a.to_member_sql()),
@@ -130,6 +150,10 @@ impl Pred {
             Pred::IsNull(i) => format!("(d{i} IS NULL)"),
             Pred::IsNotNull(i) => format!("(d{i} IS NOT NULL)"),
             Pred::Filter(i) => format!("({})", filter_expr(*i)),
+            // The oracle expands the chain by hand — leaf inlined into
+            // chained — so the comparison stays differential rather than
+            // re-using the expander's own inlining.
+            Pred::ChainedFact(i) => format!("((({}) * 2) > 0)", leaf_fact_expr(*i)),
             Pred::And(a, b) => format!("({} AND {})", a.to_raw_sql(), b.to_raw_sql()),
             Pred::Or(a, b) => format!("({} OR {})", a.to_raw_sql(), b.to_raw_sql()),
             Pred::Not(a) => format!("(NOT {})", a.to_raw_sql()),
@@ -142,9 +166,23 @@ impl Pred {
     fn references_filter(&self) -> bool {
         match self {
             Pred::Filter(_) => true,
-            Pred::Cmp(..) | Pred::IsNull(_) | Pred::IsNotNull(_) => false,
+            Pred::Cmp(..) | Pred::IsNull(_) | Pred::IsNotNull(_) | Pred::ChainedFact(_) => false,
             Pred::And(a, b) | Pred::Or(a, b) => a.references_filter() || b.references_filter(),
             Pred::Not(a) => a.references_filter(),
+        }
+    }
+
+    /// Whether this predicate names a chained fact — the EXP-23 surface. Same
+    /// anti-vacuity role as [`Pred::references_filter`]: a `ChainedFact` arm
+    /// that the generator never emits is not coverage.
+    fn references_chained_fact(&self) -> bool {
+        match self {
+            Pred::ChainedFact(_) => true,
+            Pred::Cmp(..) | Pred::IsNull(_) | Pred::IsNotNull(_) | Pred::Filter(_) => false,
+            Pred::And(a, b) | Pred::Or(a, b) => {
+                a.references_chained_fact() || b.references_chained_fact()
+            }
+            Pred::Not(a) => a.references_chained_fact(),
         }
     }
 }
@@ -170,6 +208,7 @@ fn arb_pred(n_dims: usize) -> impl Strategy<Value = Pred> {
         1 => (0..n_dims).prop_map(Pred::IsNull),
         1 => (0..n_dims).prop_map(Pred::IsNotNull),
         3 => (0..n_dims).prop_map(Pred::Filter),
+        3 => (0..n_dims).prop_map(Pred::ChainedFact),
     ];
     // depth 3, up to 8 nodes, branching 2 — deep enough for a filter member to
     // land inside a surrounding AND/OR/NOT, which is where precedence bites.
@@ -369,7 +408,24 @@ fn build_def(s: &Schema) -> SemanticViewDefinition {
         dimensions,
         metrics,
         joins: vec![],
-        facts: vec![],
+        facts: (0..s.n_dims)
+            .flat_map(|i| {
+                [
+                    (format!("fa{i}"), leaf_fact_expr(i)),
+                    (format!("fb{i}"), chained_fact_expr(i)),
+                ]
+            })
+            .map(|(name, expr)| Fact {
+                name,
+                expr,
+                source_table: Some("t".to_string()),
+                output_type: None,
+                comment: None,
+                synonyms: vec![],
+                is_filter: false,
+                access: AccessModifier::Public,
+            })
+            .collect(),
         materializations: vec![],
         created_on: None,
         database_name: None,
@@ -530,6 +586,7 @@ fn generator_varies_the_predicate_and_exercises_filter_members() {
     let mut with_pred = 0usize;
     let mut without_pred = 0usize;
     let mut with_filter = 0usize;
+    let mut with_chained_fact = 0usize;
     let mut compound = 0usize;
     let mut distinct: HashSet<String> = HashSet::new();
 
@@ -544,6 +601,9 @@ fn generator_varies_the_predicate_and_exercises_filter_members() {
                 with_pred += 1;
                 if p.references_filter() {
                     with_filter += 1;
+                }
+                if p.references_chained_fact() {
+                    with_chained_fact += 1;
                 }
                 let sql = p.to_member_sql();
                 if sql.contains(" AND ") || sql.contains(" OR ") || sql.contains("NOT ") {
@@ -567,6 +627,11 @@ fn generator_varies_the_predicate_and_exercises_filter_members() {
         with_filter > 0,
         "generator never referenced a filter member -- the member-substitution \
          and parenthesization surface is untested"
+    );
+    assert!(
+        with_chained_fact > 0,
+        "generator never referenced a chained fact -- EXP-23's surface (a fact \
+         whose expression names another fact) is untested"
     );
     assert!(
         compound > 0,

@@ -285,6 +285,24 @@ fn fact_replacement_map<'a>(
     map
 }
 
+/// The bare and (optionally) `source_table.name` normalized keys for one metric
+/// name — the metric-side twin of [`insert_fact_keys`].
+///
+/// EXP-24: the derived-metric replacement map was keyed by the BARE name only,
+/// while every detection site (`references_ref`) also matches the qualified
+/// spelling and `graph/member_refs.rs` blesses `t1.metric_a + t2.metric_b` as a
+/// legal cross-table form. So a qualified reference contributed its table to
+/// grain/join resolution and was then left in the SQL verbatim, as a raw
+/// unaggregated column.
+fn metric_keys(source_table: Option<&str>, name: &str) -> Vec<String> {
+    let mut keys = Vec::with_capacity(2);
+    if let Some(st) = source_table {
+        keys.push(normalize_ident_part(&format!("{st}.{name}")));
+    }
+    keys.push(normalize_ident_part(name));
+    keys
+}
+
 /// Insert the bare and (optionally) `source_table.name` normalized keys for one
 /// fact `name` into `map`, both pointing at `replacement`.
 fn insert_fact_keys<'a>(
@@ -725,11 +743,18 @@ pub(super) fn inline_derived_metrics(
                     || guard_constant_arg_aggregates(&expr, "*").is_some()
                 {
                     // No PK declared (or unknown alias): rewrite impossible.
-                    count_star_no_pk.insert(normalize_ident_part(&met.name), st_lower);
+                    // EXP-24: keyed like `resolved`, so a QUALIFIED reference
+                    // to this metric still trips the no-PK error rather than
+                    // silently emitting an un-guarded count.
+                    for key in metric_keys(met.source_table.as_deref(), &met.name) {
+                        count_star_no_pk.insert(key, st_lower.clone());
+                    }
                 }
             }
         }
-        resolved.insert(normalize_ident_part(&met.name), expr);
+        for key in metric_keys(met.source_table.as_deref(), &met.name) {
+            resolved.insert(key, expr.clone());
+        }
     }
 
     // Step 2: Collect derived metrics (no source_table)

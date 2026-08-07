@@ -412,3 +412,111 @@ fn expand_derived_metric_with_facts_chain() {
         "Fact->base->derived chain must resolve correctly: {sql}"
     );
 }
+
+// EXP-24 (code-review 2026-08-06): the derived-metric replacement map is keyed
+// by BARE canonical names only, while the fact path's `insert_fact_keys` and
+// per-grain's `decompose` insert bare AND own-qualified keys. Every detection
+// site uses `references_ref`, which DOES match the qualified spelling, and
+// `graph/member_refs.rs` documents `t1.metric_a + t2.metric_b` as one of "the
+// legal cross-table forms, which must keep working".
+//
+// So a qualified reference contributed the base metric's table to grain/join/
+// USING resolution, but `inline_derived_metrics` left the text verbatim.
+// Verified against the expander before the fix: `double_rev AS li.item_rev * 2`
+// emitted `SELECT li.item_rev * 2 AS "double_rev"` — a raw, unaggregated,
+// unresolvable column. The multi-grain path handles the SAME spelling correctly
+// via `decompose`, so the behaviour differed by emission path.
+
+/// `orders` base + `li` child, with a base metric on the child and a derived
+/// metric referencing it. Parameterised by the reference spelling.
+fn qualified_derived_def(reference: &str) -> SemanticViewDefinition {
+    crate::expand::test_helpers::orders_view()
+        .clear_dimensions()
+        .clear_metrics()
+        .with_dimension("status", "status", None)
+        .with_table("li", "line_items", &["id"])
+        .with_metric("item_rev", "SUM(li.price)", Some("li"))
+        .with_metric("double_rev", &format!("{reference} * 2"), None)
+        .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"])
+}
+
+fn double_rev_req() -> QueryRequest {
+    QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![],
+        metrics: vec![MetricName::new("double_rev")],
+    }
+}
+
+#[test]
+fn own_qualified_derived_metric_reference_is_inlined() {
+    let sql = expand(
+        "orders",
+        &qualified_derived_def("li.item_rev"),
+        &double_rev_req(),
+    )
+    .unwrap();
+    assert!(
+        sql.contains("(SUM(li.price)) * 2 AS \"double_rev\""),
+        "a qualified reference must inline the base metric's aggregate: {sql}"
+    );
+    assert!(
+        !sql.contains("li.item_rev"),
+        "the reference must not survive as a raw column: {sql}"
+    );
+}
+
+#[test]
+fn own_qualified_derived_reference_matches_the_bare_spelling_exactly() {
+    // The two spellings name the same metric, so they must emit the same SQL.
+    // This is the property the bare-only keying broke.
+    let qualified = expand(
+        "orders",
+        &qualified_derived_def("li.item_rev"),
+        &double_rev_req(),
+    )
+    .unwrap();
+    let bare = expand(
+        "orders",
+        &qualified_derived_def("item_rev"),
+        &double_rev_req(),
+    )
+    .unwrap();
+    assert_eq!(
+        qualified, bare,
+        "qualifying a reference with its own table must not change the SQL"
+    );
+}
+
+#[test]
+fn quoted_and_case_varied_qualified_reference_is_inlined() {
+    // The keys are canonical, so quoting and case must be immaterial on both
+    // halves — the same rule PARSE-8 applied to the validators.
+    let sql = expand(
+        "orders",
+        &qualified_derived_def("\"LI\".\"Item_Rev\""),
+        &double_rev_req(),
+    )
+    .unwrap();
+    assert!(
+        sql.contains("(SUM(li.price)) * 2 AS \"double_rev\""),
+        "quoting/case must not defeat the replacement: {sql}"
+    );
+}
+
+/// Control: a qualifier naming a DIFFERENT table must not resolve to this
+/// metric — the keying is qualified-aware, not qualifier-blind.
+#[test]
+fn wrong_table_qualified_reference_is_not_inlined() {
+    let sql = expand(
+        "orders",
+        &qualified_derived_def("orders.item_rev"),
+        &double_rev_req(),
+    )
+    .unwrap();
+    assert!(
+        !sql.contains("(SUM(li.price)) * 2"),
+        "a reference qualified with the WRONG table must not resolve: {sql}"
+    );
+}
