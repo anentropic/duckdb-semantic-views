@@ -49,23 +49,6 @@ pub(super) struct ResolvedWhere {
     pub(super) members: Vec<(String, Option<String>)>,
 }
 
-/// Resolve `raw` against the view's declared members.
-///
-/// Every identifier chain in the predicate is looked up as a dimension name,
-/// then a fact name, using the same case- and quote-insensitive key the
-/// `dimensions := [...]` list resolves through, so `region`, `REGION`, and
-/// `"region"` all name the same member.
-///
-/// A chain that resolves to a **metric** is rejected
-/// ([`ExpandError::WhereClauseReferencesMetric`]) — Snowflake's rule, and
-/// structurally necessary: the predicate runs before aggregation, so an
-/// aggregate has no value yet.
-///
-/// A chain that resolves to nothing is left **verbatim**. That is deliberate:
-/// the scan cannot tell a mistyped member from ordinary SQL that must survive
-/// (`DATE '1995-01-01'`, `NULL`, `TRUE`, `CURRENT_DATE`, a raw column). Passing
-/// it through means `DuckDB` validates it and reports an unknown column itself,
-/// rather than this layer guessing. A raw column on a table the query does not
 /// The member lookup tables a predicate is resolved against.
 ///
 /// Extracted from [`resolve_where_clause`] so that function stays inside the
@@ -159,8 +142,29 @@ fn build_member_maps<'a>(
     }
 }
 
+/// Resolve `raw` against the view's declared members.
+///
+/// Every identifier chain in the predicate is looked up as a dimension name,
+/// then a fact name, using the same case- and quote-insensitive key the
+/// `dimensions := [...]` list resolves through, so `region`, `REGION`, and
+/// `"region"` all name the same member.
+///
+/// A chain that resolves to a **metric** is rejected
+/// ([`ExpandError::WhereClauseReferencesMetric`]) — Snowflake's rule, and
+/// structurally necessary: the predicate runs before aggregation, so an
+/// aggregate has no value yet.
+///
+/// A chain that resolves to nothing is left **verbatim**. That is deliberate:
+/// the scan cannot tell a mistyped member from ordinary SQL that must survive
+/// (`DATE '1995-01-01'`, `NULL`, `TRUE`, `CURRENT_DATE`, a raw column). Passing
+/// it through means `DuckDB` validates it and reports an unknown column itself,
+/// rather than this layer guessing. A raw column on a table the query does not
 /// otherwise join fails loudly at bind time; one on a table already joined
 /// filters correctly, since that table's grain is already accounted for.
+///
+/// The member lookup tables are built by [`build_member_maps`]; see
+/// [`MemberMaps`] for what each one holds.
+///
 pub(super) fn resolve_where_clause(
     view_name: &str,
     def: &SemanticViewDefinition,
