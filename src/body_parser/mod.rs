@@ -215,15 +215,20 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
     for metric in &metrics {
         for na in &metric.non_additive_by {
             let dim_exists = dimensions.iter().any(|d| {
-                if d.name.eq_ignore_ascii_case(&na.dimension) {
+                // PARSE-8: `ident_matches` on both halves, mirroring the ORDER
+                // BY site EXP-12 migrated. This is the fifth site of that class;
+                // TECH-DEBT #28 mentions it, but its closing line reads as if
+                // the arc had fully landed, so migrating the other four alone
+                // would have preserved exactly that misreading.
+                if crate::ident::ident_matches(&d.name, &na.dimension) {
                     return true;
                 }
                 // D-08 dotted-path acceptance: if NA dim is `alias.name`,
                 // match against (source_table, name).
                 if let Some((alias_part, name_part)) = split_qualified_identifier(&na.dimension) {
                     if let Some(ref src) = d.source_table {
-                        return src.eq_ignore_ascii_case(alias_part)
-                            && d.name.eq_ignore_ascii_case(name_part);
+                        return crate::ident::ident_matches(src, alias_part)
+                            && crate::ident::ident_matches(&d.name, name_part);
                     }
                 }
                 false
@@ -254,7 +259,13 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
         if let Some(ref ws) = metric.window_spec {
             // Validate EXCLUDING dimension references
             for dim in &ws.excluding_dims {
-                let dim_exists = dimensions.iter().any(|d| d.name.eq_ignore_ascii_case(dim));
+                // PARSE-8: `ident_matches`, the project's one identifier rule —
+                // raw case-folding compared the quote characters as data, so
+                // `EXCLUDING "Region"` was rejected against a `region`
+                // dimension while `ORDER BY "Region"` beside it resolved.
+                let dim_exists = dimensions
+                    .iter()
+                    .any(|d| crate::ident::ident_matches(&d.name, dim));
                 if !dim_exists {
                     let available_dims: Vec<String> =
                         dimensions.iter().map(|d| d.name.clone()).collect();
@@ -275,7 +286,10 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
             }
             // Validate PARTITION BY dimension references
             for dim in &ws.partition_dims {
-                let dim_exists = dimensions.iter().any(|d| d.name.eq_ignore_ascii_case(dim));
+                // PARSE-8: same canonical rule as the EXCLUDING slot above.
+                let dim_exists = dimensions
+                    .iter()
+                    .any(|d| crate::ident::ident_matches(&d.name, dim));
                 if !dim_exists {
                     let available_dims: Vec<String> =
                         dimensions.iter().map(|d| d.name.clone()).collect();
@@ -377,9 +391,10 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
     // Dimension reference check
     for mat in &materializations {
         for dim_name in &mat.dimensions {
+            // PARSE-8: same canonical rule as the window-metric slots.
             let dim_exists = dimensions
                 .iter()
-                .any(|d| d.name.eq_ignore_ascii_case(dim_name));
+                .any(|d| crate::ident::ident_matches(&d.name, dim_name));
             if !dim_exists {
                 let available_dims: Vec<String> =
                     dimensions.iter().map(|d| d.name.clone()).collect();
@@ -400,9 +415,10 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
         }
         // Metric reference check
         for met_name in &mat.metrics {
+            // PARSE-8: same canonical rule.
             let met_exists = metrics
                 .iter()
-                .any(|m| m.name.eq_ignore_ascii_case(met_name));
+                .any(|m| crate::ident::ident_matches(&m.name, met_name));
             if !met_exists {
                 let suggestion = crate::util::suggest_closest(met_name, &metric_names);
                 let mut msg = format!(
@@ -3858,6 +3874,169 @@ mod tests {
             result.unwrap_err().message.contains("inner metric"),
             "the rejection must still name the inner-metric slot"
         );
+    }
+
+    // PARSE-8 (code-review 2026-08-06): EXP-12 migrated the ORDER BY and
+    // inner-metric slots onto `ident_matches`, but four sibling CREATE-time
+    // validators kept raw `eq_ignore_ascii_case`, which compares the quote
+    // characters as data. So `PARTITION BY EXCLUDING "Region"` was rejected
+    // against a `region` dimension while `ORDER BY "Region"` in the SAME clause
+    // resolved — and the expansion layer, already migrated, would have computed
+    // it. As with EXP-12, the CREATE-time validator was the stricter one.
+    //
+    // TECH-DEBT #28's closing line reads as if this arc had fully landed; these
+    // sites were not enumerated there.
+
+    #[test]
+    fn parse_keyword_body_window_quoted_excluding_dim_accepted() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                     DIMENSIONS (o.region AS o.region) \
+                     METRICS (\
+                         o.total_qty AS SUM(o.qty), \
+                         o.avg_qty AS AVG(total_qty) OVER (PARTITION BY EXCLUDING \"Region\")\
+                     )";
+        let result = parse_keyword_body(body, 0);
+        assert!(
+            result.is_ok(),
+            "a quoted EXCLUDING dimension names the declared dimension, exactly \
+             as the ORDER BY slot beside it already accepts: {:?}",
+            result.err().map(|e| e.message)
+        );
+    }
+
+    #[test]
+    fn parse_keyword_body_window_quoted_partition_dim_accepted() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                     DIMENSIONS (o.region AS o.region) \
+                     METRICS (\
+                         o.total_qty AS SUM(o.qty), \
+                         o.avg_qty AS AVG(total_qty) OVER (PARTITION BY \"Region\")\
+                     )";
+        let result = parse_keyword_body(body, 0);
+        assert!(
+            result.is_ok(),
+            "a quoted PARTITION BY dimension names the declared dimension: {:?}",
+            result.err().map(|e| e.message)
+        );
+    }
+
+    #[test]
+    fn parse_keyword_body_materialization_quoted_dimension_accepted() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                     DIMENSIONS (o.region AS o.region) \
+                     METRICS (o.total_qty AS SUM(o.qty)) \
+                     MATERIALIZATIONS (m AS (TABLE mt, DIMENSIONS (\"Region\"), METRICS (total_qty)))";
+        let result = parse_keyword_body(body, 0);
+        assert!(
+            result.is_ok(),
+            "a quoted materialization dimension names the declared dimension: {:?}",
+            result.err().map(|e| e.message)
+        );
+    }
+
+    #[test]
+    fn parse_keyword_body_materialization_quoted_metric_accepted() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                     DIMENSIONS (o.region AS o.region) \
+                     METRICS (o.total_qty AS SUM(o.qty)) \
+                     MATERIALIZATIONS (m AS (TABLE mt, DIMENSIONS (region), METRICS (\"Total_Qty\")))";
+        let result = parse_keyword_body(body, 0);
+        assert!(
+            result.is_ok(),
+            "a quoted materialization metric names the declared metric: {:?}",
+            result.err().map(|e| e.message)
+        );
+    }
+
+    // The fifth site of the same class. The review left it uncounted because
+    // TECH-DEBT #28 already mentions it -- but #28's closing line reads "the
+    // reference-tokenizer arc (#28) is fully landed", and migrating four of the
+    // five sites would recreate exactly that misreading. It mirrors the ORDER BY
+    // site including the D-08 dotted-path branch.
+    #[test]
+    fn parse_keyword_body_quoted_non_additive_by_dim_accepted() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                     DIMENSIONS (o.region AS o.region) \
+                     METRICS (o.bal NON ADDITIVE BY (\"Region\") AS SUM(o.amount))";
+        let result = parse_keyword_body(body, 0);
+        assert!(
+            result.is_ok(),
+            "a quoted NON ADDITIVE BY dimension names the declared dimension: {:?}",
+            result.err().map(|e| e.message)
+        );
+    }
+
+    #[test]
+    fn parse_keyword_body_quoted_dotted_non_additive_by_dim_accepted() {
+        // The D-08 dotted branch must fold the same way on both halves.
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                     DIMENSIONS (o.region AS o.region) \
+                     METRICS (o.bal NON ADDITIVE BY (\"O\".\"Region\") AS SUM(o.amount))";
+        let result = parse_keyword_body(body, 0);
+        assert!(
+            result.is_ok(),
+            "a quoted alias-qualified NON ADDITIVE BY dimension resolves: {:?}",
+            result.err().map(|e| e.message)
+        );
+    }
+
+    #[test]
+    fn parse_keyword_body_quoted_unknown_non_additive_by_dim_still_rejected() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                     DIMENSIONS (o.region AS o.region) \
+                     METRICS (o.bal NON ADDITIVE BY (\"nope\") AS SUM(o.amount))";
+        let err = parse_keyword_body(body, 0)
+            .expect_err("quoting an unknown name must not make it resolve");
+        assert!(
+            err.message
+                .contains("does not match any declared dimension"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// Controls: quoting an UNKNOWN name must not make it resolve. Without
+    /// these, "accept quoted references" could degenerate into "accept
+    /// anything" at all four migrated sites.
+    #[test]
+    fn parse_keyword_body_quoted_unknown_names_still_rejected_at_every_site() {
+        let cases = [
+            (
+                "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) \
+                 METRICS (o.total_qty AS SUM(o.qty), \
+                 o.avg_qty AS AVG(total_qty) OVER (PARTITION BY EXCLUDING \"nope\"))",
+                "EXCLUDING dimension",
+            ),
+            (
+                "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) \
+                 METRICS (o.total_qty AS SUM(o.qty), \
+                 o.avg_qty AS AVG(total_qty) OVER (PARTITION BY \"nope\"))",
+                "PARTITION BY dimension",
+            ),
+            (
+                "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) \
+                 METRICS (o.total_qty AS SUM(o.qty)) \
+                 MATERIALIZATIONS (m AS (TABLE mt, DIMENSIONS (\"nope\"), METRICS (total_qty)))",
+                "dimension",
+            ),
+            (
+                "AS TABLES (o AS orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) \
+                 METRICS (o.total_qty AS SUM(o.qty)) \
+                 MATERIALIZATIONS (m AS (TABLE mt, DIMENSIONS (region), METRICS (\"nope\")))",
+                "metric",
+            ),
+        ];
+        for (body, slot) in cases {
+            let result = parse_keyword_body(body, 0);
+            let err = result.expect_err(&format!(
+                "quoting an unknown name must not resolve it ({slot})"
+            ));
+            assert!(
+                err.message.contains("not found"),
+                "the rejection must still name the missing reference ({slot}): {}",
+                err.message
+            );
+        }
     }
 
     #[test]
