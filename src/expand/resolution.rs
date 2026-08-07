@@ -183,12 +183,17 @@ fn source_table_matches(
     alias: &str,
     def: &SemanticViewDefinition,
 ) -> bool {
+    // PARSE-8: `ident_matches` on the qualifier too. The NAME half of a
+    // qualified reference already resolved this way, so `"C"."Region"` matched
+    // its dimension and then failed on its own alias — quoting a qualifier is
+    // not a different table. For unquoted aliases this is identical to the
+    // former `eq_ignore_ascii_case`.
     match source_table {
-        Some(st) => st.eq_ignore_ascii_case(alias),
+        Some(st) => crate::ident::ident_matches(st, alias),
         None => def
             .tables
             .first()
-            .is_some_and(|t| t.alias.eq_ignore_ascii_case(alias)),
+            .is_some_and(|t| crate::ident::ident_matches(&t.alias, alias)),
     }
 }
 
@@ -394,6 +399,48 @@ mod tests {
             assert!(find_dimension(&def, "o.status").is_some());
             assert!(find_dimension(&def, "O.STATUS").is_some());
             assert!(find_dimension(&def, "c.status").is_none());
+        }
+
+        // PARSE-8 follow-on (code-review 2026-08-06): the NAME half of a
+        // qualified reference resolved through `ident_matches`, but the ALIAS
+        // half still used raw `eq_ignore_ascii_case`, which compares the quote
+        // characters as data. So `"C"."Region"` matched its dimension name and
+        // then failed on its own qualifier, and `find_dimension` returned None.
+        //
+        // Found by the PARSE-8 end-to-end test: once CREATE accepted a quoted
+        // dotted `NON ADDITIVE BY ("O"."Snap_Date")`, the snapshot fell to the
+        // unresolved arm and emitted the raw text as an ORDER BY term, which
+        // DuckDB rejected as an unknown column. Quoting a qualifier is not a
+        // different table.
+        #[test]
+        fn quoted_qualifier_resolves_like_its_unquoted_form() {
+            let def = lookup_def();
+            assert!(
+                find_dimension(&def, "\"c\".region").is_some(),
+                "a quoted alias names the same table"
+            );
+            assert!(
+                find_dimension(&def, "\"C\".\"Region\"").is_some(),
+                "case and quoting are both immaterial on BOTH halves"
+            );
+            assert!(
+                find_metric(&def, "\"C\".\"Revenue\"").is_some(),
+                "the metric lookup shares the qualifier rule"
+            );
+            // The base-table branch takes the same rule.
+            assert!(
+                find_dimension(&def, "\"O\".\"Status\"").is_some(),
+                "an unqualified declaration is reached through the quoted base alias"
+            );
+        }
+
+        /// Control: relaxing the qualifier must not erase SG-14 — a quoted
+        /// reference to the WRONG table must still fail to resolve.
+        #[test]
+        fn quoted_wrong_qualifier_still_returns_none() {
+            let def = lookup_def();
+            assert!(find_dimension(&def, "\"o\".\"Region\"").is_none());
+            assert!(find_dimension(&def, "\"warehouse\".region").is_none());
         }
 
         #[test]

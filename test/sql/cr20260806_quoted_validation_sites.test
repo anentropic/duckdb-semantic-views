@@ -1,0 +1,187 @@
+# Code review 2026-08-06, PARSE-8: residual raw case-folding at CREATE-time
+# validation sites.
+#
+# EXP-12 (review 2026-08-03) migrated the window ORDER BY and inner-metric
+# slots onto `ident::ident_matches`, the project's one identifier rule. Five
+# sibling validators kept `eq_ignore_ascii_case`, which compares the QUOTE
+# CHARACTERS as data -- so `PARTITION BY EXCLUDING "Region"` was rejected
+# against a `region` dimension while `ORDER BY "Region"` in the SAME clause
+# resolved. The expansion layer was already migrated, so CREATE was rejecting
+# definitions the emitter could have computed.
+#
+# Per CLAUDE.md the host-language rule is DuckDB's: identifiers match
+# case-insensitively whether or not they are quoted. Quoting is not a
+# different name.
+#
+# The runner halts a file at its first failing statement, so the per-case red
+# proof lives at the unit layer (`body_parser::tests`, eight tests). This file
+# covers the whole extension-load -> DDL -> query path.
+
+require semantic_views
+
+statement ok
+CREATE TABLE cr0806p8_orders (
+    id INTEGER PRIMARY KEY,
+    region VARCHAR,
+    snap_date DATE,
+    amount INTEGER
+);
+
+statement ok
+INSERT INTO cr0806p8_orders VALUES
+    (1, 'east', DATE '2024-01-01', 10),
+    (2, 'east', DATE '2024-01-02', 20),
+    (3, 'west', DATE '2024-01-02', 30);
+
+# Site 1 + 2: EXCLUDING and PARTITION BY, both quoted and case-varied.
+# Before the fix each errored "... dimension '"Region"' not found".
+statement ok
+CREATE SEMANTIC VIEW cr0806p8_window AS
+TABLES (o AS cr0806p8_orders PRIMARY KEY (id))
+DIMENSIONS (
+    o.region AS o.region,
+    o.snap_date AS o.snap_date
+)
+METRICS (
+    o.total AS SUM(o.amount),
+    o.excl AS SUM(total) OVER (PARTITION BY EXCLUDING "Region"),
+    o.part AS SUM(total) OVER (PARTITION BY "Region")
+);
+
+# The base aggregate, on its own (window and aggregate metrics cannot be
+# mixed in one query).
+query TI rowsort
+SELECT * FROM semantic_view(
+  'cr0806p8_window',
+  dimensions := ['region'],
+  metrics := ['total']
+);
+----
+east	30
+west	30
+
+# Both window metrics compute. `excl` excludes the region dimension from the
+# partition, so it totals everything (60); `part` partitions BY region (30/30).
+query TII rowsort
+SELECT * FROM semantic_view(
+  'cr0806p8_window',
+  dimensions := ['region'],
+  metrics := ['excl', 'part']
+);
+----
+east	60	30
+west	60	30
+
+# Site 3: NON ADDITIVE BY, quoted -- the fifth site of the same class. The
+# review left it uncounted because TECH-DEBT #28 mentions it, but #28's
+# closing line reads as if the arc had fully landed.
+statement ok
+CREATE SEMANTIC VIEW cr0806p8_na AS
+TABLES (o AS cr0806p8_orders PRIMARY KEY (id))
+DIMENSIONS (
+    o.region AS o.region,
+    o.snap_date AS o.snap_date
+)
+METRICS (
+    o.latest NON ADDITIVE BY ("Snap_Date") AS SUM(o.amount)
+);
+
+# The snapshot picks the latest snap_date (2024-01-02): 20 + 30 = 50.
+query I
+SELECT latest FROM semantic_view('cr0806p8_na', metrics := ['latest']);
+----
+50
+
+# The D-08 dotted form folds on both halves too.
+statement ok
+CREATE SEMANTIC VIEW cr0806p8_na_dotted AS
+TABLES (o AS cr0806p8_orders PRIMARY KEY (id))
+DIMENSIONS (
+    o.region AS o.region,
+    o.snap_date AS o.snap_date
+)
+METRICS (
+    o.latest NON ADDITIVE BY ("O"."Snap_Date") AS SUM(o.amount)
+);
+
+query I
+SELECT latest FROM semantic_view('cr0806p8_na_dotted', metrics := ['latest']);
+----
+50
+
+# Sites 4 + 5: materialization dimension and metric references. The
+# materialization table must exist, because a query against the view reads it.
+statement ok
+CREATE TABLE cr0806p8_agg (region VARCHAR, revenue BIGINT);
+
+statement ok
+INSERT INTO cr0806p8_agg VALUES ('east', 30), ('west', 30);
+
+statement ok
+CREATE SEMANTIC VIEW cr0806p8_mat AS
+TABLES (o AS cr0806p8_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (o.revenue AS SUM(o.amount))
+MATERIALIZATIONS (
+    agg AS (
+        TABLE cr0806p8_agg,
+        DIMENSIONS ("Region"),
+        METRICS ("Revenue")
+    )
+);
+
+query TI rowsort
+SELECT * FROM semantic_view(
+  'cr0806p8_mat',
+  dimensions := ['region'],
+  metrics := ['revenue']
+);
+----
+east	30
+west	30
+
+# Controls: quoting an UNKNOWN name must not make it resolve. Without these,
+# "accept quoted references" could degenerate into "accept anything".
+statement error
+CREATE SEMANTIC VIEW cr0806p8_bad_excl AS
+TABLES (o AS cr0806p8_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (
+    o.total AS SUM(o.amount),
+    o.excl AS SUM(total) OVER (PARTITION BY EXCLUDING "nope")
+)
+----
+not found
+
+statement error
+CREATE SEMANTIC VIEW cr0806p8_bad_na AS
+TABLES (o AS cr0806p8_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (
+    o.latest NON ADDITIVE BY ("nope") AS SUM(o.amount)
+)
+----
+does not match any declared dimension
+
+statement error
+CREATE SEMANTIC VIEW cr0806p8_bad_mat AS
+TABLES (o AS cr0806p8_orders PRIMARY KEY (id))
+DIMENSIONS (o.region AS o.region)
+METRICS (o.revenue AS SUM(o.amount))
+MATERIALIZATIONS (
+    agg AS (TABLE cr0806p8_agg, DIMENSIONS ("nope"), METRICS (revenue))
+)
+----
+not found
+
+statement ok
+DROP SEMANTIC VIEW cr0806p8_mat
+
+statement ok
+DROP SEMANTIC VIEW cr0806p8_na_dotted
+
+statement ok
+DROP SEMANTIC VIEW cr0806p8_na
+
+statement ok
+DROP SEMANTIC VIEW cr0806p8_window
