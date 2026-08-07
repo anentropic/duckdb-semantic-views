@@ -188,7 +188,7 @@ pub(super) fn is_ident_continuation(b: u8) -> bool {
 /// A quoted identifier that itself contains whitespace (`"a b"`) is a single
 /// token and is accepted. An empty (all-whitespace) slot returns `None` — the
 /// call site reports emptiness with a "missing name/alias" message of its own.
-pub(super) fn identifier_slot_error(slot: &str) -> Option<String> {
+pub(crate) fn identifier_slot_error(slot: &str) -> Option<String> {
     let s = slot.trim();
     if s.is_empty() {
         return None;
