@@ -223,8 +223,14 @@ fn followed_by_open_paren(bytes: &[u8], pos: usize) -> bool {
 /// unterminated literal.
 pub(crate) fn skip_single_quoted(bytes: &[u8], i: usize) -> usize {
     let len = bytes.len();
+    // `E'…'` — a backslash escapes the next byte (PARSE-7).
+    let is_escape = crate::util::opens_escape_string(bytes, i);
     let mut j = i + 1;
     while j < len {
+        if let Some(next) = crate::util::escaped_pair_end(bytes, j, is_escape) {
+            j = next;
+            continue;
+        }
         if bytes[j] == b'\'' {
             if j + 1 < len && bytes[j + 1] == b'\'' {
                 j += 2; // '' escape — stay inside the literal
@@ -433,6 +439,38 @@ pub(crate) fn rewrite_qualifier(expr: &str, alias: &str, replacement: &str) -> S
 
 #[cfg(test)]
 mod tests {
+
+    // PARSE-7: in a DuckDB escape string `\'` is an escaped quote, so the
+    // literal continues past it. Treating `\` as ordinary consumed the middle
+    // and closing quotes as one `''` pair and ran to the end of the buffer.
+    #[test]
+    fn skip_single_quoted_honours_backslash_escape_in_an_escape_string() {
+        let s = "e'\\'',rest";
+        let bytes = s.as_bytes();
+        let open = s.find('\'').unwrap();
+        assert_eq!(
+            skip_single_quoted(bytes, open),
+            s.find(',').unwrap(),
+            "the literal ends before the comma"
+        );
+    }
+
+    // Control: `\\` escapes the backslash, so the next quote closes.
+    #[test]
+    fn skip_single_quoted_escaped_backslash_does_not_swallow_the_close() {
+        let s = "e'\\\\',rest";
+        let bytes = s.as_bytes();
+        let open = s.find('\'').unwrap();
+        assert_eq!(skip_single_quoted(bytes, open), s.find(',').unwrap());
+    }
+
+    // Control: an ordinary literal treats `\` as data.
+    #[test]
+    fn skip_single_quoted_ordinary_string_treats_backslash_as_data() {
+        let s = "'a\\',rest";
+        let bytes = s.as_bytes();
+        assert_eq!(skip_single_quoted(bytes, 0), s.find(',').unwrap());
+    }
     use super::*;
     use proptest::prelude::*;
 

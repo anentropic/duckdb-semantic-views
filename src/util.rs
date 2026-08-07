@@ -48,6 +48,52 @@ pub fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
 
+/// Whether the `'` at `quote` opens a `DuckDB` **escape string** (`E'…'`).
+///
+/// `DuckDB` accepts the Postgres spelling in which `\'` is an escaped quote, so
+/// `e'\''` is a terminated one-character literal rather than the start of an
+/// unterminated one. Every scanner in this crate previously read `\` as an
+/// ordinary byte and consumed the middle and closing quotes as a single `''`
+/// pair, so the literal ran to the end of the buffer and everything after it
+/// was treated as string content — the PA-3/P-1 silent-mis-split class
+/// (PARSE-7, code-review 2026-08-06).
+///
+/// The `e` must sit on a token boundary. `DATE'2020-01-01'` is a valid TYPED
+/// LITERAL whose `E` belongs to the type name, and it follows the ORDINARY
+/// string rules — so a preceding identifier byte disqualifies the introducer.
+///
+/// Note that `''` remains an escape inside an escape string too: `e'a''b'` is
+/// `a'b` in `DuckDB`. Both forms must be honoured, not one or the other.
+#[must_use]
+pub fn opens_escape_string(bytes: &[u8], quote: usize) -> bool {
+    if quote == 0 {
+        return false;
+    }
+    let e = bytes[quote - 1];
+    if e != b'e' && e != b'E' {
+        return false;
+    }
+    quote < 2 || !is_ident_byte(bytes[quote - 2])
+}
+
+/// Byte offset just past a backslash escape at `i` inside an escape string, or
+/// `None` when `i` is not such an escape.
+///
+/// `in_escape_string` is the caller's [`opens_escape_string`] verdict for the
+/// literal currently open — in an ORDINARY literal a backslash is data, so this
+/// must not fire there.
+///
+/// The result is CLAMPED to `bytes.len()`: an input whose last byte is the
+/// backslash (`e'\`) has nothing to escape, and an unclamped `i + 2` lands one
+/// past the buffer. Every scanner shares this one advance precisely so that
+/// bound cannot drift between them — when the four loops each carried their own
+/// copy, the lexer's was the one that forgot to clamp and produced a token
+/// whose `end` could not be sliced (raised by review on #205).
+#[must_use]
+pub fn escaped_pair_end(bytes: &[u8], i: usize, in_escape_string: bool) -> Option<usize> {
+    (in_escape_string && bytes[i] == b'\\').then(|| (i + 2).min(bytes.len()))
+}
+
 /// Byte offset of the subslice `inner` within `outer`.
 ///
 /// `inner` MUST be a subslice of `outer` (borrowed from the same allocation,
@@ -162,6 +208,10 @@ pub(crate) struct QuoteState {
     /// index the same `bytes` slice passed to every `step` call, which every
     /// scan-in-a-loop caller preserves.
     dollar_open: Option<(usize, usize)>,
+    /// Whether the single-quoted literal currently open is a `DuckDB` escape
+    /// string (`E'…'`), in which `\\` escapes the following byte. See
+    /// [`opens_escape_string`]. Meaningless unless `in_string`.
+    string_is_escape: bool,
 }
 
 impl QuoteState {
@@ -186,9 +236,16 @@ impl QuoteState {
             return (i + 1, false);
         }
         if self.in_string {
+            // In an escape string a backslash escapes the NEXT byte, whatever it
+            // is — including a quote that would otherwise close the literal, and
+            // including another backslash (so `\\` is one escaped backslash and
+            // does not escape a quote after it).
+            if let Some(next) = escaped_pair_end(bytes, i, self.string_is_escape) {
+                return (next, false);
+            }
             if b == b'\'' {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    return (i + 2, false); // '' escape — stay in string
+                    return (i + 2, false); // '' escape — stay in string (both forms apply)
                 }
                 self.in_string = false;
             }
@@ -205,6 +262,7 @@ impl QuoteState {
             match b {
                 b'\'' => {
                     self.in_string = true;
+                    self.string_is_escape = opens_escape_string(bytes, i);
                     (i + 1, false)
                 }
                 b'"' => {
@@ -268,6 +326,7 @@ pub fn blank_sql_comments(input: &str) -> std::borrow::Cow<'_, str> {
     let bytes = input.as_bytes();
     let mut out: Option<Vec<u8>> = None; // allocated lazily on first comment
     let mut st = St::Code;
+    let mut string_is_escape = false;
     let mut dollar_tag: Option<&[u8]> = None;
     let mut i = 0;
 
@@ -284,6 +343,11 @@ pub fn blank_sql_comments(input: &str) -> std::borrow::Cow<'_, str> {
         }
         match st {
             St::InString => {
+                // `\\` escapes the next byte inside an escape string (PARSE-7).
+                if let Some(next) = escaped_pair_end(bytes, i, string_is_escape) {
+                    i = next;
+                    continue;
+                }
                 if bytes[i] == b'\'' {
                     if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
                         i += 2;
@@ -306,6 +370,7 @@ pub fn blank_sql_comments(input: &str) -> std::borrow::Cow<'_, str> {
             St::Code => match bytes[i] {
                 b'\'' => {
                     st = St::InString;
+                    string_is_escape = opens_escape_string(bytes, i);
                     i += 1;
                 }
                 b'"' => {
@@ -443,6 +508,91 @@ mod tests {
         let outer = "SHOW SEMANTIC VIEWS Ωx";
         let inner = &outer[20..]; // "Ωx"
         assert_eq!(byte_offset_within(outer, inner), 20);
+    }
+
+    // -------------------------------------------------------------------
+    // QuoteState escape-string tests (PARSE-7)
+    // -------------------------------------------------------------------
+
+    /// Live-code byte offsets of `s`, as `QuoteState` sees them.
+    fn live_offsets(s: &str) -> Vec<usize> {
+        let bytes = s.as_bytes();
+        let mut st = QuoteState::default();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let (next, live) = st.step(bytes, i);
+            if live {
+                out.push(i);
+            }
+            i = next;
+        }
+        out
+    }
+
+    // The failure that matters: a `,` after an escape string must be seen as
+    // live code. Read as an unterminated literal, everything after it is inert,
+    // so a multi-entry DDL body silently mis-splits (the PA-3/P-1 class).
+    #[test]
+    fn quote_state_sees_a_comma_after_an_escape_string_as_live_code() {
+        let s = "e'\\'',x";
+        let comma = s.find(',').unwrap();
+        assert!(
+            live_offsets(s).contains(&comma),
+            "comma after an escape string must be live code: {:?}",
+            live_offsets(s)
+        );
+    }
+
+    #[test]
+    fn quote_state_escape_string_closes_and_leaves_string_state() {
+        let bytes = b"e'\\''";
+        let mut st = QuoteState::default();
+        let mut i = 0;
+        while i < bytes.len() {
+            let (next, _) = st.step(bytes, i);
+            i = next;
+        }
+        assert!(
+            !st.in_string,
+            "an escape string with a backslash-escaped quote is terminated"
+        );
+    }
+
+    // Control: `\\` escapes the backslash, so the NEXT quote closes the string.
+    #[test]
+    fn quote_state_escaped_backslash_does_not_swallow_the_close() {
+        let bytes = b"e'\\\\'";
+        let mut st = QuoteState::default();
+        let mut i = 0;
+        while i < bytes.len() {
+            let (next, _) = st.step(bytes, i);
+            i = next;
+        }
+        assert!(
+            !st.in_string,
+            "e'\\\\' is a terminated one-backslash literal"
+        );
+    }
+
+    // Control: a typed literal's `E` is part of the type name.
+    #[test]
+    fn quote_state_typed_literal_is_not_an_escape_string() {
+        let s = "DATE'2020-01-01',x";
+        let comma = s.find(',').unwrap();
+        assert!(live_offsets(s).contains(&comma));
+    }
+
+    // Control: in an ORDINARY string a backslash is just a byte, so a trailing
+    // `\` does not escape the closing quote. (DuckDB: `SELECT 'a\'` is `a\`.)
+    #[test]
+    fn quote_state_ordinary_string_treats_backslash_as_data() {
+        let s = "'a\\',x";
+        let comma = s.find(',').unwrap();
+        assert!(
+            live_offsets(s).contains(&comma),
+            "a backslash in a plain string must not escape the close"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -606,6 +756,41 @@ mod tests {
         // Result must be valid UTF-8 by construction (checked by the type),
         // and the non-comment text intact.
         assert_eq!(&out[input.len() - 1..], "y");
+    }
+
+    // PARSE-7: DuckDB accepts Postgres-style escape strings (`E'...'`) where
+    // `\'` is an escaped quote. Every scanner in the crate treated `\` as an
+    // ordinary byte, so in `e'\''` the middle `'` and the closing `'` were
+    // consumed as one `''` escape pair and the literal read as UNTERMINATED --
+    // everything after it stayed in "string" state. Verified against DuckDB:
+    // `SELECT e'\''` returns a single quote character.
+    //
+    // Here that means a real comment after an escape string was left unblanked.
+    #[test]
+    fn blank_comments_after_an_escape_string_are_still_blanked() {
+        let s = "e'\\'' -- real";
+        let out = blank_sql_comments(s);
+        assert_eq!(out, "e'\\''        ");
+    }
+
+    // `\\` is an escaped BACKSLASH, so it does not escape a following quote --
+    // the string ends at the next `'`. (DuckDB: `SELECT E'\\\\'` is one backslash.)
+    #[test]
+    fn blank_comments_escaped_backslash_does_not_swallow_the_close() {
+        let s = "e'\\\\' -- real";
+        let out = blank_sql_comments(s);
+        assert_eq!(out, "e'\\\\'        ");
+    }
+
+    // The `E` of a TYPED LITERAL is part of the type name, not an escape-string
+    // introducer: `DATE'2020-01-01'` is valid DuckDB and its backslash rules are
+    // the ordinary ones. The introducer therefore requires a token boundary
+    // before the `e`.
+    #[test]
+    fn blank_comments_typed_literal_is_not_an_escape_string() {
+        let s = "DATE'2020-01-01' -- real";
+        let out = blank_sql_comments(s);
+        assert_eq!(out, "DATE'2020-01-01'        ");
     }
 
     #[test]

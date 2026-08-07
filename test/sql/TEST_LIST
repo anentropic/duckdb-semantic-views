@@ -97,6 +97,7 @@ test/sql/semantic_view_runtime_error.test
 test/sql/cr20260803_window_quoted_inner_ref.test
 test/sql/cr20260806_tier1_wrong_numbers.test
 test/sql/cr20260806_parser_comment_blindness.test
+test/sql/cr20260806_escape_strings.test
 test/sql/cat4_read_foreign_database.test
 test/sql/par6_cross_table_fact_join.test
 test/sql/member_reference_scoping.test

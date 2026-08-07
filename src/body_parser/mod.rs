@@ -1847,6 +1847,49 @@ mod tests {
         assert_eq!(entries[0].comment, None);
     }
 
+    // PARSE-7: DuckDB accepts Postgres-style escape strings (`E'...'`) where
+    // `\'` is an escaped quote -- `SELECT e'\''` returns one quote character.
+    // Every scanner in the crate treated `\` as an ordinary byte, so the middle
+    // and closing quotes were consumed as one `''` escape pair and the entry
+    // was rejected as an unterminated literal. This is the review's repro.
+    #[test]
+    fn test_escape_string_with_escaped_quote_parses_in_a_metric_entry() {
+        let entries =
+            parse_qualified_entries("o.m AS count_if(x = e'\\'')", 0, false, "metrics").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].expr, "count_if(x = e'\\'')");
+    }
+
+    // The worse, silent half: a `,` after the escape string stayed inside the
+    // phantom literal, so a two-entry body collapsed into one mis-split entry.
+    #[test]
+    fn test_escape_string_does_not_swallow_the_entry_separator() {
+        let entries = parse_qualified_entries(
+            "o.a AS count_if(x = e'\\''), o.b AS SUM(y)",
+            0,
+            false,
+            "metrics",
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 2, "entries: {entries:?}");
+        assert_eq!(entries[1].expr, "SUM(y)");
+    }
+
+    // Control: a typed literal's `E` is part of the type name, not an escape
+    // introducer -- `DATE'2020-01-01'` is ordinary DuckDB SQL.
+    #[test]
+    fn test_typed_literal_entry_still_splits_normally() {
+        let entries = parse_qualified_entries(
+            "o.a AS x > DATE'2020-01-01', o.b AS SUM(y)",
+            0,
+            false,
+            "metrics",
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 2, "entries: {entries:?}");
+        assert_eq!(entries[0].expr, "x > DATE'2020-01-01'");
+    }
+
     #[test]
     fn test_unterminated_quote_in_dimension_entry_errors() {
         let err =
