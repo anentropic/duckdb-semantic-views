@@ -1,0 +1,355 @@
+# Code review 2026-08-08 §6 -- the YAML-ingress class RT-5/RT-6 (#209) did not
+# reach: RT-8 (comment markers in a member expression), MODEL-1 (every semantic
+# cross-reference check lived only in `parse_keyword_body`, plus the whole
+# `WindowSpec` payload emitted raw), RT-7 (`output_type` has no DDL surface at
+# all) and RT-9 (a bare derived-metric name that IS an access modifier).
+#
+# Every shape below passed the full YAML gate before this change and then made
+# `GET_DDL` render DDL that replays to a DIFFERENT model, or to none at all.
+#
+# The end-to-end value of these cases is that they run the real extension-load
+# -> DDL -> GET_DDL path. The runner halts a file at its first failing
+# statement, so the per-case red proof lives at the unit layer
+# (`model::tests::yaml_*`, `render_ddl::tests::access_modifier_name_collision_tests`),
+# where each case reports independently.
+
+require semantic_views
+
+statement ok
+CREATE TABLE cr0808y_orders (id INTEGER PRIMARY KEY, amount DOUBLE, region VARCHAR);
+
+statement ok
+INSERT INTO cr0808y_orders VALUES (1, 100.0, 'East'), (2, 200.0, 'West');
+
+# ============================================================
+# RT-8 -- a `--` in a member expression. The front door blanks comments BEFORE
+# parsing, so on replay everything from the `--` to end-of-line vanished,
+# INCLUDING the comma separating the member from the next one: two dimensions
+# came back as one, with the second's definition absorbed into the first.
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW cr0808y_comment FROM YAML $$
+tables:
+  - alias: o
+    table: cr0808y_orders
+    pk_columns: [id]
+dimensions:
+  - name: d1
+    expr: 'o.region -- x'
+    source_table: o
+  - name: d2
+    expr: o.amount
+    source_table: o
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+$$
+----
+SQL comment marker
+
+# Block comments go the same way: blanking replaces them with spaces, so the
+# replayed expression is a different string even when no boundary moves.
+statement error
+CREATE SEMANTIC VIEW cr0808y_blockcomment FROM YAML $$
+tables:
+  - alias: o
+    table: cr0808y_orders
+    pk_columns: [id]
+dimensions: []
+metrics:
+  - name: total
+    expr: 'SUM(o.amount) /* x */'
+    source_table: o
+$$
+----
+SQL comment marker
+
+# Control: a comment marker inside a STRING LITERAL is not a comment, and must
+# still import. Without this the rule could degenerate into "refuse every --".
+statement ok
+CREATE SEMANTIC VIEW cr0808y_litdash FROM YAML $$
+tables:
+  - alias: o
+    table: cr0808y_orders
+    pk_columns: [id]
+dimensions:
+  - name: d1
+    expr: "o.region || '--'"
+    source_table: o
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+$$
+
+query I
+SELECT COUNT(*) FROM (SELECT GET_DDL('SEMANTIC_VIEW', 'cr0808y_litdash') AS d)
+WHERE d LIKE '%o.d1 AS o.region || ''--''%';
+----
+1
+
+# ============================================================
+# MODEL-1 -- the semantic cross-references. Each of these renders GET_DDL that
+# this project's own parser rejects.
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW cr0808y_nab FROM YAML $$
+tables:
+  - alias: o
+    table: cr0808y_orders
+    pk_columns: [id]
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+    non_additive_by:
+      - dimension: ghost
+$$
+----
+ghost
+
+statement error
+CREATE SEMANTIC VIEW cr0808y_winner FROM YAML $$
+tables:
+  - alias: o
+    table: cr0808y_orders
+    pk_columns: [id]
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+  - name: w
+    expr: AVG(ghost) OVER ()
+    source_table: o
+    window_spec:
+      window_function: AVG
+      inner_metric: ghost
+$$
+----
+ghost
+
+statement error
+CREATE SEMANTIC VIEW cr0808y_matref FROM YAML $$
+tables:
+  - alias: o
+    table: cr0808y_orders
+    pk_columns: [id]
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+materializations:
+  - name: m
+    table: cr0808y_mt
+    metrics: [ghost]
+$$
+----
+ghost
+
+statement error
+CREATE SEMANTIC VIEW cr0808y_matdup FROM YAML $$
+tables:
+  - alias: o
+    table: cr0808y_orders
+    pk_columns: [id]
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+materializations:
+  - name: m1
+    table: cr0808y_mt
+    metrics: [total]
+  - name: M1
+    table: cr0808y_mt2
+    metrics: [total]
+$$
+----
+Duplicate materialization name
+
+statement error
+CREATE SEMANTIC VIEW cr0808y_matempty FROM YAML $$
+tables:
+  - alias: o
+    table: cr0808y_orders
+    pk_columns: [id]
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+materializations:
+  - name: m
+    table: cr0808y_mt
+$$
+----
+at least one of DIMENSIONS or METRICS
+
+# The model-CHANGING one: a frame clause that closes the OVER parenthesis and
+# opens a new METRICS entry. Replay parsed THREE metrics where the definition
+# declared two -- a metric injected out of a frame-clause string.
+statement error
+CREATE SEMANTIC VIEW cr0808y_frameinject FROM YAML $$
+tables:
+  - alias: o
+    table: cr0808y_orders
+    pk_columns: [id]
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+  - name: w
+    expr: AVG(total) OVER ()
+    source_table: o
+    window_spec:
+      window_function: AVG
+      inner_metric: total
+      frame_clause: 'ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) , junk AS ('
+$$
+----
+window frame clause
+
+# ============================================================
+# RT-7 -- `output_type` has no DDL surface, so GET_DDL dropped it silently and
+# the restored view lost its CAST. Refused with the workaround named.
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW cr0808y_outtype FROM YAML $$
+tables:
+  - alias: o
+    table: cr0808y_orders
+    pk_columns: [id]
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+    output_type: 'VARCHAR(10)'
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+$$
+----
+output_type
+
+# ============================================================
+# RT-9 -- a bare derived-metric name that IS an access modifier. `private`
+# lexes as an ordinary identifier, but the METRICS entry parser peels an
+# entry-initial PRIVATE/PUBLIC before it looks for a name, so the rendered
+# `private AS total * 2` replayed as "Missing metric name before 'AS'".
+# Quoted on emission it round-trips, so the definition stays storable.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW cr0808y_privname FROM YAML $$
+tables:
+  - alias: o
+    table: cr0808y_orders
+    pk_columns: [id]
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+  - name: private
+    expr: total * 2
+$$
+
+query I
+SELECT COUNT(*) FROM (SELECT GET_DDL('SEMANTIC_VIEW', 'cr0808y_privname') AS d)
+WHERE d LIKE '%"private" AS total * 2%';
+----
+1
+
+# A PRIVATE metric whose name is also `private` keeps the name bare behind the
+# modifier -- the peel consumes the modifier, so quoting there would store a
+# name the definition never declared.
+statement ok
+CREATE SEMANTIC VIEW cr0808y_privboth FROM YAML $$
+tables:
+  - alias: o
+    table: cr0808y_orders
+    pk_columns: [id]
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+  - name: private
+    expr: total * 2
+    access: Private
+$$
+
+query I
+SELECT COUNT(*) FROM (SELECT GET_DDL('SEMANTIC_VIEW', 'cr0808y_privboth') AS d)
+WHERE d LIKE '%PRIVATE private AS total * 2%';
+----
+1
+
+# ============================================================
+# Controls: an ordinary window metric and an ordinary materialization must
+# still import, and must survive GET_DDL unchanged.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW cr0808y_goodwindow FROM YAML $$
+tables:
+  - alias: o
+    table: cr0808y_orders
+    pk_columns: [id]
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: o
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+  - name: w
+    expr: AVG(total) OVER (PARTITION BY region ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+    source_table: o
+    window_spec:
+      window_function: AVG
+      inner_metric: total
+      partition_dims: [region]
+      frame_clause: 'ROWS BETWEEN 1 PRECEDING AND CURRENT ROW'
+$$
+
+query I
+SELECT COUNT(*) FROM (SELECT GET_DDL('SEMANTIC_VIEW', 'cr0808y_goodwindow') AS d)
+WHERE d LIKE '%AVG(total) OVER (PARTITION BY region ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)%';
+----
+1

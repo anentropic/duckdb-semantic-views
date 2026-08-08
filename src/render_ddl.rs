@@ -125,12 +125,55 @@ fn emit_table(s: &str) -> String {
 /// Idempotent for the same reason `emit_alias` is: re-parsing a quoted name
 /// stores it WITH its quotes, and a well-formed `"..."` round-trips verbatim,
 /// so the second render emits it unchanged.
-fn emit_member_name(out: &mut String, source_table: Option<&String>, name: &str) {
+///
+/// `entry_initial` says whether the name is the FIRST thing in its entry —
+/// false when a `PRIVATE ` access modifier has already been emitted ahead of
+/// it. See [`emit_entry_initial_name`] for what turns on that.
+fn emit_member_name(
+    out: &mut String,
+    source_table: Option<&String>,
+    name: &str,
+    entry_initial: bool,
+) {
     if let Some(src) = source_table {
+        // A qualifier makes the entry start `<alias>.`, and the access-modifier
+        // peel declines when the next non-space character is a dot, so an alias
+        // spelled `private` is inert. Only the unqualified form is exposed.
         out.push_str(&emit_alias(src));
         out.push('.');
+        out.push_str(&emit_alias(name));
+    } else {
+        out.push_str(&emit_entry_initial_name(name, entry_initial));
     }
-    out.push_str(&emit_alias(name));
+}
+
+/// [`emit_alias`], plus the one collision it cannot see: a bare name that IS an
+/// access modifier.
+///
+/// RT-9 (code-review 2026-08-08). `emit_alias` quotes on LEXING grounds — a
+/// value is quoted when it would not re-tokenize as one identifier — and
+/// `private` tokenizes perfectly. What breaks is a layer up:
+/// `parse_leading_access_modifier` peels an entry-initial `PRIVATE`/`PUBLIC`
+/// followed by whitespace as the access modifier BEFORE the entry parser looks
+/// for a name, so a YAML-declared derived metric named `private` rendered
+/// `private AS total * 2` and replay failed with "Missing metric name before
+/// 'AS'". Quoting it is the non-breaking fix — `"private"` is not the keyword,
+/// round-trips verbatim, and the value stored is the one that was declared.
+///
+/// Only when the name is entry-INITIAL. Behind an emitted `PRIVATE ` modifier
+/// the peel consumes the modifier and reads `private` as the name, which is
+/// already correct; quoting there would store `"private"` where the definition
+/// said `private` — a new drift in place of the old one.
+///
+/// Idempotent: the quoted form is not the bare keyword, so a second render
+/// leaves it alone.
+fn emit_entry_initial_name(name: &str, entry_initial: bool) -> String {
+    if entry_initial
+        && (name.eq_ignore_ascii_case("PRIVATE") || name.eq_ignore_ascii_case("PUBLIC"))
+    {
+        return crate::expand::quote_ident(name);
+    }
+    emit_alias(name)
 }
 
 /// Emit TABLES clause entries.
@@ -239,10 +282,11 @@ fn emit_facts(out: &mut String, def: &SemanticViewDefinition) {
     out.push_str("FACTS (\n");
     for (i, fact) in def.facts.iter().enumerate() {
         out.push_str("    ");
-        if matches!(fact.access, AccessModifier::Private) {
+        let private = matches!(fact.access, AccessModifier::Private);
+        if private {
             out.push_str("PRIVATE ");
         }
-        emit_member_name(out, fact.source_table.as_ref(), &fact.name);
+        emit_member_name(out, fact.source_table.as_ref(), &fact.name, !private);
         out.push_str(" AS ");
         out.push_str(&fact.expr);
         emit_comment(out, fact.comment.as_deref());
@@ -261,7 +305,8 @@ fn emit_dimensions(out: &mut String, def: &SemanticViewDefinition) {
     out.push_str("DIMENSIONS (\n");
     for (i, dim) in def.dimensions.iter().enumerate() {
         out.push_str("    ");
-        emit_member_name(out, dim.source_table.as_ref(), &dim.name);
+        // DIMENSIONS carry no access modifier, so the name is always first.
+        emit_member_name(out, dim.source_table.as_ref(), &dim.name, true);
         out.push_str(" AS ");
         out.push_str(&dim.expr);
         emit_comment(out, dim.comment.as_deref());
@@ -375,10 +420,11 @@ fn emit_metrics(out: &mut String, def: &SemanticViewDefinition) {
     out.push_str("METRICS (\n");
     for (i, metric) in def.metrics.iter().enumerate() {
         out.push_str("    ");
-        if matches!(metric.access, AccessModifier::Private) {
+        let private = matches!(metric.access, AccessModifier::Private);
+        if private {
             out.push_str("PRIVATE ");
         }
-        emit_member_name(out, metric.source_table.as_ref(), &metric.name);
+        emit_member_name(out, metric.source_table.as_ref(), &metric.name, !private);
         if !metric.using_relationships.is_empty() {
             out.push_str(" USING (");
             out.push_str(&metric.using_relationships.join(", "));
@@ -1591,6 +1637,114 @@ mod tests {
         assert!(out.is_empty());
         emit_labels(&mut out, true);
         assert_eq!(out, " LABELS = (FILTER)");
+    }
+
+    // -------------------------------------------------------------------
+    // RT-9 (code-review 2026-08-08): a bare entry-initial name that IS an
+    // access modifier
+    // -------------------------------------------------------------------
+    // `emit_member_name` quote-protects on LEXING grounds — a name is quoted
+    // when it would not re-tokenize as one identifier. `private` tokenizes
+    // fine; it is the METRICS entry parser that peels an entry-initial
+    // `PRIVATE`/`PUBLIC` as the access modifier before it looks for a name. A
+    // YAML-declared derived metric named `private` therefore rendered
+    // `private AS total * 2`, and replay failed with "Missing metric name
+    // before 'AS'". DDL cannot create the shape (the modifier is peeled there
+    // too), so YAML is the only ingress — which is why quoting on emission is
+    // the fix rather than rejecting at import: it keeps a definition that is
+    // already storable, and `"private"` round-trips unchanged.
+    mod access_modifier_name_collision_tests {
+        use super::*;
+
+        fn def_with_derived_metric(name: &str, access: AccessModifier) -> SemanticViewDefinition {
+            let mut def = minimal_def();
+            def.metrics.push(Metric {
+                name: name.to_string(),
+                expr: "revenue * 2".to_string(),
+                source_table: None,
+                access,
+                ..Default::default()
+            });
+            def
+        }
+
+        /// Replay is the assertion, not the rendered bytes: the point is that
+        /// the parser reads back the name that was stored.
+        fn replayed_metric_names(def: &SemanticViewDefinition) -> Vec<String> {
+            let ddl = render_create_ddl("rt9", def).expect("def renders");
+            let body = ddl
+                .strip_prefix("CREATE OR REPLACE SEMANTIC VIEW rt9 ")
+                .expect("rendered header shape");
+            let kb = crate::body_parser::parse_keyword_body(body, 0).unwrap_or_else(|e| {
+                panic!("rendered DDL failed to re-parse: {}\n{ddl}", e.message)
+            });
+            kb.metrics.into_iter().map(|m| m.name).collect()
+        }
+
+        #[test]
+        fn a_bare_derived_metric_named_private_replays_as_itself() {
+            let def = def_with_derived_metric("private", AccessModifier::Public);
+            assert_eq!(
+                replayed_metric_names(&def),
+                vec!["revenue".to_string(), "\"private\"".to_string()],
+                "an entry-initial PRIVATE must be quoted so the parser sees a name"
+            );
+        }
+
+        #[test]
+        fn a_bare_derived_metric_named_public_replays_as_itself() {
+            // Same peel, other keyword: `parse_leading_access_modifier` strips
+            // PUBLIC identically, so fixing only PRIVATE would leave a twin.
+            let def = def_with_derived_metric("PuBlIc", AccessModifier::Public);
+            assert_eq!(
+                replayed_metric_names(&def),
+                vec!["revenue".to_string(), "\"PuBlIc\"".to_string()],
+                "the collision is case-insensitive, like the keyword"
+            );
+        }
+
+        #[test]
+        fn a_private_metric_named_private_still_renders_its_name_bare() {
+            // Control, and the reason the rule is "entry-INITIAL": with the
+            // `PRIVATE ` modifier emitted ahead of it the name is no longer
+            // first, the peel consumes the modifier, and `private` is read as
+            // the name. Quoting unconditionally here would store `"private"`
+            // where the definition said `private` — a new drift.
+            let def = def_with_derived_metric("private", AccessModifier::Private);
+            let ddl = render_create_ddl("rt9", &def).expect("def renders");
+            assert!(
+                ddl.contains("PRIVATE private AS revenue * 2"),
+                "the name stays bare behind the modifier: {ddl}"
+            );
+            assert_eq!(
+                replayed_metric_names(&def),
+                vec!["revenue".to_string(), "private".to_string()]
+            );
+        }
+
+        #[test]
+        fn a_qualified_metric_on_an_alias_named_private_still_renders_bare() {
+            // Control: `private.m` is not the modifier — the peel declines when
+            // the next non-space character is a dot — so nothing needs quoting.
+            let mut def = minimal_def();
+            def.tables.push(TableRef {
+                alias: "private".to_string(),
+                table: "p".to_string(),
+                ..Default::default()
+            });
+            def.metrics.push(Metric {
+                name: "m".to_string(),
+                expr: "SUM(private.x)".to_string(),
+                source_table: Some("private".to_string()),
+                ..Default::default()
+            });
+            let ddl = render_create_ddl("rt9", &def).expect("def renders");
+            assert!(ddl.contains("private.m AS SUM(private.x)"), "{ddl}");
+            assert_eq!(
+                replayed_metric_names(&def),
+                vec!["revenue".to_string(), "m".to_string()]
+            );
+        }
     }
 
     // -------------------------------------------------------------------
