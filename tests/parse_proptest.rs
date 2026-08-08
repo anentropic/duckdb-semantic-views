@@ -827,24 +827,69 @@ fn test_null_byte_in_name() {
     assert!(result.is_ok(), "plan_rewrite panicked on null byte in name");
 }
 
+/// A `;` in the view-name position is rejected — the name scanner stops at it,
+/// so the trailing text is left unconsumed and the statement fails to parse.
+///
+/// TC-12: the invariant this test's comment used to claim ("the rewritten SQL
+/// must start with `SELECT * FROM`") stopped being expressible here when
+/// `plan_rewrite` began returning a structured `RewriteAction` instead of a SQL
+/// string — the only variant that carries SQL at all is `Passthrough`, and a
+/// CREATE never produces one. All three match arms were consequently left
+/// assertion-free, so the test could only have failed by panicking.
+///
+/// Each shape is paired with the identical statement minus the `;injection`,
+/// which must parse. Without that control the rejections would be attributable
+/// to anything in the query, and the test would pass just as happily if the
+/// grammar broke entirely.
 #[test]
 fn test_semicolon_in_name() {
-    // Name extraction stops at whitespace or '(' — a ';' inside the "name" position
-    // means the name is everything before ';' or the whole token. Either way, the
-    // rewritten SQL must start with "SELECT * FROM " (no raw ';' injected into the wrapper).
-    let query = "CREATE SEMANTIC VIEW x;injection (tables := [], dimensions := [])";
-    match plan_rewrite(query) {
-        Ok(Some(_action)) => {
-            // A structured rewrite was produced. The view name is carried as a
-            // struct field (not spliced into a wrapper SELECT string), so a ';'
-            // in the name position cannot terminate any statement — the
-            // injection vector the old string-form guarded against is gone by
-            // construction. Since the name ends at whitespace/'(', the name is
-            // "x;injection" or the parser hits an error; either outcome is safe.
-        }
-        Ok(None) => {} // Not detected as our DDL — acceptable
-        Err(_) => {}   // Parse error — acceptable
+    // (with `;injection` in the name position, same statement without it)
+    let pairs = [
+        (
+            "CREATE SEMANTIC VIEW x;injection AS TABLES (t) DIMENSIONS (t.a AS t.a)",
+            "CREATE SEMANTIC VIEW x AS TABLES (t) DIMENSIONS (t.a AS t.a)",
+        ),
+        ("DROP SEMANTIC VIEW x;injection", "DROP SEMANTIC VIEW x"),
+        (
+            "ALTER SEMANTIC VIEW x;injection RENAME TO y",
+            "ALTER SEMANTIC VIEW x RENAME TO y",
+        ),
+        (
+            "DESCRIBE SEMANTIC VIEW x;injection",
+            "DESCRIBE SEMANTIC VIEW x",
+        ),
+        ("SHOW SEMANTIC VIEWS;injection", "SHOW SEMANTIC VIEWS"),
+    ];
+
+    for (injected, control) in pairs {
+        let Err(err) = plan_rewrite(injected) else {
+            panic!(
+                "a ';' in the name position must be rejected, not absorbed \
+                 into the name: {injected:?} was accepted"
+            )
+        };
+        assert!(
+            err.position.is_some(),
+            "the rejection must carry a caret position: {injected:?} -> {err:?}"
+        );
+
+        // Anti-vacuity: the same statement without the `;injection` parses, so
+        // the rejection above is attributable to the `;` and not to the rest of
+        // the query being malformed.
+        let ok = plan_rewrite(control)
+            .unwrap_or_else(|e| panic!("control statement must parse: {control:?} -> {e:?}"));
+        assert!(
+            ok.is_some(),
+            "control statement must be recognised as ours: {control:?}"
+        );
     }
+
+    // The historical input from this test, kept for continuity. It is malformed
+    // for a second reason (no `AS`), so it carries no control pair.
+    assert!(
+        plan_rewrite("CREATE SEMANTIC VIEW x;injection (tables := [], dimensions := [])").is_err(),
+        "legacy named-argument CREATE form with an injected ';' must be rejected"
+    );
 }
 
 #[test]
