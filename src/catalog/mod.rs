@@ -21,6 +21,27 @@ pub(crate) mod writes;
 // companion file is deleted and this constant is never referenced again at runtime.
 const V010_COMPANION_EXT: &str = "semantic_views";
 
+/// Path of the v0.1.0 companion file that would sit alongside `db_path`, or
+/// `None` for an in-memory database (which never has one).
+///
+/// The one place this shape is computed. Both readers of it — the writable
+/// import pass in [`init_catalog`] and the read-only refusal above it (CAT-8) —
+/// must agree byte-for-byte, or the read-only branch would refuse for a file
+/// the import pass would not have looked at (or, worse, stay silent for one it
+/// would).
+fn v010_companion_path(db_path: &str) -> Option<PathBuf> {
+    if db_path == ":memory:" {
+        return None;
+    }
+    let mut p = PathBuf::from(db_path);
+    let ext = match p.extension() {
+        Some(e) => format!("{}.{V010_COMPANION_EXT}", e.to_string_lossy()),
+        None => V010_COMPANION_EXT.to_string(),
+    };
+    p.set_extension(ext);
+    Some(p)
+}
+
 /// A unique temp-file path for a file-backed unit test (CAT-7).
 ///
 /// File-backed tests used to hardcode a fixed name under `std::env::temp_dir()`.
@@ -94,6 +115,26 @@ pub fn init_catalog(
                     .into(),
             );
         }
+        // CAT-8: the v0.1.0 companion-file import below is equally unreachable
+        // read-only — it INSERTs. Left unchecked the two un-migrated shapes
+        // behaved differently: the legacy *table* refused loudly (above), while
+        // a companion file was simply never looked at, so every view in it
+        // resolved as "does not exist" with no hint that a whole catalog was
+        // sitting unimported next to the database. Refuse with the same
+        // actionable wording instead.
+        if let Some(companion) = v010_companion_path(db_path) {
+            if companion.exists() {
+                return Err(format!(
+                    "semantic_views: this database has a v0.1.0 companion file \
+                     '{}' whose semantic views have not been imported yet, and \
+                     the database is open read-only, so it cannot be migrated. \
+                     Open it writable once (any LOAD will import it), then \
+                     reopen read-only.",
+                    companion.display()
+                )
+                .into());
+            }
+        }
         return Ok(());
     }
     // FF-10: `definition` is `NOT NULL`. A SQL-NULL definition is an
@@ -124,16 +165,7 @@ pub fn init_catalog(
 
     // One-time migration: if a v0.1.0 companion file exists alongside the database,
     // import its contents into the table then delete the file.
-    if db_path != ":memory:" {
-        let migration_path: PathBuf = {
-            let mut p = PathBuf::from(db_path);
-            let ext = match p.extension() {
-                Some(e) => format!("{}.{V010_COMPANION_EXT}", e.to_string_lossy()),
-                None => V010_COMPANION_EXT.to_string(),
-            };
-            p.set_extension(ext);
-            p
-        };
+    if let Some(migration_path) = v010_companion_path(db_path) {
         if migration_path.exists() {
             let contents = std::fs::read_to_string(&migration_path).map_err(|e| {
                 format!(
@@ -1840,6 +1872,109 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Bootstrap a valid, empty DuckDB file at `db_path` so it can be reopened
+    /// read-only (`open_with_flags` will not create a file in read-only mode).
+    #[cfg(not(feature = "extension"))]
+    fn bootstrap_empty_db_file(db_path: &str) {
+        let con = Connection::open(db_path).expect("open writable to create the file");
+        con.execute_batch("CREATE TABLE cat8_bootstrap(x INTEGER);")
+            .expect("write something so the file has real content");
+        con.execute_batch("CHECKPOINT;").expect("flush to disk");
+    }
+
+    #[cfg(not(feature = "extension"))]
+    fn open_read_only(db_path: &str) -> Connection {
+        let cfg = duckdb::Config::default()
+            .access_mode(duckdb::AccessMode::ReadOnly)
+            .expect("set access_mode");
+        Connection::open_with_flags(db_path, cfg).expect("open read-only")
+    }
+
+    /// CAT-8 (code-review 2026-08-08): a read-only open of a database that
+    /// still has an unimported v0.1.0 companion file used to succeed silently
+    /// — the companion detection lives *below* the `is_read_only` early return,
+    /// so it was unreachable, and every view in the file then resolved as
+    /// "does not exist" with nothing pointing at the un-migrated catalog next
+    /// to the database. The sibling un-migrated shape (a legacy `_definitions`
+    /// *table*) has always refused loudly; this makes the two agree.
+    #[cfg(not(feature = "extension"))]
+    #[test]
+    fn cat8_read_only_open_refuses_an_unimported_companion_file() {
+        let db_path_buf = unique_temp_db_path("test_cat8_ro_companion");
+        let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
+        let companion = PathBuf::from(format!("{db_path}.{V010_COMPANION_EXT}"));
+
+        bootstrap_empty_db_file(db_path);
+        std::fs::write(
+            &companion,
+            r#"{"orders": "{\"base_table\":\"orders\",\"dimensions\":[],\"metrics\":[]}"}"#,
+        )
+        .unwrap();
+
+        let con = open_read_only(db_path);
+        let err = init_catalog(&con, db_path, true)
+            .expect_err("an unimported companion file must be refused, not ignored");
+        let msg = err.to_string();
+        for expected in [
+            "v0.1.0 companion file",
+            "read-only",
+            "Open it writable once",
+        ] {
+            assert!(
+                msg.contains(expected),
+                "message must stay as actionable as the legacy-table refusal \
+                 (missing {expected:?}), got: {msg}"
+            );
+        }
+        assert!(
+            msg.contains(&companion.display().to_string()),
+            "message must name the file to act on, got: {msg}"
+        );
+        assert!(
+            companion.exists(),
+            "refusing must not delete the file — it is the only copy of those views"
+        );
+
+        drop(con);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(&companion);
+    }
+
+    /// The CAT-8 control: a read-only open with **no** companion file is still
+    /// a clean no-op. Without this the fix could refuse every read-only open
+    /// and the test above would not notice.
+    #[cfg(not(feature = "extension"))]
+    #[test]
+    fn cat8_read_only_open_without_a_companion_file_is_a_no_op() {
+        let db_path_buf = unique_temp_db_path("test_cat8_ro_clean");
+        let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
+
+        bootstrap_empty_db_file(db_path);
+        let con = open_read_only(db_path);
+        init_catalog(&con, db_path, true)
+            .expect("a read-only open with nothing to migrate must succeed");
+
+        drop(con);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    /// The companion path both branches compute has to be the same one, or the
+    /// read-only refusal fires for a file the writable import would never look
+    /// at. Pins the `set_extension` shape (`x.duckdb` -> `x.duckdb.semantic_views`,
+    /// extensionless `x` -> `x.semantic_views`) and the in-memory exemption.
+    #[test]
+    fn cat8_companion_path_shape() {
+        assert_eq!(
+            v010_companion_path("/tmp/x.duckdb"),
+            Some(PathBuf::from("/tmp/x.duckdb.semantic_views"))
+        );
+        assert_eq!(
+            v010_companion_path("/tmp/x"),
+            Some(PathBuf::from("/tmp/x.semantic_views"))
+        );
+        assert_eq!(v010_companion_path(":memory:"), None);
     }
 
     #[cfg(not(feature = "extension"))]
