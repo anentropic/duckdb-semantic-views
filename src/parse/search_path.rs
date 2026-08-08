@@ -201,6 +201,15 @@ pub(crate) fn inject_search_path(sql: &str) -> Cow<'_, str> {
     if insert_at.is_empty() {
         return Cow::Borrowed(sql);
     }
+    // PARSE-11 (code-review 2026-08-08): the offsets are collected in call-HEAD
+    // order, but a resolving call NESTED inside another's argument list closes
+    // BEFORE the outer one — so head order is not close order, and the splice
+    // below (which walks `prev -> close` forward) sliced start > end and
+    // panicked. Both FFI hooks `catch_unwind`, so the panic surfaced only as
+    // "injection silently did not happen, for every call in the statement".
+    // Sorting is enough: every offset indexes the ORIGINAL text and each call
+    // has its own distinct close paren.
+    insert_at.sort_unstable();
     let mut out = String::with_capacity(sql.len() + insert_at.len() * 64);
     let mut prev = 0usize;
     for close in insert_at {
@@ -508,6 +517,62 @@ mod tests {
         assert!(
             got.contains("search_path := list_concat"),
             "a commented-out argument is not a real one: {got}"
+        );
+    }
+
+    /// The nested-call statement of PARSE-11 (code-review 2026-08-08).
+    const NESTED_CALLS: &str =
+        "SELECT * FROM semantic_view((SELECT view_name FROM show_semantic_dimensions('x') LIMIT 1))";
+
+    // PARSE-11: `insert_at` was collected in HEAD order, but a resolving call
+    // nested inside another's parens CLOSES first, so the offsets descended and
+    // `&sql[prev..close]` sliced start > end -> panic. Both FFI hooks
+    // `catch_unwind`, so in production the panic was swallowed and the
+    // statement ran with NO injection for either call (the PARSE-5 consequence,
+    // silently, on every execution).
+    #[test]
+    fn nested_resolving_calls_do_not_panic_and_both_get_injected() {
+        let got = inject_search_path(NESTED_CALLS);
+        assert_eq!(
+            got.matches("search_path :=").count(),
+            2,
+            "both the inner and the outer call must be injected: {got}"
+        );
+        // The inner call's argument lands inside the inner parens, the outer's
+        // after the subquery — i.e. the spliced text is well-formed, not just
+        // present twice.
+        assert_eq!(
+            got,
+            format!(
+                "SELECT * FROM semantic_view((SELECT view_name FROM show_semantic_dimensions('x'{inner}) LIMIT 1){outer})",
+                inner = suffix(),
+                outer = suffix()
+            ),
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn injection_is_idempotent_for_the_nested_shape() {
+        // AR-5 re-runs `plan_rewrite` on already-rewritten text; the nested
+        // shape must survive that as the flat one does.
+        let once = inject_search_path(NESTED_CALLS).into_owned();
+        let twice = inject_search_path(&once).into_owned();
+        assert_eq!(once, twice, "second pass changed the statement");
+    }
+
+    // PARSE-13: `blank_sql_comments` ended a `--` comment only at `\n`, but
+    // DuckDB's scanner ends it at a bare `\r` too. The whole statement was
+    // therefore blanked, so no call was found and the query ran with no path
+    // while DuckDB happily executed it.
+    #[test]
+    fn a_leading_line_comment_ended_by_a_bare_carriage_return_does_not_defeat_injection() {
+        let sql = "-- note\rSELECT * FROM semantic_view('v')";
+        let got = inject_search_path(sql);
+        assert_eq!(
+            got,
+            format!("-- note\rSELECT * FROM semantic_view('v'{})", suffix()),
+            "a CR-terminated comment must not swallow the statement"
         );
     }
 }
