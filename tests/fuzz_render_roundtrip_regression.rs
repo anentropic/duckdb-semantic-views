@@ -59,13 +59,45 @@ fn ci_crash_input_no_longer_breaks_the_fixpoint() {
 
     let rendered0 = render_create_ddl("fuzz_view", &def).expect("render0");
     let body0 = body_of(&rendered0).expect("body0");
-    let Ok(kb1) = parse_keyword_body(body0, 0) else {
-        return; // not in the parser's image — stage-0 skip, the fixpoint is safe
-    };
-    for m in &kb1.metrics {
-        assert!(
-            !m.name.trim().is_empty(),
-            "parser produced a nameless metric: {kb1:#?}"
-        );
+
+    // TC-14 (code-review 2026-08-08): this used to be
+    // `let Ok(kb1) = ... else { return; }` — a silent escape. The input is
+    // FIXED, so "the parser happened to reject it" is not a case to skip past:
+    // the assertion below evaporates with no signal, the RT-5 fuzz-oracle
+    // shape. Making it explicit immediately showed the escape was live rather
+    // than defensive — the body does NOT parse today.
+    //
+    // What matters here is the invariant the CI crash was about: a
+    // round-tripped definition must never yield a metric with no name. Both
+    // outcomes satisfy it, and both are now pinned, so neither can change
+    // unobserved:
+    //
+    //   Ok  — every parsed metric carries a name (the original assertion).
+    //   Err — the parser refuses LOUDLY, and for the one reason we know of.
+    //         The metric here is named `PRIVATE`; `render_create_ddl`
+    //         quote-protects names on lexing grounds only, so it emits it bare
+    //         and the parser peels entry-initial `PRIVATE` as the access
+    //         modifier. That is review finding RT-9 (2026-08-08), still open:
+    //         the arm below is pinning a *known-degraded* state, not a
+    //         contract. When RT-9 is fixed this test flips to the Ok arm on
+    //         its own and this arm becomes dead — delete it then.
+    match parse_keyword_body(body0, 0) {
+        Ok(kb1) => {
+            for m in &kb1.metrics {
+                assert!(
+                    !m.name.trim().is_empty(),
+                    "parser produced a nameless metric: {kb1:#?}"
+                );
+            }
+        }
+        Err(e) => {
+            assert!(
+                e.message.contains("Missing metric name"),
+                "the only rejection we accept for this fixed body is RT-9's \
+                 bare-`PRIVATE`-metric-name one; any other parse failure means \
+                 this replay stopped exercising what it was written for.\n\
+                 got: {e:?}\nrendered body: {body0}"
+            );
+        }
     }
 }
