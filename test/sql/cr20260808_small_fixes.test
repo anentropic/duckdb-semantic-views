@@ -1,0 +1,70 @@
+# Code review 2026-08-08 — small-finding regression guards.
+#
+# IDENT-6: `SHOW ... STARTS WITH` is a LITERAL prefix. It used to emit
+# `name LIKE '<prefix>%'`, so `_` and `%` inside the prefix reached the pattern
+# matcher as wildcards.
+
+require semantic_views
+
+statement ok
+CREATE TABLE cr0808_t (id INTEGER PRIMARY KEY, a_b VARCHAR, axb VARCHAR, pq VARCHAR, pzq VARCHAR);
+
+statement ok
+CREATE SEMANTIC VIEW cr0808_starts_with_sv AS
+  TABLES (
+    t AS cr0808_t PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    t.a_b AS t.a_b,
+    t.axb AS t.axb,
+    t."p%q" AS t.pq,
+    t.pzq AS t.pzq
+  )
+  METRICS (
+    t.n AS COUNT(t.id)
+  )
+
+# ============================================================
+# IDENT-6 case 1: `_` in the prefix is a literal underscore.
+# Pre-fix this also returned `axb`, because `_` was a LIKE
+# single-character wildcard.
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN cr0808_starts_with_sv STARTS WITH 'a_b'
+----
+memory	main	cr0808_starts_with_sv	cr0808_t	a_b	(empty)	[]	(empty)
+
+# ============================================================
+# IDENT-6 case 2: `%` in the prefix is a literal percent.
+# Pre-fix `p%` matched every name beginning with `p` — both
+# `p%q` and `pzq`.
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN cr0808_starts_with_sv STARTS WITH 'p%'
+----
+memory	main	cr0808_starts_with_sv	cr0808_t	p%q	(empty)	[]	(empty)
+
+# ============================================================
+# IDENT-6 control: an ordinary prefix still matches every name
+# that starts with it (the clause did not become an equality).
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN cr0808_starts_with_sv STARTS WITH 'a'
+----
+memory	main	cr0808_starts_with_sv	cr0808_t	a_b	(empty)	[]	(empty)
+memory	main	cr0808_starts_with_sv	cr0808_t	axb	(empty)	[]	(empty)
+
+# ============================================================
+# IDENT-6 control: STARTS WITH stays case-SENSITIVE (Snowflake's
+# rule for this clause, unlike LIKE which maps to ILIKE).
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN cr0808_starts_with_sv STARTS WITH 'A'
+----
+
+statement ok
+DROP SEMANTIC VIEW cr0808_starts_with_sv

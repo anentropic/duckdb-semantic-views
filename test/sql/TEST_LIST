@@ -105,3 +105,4 @@ test/sql/cat4_read_foreign_database.test
 test/sql/par6_cross_table_fact_join.test
 test/sql/member_reference_scoping.test
 test/sql/cr20260808_where_member_fan_fence.test
+test/sql/cr20260808_small_fixes.test
