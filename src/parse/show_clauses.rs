@@ -628,6 +628,11 @@ mod tests {
     /// discriminate `a_b` from `axb` when `DuckDB` runs it. A unit test on the
     /// predicate string alone cannot tell a correct escape from a
     /// plausible-looking one, so this executes it.
+    ///
+    /// Gated off the `extension` feature, which swaps the bundled `DuckDB` API
+    /// for loadable-extension stubs — `Connection::open_in_memory` panics there
+    /// with "DuckDB API not initialized". The default-features run covers it.
+    #[cfg(not(feature = "extension"))]
     #[test]
     fn starts_with_discriminates_underscore_from_wildcard_in_duckdb() {
         let conn = duckdb::Connection::open_in_memory().expect("in-memory DuckDB opens");
