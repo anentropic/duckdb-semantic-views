@@ -277,7 +277,10 @@ fn expand_derived_only_no_base_metrics_requested() {
         "JOIN to li must be included for derived metric referencing li-based metrics: {sql}"
     );
     assert!(
-        sql.contains("(SUM(li.amount)) - (SUM(li.unit_cost)) AS \"profit\""),
+        sql.contains(
+            "(SUM(CASE WHEN \"li\".\"id\" IS NOT NULL THEN li.amount END)) \
+             - (SUM(CASE WHEN \"li\".\"id\" IS NOT NULL THEN li.unit_cost END)) AS \"profit\""
+        ),
         "Derived metric expression must be inlined: {sql}"
     );
 }
@@ -458,7 +461,9 @@ fn own_qualified_derived_metric_reference_is_inlined() {
     )
     .unwrap();
     assert!(
-        sql.contains("(SUM(li.price)) * 2 AS \"double_rev\""),
+        sql.contains(
+            "(SUM(CASE WHEN \"li\".\"id\" IS NOT NULL THEN li.price END)) * 2 AS \"double_rev\""
+        ),
         "a qualified reference must inline the base metric's aggregate: {sql}"
     );
     assert!(
@@ -500,7 +505,9 @@ fn quoted_and_case_varied_qualified_reference_is_inlined() {
     )
     .unwrap();
     assert!(
-        sql.contains("(SUM(li.price)) * 2 AS \"double_rev\""),
+        sql.contains(
+            "(SUM(CASE WHEN \"li\".\"id\" IS NOT NULL THEN li.price END)) * 2 AS \"double_rev\""
+        ),
         "quoting/case must not defeat the replacement: {sql}"
     );
 }
