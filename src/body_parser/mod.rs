@@ -5,6 +5,7 @@
 
 mod annotations;
 mod clause_bounds;
+pub(crate) mod cross_refs;
 mod cursor;
 mod entries;
 mod lexer;
@@ -22,7 +23,6 @@ use crate::model::{
 };
 
 use clause_bounds::find_clause_bounds;
-use scan::split_qualified_identifier;
 
 pub(crate) use entries::parse_qualified_entries;
 pub(crate) use materializations::parse_materializations_clause;
@@ -33,6 +33,18 @@ pub(crate) use scan::{
     source_table_roundtrips_verbatim, split_at_depth0_commas,
 };
 pub(crate) use tables::parse_tables_clause;
+
+/// Re-parse a rendered window expression, returning just the `WindowSpec`.
+///
+/// MODEL-1 (code-review 2026-08-08): the YAML choke point needs to check that a
+/// `WindowSpec` it is about to store SURVIVES the render → parse round trip,
+/// because `emit_window_expr` writes every one of its fields out raw. Doing
+/// that with the real parser (rather than a second copy of its rules here) is
+/// what makes the check complete: whatever the parser would read back is what
+/// gets compared. Positions are irrelevant to that caller, so the offset is 0.
+pub(crate) fn reparse_window_expr(expr: &str) -> Result<Option<WindowSpec>, ParseError> {
+    window::parse_window_over_clause(expr, 0).map(|(_, ws)| ws)
+}
 
 /// Parsed DIMENSIONS / FACTS entry (R-4: named fields, was a 6-tuple).
 ///
@@ -207,235 +219,21 @@ pub fn parse_keyword_body(text: &str, base_offset: usize) -> Result<KeywordBody,
         })
         .collect();
 
-    // Phase 47: Validate NON ADDITIVE BY dimension references
-    // Phase 68 B1 / D-08: accept dotted-path qualifier `alias.dim_name` in
-    // addition to the bare `dim_name` form. The dotted form is split at the
-    // first depth-0 dot OUTSIDE a quoted region (so `"a.b"` stays atomic but
-    // `o."order date"` splits into `o` + `"order date"`).
-    for metric in &metrics {
-        for na in &metric.non_additive_by {
-            let dim_exists = dimensions.iter().any(|d| {
-                // PARSE-8: `ident_matches` on both halves, mirroring the ORDER
-                // BY site EXP-12 migrated. This is the fifth site of that class;
-                // TECH-DEBT #28 mentions it, but its closing line reads as if
-                // the arc had fully landed, so migrating the other four alone
-                // would have preserved exactly that misreading.
-                if crate::ident::ident_matches(&d.name, &na.dimension) {
-                    return true;
-                }
-                // D-08 dotted-path acceptance: if NA dim is `alias.name`,
-                // match against (source_table, name).
-                if let Some((alias_part, name_part)) = split_qualified_identifier(&na.dimension) {
-                    if let Some(ref src) = d.source_table {
-                        return crate::ident::ident_matches(src, alias_part)
-                            && crate::ident::ident_matches(&d.name, name_part);
-                    }
-                }
-                false
-            });
-            if !dim_exists {
-                let available_dims: Vec<String> =
-                    dimensions.iter().map(|d| d.name.clone()).collect();
-                let suggestion = crate::util::suggest_closest(&na.dimension, &available_dims);
-                let mut msg = format!(
-                    "NON ADDITIVE BY dimension '{}' on metric '{}' does not match any declared dimension.",
-                    na.dimension, metric.name
-                );
-                if let Some(closest) = suggestion {
-                    use std::fmt::Write;
-                    let _ = write!(msg, " Did you mean '{closest}'?");
-                }
-                return Err(ParseError {
-                    message: msg,
-                    position: None,
-                });
-            }
-        }
-    }
-
-    // Phase 48: Validate window metric EXCLUDING dimension and inner metric references
-    let metric_names: Vec<String> = metrics.iter().map(|m| m.name.clone()).collect();
-    for metric in &metrics {
-        if let Some(ref ws) = metric.window_spec {
-            // Validate EXCLUDING dimension references
-            for dim in &ws.excluding_dims {
-                // PARSE-8: `ident_matches`, the project's one identifier rule —
-                // raw case-folding compared the quote characters as data, so
-                // `EXCLUDING "Region"` was rejected against a `region`
-                // dimension while `ORDER BY "Region"` beside it resolved.
-                let dim_exists = dimensions
-                    .iter()
-                    .any(|d| crate::ident::ident_matches(&d.name, dim));
-                if !dim_exists {
-                    let available_dims: Vec<String> =
-                        dimensions.iter().map(|d| d.name.clone()).collect();
-                    let suggestion = crate::util::suggest_closest(dim, &available_dims);
-                    let mut msg = format!(
-                        "Window metric '{}': EXCLUDING dimension '{}' not found in semantic view dimensions.",
-                        metric.name, dim
-                    );
-                    if let Some(closest) = suggestion {
-                        use std::fmt::Write;
-                        let _ = write!(msg, " Did you mean '{closest}'?");
-                    }
-                    return Err(ParseError {
-                        message: msg,
-                        position: None,
-                    });
-                }
-            }
-            // Validate PARTITION BY dimension references
-            for dim in &ws.partition_dims {
-                // PARSE-8: same canonical rule as the EXCLUDING slot above.
-                let dim_exists = dimensions
-                    .iter()
-                    .any(|d| crate::ident::ident_matches(&d.name, dim));
-                if !dim_exists {
-                    let available_dims: Vec<String> =
-                        dimensions.iter().map(|d| d.name.clone()).collect();
-                    let suggestion = crate::util::suggest_closest(dim, &available_dims);
-                    let mut msg = format!(
-                        "Window metric '{}': PARTITION BY dimension '{}' not found in semantic view dimensions.",
-                        metric.name, dim
-                    );
-                    if let Some(closest) = suggestion {
-                        use std::fmt::Write;
-                        let _ = write!(msg, " Did you mean '{closest}'?");
-                    }
-                    return Err(ParseError {
-                        message: msg,
-                        position: None,
-                    });
-                }
-            }
-            // Validate ORDER BY dimension references
-            // Phase 68 B2 / D-08: accept dotted-path qualifier `alias.dim_name`
-            // in addition to the bare `dim_name` form (mirrors NAB resolver).
-            for ob in &ws.order_by {
-                // EXP-12: `ident_matches` so a quoted reference resolves to its
-                // unquoted declaration, as everywhere else in the language.
-                // Raw case-folding compared the quote characters as data, so
-                // `ORDER BY "region"` was rejected against a `region` dimension.
-                let dim_exists = dimensions.iter().any(|d| {
-                    if crate::ident::ident_matches(&d.name, &ob.expr) {
-                        return true;
-                    }
-                    if let Some((alias_part, name_part)) = split_qualified_identifier(&ob.expr) {
-                        if let Some(ref src) = d.source_table {
-                            return crate::ident::ident_matches(src, alias_part)
-                                && crate::ident::ident_matches(&d.name, name_part);
-                        }
-                    }
-                    false
-                });
-                if !dim_exists {
-                    let available_dims: Vec<String> =
-                        dimensions.iter().map(|d| d.name.clone()).collect();
-                    let suggestion = crate::util::suggest_closest(&ob.expr, &available_dims);
-                    let mut msg = format!(
-                        "Window metric '{}': ORDER BY dimension '{}' not found in semantic view dimensions.",
-                        metric.name, ob.expr
-                    );
-                    if let Some(closest) = suggestion {
-                        use std::fmt::Write;
-                        let _ = write!(msg, " Did you mean '{closest}'?");
-                    }
-                    return Err(ParseError {
-                        message: msg,
-                        position: None,
-                    });
-                }
-            }
-            // Validate inner metric reference
-            // EXP-12: same canonical rule. This check was the strictest of the
-            // four sites resolving `inner_metric`, and its strictness is what
-            // kept a quoted reference out of the catalog — and so masked the
-            // fence and anchor sites, which lost the inner aggregate's grain
-            // when they did see one. All four migrate together, deliberately.
-            let inner_exists = metric_names
-                .iter()
-                .any(|n| crate::ident::ident_matches(n, &ws.inner_metric));
-            if !inner_exists {
-                let suggestion = crate::util::suggest_closest(&ws.inner_metric, &metric_names);
-                let mut msg = format!(
-                    "Window metric '{}': inner metric '{}' not found in semantic view metrics.",
-                    metric.name, ws.inner_metric
-                );
-                if let Some(closest) = suggestion {
-                    use std::fmt::Write;
-                    let _ = write!(msg, " Did you mean '{closest}'?");
-                }
-                return Err(ParseError {
-                    message: msg,
-                    position: None,
-                });
-            }
-        }
-    }
-
-    // Phase 54: Validate materialization references
-    // Duplicate name check
-    {
-        let mut seen_names: Vec<String> = Vec::new();
-        for mat in &materializations {
-            let lower = mat.name.to_ascii_lowercase();
-            if seen_names.iter().any(|n| n == &lower) {
-                return Err(ParseError {
-                    message: format!("Duplicate materialization name '{}'.", mat.name),
-                    position: None,
-                });
-            }
-            seen_names.push(lower);
-        }
-    }
-    // Dimension reference check
-    for mat in &materializations {
-        for dim_name in &mat.dimensions {
-            // PARSE-8: same canonical rule as the window-metric slots.
-            let dim_exists = dimensions
-                .iter()
-                .any(|d| crate::ident::ident_matches(&d.name, dim_name));
-            if !dim_exists {
-                let available_dims: Vec<String> =
-                    dimensions.iter().map(|d| d.name.clone()).collect();
-                let suggestion = crate::util::suggest_closest(dim_name, &available_dims);
-                let mut msg = format!(
-                    "Materialization '{}': dimension '{}' not found in semantic view dimensions.",
-                    mat.name, dim_name
-                );
-                if let Some(closest) = suggestion {
-                    use std::fmt::Write;
-                    let _ = write!(msg, " Did you mean '{closest}'?");
-                }
-                return Err(ParseError {
-                    message: msg,
-                    position: None,
-                });
-            }
-        }
-        // Metric reference check
-        for met_name in &mat.metrics {
-            // PARSE-8: same canonical rule.
-            let met_exists = metrics
-                .iter()
-                .any(|m| crate::ident::ident_matches(&m.name, met_name));
-            if !met_exists {
-                let suggestion = crate::util::suggest_closest(met_name, &metric_names);
-                let mut msg = format!(
-                    "Materialization '{}': metric '{}' not found in semantic view metrics.",
-                    mat.name, met_name
-                );
-                if let Some(closest) = suggestion {
-                    use std::fmt::Write;
-                    let _ = write!(msg, " Did you mean '{closest}'?");
-                }
-                return Err(ParseError {
-                    message: msg,
-                    position: None,
-                });
-            }
-        }
-    }
+    // MODEL-1 (code-review 2026-08-08): the semantic cross-reference checks
+    // that used to be inlined here (NON ADDITIVE BY, window EXCLUDING /
+    // PARTITION BY / ORDER BY / inner metric, materialization duplicate names
+    // and references) now live in `cross_refs`, so the YAML import path runs
+    // exactly the same checks instead of skipping them. Messages are unchanged;
+    // they were positionless here too.
+    crate::body_parser::cross_refs::validate_cross_references(
+        &dimensions,
+        &metrics,
+        &materializations,
+    )
+    .map_err(|message| ParseError {
+        message,
+        position: None,
+    })?;
 
     Ok(KeywordBody {
         tables,
