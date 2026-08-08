@@ -29,7 +29,7 @@ pub(crate) use materializations::parse_materializations_clause;
 pub(crate) use metrics::parse_metrics_clause;
 pub(crate) use relationships::parse_relationships_clause;
 pub(crate) use scan::{
-    column_roundtrips_verbatim, identifier_slot_roundtrips_verbatim,
+    column_roundtrips_verbatim, identifier_slot_error, identifier_slot_roundtrips_verbatim,
     source_table_roundtrips_verbatim, split_at_depth0_commas,
 };
 pub(crate) use tables::parse_tables_clause;
@@ -743,6 +743,93 @@ mod tests {
             "the primary defect is the missing name, got: {}",
             err.message
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // A metric whose name is EATEN by a peeled clause (CI fuzz_render_roundtrip,
+    // 2026-08-08).
+    //
+    // The `before_as.is_empty()` check runs BEFORE `USING (...)` and
+    // `NON ADDITIVE BY (...)` are peeled off the prefix, so an entry consisting
+    // of nothing but those clauses cleared it with a non-empty `before_as` and
+    // reached the name slot empty. `identifier_slot_error` returns `None` for an
+    // empty slot, so the metric was stored NAMELESS.
+    //
+    // That is not merely untidy: `render_ddl` emits an empty name as `""`, which
+    // this parser rejects as an empty quoted identifier — so the nameless metric
+    // rendered to DDL that no longer parses, breaking the render fixpoint
+    // `render(parse(render(d))) == render(d)` that `fuzz_render_roundtrip`
+    // asserts with no escape.
+    //
+    // One test per reachable shape: the four differ in WHICH clause eats the
+    // name, and a single combined test would stop at the first and leave the
+    // rest unproven.
+    // -----------------------------------------------------------------------
+
+    /// Shape 1: an access modifier plus `USING ()` — the exact entry CI's
+    /// fuzzer reduced to.
+    #[test]
+    fn access_modifier_plus_empty_using_is_not_a_metric_name() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    METRICS (PRIVATE USING () AS 1)";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message.contains("Missing metric name"),
+            "a metric with no name must be rejected, got: {}",
+            err.message
+        );
+    }
+
+    /// Shape 2: `USING ()` alone, with no access modifier ahead of it.
+    #[test]
+    fn empty_using_alone_is_not_a_metric_name() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    METRICS (USING () AS 1)";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message.contains("Missing metric name"),
+            "a metric with no name must be rejected, got: {}",
+            err.message
+        );
+    }
+
+    /// Shape 3: `NON ADDITIVE BY ()` is peeled off before `USING`, so it eats
+    /// the name through a different door.
+    #[test]
+    fn empty_non_additive_by_alone_is_not_a_metric_name() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    METRICS (NON ADDITIVE BY () AS 1)";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message.contains("Missing metric name"),
+            "a metric with no name must be rejected, got: {}",
+            err.message
+        );
+    }
+
+    /// Shape 4: both clauses present, each empty — neither peel leaves a name.
+    #[test]
+    fn empty_using_and_non_additive_by_together_are_not_a_metric_name() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    METRICS (USING () NON ADDITIVE BY () AS 1)";
+        let err = parse_keyword_body(body, 0).unwrap_err();
+        assert!(
+            err.message.contains("Missing metric name"),
+            "a metric with no name must be rejected, got: {}",
+            err.message
+        );
+    }
+
+    /// Control for the four above: a REAL name in front of the same empty
+    /// clauses still parses, and keeps its name. Without this, the fix could
+    /// pass by rejecting every `USING ()` entry outright.
+    #[test]
+    fn a_named_metric_with_empty_clauses_still_parses() {
+        let body = "AS TABLES (o AS orders PRIMARY KEY (id)) \
+                    METRICS (PRIVATE o.total USING () NON ADDITIVE BY () AS sum(o.v))";
+        let kb = parse_keyword_body(body, 0).expect("a named metric must still parse");
+        assert_eq!(kb.metrics.len(), 1);
+        assert_eq!(kb.metrics[0].name, "total");
     }
 
     /// Control: `OVER (...)` legitimately follows `AS` — `parse_window_over_clause`

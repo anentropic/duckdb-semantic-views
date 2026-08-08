@@ -1,0 +1,182 @@
+# Code review 2026-08-06, RT-5/RT-6, plus what removing the fuzz oracle's
+# parse-fail escape found on 2026-08-07 (TECH-DEBT #58).
+#
+# YAML is the only surface that reaches a stored `SemanticViewDefinition`
+# without passing through the clause parsers. It performed no validation at
+# all, so it could store definitions `GET_DDL` renders as DDL this project's
+# own parser rejects -- or, worse, as DDL that re-parses into a DIFFERENT
+# definition. The rule is now `model::validate_ddl_representable`, applied at
+# import.
+#
+# The end-to-end value of these cases is that they run through the real
+# extension-load -> DDL -> GET_DDL path rather than calling the validator
+# directly. The runner halts a file at its first failing statement, so the
+# per-case red proof lives at the unit layer (`model::tests::yaml_*`), where
+# each case reports independently.
+
+require semantic_views
+
+statement ok
+CREATE TABLE cr0806y_orders (id INTEGER PRIMARY KEY, amount DOUBLE, region VARCHAR);
+
+statement ok
+INSERT INTO cr0806y_orders VALUES (1, 100.0, 'East'), (2, 200.0, 'West');
+
+statement ok
+CREATE TABLE cr0806y_cust (cust_id INTEGER PRIMARY KEY, name VARCHAR);
+
+# ============================================================
+# The structural rule: the grammar requires DIMENSIONS or METRICS.
+# Found by fuzz_render_roundtrip once RT-5 removed its parse-fail escape --
+# GET_DDL rendered a lone TABLES clause, which its own parser refuses with
+# "At least one of 'DIMENSIONS' or 'METRICS' is required."
+# ============================================================
+
+statement error
+CREATE SEMANTIC VIEW cr0806y_bare FROM YAML $$
+tables:
+  - alias: o
+    table: cr0806y_orders
+    pk_columns: [id]
+dimensions: []
+metrics: []
+$$
+----
+neither dimensions nor metrics
+
+# A member with no expression. Every member is `name AS expr`, and this
+# rendered as a bare `o.total AS ` -- "Missing expression after 'AS'". Also
+# found by the fuzzer, on the run after the one above.
+statement error
+CREATE SEMANTIC VIEW cr0806y_noexpr FROM YAML $$
+tables:
+  - alias: o
+    table: cr0806y_orders
+    pk_columns: [id]
+dimensions: []
+metrics:
+  - name: total
+    expr: ''
+    source_table: o
+$$
+----
+empty expression
+
+# ============================================================
+# Identifier slots (RT-5/RT-6).
+# ============================================================
+
+# A member name the DDL grammar cannot spell.
+statement error
+CREATE SEMANTIC VIEW cr0806y_spacename FROM YAML $$
+tables:
+  - alias: o
+    table: cr0806y_orders
+    pk_columns: [id]
+dimensions:
+  - name: my dim
+    expr: o.region
+    source_table: o
+metrics: []
+$$
+----
+my dim
+
+# The silent one: `source_table: a.b` renders `a.b.region AS o.region`, which
+# re-parses as source table `a`, member `b.region`.
+statement error
+CREATE SEMANTIC VIEW cr0806y_dotted FROM YAML $$
+tables:
+  - alias: o
+    table: cr0806y_orders
+    pk_columns: [id]
+dimensions:
+  - name: region
+    expr: o.region
+    source_table: a.b
+metrics: []
+$$
+----
+a.b
+
+# An empty physical table name. `emit_table` quotes every other
+# non-round-tripping spelling; `quote_ident("")` is `""`, which the TABLES
+# parser rejects as an empty quoted identifier.
+statement error
+CREATE SEMANTIC VIEW cr0806y_emptytable FROM YAML $$
+tables:
+  - alias: o
+    table: ""
+    pk_columns: []
+dimensions: []
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+$$
+----
+empty table name
+
+# ============================================================
+# The other direction: shapes the DDL grammar DOES accept must keep importing,
+# and must survive GET_DDL. Without these, "validate YAML" degenerates into
+# "reject YAML" (PR #209 review).
+# ============================================================
+
+# A dot-qualified relationship name -- what RELATIONSHIPS validates with
+# `identifier_slot_error`, which accepts a qualified identifier.
+statement ok
+CREATE SEMANTIC VIEW cr0806y_dotrel FROM YAML $$
+tables:
+  - alias: o
+    table: cr0806y_orders
+    pk_columns: [id]
+  - alias: c
+    table: cr0806y_cust
+    pk_columns: [cust_id]
+joins:
+  - name: a.b
+    from_alias: o
+    table: c
+    fk_columns: [id]
+dimensions: []
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+$$
+
+# The rendered DDL keeps the qualified name verbatim -- the round trip the
+# validator exists to protect.
+query I
+SELECT COUNT(*) FROM (SELECT GET_DDL('SEMANTIC_VIEW', 'cr0806y_dotrel') AS d)
+WHERE d LIKE '%a.b AS o(id) REFERENCES c%';
+----
+1
+
+# A physical table name needing quotes still imports: the renderer quotes it,
+# so it round-trips.
+statement ok
+CREATE SEMANTIC VIEW cr0806y_quotedtable FROM YAML $$
+tables:
+  - alias: o
+    table: '"cr0806y orders"'
+    pk_columns: [id]
+dimensions: []
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+$$
+
+query I
+SELECT COUNT(*) FROM (SELECT GET_DDL('SEMANTIC_VIEW', 'cr0806y_quotedtable') AS d)
+WHERE d LIKE '%o AS "cr0806y orders"%';
+----
+1
+
+statement ok
+DROP SEMANTIC VIEW cr0806y_quotedtable
+
+statement ok
+DROP SEMANTIC VIEW cr0806y_dotrel

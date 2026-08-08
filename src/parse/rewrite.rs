@@ -2797,7 +2797,10 @@ tables:
     table: orders
     pk_columns: []
 dimensions: []
-metrics: []
+metrics:
+  - name: total
+    expr: sum(o.amount)
+    source_table: o
 $$"#;
         let result = rewrite_ddl_yaml_body(DdlKind::Create, &vref("v"), yaml_text, None).unwrap();
         let RewriteAction::Create { def, .. } = result else {

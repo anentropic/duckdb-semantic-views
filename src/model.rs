@@ -569,13 +569,752 @@ impl SemanticViewDefinition {
                 Self::YAML_SIZE_CAP,
             ));
         }
-        Self::from_yaml(name, yaml)
+        let def = Self::from_yaml(name, yaml)?;
+        // RT-5 / RT-6: YAML is the only path into a definition that bypasses
+        // the clause parsers, so the identifier rules they enforce are applied
+        // here instead. Without this, GET_DDL can render a definition its own
+        // parser rejects — or, worse, one that re-parses to a different model.
+        validate_ddl_representable(&def)
+            .map_err(|e| format!("invalid YAML definition for semantic view '{name}': {e}"))?;
+        Ok(def)
     }
+}
+
+/// What EVERY identifier slot must satisfy: `identifier_slot_error`, plus the
+/// two things that helper deliberately does not cover.
+///
+/// A slot may carry a SQL comment marker and survive every identifier check —
+/// the front door blanks comments BEFORE parsing, so `PRIMARY KEY (a--b)` comes
+/// back truncated to end-of-line. `identifier_slot_error` has no comment
+/// awareness, so that is a separate check rather than part of it.
+///
+/// And a slot may be EMPTY: `identifier_slot_error` returns `None` for an
+/// all-whitespace value on purpose, because its DDL call sites report emptiness
+/// with a clause-specific "missing name/alias" message built from context it
+/// does not have. Here there is no such call site, so the check belongs here.
+fn slot_common(kind: &str, what: &str, value: &str) -> Result<(), String> {
+    // Load-bearing, not defensive: a relationship named `"  "` renders as
+    // `      AS o(cid) REFERENCES c`, which the RELATIONSHIPS parser rejects
+    // with "Relationship name is required" (PR #209 review).
+    if value.trim().is_empty() {
+        return Err(format!("{kind} {what} is empty"));
+    }
+    if let Some(e) = crate::body_parser::identifier_slot_error(value) {
+        return Err(format!("{kind} {what} '{value}' is invalid: {e}"));
+    }
+    if crate::util::blank_sql_comments(value) != value {
+        return Err(format!(
+            "{kind} {what} '{value}' contains a SQL comment marker"
+        ));
+    }
+    Ok(())
+}
+
+/// A slot the grammar fills with exactly ONE identifier: an alias, a table, a
+/// member name, a column.
+///
+/// A dot here re-parses as a qualifier and silently yields a DIFFERENT model —
+/// `source_table: "a.b"` with `name: "region"` renders `a.b.region`, which
+/// comes back as alias `a`, name `b.region`, with no error anywhere.
+/// `identifier_slot_error` accepts it, because a qualified identifier is a
+/// perfectly good identifier; it is the SLOT that admits only one part.
+fn slot_single(kind: &str, what: &str, value: &str) -> Result<(), String> {
+    slot_common(kind, what, value)?;
+    match crate::ident::parse_qualified_identifier(value) {
+        Ok(parts) if parts.len() == 1 => Ok(()),
+        Ok(_) => Err(format!(
+            "{kind} {what} '{value}' must be a single identifier, not a qualified one"
+        )),
+        Err(e) => Err(format!("{kind} {what} '{value}' is invalid: {e}")),
+    }
+}
+
+/// A slot the grammar fills with ONE identifier that may legitimately be
+/// dot-qualified — a relationship name, a materialization's physical table.
+///
+/// Both are emitted verbatim by the renderer and both are read back as a single
+/// value, so `a.b` renders as `a.b` and re-parses as `a.b`: the same model, no
+/// drift. The DDL parsers for these slots agree — RELATIONSHIPS validates its
+/// name with `identifier_slot_error`, which accepts a qualified identifier, and
+/// a materialization's TABLE is a *physical* table, where `schema.table` is the
+/// ordinary spelling. Sending these through [`slot_single`] would have made
+/// YAML refuse definitions the DDL path accepts and `GET_DDL` round-trips
+/// unchanged (PR #209 review, both verified against the parser).
+///
+/// What [`slot_common`] still refuses is what actually breaks: an empty or
+/// blank slot, a multi-token run (`my table`, `a DIMENSIONS`), and a comment
+/// marker.
+fn slot_qualified(kind: &str, what: &str, value: &str) -> Result<(), String> {
+    slot_common(kind, what, value)
+}
+
+/// A slot that legitimately accepts `alias.name` as well as a bare name — a
+/// member REFERENCE, per the D-08 dotted form.
+fn slot_reference(kind: &str, what: &str, value: &str) -> Result<(), String> {
+    slot_common(kind, what, value)?;
+    match crate::ident::parse_qualified_identifier(value) {
+        Ok(parts) if parts.len() <= 2 => Ok(()),
+        Ok(_) => Err(format!(
+            "{kind} {what} '{value}' has too many qualifier parts"
+        )),
+        Err(e) => Err(format!("{kind} {what} '{value}' is invalid: {e}")),
+    }
+}
+
+/// One element of a `(a, b, …)` column list.
+fn slot_column(kind: &str, what: &str, value: &str) -> Result<(), String> {
+    slot_single(kind, what, value)?;
+    if crate::body_parser::column_roundtrips_verbatim(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{kind} {what} '{value}' does not round-trip as one column"
+        ))
+    }
+}
+
+fn validate_yaml_tables(def: &SemanticViewDefinition) -> Result<(), String> {
+    for t in &def.tables {
+        slot_single("table", "alias", &t.alias)?;
+        // The physical table name goes out through `emit_table`, which quotes
+        // anything that would not re-parse verbatim — a space, a depth-0 comma
+        // and a `--` run all survive that way (each probed). The one value it
+        // cannot protect is the empty string: `quote_ident("")` is `""`, which
+        // the TABLES parser rejects as an empty quoted identifier. So this is
+        // deliberately an emptiness check and not a `slot_*` call — the wider
+        // check would reject names `GET_DDL` renders correctly (PR #209 review).
+        if t.table.is_empty() {
+            return Err(format!(
+                "table '{}' has an empty table name; a TABLES entry is \
+                 'alias AS table_name'",
+                t.alias
+            ));
+        }
+        for c in &t.pk_columns {
+            slot_column("table", "PRIMARY KEY column", c)?;
+        }
+        for uc in &t.unique_constraints {
+            for c in uc {
+                slot_column("table", "UNIQUE column", c)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_yaml_joins(def: &SemanticViewDefinition) -> Result<(), String> {
+    for j in &def.joins {
+        let Some(name) = j.name.as_deref() else {
+            return Err(format!(
+                "relationship from '{}' to '{}' has no name; a relationship name is \
+                 required (the DDL form is 'rel_name AS from_alias(fk_cols) REFERENCES to_alias')",
+                j.from_alias, j.table
+            ));
+        };
+        slot_qualified("relationship", "name", name)?;
+        slot_single("relationship", "from_alias", &j.from_alias)?;
+        slot_single("relationship", "table", &j.table)?;
+        for c in &j.fk_columns {
+            slot_column("relationship", "FK column", c)?;
+        }
+        for c in &j.ref_columns {
+            slot_column("relationship", "REFERENCES column", c)?;
+        }
+    }
+    Ok(())
+}
+
+/// Dimensions and facts must be qualified; metrics need not be.
+///
+/// Probed against the grammar rather than assumed: a metric with no
+/// `source_table` is a DERIVED metric, and `profit AS revenue - cost` is
+/// accepted unqualified. Sweeping metrics into the same rule would reject every
+/// YAML-imported derived metric.
+/// Every member is `name AS expr`, and the clause parsers reject an entry whose
+/// expression is missing ("Missing expression after 'AS'"). A blank one renders
+/// as exactly that — `e.p AS ` — so `GET_DDL` emits DDL it cannot read back.
+///
+/// Whitespace-only counts as blank: the parser trims before deciding, so
+/// `e.p AS    ` fails the same way. Found by `fuzz_render_roundtrip`; bisecting
+/// its crash cleared every other field in the definition (a NUL-bearing alias,
+/// a table name full of spaces, a trailing-space member name — the renderer
+/// quotes all of those and they round-trip).
+///
+/// Deliberately narrow: it is the *expression* that the grammar requires, not
+/// the rest of a member's payload. Comments, synonyms and `output_type` were
+/// probed with quotes, newlines, parens and empty values, and all round-trip,
+/// so none of them is checked here.
+fn member_expr(kind: &str, name: &str, expr: &str) -> Result<(), String> {
+    if expr.trim().is_empty() {
+        return Err(format!(
+            "{kind} '{name}' has an empty expression; a {kind} is '{name} AS <expr>'"
+        ));
+    }
+    // An expression is free-form SQL, so unlike an identifier it CANNOT be
+    // quote-protected on the way out — the renderer must emit it verbatim, and
+    // whatever structure it carries is structure the clause parser will read.
+    // The fuzz target's own header has always said as much ("a free-form `expr`
+    // cannot be quote-protected"); what was missing was the matching
+    // precondition, so an expression the grammar cannot carry looked like
+    // render/parse drift instead of an unstorable definition.
+    //
+    // `column_roundtrips_verbatim` is exactly the rule that matters here, for
+    // the same reason it matters for a column: balanced quotes and brackets
+    // that never dip negative (an unbalanced `)` closes the CLAUSE early — the
+    // shape the fuzzer found, `AS )   P ; rip`), no depth-0 comma (which would
+    // split one member into two), and no surrounding whitespace (which the
+    // parser trims, silently storing a different expression than the one given).
+    if !crate::body_parser::column_roundtrips_verbatim(expr) {
+        return Err(format!(
+            "{kind} '{name}' has an expression the DDL grammar cannot carry \
+             ('{expr}'); an expression must have balanced quotes and brackets, \
+             no top-level comma, and no surrounding whitespace"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_yaml_members(def: &SemanticViewDefinition) -> Result<(), String> {
+    for d in &def.dimensions {
+        slot_single("dimension", "name", &d.name)?;
+        member_expr("dimension", &d.name, &d.expr)?;
+        let Some(src) = d.source_table.as_deref() else {
+            return Err(format!(
+                "dimension '{}' has no source_table; a dimension must name its table \
+                 (the DDL form is 'alias.name AS expr')",
+                d.name
+            ));
+        };
+        slot_single("dimension", "source_table", src)?;
+    }
+    for f in &def.facts {
+        slot_single("fact", "name", &f.name)?;
+        member_expr("fact", &f.name, &f.expr)?;
+        let Some(src) = f.source_table.as_deref() else {
+            return Err(format!(
+                "fact '{}' has no source_table; a fact must name its table \
+                 (the DDL form is 'alias.name AS expr')",
+                f.name
+            ));
+        };
+        slot_single("fact", "source_table", src)?;
+    }
+    for m in &def.metrics {
+        slot_single("metric", "name", &m.name)?;
+        member_expr("metric", &m.name, &m.expr)?;
+        if let Some(src) = m.source_table.as_deref() {
+            slot_single("metric", "source_table", src)?;
+        } else {
+            // A metric with no source table is a DERIVED metric, and
+            // `body_parser/metrics.rs` refuses three clauses on that form —
+            // each with its own error. YAML could set all three anyway, and
+            // `GET_DDL` then rendered e.g. `ZZZZ NON ADDITIVE BY (v) AS ZZZZ`,
+            // which this project's own parser rejects. Found by
+            // `fuzz_render_roundtrip`; the three are listed together because
+            // they are one rule in the grammar ("only qualified metrics may
+            // use these"), and fixing them one at a time would just mean three
+            // more red CI runs.
+            for (present, clause) in [
+                (!m.using_relationships.is_empty(), "USING"),
+                (!m.non_additive_by.is_empty(), "NON ADDITIVE BY"),
+                (m.window_spec.is_some(), "OVER"),
+            ] {
+                if present {
+                    return Err(format!(
+                        "metric '{}' has no source_table, making it a derived metric, \
+                         but carries a {clause} clause; only a qualified metric \
+                         ('alias.name AS expr') may use {clause}",
+                        m.name
+                    ));
+                }
+            }
+        }
+        for r in &m.using_relationships {
+            slot_reference("metric", "USING relationship", r)?;
+        }
+        for na in &m.non_additive_by {
+            slot_reference("metric", "NON ADDITIVE BY dimension", &na.dimension)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_yaml_materializations(def: &SemanticViewDefinition) -> Result<(), String> {
+    for mat in &def.materializations {
+        slot_single("materialization", "name", &mat.name)?;
+        slot_qualified("materialization", "table", &mat.table)?;
+        for d in &mat.dimensions {
+            slot_reference("materialization", "dimension reference", d)?;
+        }
+        for m in &mat.metrics {
+            slot_reference("materialization", "metric reference", m)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reject a definition whose CLAUSE STRUCTURE the DDL grammar could not have
+/// produced, independently of what its identifier slots contain.
+///
+/// `find_clause_bounds` requires TABLES, and requires at least one of
+/// DIMENSIONS / METRICS. A definition with neither renders a lone TABLES clause
+/// — a body its own parser refuses with "At least one of 'DIMENSIONS' or
+/// 'METRICS' is required." — so `GET_DDL` emits DDL that cannot be replayed.
+///
+/// Found by `fuzz_render_roundtrip` within minutes of RT-5 removing that
+/// target's parse-fail escape, which is the point: the escape had been
+/// classifying exactly this finding as uninteresting input.
+fn validate_yaml_structure(def: &SemanticViewDefinition) -> Result<(), String> {
+    // An empty `tables` is the legacy stored format. `render_create_ddl`
+    // declines to render it at all ("Legacy definition format; please
+    // re-create..."), so the clause requirements bite only for the definitions
+    // it does render — scoping the check this way keeps legacy YAML importable.
+    if def.tables.is_empty() {
+        return Ok(());
+    }
+    if def.dimensions.is_empty() && def.metrics.is_empty() {
+        return Err(
+            "definition has neither dimensions nor metrics; at least one of the two is \
+             required (the DDL grammar requires a DIMENSIONS or a METRICS clause)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Reject a definition the DDL grammar could not have produced — in its
+/// identifier slots or in its clause structure (RT-5 / RT-6, code-review
+/// 2026-08-06).
+///
+/// This is the reachability rule for a stored definition: the DDL path enforces
+/// it through the clause grammar, and YAML — the one surface that reaches
+/// `SemanticViewDefinition` without going through the clause parsers — enforces
+/// it by calling this. `fuzz_render_roundtrip` uses it as its PRECONDITION, so
+/// that a parse failure after it is a genuine render-contract break rather than
+/// something to shrug at.
+///
+/// YAML is the one surface that reaches `SemanticViewDefinition` without going
+/// through the clause parsers, so it was the one surface with no
+/// identifier-syntax validation at all. `GET_DDL` then rendered those slots
+/// verbatim, and the results ranged from bad to silent:
+///
+/// - a join with no `name` rendered `     AS o(customer_id) REFERENCES c`, DDL
+///   this project's own parser rejects;
+/// - a dimension with no `source_table` rendered `region AS c.region`, likewise
+///   rejected;
+/// - `source_table: "a.b"` rendered `a.b.region AS …`, which re-parses cleanly
+///   as source table `a` and name `b.region` — a DIFFERENT model, no error;
+/// - `pk_columns: ["a--b"]` rendered `PRIMARY KEY (a--b)`, which the front
+///   door's comment-blanking pre-pass truncates to end-of-line.
+pub fn validate_ddl_representable(def: &SemanticViewDefinition) -> Result<(), String> {
+    validate_yaml_structure(def)?;
+    validate_yaml_tables(def)?;
+    validate_yaml_joins(def)?;
+    validate_yaml_members(def)?;
+    validate_yaml_materializations(def)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // RT-5 / RT-6 (code-review 2026-08-06): YAML import performed NO
+    // identifier-syntax validation, while the DDL path validates every slot.
+    // So YAML could produce definitions the DDL grammar cannot express — and
+    // `GET_DDL` then rendered them back as DDL its own parser rejects, or,
+    // worse, as DDL that re-parses to a DIFFERENT model.
+    //
+    // Verified against the renderer before the fix:
+    //   - a join with no `name`      -> `     AS o(customer_id) REFERENCES c`
+    //   - a dimension with no `source_table` -> `region AS c.region`
+    //   - `source_table: "a.b"`      -> `a.b.region AS c.region`, which
+    //     re-parses as source_table `a`, name `b.region` — silently a
+    //     different model, no error anywhere.
+    //
+    // The grammar's actual requirements, probed rather than assumed:
+    // dimensions and facts REQUIRE a source table; metrics do NOT (a derived
+    // metric is legitimately unqualified); relationships REQUIRE a name.
+
+    fn yaml_err(yaml: &str) -> String {
+        SemanticViewDefinition::from_yaml_with_size_cap("v", yaml)
+            .expect_err("YAML the DDL grammar could not express must be rejected")
+    }
+
+    const VALID_TABLES: &str = "tables:\n  - alias: o\n    table: orders\n    pk_columns: [id]\n";
+
+    #[test]
+    fn yaml_join_without_a_name_is_rejected() {
+        let yaml = format!(
+            "tables:\n  - alias: o\n    table: orders\n    pk_columns: [id]\n  \
+             - alias: c\n    table: customers\n    pk_columns: [id]\n\
+             joins:\n  - from_alias: o\n    table: c\n    fk_columns: [customer_id]\n\
+             dimensions:\n  - name: region\n    expr: c.region\n    source_table: c\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(
+            e.contains("relationship") && e.contains("name"),
+            "the error must name the missing relationship name: {e}"
+        );
+    }
+
+    #[test]
+    fn yaml_dimension_without_a_source_table_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: region\n    expr: o.region\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("dimension"), "{e}");
+        assert!(
+            e.contains("source_table") || e.contains("source table"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn yaml_fact_without_a_source_table_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}facts:\n  - name: net\n    expr: o.a * 2\n\
+             dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("fact"), "{e}");
+    }
+
+    #[test]
+    fn yaml_dotted_source_table_is_rejected() {
+        // The silent one: `a.b` + `region` renders `a.b.region`, which
+        // re-parses as alias `a`, name `b.region`.
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: region\n    expr: o.region\n    source_table: a.b\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(
+            e.contains("a.b"),
+            "the error must quote the offending slot: {e}"
+        );
+    }
+
+    #[test]
+    fn yaml_member_name_with_a_space_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: my dim\n    expr: o.region\n    source_table: o\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("my dim"), "{e}");
+    }
+
+    #[test]
+    fn yaml_pk_column_containing_a_comment_marker_is_rejected() {
+        // `a--b` passes the render-side column predicate (QuoteState has no
+        // comment awareness) and renders `PRIMARY KEY (a--b)`, which the front
+        // door's comment-blanking pre-pass then truncates to end-of-line.
+        let yaml = "tables:\n  - alias: o\n    table: orders\n    pk_columns: [a--b]\n\
+                    dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+                    metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n";
+        let e = yaml_err(yaml);
+        assert!(e.contains("a--b"), "{e}");
+    }
+
+    // --- PR #209 review + fuzz_render_roundtrip, 2026-08-07 ---
+    //
+    // Removing the fuzz oracle's parse-fail escape immediately paid: the target
+    // shrank to a definition with TABLES and nothing else, which
+    // `validate_ddl_representable` waved through and `GET_DDL` then rendered as
+    // a body its own parser rejects. Three more shapes came out of probing the
+    // same boundary by hand, two of them in the opposite direction — slots this
+    // validator refused that the DDL grammar accepts and that round-trip
+    // unchanged.
+
+    #[test]
+    fn yaml_with_neither_dimensions_nor_metrics_is_rejected() {
+        // `clause_bounds.rs`: TABLES is required and so is at least one of
+        // DIMENSIONS / METRICS. Rendered, this definition is a lone TABLES
+        // clause -- "At least one of 'DIMENSIONS' or 'METRICS' is required."
+        let yaml = format!("{VALID_TABLES}dimensions: []\nmetrics: []\n");
+        let e = yaml_err(&yaml);
+        assert!(
+            e.contains("dimension") && e.contains("metric"),
+            "the error must name the required clauses: {e}"
+        );
+    }
+
+    #[test]
+    fn the_shape_ci_fuzzing_found_is_covered_by_the_oracles_precondition() {
+        // `fuzz_render_roundtrip` skips only what `validate_ddl_representable`
+        // rejects, so the target stays red until this definition is one of
+        // them. Reconstructed field-for-field from the crash artifact
+        // (`fuzz/seeds/fuzz_render_roundtrip/regression_tables_only_no_members.txt`,
+        // byte-identical to the one CI uploaded): TABLES and nothing else.
+        //
+        // Asserted on a directly-constructed definition rather than through
+        // YAML because that is how the fuzz target builds one — the YAML route
+        // is covered separately by
+        // `yaml_with_neither_dimensions_nor_metrics_is_rejected`.
+        let def = SemanticViewDefinition {
+            tables: vec![TableRef {
+                alias: "emantic".to_string(),
+                table: " view".to_string(),
+                comment: Some("nder roundtrip seed: ".to_string()),
+                synonyms: vec!["e".to_string(), String::new(), String::new()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let e = validate_ddl_representable(&def)
+            .expect_err("the definition CI's fuzzer found must not pass the precondition");
+        assert!(
+            e.contains("dimension") && e.contains("metric"),
+            "it fails for the reason the parser fails on it -- a missing \
+             DIMENSIONS/METRICS clause, not its table name: {e}"
+        );
+    }
+
+    // Round two of the same fuzz oracle (2026-08-07). The shrunk definition
+    // rendered `e.p  AS ` -- a metric with an EMPTY expression. Bisecting the
+    // crash field-by-field cleared every other suspect in it: a NUL-bearing
+    // alias, a table name full of spaces, and a trailing-space member name all
+    // round-trip (the renderer quotes them). Only the blank expression breaks,
+    // and it breaks identically for all three member kinds, so all three are
+    // pinned here rather than just the one the fuzzer happened to reach.
+    //
+    // Every other payload field that reaches the renderer was probed in the
+    // same batch and is fine: comments containing quotes / newlines / nothing,
+    // synonyms containing quotes / parens / nothing, and `output_type` empty,
+    // spacey or malformed.
+
+    #[test]
+    fn yaml_derived_metric_carrying_a_qualified_only_clause_is_rejected() {
+        // `body_parser/metrics.rs` refuses USING / NON ADDITIVE BY / OVER on an
+        // unqualified metric. All three are checked here because they are one
+        // rule in the grammar; the fuzzer only ever reached NON ADDITIVE BY.
+        for (field, clause) in [
+            ("using_relationships: [r]", "USING"),
+            ("non_additive_by:\n      - dimension: d", "NON ADDITIVE BY"),
+        ] {
+            let yaml = format!(
+                "{VALID_TABLES}dimensions: []\n\
+                 metrics:\n  - name: derived\n    expr: base * 2\n    {field}\n"
+            );
+            let e = yaml_err(&yaml);
+            assert!(
+                e.contains("derived") && e.contains(clause),
+                "the error must name the metric and the offending clause ({clause}): {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_member_expression_the_grammar_cannot_carry_is_rejected() {
+        // An expression is free-form SQL and CANNOT be quote-protected on the
+        // way out, so the precondition has to refuse the shapes that would
+        // re-parse as something else. The unbalanced `)` is the one the fuzzer
+        // found: it closes the DIMENSIONS clause early.
+        for expr in [
+            "')'",        // fine -- inside a string literal (control, below)
+            ")  P ; rip", // unbalanced close paren: ends the clause
+            "a, b",       // depth-0 comma: splits one member into two
+            "sum(o.a) ",  // trailing space: the parser trims, storing a different expr
+            "sum((o.a)",  // unbalanced open paren: swallows the rest of the clause
+        ]
+        .iter()
+        .skip(1)
+        {
+            let yaml = format!(
+                "{VALID_TABLES}dimensions: []\n\
+                 metrics:\n  - name: total\n    expr: '{}'\n    source_table: o\n",
+                expr.replace('\'', "''")
+            );
+            let e = yaml_err(&yaml);
+            assert!(
+                e.contains("total"),
+                "the error must name the offending metric (expr {expr:?}): {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_expression_with_punctuation_inside_a_literal_still_imports() {
+        // Control: parens and commas inside a string literal are inert, and a
+        // nested call is ordinary. Neither may be swept up by the rule above.
+        let yaml = format!(
+            "{VALID_TABLES}dimensions: []\n\
+             metrics:\n  - name: total\n    expr: \"coalesce(sum(o.amount), 0) || ')'\"\n    source_table: o\n"
+        );
+        SemanticViewDefinition::from_yaml_with_size_cap("v", &yaml)
+            .expect("balanced nesting and quoted punctuation are ordinary SQL");
+    }
+
+    #[test]
+    fn yaml_metric_with_an_empty_expression_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions: []\n\
+             metrics:\n  - name: total\n    expr: ''\n    source_table: o\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("metric") && e.contains("total"), "{e}");
+    }
+
+    #[test]
+    fn yaml_dimension_with_an_empty_expression_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: region\n    expr: ''\n    source_table: o\n\
+             metrics: []\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("dimension") && e.contains("region"), "{e}");
+    }
+
+    #[test]
+    fn yaml_fact_with_a_blank_expression_is_rejected() {
+        // Whitespace-only, not empty: the parser trims before deciding, so
+        // `f AS    ` is the same "Missing expression after 'AS'" as `f AS `.
+        let yaml = format!(
+            "{VALID_TABLES}facts:\n  - name: net\n    expr: '   '\n    source_table: o\n\
+             dimensions: []\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("fact") && e.contains("net"), "{e}");
+    }
+
+    #[test]
+    fn yaml_member_payloads_that_do_round_trip_still_import() {
+        // Control for the three above: the renderer handles quotes, newlines
+        // and parens in comments / synonyms / types, so none of those may be
+        // swept up by an over-broad "payload must be tame" rule.
+        let yaml = "tables:\n  - alias: o\n    table: orders\n    pk_columns: [id]\n\
+                    dimensions: []\n\
+                    metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n\
+                    \x20   comment: \"it's a metric\"\n\
+                    \x20   synonyms: [\"a)\", \"it's\"]\n\
+                    \x20   output_type: 'DECIMAL(10, 2)'\n";
+        SemanticViewDefinition::from_yaml_with_size_cap("v", yaml)
+            .expect("comments, synonyms and types with punctuation all round-trip");
+    }
+
+    #[test]
+    fn yaml_empty_physical_table_name_is_rejected() {
+        // The one table-name value `emit_table` cannot protect: everything
+        // else that would not re-parse verbatim gets quoted (a space, a comma,
+        // even `--`), but `quote_ident("")` is `""`, which the TABLES parser
+        // rejects as an empty quoted identifier.
+        let yaml = "tables:\n  - alias: o\n    table: ''\ndimensions: []\n\
+                    metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n";
+        let e = yaml_err(yaml);
+        assert!(e.contains("table"), "{e}");
+    }
+
+    #[test]
+    fn yaml_blank_relationship_name_is_rejected() {
+        // `identifier_slot_error` returns `None` for an all-whitespace slot --
+        // its DDL call sites report emptiness themselves, from context this
+        // validator does not have. Rendered, a blank name yields
+        // `      AS o(cid) REFERENCES c`.
+        let yaml = "tables:\n  - alias: o\n    table: orders\n    pk_columns: [id]\n  \
+                    - alias: c\n    table: customers\n    pk_columns: [id]\n\
+                    joins:\n  - name: '  '\n    from_alias: o\n    table: c\n    fk_columns: [cid]\n\
+                    dimensions: []\n\
+                    metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n";
+        let e = yaml_err(yaml);
+        assert!(e.contains("relationship"), "{e}");
+    }
+
+    #[test]
+    fn yaml_dotted_relationship_name_still_imports() {
+        // The RELATIONSHIPS parser validates the name with
+        // `identifier_slot_error`, which accepts a qualified identifier, and
+        // the renderer emits it verbatim -- `a.b` re-parses to `a.b`. Refusing
+        // it here would reject YAML the DDL path accepts.
+        let yaml = "tables:\n  - alias: o\n    table: orders\n    pk_columns: [id]\n  \
+                    - alias: c\n    table: customers\n    pk_columns: [id]\n\
+                    joins:\n  - name: a.b\n    from_alias: o\n    table: c\n    fk_columns: [cid]\n\
+                    dimensions: []\n\
+                    metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n";
+        SemanticViewDefinition::from_yaml_with_size_cap("v", yaml)
+            .expect("a dot-qualified relationship name is what the DDL parser accepts");
+    }
+
+    #[test]
+    fn yaml_qualified_materialization_table_still_imports() {
+        // A materialization's TABLE is a PHYSICAL table, so `schema.table` is
+        // the ordinary spelling, not a hostile one -- and it round-trips.
+        let yaml = "tables:\n  - alias: o\n    table: orders\n    pk_columns: [id]\n\
+                    dimensions: []\n\
+                    metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n\
+                    materializations:\n  - name: m\n    table: sch.mt\n    metrics: [total]\n";
+        SemanticViewDefinition::from_yaml_with_size_cap("v", yaml)
+            .expect("a schema-qualified materialization table is a legal physical table name");
+    }
+
+    #[test]
+    fn yaml_multi_token_materialization_table_is_still_rejected() {
+        // Control for the two relaxations above: `mat.table` is emitted RAW,
+        // so a multi-token value really does break -- `TABLE my table,` comes
+        // back as "duplicate TABLE sub-clause".
+        let yaml = "tables:\n  - alias: o\n    table: orders\n    pk_columns: [id]\n\
+                    dimensions: []\n\
+                    metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n\
+                    materializations:\n  - name: m\n    table: my table\n    metrics: [total]\n";
+        let e = yaml_err(yaml);
+        assert!(e.contains("my table"), "{e}");
+    }
+
+    #[test]
+    fn yaml_multi_token_relationship_name_is_still_rejected() {
+        // Control: relaxing to "may be qualified" must not relax to "anything".
+        let yaml = "tables:\n  - alias: o\n    table: orders\n    pk_columns: [id]\n  \
+                    - alias: c\n    table: customers\n    pk_columns: [id]\n\
+                    joins:\n  - name: x y\n    from_alias: o\n    table: c\n    fk_columns: [cid]\n\
+                    dimensions: []\n\
+                    metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n";
+        let e = yaml_err(yaml);
+        assert!(e.contains("x y"), "{e}");
+    }
+
+    /// Controls: the legitimate shapes must still import. Without these,
+    /// "validate YAML" could degenerate into "reject YAML".
+    #[test]
+    fn yaml_valid_definition_still_imports() {
+        let yaml = format!(
+            "tables:\n  - alias: o\n    table: orders\n    pk_columns: [id]\n  \
+             - alias: c\n    table: customers\n    pk_columns: [id]\n\
+             joins:\n  - name: o_to_c\n    from_alias: o\n    table: c\n    fk_columns: [customer_id]\n\
+             facts:\n  - name: net\n    expr: o.a * 2\n    source_table: o\n\
+             dimensions:\n  - name: region\n    expr: c.region\n    source_table: c\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n"
+        );
+        SemanticViewDefinition::from_yaml_with_size_cap("v", &yaml)
+            .expect("a well-formed YAML definition must import");
+    }
+
+    #[test]
+    fn yaml_derived_metric_without_a_source_table_still_imports() {
+        // A metric with no source_table is a DERIVED metric — the grammar
+        // accepts `profit AS revenue - cost` unqualified, so this must not be
+        // swept up by the dimension/fact rule.
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: base\n    expr: sum(o.amount)\n    source_table: o\n  \
+             - name: derived\n    expr: base * 2\n"
+        );
+        SemanticViewDefinition::from_yaml_with_size_cap("v", &yaml)
+            .expect("a derived metric is legitimately unqualified");
+    }
+
+    #[test]
+    fn yaml_quoted_identifier_slots_still_import() {
+        // Quoting is a legal spelling, not a hostile one.
+        let yaml = "tables:\n  - alias: o\n    table: orders\n    pk_columns: ['\"my id\"']\n\
+                    dimensions:\n  - name: '\"my dim\"'\n    expr: o.d\n    source_table: o\n\
+                    metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n";
+        SemanticViewDefinition::from_yaml_with_size_cap("v", yaml)
+            .expect("a well-formed quoted identifier is a legal slot value");
+    }
 
     // --- AR-4: schema_version probe + incomplete-relationship detection ---
 

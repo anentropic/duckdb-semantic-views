@@ -19,10 +19,13 @@
 //
 // Genuine grammar drift between `render_ddl.rs` and the body parser (a dropped
 // field, a reordered clause, a mis-quoted special identifier) still breaks this.
-// A re-parse failure at either stage is tolerated — the strict
-// `parse(render(def)) == def` equality for CANONICAL defs lives in
-// tests/roundtrip_proptest.rs, which backstops the "canonical def renders to
-// parseable, identical DDL" property this target deliberately does not re-assert.
+//
+// Only the FIRST parse (`def` → `d1`) may fail without a panic, and only
+// because an arbitrary `def` is not in the parser's image — that is the
+// normalization step, not an assertion. Once `d1` exists it came from the
+// parser, so every parse and render after it is a contract with no escape.
+// See the long note on stage 0 for why the "YAML-storable ⇒ parseable DDL"
+// implication is enforced at the YAML entry point instead of here.
 use libfuzzer_sys::fuzz_target;
 use semantic_views::body_parser::{parse_keyword_body, KeywordBody};
 use semantic_views::model::SemanticViewDefinition;
@@ -67,7 +70,40 @@ fn kb_to_def(kb: KeywordBody) -> SemanticViewDefinition {
 }
 
 fuzz_target!(|def: SemanticViewDefinition| {
-    // --- Normalize once into the parser's image ---
+    // --- Stage 0: use the arbitrary def only to GENERATE candidate DDL ---
+    //
+    // This stage deliberately asserts NOTHING, and that is a considered
+    // reversal of RT-5. The reasoning, and why the intermediate design failed:
+    //
+    // RT-5 removed stage 0's escape on the theory that
+    // `validate_ddl_representable` characterizes the parser's image — "a def
+    // that passes it must render to parseable DDL". Making that true meant
+    // teaching the validator every rule the grammar enforces. Eight rounds of
+    // fuzzing produced eight such rules (blank member expr; unstorable pk
+    // column; raw-emitted member names; derived-metric USING / NON ADDITIVE BY
+    // / OVER; expression well-formedness), and round eight was
+    //
+    //     Window metric '"c "': inner metric 'iu' not found in semantic view
+    //
+    // — a SEMANTIC cross-reference rule, with `USING` relationship names,
+    // `NON ADDITIVE BY` dimensions and materialization targets queued behind
+    // it. Completing the precondition means re-implementing the parser's whole
+    // validation surface in the model layer, where it is free to drift from
+    // the real one. That is a worse defect than the one it closes.
+    //
+    // So the invariant this target owns is the one its header has always
+    // described and the one that is actually true: render is a fixpoint on a
+    // PARSER-PRODUCED definition. `d1` below comes from the parser, so it is in
+    // the parser's image by construction and needs no precondition at all.
+    //
+    // What that gives up, stated plainly per the coverage-forward rule: this
+    // target no longer asserts "YAML-storable ⇒ renders to parseable DDL".
+    // That contract did not go away — it moved to where it can be checked
+    // without a second parser: `validate_ddl_representable` still enforces it
+    // at the YAML entry point, covered by the unit tests in `src/model.rs` and
+    // `test/sql/cr20260806_yaml_ddl_contract.test`. The eight rules above are
+    // all still enforced there. TECH-DEBT #60 records what would be needed to
+    // assert the implication here too.
     let Ok(rendered0) = render_create_ddl("fuzz_view", &def) else {
         return; // legacy-format defs (empty tables) don't render
     };
@@ -75,7 +111,7 @@ fuzz_target!(|def: SemanticViewDefinition| {
         return;
     };
     let Ok(kb1) = parse_keyword_body(body0, 0) else {
-        return; // arbitrary content the parser can't accept — not a reachable def
+        return; // `def` is not in the parser's image — not a contract break
     };
     let d1 = kb_to_def(kb1); // parser-produced (canonical)
 
@@ -85,12 +121,17 @@ fuzz_target!(|def: SemanticViewDefinition| {
     let Some(body1) = body_of(&rendered1) else {
         panic!("rendered DDL lost its AS body: {rendered1}");
     };
-    let Ok(kb2) = parse_keyword_body(body1, 0) else {
-        // Re-parse of freshly-rendered canonical DDL failed. The strict
-        // "canonical def renders to parseable, identical DDL" property is
-        // covered by tests/roundtrip_proptest.rs; tolerated here.
-        return;
-    };
+    // RT-5: no escape here at all. `d1` came FROM the parser, so
+    // `render(d1)` failing to re-parse is a contract break by definition. The
+    // old comment deferred to `tests/roundtrip_proptest.rs` — whose generators
+    // pin `name: Some(...)` and `source_table: Some(...)`, so it structurally
+    // could not reach these shapes. Each half pointed at the other.
+    let kb2 = parse_keyword_body(body1, 0).unwrap_or_else(|e| {
+        panic!(
+            "freshly-rendered canonical DDL no longer re-parses: {}\n{rendered1}",
+            e.message
+        )
+    });
     let d2 = kb_to_def(kb2);
     let rendered2 = render_create_ddl("fuzz_view", &d2).expect("re-parsed definition must render");
     let Some(body2) = body_of(&rendered2) else {
