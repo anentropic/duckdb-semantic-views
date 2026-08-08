@@ -9,9 +9,19 @@ use crate::expand::test_helpers::TestFixtureExt;
 use crate::model::SemanticViewDefinition;
 
 /// Build a multi-table def: orders (o) -> line_items (li), with a dim on o and facts on li.
+///
+/// TC-12: every def in this file used to declare a fourth table
+/// `orders AS orders` with no primary key, joined to nothing. Being declared
+/// first made it the graph root, so `expand` emitted
+/// `FROM "orders" AS "orders" LEFT JOIN "line_items" AS "li" ON … = "o"."id"`
+/// — a forward reference to an alias joined on the *next* line, which DuckDB
+/// rejects with `Binder Error: Referenced table "o" not found`. The
+/// substring assertions below all passed against SQL that could not bind,
+/// which is exactly why they needed an executable sibling. The dead alias is
+/// gone; see `fact_query_basic_is_row_level_against_real_data` for the
+/// data-level statement of the same behaviour.
 fn multi_table_def() -> SemanticViewDefinition {
     SemanticViewDefinition::default()
-        .with_table("orders", "orders", &[])
         .with_table("o", "orders", &["id"])
         .with_table("li", "line_items", &["id"])
         .with_dimension("region", "o.region", Some("o"))
@@ -20,15 +30,21 @@ fn multi_table_def() -> SemanticViewDefinition {
         .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"])
 }
 
-#[test]
-fn test_fact_query_basic() {
-    let def = multi_table_def();
-    let req = QueryRequest {
+/// The request `test_fact_query_basic` and its executable sibling both use:
+/// one fact on the child table, one dimension on the parent.
+fn basic_fact_request() -> QueryRequest {
+    QueryRequest {
         where_clause: None,
         facts: vec![FactName::new("net_price")],
         dimensions: vec![DimensionName::new("region")],
         metrics: vec![],
-    };
+    }
+}
+
+#[test]
+fn test_fact_query_basic() {
+    let def = multi_table_def();
+    let req = basic_fact_request();
     let sql = expand("test_view", &def, &req).unwrap();
     assert!(
         !sql.contains("GROUP BY"),
@@ -41,6 +57,59 @@ fn test_fact_query_basic() {
     );
     assert!(sql.contains("FROM"), "Must have FROM clause: {sql}");
     assert!(sql.contains("LEFT JOIN"), "Must include JOIN for li: {sql}");
+}
+
+/// What the structural assertions above are *for*, stated in numbers: the same
+/// def and request, run against real rows.
+///
+/// TC-12 (code-review 2026-08-08): `contains("LEFT JOIN")` and
+/// `!contains("GROUP BY")` were never executed against data, so they could not
+/// distinguish "joins the child at row grain" from "emits a string containing
+/// the words LEFT JOIN". Three claims are checked here that no substring can
+/// make:
+///
+/// * the result is at **line-item** grain, not order grain — two line items on
+///   one order produce two rows, and the parent's dimension repeats;
+/// * the fact expression is evaluated per row rather than aggregated;
+/// * an order with no line items contributes **no** row, i.e. the `LEFT JOIN`
+///   is fenced by the child-key `IS NOT NULL` guard rather than manufacturing
+///   a NULL fact row.
+#[cfg(not(feature = "extension"))]
+#[test]
+fn fact_query_basic_is_row_level_against_real_data() {
+    let sql = expand("test_view", &multi_table_def(), &basic_fact_request()).unwrap();
+
+    let con = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+    con.execute_batch(
+        "CREATE TABLE orders (id INTEGER, region VARCHAR);
+         -- order 3 has no line items at all
+         INSERT INTO orders VALUES (1, 'E'), (2, 'W'), (3, 'S');
+         CREATE TABLE line_items (id INTEGER, order_id INTEGER, price INTEGER, discount DOUBLE);
+         INSERT INTO line_items VALUES (1, 1, 100, 0.0), (2, 1, 50, 0.5), (3, 2, 10, 0.0);",
+    )
+    .expect("setup");
+
+    let mut stmt = con
+        .prepare(&format!(
+            "SELECT region, net_price FROM ({sql}) ORDER BY 1, 2"
+        ))
+        .expect("the emitted fact query must bind");
+    let rows: Vec<(String, f64)> = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+        .expect("run")
+        .map(|r| r.expect("row"))
+        .collect();
+
+    assert_eq!(
+        rows,
+        vec![
+            ("E".to_string(), 25.0),  // line item 2: 50 * (1 - 0.5)
+            ("E".to_string(), 100.0), // line item 1: 100 * (1 - 0.0)
+            ("W".to_string(), 10.0),  // line item 3: 10 * (1 - 0.0)
+        ],
+        "a fact query is one row per line item with the parent's dimension \
+         repeated, and the childless order 'S' contributes none"
+    );
 }
 
 #[test]
@@ -70,7 +139,6 @@ fn test_fact_query_no_dimensions() {
 #[test]
 fn test_fact_query_inline_facts() {
     let def = SemanticViewDefinition::default()
-        .with_table("orders", "orders", &[])
         .with_table("o", "orders", &["id"])
         .with_table("li", "line_items", &["id"])
         .with_fact("net_price", "li.price * (1 - li.discount)", "li")
@@ -148,7 +216,6 @@ fn test_fact_query_private_fact() {
 fn test_fact_path_violation() {
     // Fan shape: o -> li, o -> payments (divergent paths)
     let def = SemanticViewDefinition::default()
-        .with_table("orders", "orders", &[])
         .with_table("o", "orders", &["id"])
         .with_table("li", "line_items", &["id"])
         .with_table("p", "payments", &["id"])
@@ -265,7 +332,6 @@ fn fact_reaches_a_multi_hop_chain_across_fan_in() {
 fn test_fact_path_valid_linear() {
     // Chain: o -> li -> details (linear path)
     let def = SemanticViewDefinition::default()
-        .with_table("orders", "orders", &[])
         .with_table("o", "orders", &["id"])
         .with_table("li", "line_items", &["id"])
         .with_table("d", "details", &["id"])

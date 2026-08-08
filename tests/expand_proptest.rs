@@ -325,11 +325,21 @@ fn arb_query_request(def: &SemanticViewDefinition) -> impl Strategy<Value = Quer
             metrics: mets.into_iter().map(MetricName::new).collect(),
             // PIN: structural harness -- asserts expand() shape/no-panic, not numbers; the numeric coverage for this field lives in the differential harnesses. TECH-DEBT #66
             facts: vec![],
-            // No predicate: this generator covers the unfiltered shapes, and the
-            // invariants asserted below are about dimension/metric expansion.
-            // Property coverage for `where_clause` still needs its own generator
-            // (predicates are arbitrary user text spliced into generated SQL, so
-            // they want a fuzz/proptest of their own) — not yet written.
+            // No predicate, deliberately: this generator covers the unfiltered
+            // shapes and the invariants asserted below are structural claims
+            // about dimension/metric expansion (GROUP BY ordinals, DISTINCT,
+            // alias quoting), none of which a WHERE clause participates in.
+            //
+            // TC-12: this used to say randomized `where_clause` coverage was
+            // "not yet written". It exists now — PBT-6 (code-review 2026-08-03)
+            // added an AST-generated predicate, rendered once in member names
+            // for the request and once in raw columns for the oracle, to the
+            // numeric differential harnesses: `differential_proptest`,
+            // `star_schema_proptest`, `multi_hop_join_proptest`,
+            // `semi_additive_proptest` and `window_metric_proptest`. Those are
+            // the harnesses that compare numbers, which is where a predicate
+            // bug shows up; leaving it `None` here keeps this file's
+            // no-predicate shapes covered rather than duplicating them.
             // PIN: structural harness -- asserts expand() shape/no-panic, not numbers; the numeric coverage for this field lives in the differential harnesses. TECH-DEBT #66
             where_clause: None,
         })
