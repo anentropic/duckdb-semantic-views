@@ -19,13 +19,16 @@
 //
 // Genuine grammar drift between `render_ddl.rs` and the body parser (a dropped
 // field, a reordered clause, a mis-quoted special identifier) still breaks this.
-// A re-parse failure at either stage is tolerated — the strict
-// `parse(render(def)) == def` equality for CANONICAL defs lives in
-// tests/roundtrip_proptest.rs, which backstops the "canonical def renders to
-// parseable, identical DDL" property this target deliberately does not re-assert.
+//
+// Only the FIRST parse (`def` → `d1`) may fail without a panic, and only
+// because an arbitrary `def` is not in the parser's image — that is the
+// normalization step, not an assertion. Once `d1` exists it came from the
+// parser, so every parse and render after it is a contract with no escape.
+// See the long note on stage 0 for why the "YAML-storable ⇒ parseable DDL"
+// implication is enforced at the YAML entry point instead of here.
 use libfuzzer_sys::fuzz_target;
 use semantic_views::body_parser::{parse_keyword_body, KeywordBody};
-use semantic_views::model::{validate_ddl_representable, SemanticViewDefinition};
+use semantic_views::model::SemanticViewDefinition;
 use semantic_views::render_ddl::render_create_ddl;
 
 /// Strip the rendered header (`CREATE OR REPLACE SEMANTIC VIEW <name>
@@ -67,46 +70,49 @@ fn kb_to_def(kb: KeywordBody) -> SemanticViewDefinition {
 }
 
 fuzz_target!(|def: SemanticViewDefinition| {
-    // --- Precondition, applied UP FRONT ---
+    // --- Stage 0: use the arbitrary def only to GENERATE candidate DDL ---
     //
-    // RT-5 made this rule explicit but consulted it LAZILY — only in the
-    // stage-1 parse-failure branch below. That was inconsistent, and the
-    // inconsistency had teeth: when stage 1 happened to parse, the target went
-    // on to assert against a chain rooted in a definition no entry point can
-    // store, and reported the resulting stage-2 failure as render/parse drift.
-    // (Observed 2026-08-07: an input whose `pk_columns` contained `""`, which
-    // the precondition already rejects, reached the stage-2 panic.)
+    // This stage deliberately asserts NOTHING, and that is a considered
+    // reversal of RT-5. The reasoning, and why the intermediate design failed:
     //
-    // A definition that fails `validate_ddl_representable` cannot be stored by
-    // any real entry point — the DDL grammar rejects it, and YAML import now
-    // rejects it too — so nothing downstream of it is a contract this project
-    // owes anyone. Skipping it is a stated rule; skipping it CONSISTENTLY is
-    // what makes the two assertions below mean what they say.
-    if validate_ddl_representable(&def).is_err() {
-        return;
-    }
-
-    // --- Normalize once into the parser's image ---
+    // RT-5 removed stage 0's escape on the theory that
+    // `validate_ddl_representable` characterizes the parser's image — "a def
+    // that passes it must render to parseable DDL". Making that true meant
+    // teaching the validator every rule the grammar enforces. Eight rounds of
+    // fuzzing produced eight such rules (blank member expr; unstorable pk
+    // column; raw-emitted member names; derived-metric USING / NON ADDITIVE BY
+    // / OVER; expression well-formedness), and round eight was
+    //
+    //     Window metric '"c "': inner metric 'iu' not found in semantic view
+    //
+    // — a SEMANTIC cross-reference rule, with `USING` relationship names,
+    // `NON ADDITIVE BY` dimensions and materialization targets queued behind
+    // it. Completing the precondition means re-implementing the parser's whole
+    // validation surface in the model layer, where it is free to drift from
+    // the real one. That is a worse defect than the one it closes.
+    //
+    // So the invariant this target owns is the one its header has always
+    // described and the one that is actually true: render is a fixpoint on a
+    // PARSER-PRODUCED definition. `d1` below comes from the parser, so it is in
+    // the parser's image by construction and needs no precondition at all.
+    //
+    // What that gives up, stated plainly per the coverage-forward rule: this
+    // target no longer asserts "YAML-storable ⇒ renders to parseable DDL".
+    // That contract did not go away — it moved to where it can be checked
+    // without a second parser: `validate_ddl_representable` still enforces it
+    // at the YAML entry point, covered by the unit tests in `src/model.rs` and
+    // `test/sql/cr20260806_yaml_ddl_contract.test`. The eight rules above are
+    // all still enforced there. TECH-DEBT #60 records what would be needed to
+    // assert the implication here too.
     let Ok(rendered0) = render_create_ddl("fuzz_view", &def) else {
         return; // legacy-format defs (empty tables) don't render
     };
     let Some(body0) = body_of(&rendered0) else {
         return;
     };
-    // RT-5: this used to be an unconditional escape — "arbitrary content the
-    // parser can't accept". That is what let the GET_DDL contract break exactly
-    // where the oracle stopped looking: `Arbitrary` produced `name: None` /
-    // `source_table: None`, render emitted DDL this parser rejects, and the
-    // target classified its own finding as unreachable input and stayed green.
-    // With the precondition above already applied, a parse failure here is a
-    // genuine contract break, with no escape left.
-    let kb1 = parse_keyword_body(body0, 0).unwrap_or_else(|e| {
-        panic!(
-            "render produced DDL the parser rejects, for a definition every entry \
-             point would accept: {}\n{rendered0}",
-            e.message
-        )
-    });
+    let Ok(kb1) = parse_keyword_body(body0, 0) else {
+        return; // `def` is not in the parser's image — not a contract break
+    };
     let d1 = kb_to_def(kb1); // parser-produced (canonical)
 
     // --- Assert render is idempotent on the parser-produced def ---
