@@ -916,10 +916,17 @@ fn validate_window_spec(metric_name: &str, ws: &WindowSpec) -> Result<(), String
     if replayed.as_ref() == Some(ws) {
         Ok(())
     } else {
+        // Both specs go in the message. The rejections this fires on are
+        // subtle by nature — a `frame_clause` that escapes its parentheses, a
+        // partition dimension named `rows` that reads back as a frame — and
+        // "reads back as something different" without saying *what* leaves the
+        // author diffing two invisible values. `{:?}` on both is verbose but it
+        // is the only thing that makes a whitespace or keyword-boundary case
+        // diagnosable from the error alone.
         Err(format!(
             "metric '{metric_name}' has a window specification that does not \
              round-trip: it renders as '{rendered}', which reads back as a \
-             DIFFERENT window specification"
+             DIFFERENT window specification.\n  stored:   {ws:?}\n  re-parsed: {replayed:?}"
         ))
     }
 }
