@@ -687,6 +687,12 @@ fn has_constant_arg_aggregate(expr: &str) -> bool {
 /// matching [`rewrite_count_star`]'s contract. Quoted regions are inert
 /// throughout ([`crate::util::QuoteState`]), so `'count(1)'` and
 /// `"sum(1) col"` are left alone.
+///
+/// Two residuals are recorded in TECH-DEBT #61: the NULL-RETAINING aggregates
+/// (`list` / `array_agg` / `first` / `last` / `arbitrary`, which keep a NULL
+/// element rather than skipping it, so the phantom leaves a NULL in the list
+/// instead of a value), and the case where the source table declares no
+/// PRIMARY KEY, where there is no column to guard with at all.
 pub(super) fn guard_aggregate_args(expr: &str, pk_ref: &str) -> Option<String> {
     let mut out = String::with_capacity(expr.len() + pk_ref.len() + 32);
     let mut copied = 0usize;
