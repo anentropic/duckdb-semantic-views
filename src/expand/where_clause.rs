@@ -43,10 +43,34 @@ pub(super) struct ResolvedWhere {
     /// table at all requires joining it, and that join multiplies the metric's
     /// rows exactly as a grouping join would.
     pub(super) source_tables: Vec<String>,
-    /// `(member name, source table)` for each declared member the predicate
-    /// named, in first-reference order. Fed to the fan-trap check so its error
-    /// can name the member the user actually wrote.
-    pub(super) members: Vec<(String, Option<String>)>,
+    /// Each declared member the predicate named, in first-reference order. Fed
+    /// to the fan-trap check so its error can name the member the user actually
+    /// wrote.
+    pub(super) members: Vec<WhereMember>,
+}
+
+/// One declared member a predicate named.
+///
+/// Carries everything the fences downstream need to decide whether resolving
+/// this member forces an unsound join: the name as the user wrote it, the table
+/// it is declared on, and — EXP-27 — the tables its expression reaches through
+/// fact references. The last is the per-member half of what
+/// [`ResolvedWhere::source_tables`] accumulates view-wide; kept per member so a
+/// fan-trap error can name the member responsible for the join rather than just
+/// the table.
+#[derive(Debug)]
+pub(super) struct WhereMember {
+    /// The reference as written in the predicate (`of`, `o.of`, `"OF"`).
+    pub(super) name: String,
+    /// The table the member is declared on, lowercased. `None` for a member
+    /// declared without one, which is base-table grain.
+    pub(super) table: Option<String>,
+    /// Lowercased aliases of the tables this member reaches TRANSITIVELY
+    /// through fact references (EXP-23's set, per member). Resolving the member
+    /// splices those tables' columns into the predicate, so the query must join
+    /// them — and a join that fans relative to a metric's grain inflates that
+    /// metric, which is what EXP-27 was.
+    pub(super) fact_tables: Vec<String>,
 }
 
 /// The member lookup tables a predicate is resolved against.
@@ -217,7 +241,7 @@ pub(super) fn resolve_where_clause(
     }
 
     let mut source_tables: Vec<String> = Vec::new();
-    let mut members: Vec<(String, Option<String>)> = Vec::new();
+    let mut members: Vec<WhereMember> = Vec::new();
     let mut seen_members: HashSet<String> = HashSet::new();
     for r in scan_references(raw) {
         let key = r.key();
@@ -231,16 +255,26 @@ pub(super) fn resolve_where_clause(
             // EXP-23: plus every table the member reaches through a fact
             // reference, so the join resolver sees what the spliced expression
             // will actually name.
-            if let Some(reached) = member_fact_tables.get(&key) {
-                for t in reached {
-                    let lowered = t.to_ascii_lowercase();
-                    if !source_tables.contains(&lowered) {
-                        source_tables.push(lowered);
-                    }
+            let reached: Vec<String> = member_fact_tables
+                .get(&key)
+                .map(|reached| reached.iter().map(|t| t.to_ascii_lowercase()).collect())
+                .unwrap_or_default();
+            for lowered in &reached {
+                if !source_tables.contains(lowered) {
+                    source_tables.push(lowered.clone());
                 }
             }
             if seen_members.insert(key.clone()) {
-                members.push((r.raw.to_string(), table.map(str::to_ascii_lowercase)));
+                // EXP-27: the reached set travels WITH the member, not just
+                // into the view-wide `source_tables`. Those tables get joined
+                // on this member's behalf, so the fan fence has to see the pair
+                // — before #207 an unjoined table failed loudly at bind time,
+                // and the join that replaced that error arrived unfenced.
+                members.push(WhereMember {
+                    name: r.raw.to_string(),
+                    table: table.map(str::to_ascii_lowercase),
+                    fact_tables: reached,
+                });
             }
             continue;
         }
@@ -366,6 +400,21 @@ mod tests {
             r.source_tables.contains(&"c".to_string()),
             "the table reached THROUGH the fact reference must be joined: {:?}",
             r.source_tables
+        );
+        // EXP-27: the same reach must also travel WITH the member, not only
+        // into the view-wide `source_tables`. The fan fence walks per member,
+        // so a reach recorded only view-wide is a reach it cannot see — which
+        // is how the join this test pins arrived unfenced.
+        let member = r
+            .members
+            .iter()
+            .find(|m| m.name == "adjusted")
+            .expect("the named member is recorded");
+        assert_eq!(member.table.as_deref(), Some("o"));
+        assert_eq!(
+            member.fact_tables,
+            vec!["c".to_string()],
+            "the per-member reach feeds the fan fence"
         );
     }
 

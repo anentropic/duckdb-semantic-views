@@ -436,7 +436,7 @@ pub fn expand(
     // so without this the deciders could not see it at all.
     let where_has_unqualified_member = resolved_where
         .as_ref()
-        .is_some_and(|w| w.members.iter().any(|(_, table)| table.is_none()));
+        .is_some_and(|w| w.members.iter().any(|m| m.table.is_none()));
     let grain_plan = super::per_grain::plan(
         def,
         &resolved_dims,
