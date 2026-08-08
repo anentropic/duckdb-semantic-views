@@ -284,7 +284,10 @@ Each entry in the ``dimensions`` list declares a named grouping expression.
      - string
      - No
      - null
-     - Override output column type. Wraps the expression in ``CAST(expr AS <type>)``.
+     - **No longer accepted.** Write the cast into the expression instead --
+       ``expr: CAST(o.ordered_at AS DATE)``. No DDL clause can express a member
+       type, so ``GET_DDL`` dropped this field and a restored view silently lost
+       the cast; a cast written into ``expr`` survives the round trip.
    * - ``comment``
      - string
      - No
@@ -304,9 +307,8 @@ Each entry in the ``dimensions`` list declares a named grouping expression.
        source_table: o
        comment: Sales territory
      - name: order_month
-       expr: date_trunc('month', o.ordered_at)
+       expr: CAST(date_trunc('month', o.ordered_at) AS DATE)
        source_table: o
-       output_type: DATE
 
 
 .. _ref-yaml-format-metric:
@@ -344,7 +346,8 @@ Each entry in the ``metrics`` list declares a named aggregation, derived metric,
      - string
      - No
      - null
-     - Override output column type.
+     - **No longer accepted.** Write the cast into the expression instead
+       (see the dimension table above).
    * - ``using_relationships``
      - list of string
      - No
@@ -471,7 +474,9 @@ Each entry in the ``facts`` list declares a named row-level expression. Facts ca
      - string
      - No
      - null
-     - Output type hint for ``SHOW SEMANTIC FACTS``.
+     - **No longer accepted.** Write the cast into the expression instead
+       (see the dimension table above). ``SHOW SEMANTIC FACTS`` reports an
+       empty ``data_type`` for every newly created view as a result.
    * - ``comment``
      - string
      - No
