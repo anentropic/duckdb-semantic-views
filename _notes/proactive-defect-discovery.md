@@ -226,6 +226,35 @@ item on the list and is the one that finally gives role-playing (PBT-10) and hos
 numerics (PBT-12) randomized coverage, because self-checking oracles don't need the
 hand-formulated oracle those cells were waiting on.
 
+## 3a. Operational note: parallel agents must not share `CARGO_TARGET_DIR`
+
+Recorded from the 2026-08-08 fix round, where five agents worked in separate git worktrees
+against one shared target directory. It produced three distinct false signals, two of which
+were caught only because the agent re-verified by hand:
+
+- **A false green** — an integration test linked a `libsemantic_views` that predated the
+  agent's own source edit, reporting a validator returning `Ok` for input an in-crate test
+  proved it rejected.
+- **A false red** — a proptest failed with SQL visibly from a *sibling's* fence-reverted
+  verification build; the same case passed 60/60 in fresh processes.
+- **A stale-path panic** — `CARGO_MANIFEST_DIR` is baked in at compile time, so a lib-test
+  binary built inside a worktree kept pointing at it; removing the merged worktree made
+  `duckdb_version_pins_agree` fail with "No such file or directory" on a file that was
+  present. Nothing was wrong with the code or the file.
+
+None of these is a defect in the project, and all three are indistinguishable from real
+results at a glance — which is the point: a test run you cannot trust is worse than no test
+run, because it launders a guess into a reported fact. Give each worktree its own
+`CARGO_TARGET_DIR` (disk permitting), or serialize the agents that run tests. If a shared
+directory is unavoidable, treat any single anomalous result as suspect, force a rebuild
+(`touch src/lib.rs`), and confirm the `Compiling semantic_views … (<this worktree>)` line
+belongs to you before believing the outcome.
+
+Corollary for disk: the amalgamation build needs several GB of scratch, and `ld` fails with a
+bus error rather than a clear message when `/tmp` fills. `target/debug/{deps,incremental}` are
+the safe things to reclaim — they rebuild without the ~10-minute C++ step that
+`target/debug/build` holds.
+
 ## 4. What already works — keep it
 
 The differential-oracle harness family (every hand-written oracle has held; harness gaps, not
