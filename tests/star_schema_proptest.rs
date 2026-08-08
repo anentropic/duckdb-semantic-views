@@ -89,6 +89,15 @@ enum WMember {
     Ftd,
     /// Filter member on the parent: `u.ucat = 0 OR u.ucat = 2`.
     Fucat,
+    /// EXP-27: a filter member declared on the **parent** whose expression
+    /// reaches a fact declared on the **child** — `fchain AS tv1 > 0` over
+    /// `t.tv1 AS t.v + 1`. Its declared table does not fan, but resolving it
+    /// splices in the child's columns, so the query has to join the child
+    /// anyway. That join is what #207 started emitting and what no fence
+    /// looked at: `check_where_clause_fan_traps` walked only the member's
+    /// declared table (`u`, safe) and `check_referenced_fact_fan_traps` is
+    /// handed the queried members, never the predicate's.
+    Fchain,
 }
 
 impl WMember {
@@ -99,6 +108,7 @@ impl WMember {
             WMember::Ucat => "ucat",
             WMember::Ftd => "ftd",
             WMember::Fucat => "fucat",
+            WMember::Fchain => "fchain",
         }
     }
 
@@ -109,21 +119,35 @@ impl WMember {
             WMember::Ucat => "u.ucat",
             WMember::Ftd => "(t.d = 0 OR t.d = 2)",
             WMember::Fucat => "(u.ucat = 0 OR u.ucat = 2)",
+            // The fact written out independently, parenthesized at the
+            // reference site exactly as the splice must parenthesize it.
+            WMember::Fchain => "((t.v + 1) > 0)",
         }
     }
 
-    /// Whether the member lives on the CHILD table. A predicate touching the
-    /// child cannot be evaluated inside the parent-grain CTE without joining
-    /// `t` into it — which fans `u` — so such a query must be rejected when the
-    /// parent metric is selected.
+    /// Whether resolving the member forces the CHILD table into the query. A
+    /// predicate touching the child cannot be evaluated inside the parent-grain
+    /// CTE without joining `t` into it — which fans `u` — so such a query must
+    /// be rejected when the parent metric is selected.
+    ///
+    /// EXP-27: `Fchain` counts here even though it is *declared* on the parent.
+    /// What matters is which tables the resolved predicate names, not where the
+    /// member's name was written down — that mismatch is the whole bug.
     fn is_child_side(self) -> bool {
-        matches!(self, WMember::Td | WMember::Ftd)
+        matches!(self, WMember::Td | WMember::Ftd | WMember::Fchain)
     }
 
     /// Whether the member is a bare column reference (so it can carry a
     /// comparison operator) as opposed to a self-contained boolean filter.
     fn is_comparable(self) -> bool {
         matches!(self, WMember::Td | WMember::Ucat)
+    }
+
+    /// Whether the member reaches its tables through a FACT reference (EXP-27)
+    /// rather than naming them itself — the generator-coverage guard for the
+    /// new arm.
+    fn is_fact_chain(self) -> bool {
+        matches!(self, WMember::Fchain)
     }
 }
 
@@ -181,6 +205,18 @@ impl Pred {
             Pred::Not(a) => a.references_filter(),
         }
     }
+
+    /// Whether any named member reaches its table through a fact chain
+    /// (EXP-27) — the generator-coverage guard for the `Fchain` arm.
+    fn references_fact_chain(&self) -> bool {
+        match self {
+            Pred::Cmp(m, _, _) | Pred::Filter(m) => m.is_fact_chain(),
+            Pred::And(a, b) | Pred::Or(a, b) => {
+                a.references_fact_chain() || b.references_fact_chain()
+            }
+            Pred::Not(a) => a.references_fact_chain(),
+        }
+    }
 }
 
 fn arb_pred() -> impl Strategy<Value = Pred> {
@@ -191,6 +227,9 @@ fn arb_pred() -> impl Strategy<Value = Pred> {
             -1i64..=3,
         ).prop_map(|(m, op, k)| Pred::Cmp(m, op, k)),
         2 => prop_oneof![Just(WMember::Ftd), Just(WMember::Fucat)].prop_map(Pred::Filter),
+        // EXP-27: the fact-chain member gets its own weight so it appears in a
+        // healthy share of predicates rather than only inside deep compounds.
+        1 => Just(Pred::Filter(WMember::Fchain)),
     ];
     leaf.prop_recursive(3, 8, 2, |inner| {
         prop_oneof![
@@ -336,6 +375,19 @@ fn build_def() -> SemanticViewDefinition {
             synonyms: vec![],
             is_filter: true,
         },
+        // EXP-27: declared on the PARENT, but its expression names a fact on
+        // the CHILD. Resolving it joins `t`, which fans `u` — so a predicate
+        // naming it must be rejected alongside the parent-grain metric even
+        // though nothing about the member's own table says so.
+        Dimension {
+            name: "fchain".to_string(),
+            expr: "tv1 > 0".to_string(),
+            source_table: Some("u".to_string()),
+            output_type: None,
+            comment: None,
+            synonyms: vec![],
+            is_filter: true,
+        },
     ];
     let base_metric = |name: &str, expr: &str, source: Option<&str>| Metric {
         name: name.to_string(),
@@ -373,16 +425,31 @@ fn build_def() -> SemanticViewDefinition {
         dimensions,
         metrics,
         joins,
-        facts: vec![Fact {
-            name: "uw1".to_string(),
-            expr: "u.w + 1".to_string(),
-            source_table: Some("u".to_string()),
-            output_type: None,
-            comment: None,
-            synonyms: vec![],
-            is_filter: false,
-            access: AccessModifier::Public,
-        }],
+        facts: vec![
+            Fact {
+                name: "uw1".to_string(),
+                expr: "u.w + 1".to_string(),
+                source_table: Some("u".to_string()),
+                output_type: None,
+                comment: None,
+                synonyms: vec![],
+                is_filter: false,
+                access: AccessModifier::Public,
+            },
+            // EXP-27: the CHILD-side fact the parent-declared `fchain` member
+            // reaches. Compound, so a splice that loses the parentheses
+            // (`t.v + 1 > 0` vs `(t.v + 1) > 0`) would show up as a diff too.
+            Fact {
+                name: "tv1".to_string(),
+                expr: "t.v + 1".to_string(),
+                source_table: Some("t".to_string()),
+                output_type: None,
+                comment: None,
+                synonyms: vec![],
+                is_filter: false,
+                access: AccessModifier::Public,
+            },
+        ],
         materializations: vec![],
         created_on: None,
         database_name: None,
@@ -741,9 +808,15 @@ fn generator_reaches_both_where_clause_branches() {
     let mut with_pred = 0usize;
     let mut without_pred = 0usize;
     let mut with_filter = 0usize;
+    let mut with_fact_chain = 0usize;
     // The two branches the property treats differently under a predicate.
     let mut parent_metric_child_pred = 0usize;
     let mut parent_metric_parent_only_pred = 0usize;
+    // EXP-27 specifically: the fact-chain member alongside the parent metric,
+    // which is the pair the new fence rejects. Without this the `Fchain` arm
+    // could be generated only in accepted queries and the fence stay untested.
+    let mut parent_metric_fact_chain_pred = 0usize;
+    let mut accepted_fact_chain_pred = 0usize;
     let mut distinct: HashSet<String> = HashSet::new();
 
     for _ in 0..400 {
@@ -760,6 +833,12 @@ fn generator_reaches_both_where_clause_branches() {
                 if p.references_filter() {
                     with_filter += 1;
                 }
+                if p.references_fact_chain() {
+                    with_fact_chain += 1;
+                    if !(selects_parent_metric && selects_child_dim) && !selects_parent_metric {
+                        accepted_fact_chain_pred += 1;
+                    }
+                }
                 distinct.insert(p.to_member_sql());
                 // The dim-based fence branch takes precedence in the property,
                 // so only count cases that actually reach the where-clause one.
@@ -768,6 +847,9 @@ fn generator_reaches_both_where_clause_branches() {
                         parent_metric_child_pred += 1;
                     } else {
                         parent_metric_parent_only_pred += 1;
+                    }
+                    if p.references_fact_chain() {
+                        parent_metric_fact_chain_pred += 1;
                     }
                 }
             }
@@ -793,6 +875,24 @@ fn generator_reaches_both_where_clause_branches() {
         parent_metric_parent_only_pred > 0,
         "no case reached the parent-metric + parent-only-predicate branch; the \
          per-grain predicate oracle is never compared"
+    );
+    assert!(
+        with_fact_chain > 0,
+        "generator never referenced the EXP-27 fact-chain member -- a \
+         where_clause member reaching another table THROUGH a fact has no \
+         randomized coverage"
+    );
+    assert!(
+        parent_metric_fact_chain_pred > 0,
+        "no case paired the fact-chain member with the parent metric; the \
+         EXP-27 fence is never exercised and its assertion is vacuous \
+         (present={with_fact_chain})"
+    );
+    assert!(
+        accepted_fact_chain_pred > 0,
+        "the fact-chain member only ever appeared in REJECTED cases, so the \
+         non-fanning half -- that resolving it still produces the right number \
+         -- is never oracled"
     );
     assert!(
         distinct.len() > 50,

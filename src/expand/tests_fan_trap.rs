@@ -5,7 +5,7 @@
 //! archaeology. `use super::*` resolves against `crate::expand`'s re-exports.
 
 use super::*;
-use crate::expand::test_helpers::minimal_def;
+use crate::expand::test_helpers::{minimal_def, TestFixtureExt};
 use crate::model::{Cardinality, Dimension, Join, Metric, SemanticViewDefinition, TableRef};
 
 fn fan_trap_three_table_def() -> SemanticViewDefinition {
@@ -755,4 +755,202 @@ fn window_quoted_inner_metric_contributes_its_grain_to_the_fence() {
              {reference}, got {grains:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// EXP-27 (code-review 2026-08-08): a `where_clause` member whose FACT CHAIN
+// reaches a fanning table had that table joined with no fan fence at all.
+//
+// #207 (EXP-23) taught `resolve_where_clause` to contribute the tables a
+// predicate member reaches THROUGH its fact references to `source_tables`, so
+// the join resolver joins them and the inlined expression binds. That is right
+// for the parent direction (`s -> c`), which is the case EXP-23 was about. It
+// is wrong without a fence for the CHILD direction: neither fan check sees the
+// pair. `check_where_clause_fan_traps` walks only the member's OWN table
+// (`fan_trap.rs`, `member_table`), and `check_referenced_fact_fan_traps` is
+// handed the QUERIED dimensions and metrics -- a `where_clause` member is
+// neither. So the fanning join is emitted and the metric silently doubles.
+//
+// Pre-#207 both shapes below were a loud binder error (`li` was never joined),
+// so this is a loud -> silent-wrong regression, not a pre-existing gap.
+// ---------------------------------------------------------------------------
+
+/// base `o`, child `li` (`li.order_id REFERENCES o.id`, so `o -> li` fans).
+/// Fact `liq` lives on the CHILD; fact `of` lives on the base and reaches it.
+fn exp27_def() -> SemanticViewDefinition {
+    SemanticViewDefinition::default()
+        .with_table("o", "exp27_o", &["id"])
+        .with_table("li", "exp27_li", &["id"])
+        .with_dimension("region", "o.region", Some("o"))
+        .with_fact("liq", "li.qty", "li")
+        .with_fact("of", "li.liq * 2", "o")
+        .with_metric("rev", "SUM(o.amount)", Some("o"))
+        .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"])
+}
+
+fn exp27_req(where_clause: &str) -> QueryRequest {
+    QueryRequest {
+        where_clause: Some(where_clause.to_string()),
+        facts: vec![],
+        dimensions: vec![DimensionName::new("region")],
+        metrics: vec![MetricName::new("rev")],
+    }
+}
+
+/// The FACT branch: the predicate names a fact on the base whose expression
+/// reaches a fact on the child table.
+#[test]
+fn exp27_where_member_fact_chain_to_a_fanning_table_is_fenced() {
+    let def = exp27_def();
+    match expand("v", &def, &exp27_req("of > 0")) {
+        Err(ExpandError::WhereClauseFanTrap {
+            metric_name,
+            member_name,
+            member_table,
+            relationship_name,
+            ..
+        }) => {
+            assert_eq!(metric_name, "rev");
+            assert_eq!(member_name, "of");
+            assert_eq!(
+                member_table, "li",
+                "the table joined on the member's behalf"
+            );
+            assert_eq!(relationship_name, "li_to_o");
+        }
+        Err(other) => panic!("expected WhereClauseFanTrap, got: {other}"),
+        Ok(sql) => panic!(
+            "EXP-27: the fanning child table was joined for a where_clause fact \
+             chain with no fence -- SUM(o.amount) is aggregated over multiplied \
+             rows.\nemitted SQL:\n{sql}"
+        ),
+    }
+}
+
+/// The DIMENSION branch: the predicate names a *dimension* on the base whose
+/// expression reaches the same child-table fact. TECH-DEBT #54 made dimension
+/// expressions fact-inlined, so this reaches the identical join with an
+/// identical absence of fencing.
+#[test]
+fn exp27_where_member_dimension_reaching_a_fanning_fact_is_fenced() {
+    let def = exp27_def().with_dimension(
+        "band",
+        "CASE WHEN li.liq > 0 THEN 'hi' ELSE 'lo' END",
+        Some("o"),
+    );
+    match expand("v", &def, &exp27_req("band = 'hi'")) {
+        Err(ExpandError::WhereClauseFanTrap {
+            metric_name,
+            member_name,
+            member_table,
+            ..
+        }) => {
+            assert_eq!(metric_name, "rev");
+            assert_eq!(member_name, "band");
+            assert_eq!(member_table, "li");
+        }
+        Err(other) => panic!("expected WhereClauseFanTrap, got: {other}"),
+        Ok(sql) => panic!(
+            "EXP-27 (dimension branch): a where_clause DIMENSION whose expression \
+             reaches a child-table fact joined the fanning table \
+             unfenced.\nemitted SQL:\n{sql}"
+        ),
+    }
+}
+
+/// Transitivity: `member_fact_tables` walks the chain, so a two-hop chain that
+/// only reaches the fanning table at its far end must be fenced too. A fence
+/// that looked at the directly-named fact alone would miss this.
+#[test]
+fn exp27_transitive_fact_chain_to_a_fanning_table_is_fenced() {
+    let def = exp27_def().with_fact("of2", "of + 1", "o");
+    match expand("v", &def, &exp27_req("of2 > 0")) {
+        Err(ExpandError::WhereClauseFanTrap { member_name, .. }) => {
+            assert_eq!(member_name, "of2");
+        }
+        Err(other) => panic!("expected WhereClauseFanTrap, got: {other}"),
+        Ok(sql) => panic!(
+            "EXP-27 (transitive): `of2 -> of -> liq@li` reached the fanning table \
+             through two hops unfenced.\nemitted SQL:\n{sql}"
+        ),
+    }
+}
+
+/// CONTROL 1 -- the legitimate EXP-23 shape must keep working: a fact chain
+/// that reaches a PARENT table crosses the many-to-one edge forwards, which
+/// does not fan, so the join is joined and the query expands. This is the
+/// `cr0806i_cross` fixture from `cr20260806_inlining_gaps.test` in miniature.
+#[test]
+fn exp27_control_non_fanning_parent_fact_chain_still_expands() {
+    let def = SemanticViewDefinition::default()
+        .with_table("s", "exp27_sales", &["id"])
+        .with_table("c", "exp27_cust", &["id"])
+        .with_dimension("sid", "s.id", Some("s"))
+        .with_fact("cust_rate", "c.rate", "c")
+        .with_fact("weighted", "s.amount * cust_rate", "s")
+        .with_metric("total", "SUM(s.amount)", Some("s"))
+        .with_pkfk_join("s_to_c", "s", "c", &["cust_id"], &["id"]);
+    let req = QueryRequest {
+        where_clause: Some("weighted > 25".to_string()),
+        facts: vec![],
+        dimensions: vec![DimensionName::new("sid")],
+        metrics: vec![MetricName::new("total")],
+    };
+    let sql = expand("v", &def, &req).expect("a parent-direction fact chain must still expand");
+    assert!(
+        sql.contains("exp27_cust"),
+        "the table reached through the fact chain must still be joined: {sql}"
+    );
+}
+
+/// CONTROL 2 -- the fence is anchored at the METRIC's grain, not at the
+/// member's own table, exactly like the existing where-clause fan check. A
+/// metric already at the child grain is not multiplied by joining the child, so
+/// the same predicate must still expand.
+#[test]
+fn exp27_control_child_grain_metric_is_not_fenced() {
+    let def = exp27_def().with_metric("li_qty", "SUM(li.qty)", Some("li"));
+    let req = QueryRequest {
+        where_clause: Some("of > 0".to_string()),
+        facts: vec![],
+        dimensions: vec![],
+        metrics: vec![MetricName::new("li_qty")],
+    };
+    let sql = expand("v", &def, &req)
+        .expect("a metric at the child grain is not inflated by joining the child");
+    assert!(sql.contains("exp27_li"), "{sql}");
+}
+
+/// The data-level statement of what the fence prevents: with one order and two
+/// line items, joining `li` doubles `SUM(o.amount)`. Kept as an executable
+/// oracle so the fixture cannot drift into one where the join is harmless and
+/// the fence tests above become vacuous.
+#[cfg(not(feature = "extension"))]
+#[test]
+fn exp27_the_fanning_join_really_does_double_the_metric() {
+    let con = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+    con.execute_batch(
+        "CREATE TABLE exp27_o (id INTEGER, region VARCHAR, amount INTEGER);
+         INSERT INTO exp27_o VALUES (1, 'E', 100);
+         CREATE TABLE exp27_li (id INTEGER, order_id INTEGER, qty INTEGER);
+         INSERT INTO exp27_li VALUES (1, 1, 5), (2, 1, 6);",
+    )
+    .expect("setup");
+    let one = |sql: &str| {
+        con.query_row(sql, [], |r| r.get::<_, i64>(0))
+            .expect("query")
+    };
+    assert_eq!(
+        one("SELECT SUM(o.amount) FROM exp27_o o"),
+        100,
+        "the un-joined answer is the correct one"
+    );
+    assert_eq!(
+        one("SELECT SUM(o.amount) FROM exp27_o o \
+             LEFT JOIN exp27_li li ON li.order_id = o.id \
+             WHERE ((li.qty) * 2) > 0"),
+        200,
+        "joining the child table for the predicate doubles the metric -- this \
+         is the 2x EXP-27 emitted silently"
+    );
 }
