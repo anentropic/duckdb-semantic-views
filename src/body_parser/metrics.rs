@@ -348,6 +348,24 @@ fn parse_single_metric_entry(entry: &str, entry_offset: usize) -> Result<ParsedM
         }
     };
 
+    // The `before_as.is_empty()` guard above ran BEFORE `USING (...)` and
+    // `NON ADDITIVE BY (...)` were peeled off, so an entry made of nothing but
+    // those clauses (`USING () AS 1`, `PRIVATE NON ADDITIVE BY () AS 1`) cleared
+    // it with a non-empty `before_as` and arrives here with the name slot empty.
+    // `identifier_slot_error` returns `None` for an empty slot, so without this
+    // check the metric was stored NAMELESS -- and `render_ddl` emits an empty
+    // name as `""`, which this parser rejects as an empty quoted identifier. The
+    // nameless metric therefore rendered to DDL that no longer parsed, breaking
+    // the `render(parse(render(d))) == render(d)` fixpoint (CI
+    // fuzz_render_roundtrip, 2026-08-08). Same diagnostic as the guard above:
+    // from the user's side the defect is identical, the name is missing.
+    if final_name_portion.trim().is_empty() {
+        return Err(ParseError {
+            message: format!("Missing metric name before 'AS' in entry '{entry}'."),
+            position: Some(entry_offset),
+        });
+    }
+
     // Distinguish qualified (`alias.name`) from unqualified (derived) at the
     // first `.` SYMBOL token — quote-aware (a dot inside `"a.b"` is inert).
     let name_base = entry_offset + byte_offset_within(entry, final_name_portion);
