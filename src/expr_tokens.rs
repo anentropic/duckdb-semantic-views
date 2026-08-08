@@ -170,6 +170,25 @@ fn scan_chains(expr: &str, kind: ChainKind) -> Vec<IdentRef<'_>> {
             }
             _ if b == b'"' || crate::util::is_ident_byte(b) => {
                 let end = scan_chain(bytes, i);
+                // PARSE-12 (code-review 2026-08-08): a chain IMMEDIATELY
+                // followed by `'` is a literal's introducer, not a name — the
+                // escape-string forms `e'…'` / `E'…'` (PARSE-7 made them
+                // first-class) and every typed literal (`DATE'2020-01-01'`, and
+                // the qualified / quoted type names DuckDB also accepts:
+                // `main.date'…'`, `"date"'…'`). Emitting it as a reference let
+                // a member named `e` or `date` be substituted OVER the
+                // introducer, turning a valid definition into a query-time
+                // syntax error, and reported a phantom dependency that (since
+                // PAR-6) changes join topology. The literal starts here, so the
+                // string skipper runs from the quote — and it derives the
+                // backslash rules from the SAME adjacency test
+                // (`util::opens_escape_string`), which is what makes `e'\''`
+                // (backslash escapes) and `DATE'…'` (backslash is data) both
+                // come out right.
+                if bytes.get(end) == Some(&b'\'') {
+                    i = skip_single_quoted(bytes, end);
+                    continue;
+                }
                 let is_head = followed_by_open_paren(bytes, end);
                 let want = if is_head {
                     ChainKind::FunctionHead
@@ -715,6 +734,91 @@ mod tests {
         assert_eq!(rewrite_qualifier("b.city", "a", "a__dep"), "b.city");
     }
 
+    // ----- PARSE-12: a chain abutting a `'` introduces a LITERAL -----
+    //
+    // (code-review 2026-08-08) `e` / `E` / `DATE` / any type name immediately
+    // before a quote is the literal's introducer, not a name: the `e` in
+    // `e'\''` is an ident byte, so `scan_chain` emitted a one-byte Reference
+    // and the string skipper only saw the quote afterwards. DuckDB parses all
+    // of these as one literal token — including the qualified and quoted type
+    // names (`main.date'…'`, `"date"'…'`), verified against DuckDB — so the
+    // whole chain is suppressed, not just a bare `e`.
+
+    #[test]
+    fn an_escape_string_introducer_is_not_a_reference() {
+        // `count_if(x = e'\'')`
+        let expr = "count_if(x = e'\\'')";
+        assert_eq!(keys(expr), vec!["x"], "the `e` introduces the literal");
+        // FIND: a member named `e` is NOT a dependency of this expression
+        // (a phantom one changes join topology since PAR-6).
+        assert!(!references_ref(expr, "e", None));
+    }
+
+    #[test]
+    fn inlining_does_not_corrupt_an_escape_string_literal() {
+        // With a declared member named `e`, INLINE spliced the replacement over
+        // the introducer: `count_if(x = (o.something)'\'')` — a query-time
+        // syntax error produced from a valid definition.
+        let expr = "count_if(x = e'\\'')";
+        let mut m: HashMap<String, &str> = HashMap::new();
+        m.insert("e".to_string(), "(o.something)");
+        assert_eq!(inline_references(expr, &m), expr);
+    }
+
+    #[test]
+    fn rewriting_a_qualifier_does_not_corrupt_an_escape_string_literal() {
+        // The role-playing alias rewriter turned `e'a'` into `e__dep'a'`
+        // whenever the rewritten alias happened to be named `e`.
+        assert_eq!(
+            rewrite_qualifier("e.name || e'a'", "e", "e__dep"),
+            "e__dep.name || e'a'"
+        );
+        // Uppercase introducer, same rule.
+        assert_eq!(
+            rewrite_qualifier("e.name || E'a'", "e", "e__dep"),
+            "e__dep.name || E'a'"
+        );
+    }
+
+    #[test]
+    fn a_typed_literal_prefix_is_not_a_reference() {
+        // A fact named `date` corrupted `o.ts > DATE'2020-01-01'`.
+        let expr = "o.ts > DATE'2020-01-01'";
+        assert_eq!(keys(expr), vec!["o.ts"]);
+        assert!(!references_ref(expr, "date", None));
+        let mut m: HashMap<String, &str> = HashMap::new();
+        m.insert("date".to_string(), "(o.day)");
+        assert_eq!(inline_references(expr, &m), expr);
+        // DuckDB accepts a qualified and a quoted type name in this position
+        // (`main.date'…'` / `"date"'…'` both parse), so the whole chain is the
+        // introducer — not just its last part.
+        assert!(scan_references("main.date'2020-01-01'").is_empty());
+        assert!(scan_references("\"date\"'2020-01-01'").is_empty());
+    }
+
+    #[test]
+    fn a_chain_not_abutting_a_quote_still_scans() {
+        // Controls for the suppression rule — it is ADJACENCY-based (the same
+        // rule `util::opens_escape_string` uses), so an ordinary reference near
+        // a literal is untouched.
+        assert_eq!(keys("x + e"), vec!["x", "e"]);
+        assert_eq!(keys("e || 'a'"), vec!["e"]);
+        assert_eq!(keys("\"e\" + 1"), vec!["e", "1"]);
+        assert!(references_ref("e + 1", "e", None));
+        // The literal's own content is still skipped, and the reference after
+        // it still scans.
+        assert_eq!(keys("e'a' + cost"), vec!["cost"]);
+    }
+
+    #[test]
+    fn a_suppressed_introducer_is_not_a_function_head_either() {
+        // The two scans partition the chains; a suppressed chain belongs to
+        // neither (it is part of a literal token).
+        assert!(scan_function_heads("count_if(x = e'\\'')")
+            .iter()
+            .all(|h| h.key() != "e"));
+    }
+
     // ----- generative proptests -----
 
     /// A quoted-identifier part whose inner content is arbitrary (including
@@ -730,6 +834,17 @@ mod tests {
             r#""[a-zA-Z0-9 .,()]{0,6}""#,
             // single-quoted string literals with identifier-looking content
             "'[a-zA-Z0-9 .]{0,8}'",
+            // PARSE-12: a chain ABUTTING a quote introduces a literal — escape
+            // strings (`e'…'`, `E'…'`, whose backslash rules differ) and typed
+            // literals (`DATE'…'`, and the qualified / quoted type names DuckDB
+            // also accepts). Generated, not just pinned by fixed examples, so
+            // the tiling / disjointness / FIND-INLINE-agree properties below
+            // exercise the shape too.
+            "[eE]'[a-zA-Z0-9 ]{0,4}'",
+            Just("e'a\\'b'".to_string()),
+            "[a-z]{1,4}'[a-zA-Z0-9 :.-]{0,8}'",
+            Just("main.date'2020-01-01'".to_string()),
+            Just("\"date\"'2020-01-01'".to_string()),
             // dollar-quoted strings
             Just("$$a.b revenue$$".to_string()),
             // operators / punctuation / whitespace
@@ -788,6 +903,27 @@ mod tests {
             m.insert(inner.clone(), "REPL");
             prop_assert_eq!(inline_references(&lit, &m), lit.clone());
             prop_assert_eq!(inline_references(&dollar, &m), dollar);
+        }
+
+        /// PARSE-12: an identifier chain IMMEDIATELY followed by `'` is the
+        /// introducer of a literal, so it is neither found as a reference nor
+        /// substituted — for any prefix, not just the `e` / `DATE` examples.
+        #[test]
+        fn a_chain_abutting_a_quote_is_never_a_reference(
+            prefix in "[a-zA-Z_][a-zA-Z0-9_]{0,4}",
+            inner in "[a-zA-Z0-9 ]{0,6}",
+        ) {
+            // The left-hand reference is a QUOTED name containing a space, so
+            // no generated `prefix` can collide with it.
+            let expr = format!("\"lhs col\" = {prefix}'{inner}'");
+            prop_assert!(!references_ref(&expr, &prefix, None), "expr={expr:?}");
+            let mut m: HashMap<String, &str> = HashMap::new();
+            let key = crate::ident::normalize_ident_part(&prefix);
+            m.insert(key, "<R>");
+            prop_assert_eq!(inline_references(&expr, &m), expr.clone());
+            // Anti-vacuity: the scan really ran — the ordinary reference before
+            // the literal is still found (so "nothing scans" cannot pass this).
+            prop_assert!(references_ref(&expr, "lhs col", None), "expr={expr:?}");
         }
 
         /// FIND and INLINE agree: a name is reported as referenced iff inlining

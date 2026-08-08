@@ -1,0 +1,161 @@
+# Code review 2026-08-08, PARSE-10 and PARSE-12: two parser defects that turned
+# a valid definition into a wrong (or unbindable) query, end-to-end through the
+# extension-load -> DDL -> query path.
+#
+# PARSE-10 -- `parse_window_over_clause` never looked at the text AFTER the
+# OVER body's `)`, and took everything before the first `(` as the window
+# function's NAME. Emission rebuilds the SQL from the parsed WindowSpec alone,
+# so `AVG(w) OVER (...) + 100` computed without the `+ 100` while GET_DDL
+# round-tripped the text that still had it: definition and behaviour disagreed,
+# silently. Composition around a window function is now REJECTED rather than
+# silently dropped (the P-2/F-3 "reject, don't discard" rule) -- it is not
+# supported; see TECH-DEBT "window-metric composition".
+#
+# PARSE-12 -- an identifier chain immediately followed by `'` is a literal's
+# introducer (`e'...'`, `DATE'...'`), but the reference scanner emitted it as a
+# name. A declared member called `e` or `date` was then substituted OVER the
+# introducer, so a valid definition reached DuckDB as `(q.s)'...'`.
+#
+# The runner halts a file at its first failing statement, so the per-case red
+# proof lives at the unit layer (`body_parser::window::tests`,
+# `expr_tokens::tests`, `parse::search_path::tests`, `util::tests`), each of
+# which was individually watched failing before the fix. This file covers the
+# whole pipeline.
+
+require semantic_views
+
+statement ok
+CREATE TABLE cr0808_sales (
+    id INTEGER PRIMARY KEY,
+    store VARCHAR,
+    d DATE,
+    qty INTEGER
+);
+
+statement ok
+INSERT INTO cr0808_sales VALUES
+    (1, 'a', DATE '2020-01-01', 10),
+    (2, 'a', DATE '2021-01-01', 20),
+    (3, 'b', DATE '2021-06-01', 30);
+
+# ============================================================
+# PARSE-10: residue after the OVER clause.
+# ============================================================
+
+# `+ 100` was silently discarded: the metric returned a number 100 too small.
+statement error
+CREATE SEMANTIC VIEW cr0808_w1 AS
+TABLES (s AS cr0808_sales PRIMARY KEY (id))
+DIMENSIONS (s.store AS s.store, s.d AS s.d)
+METRICS (
+    s.total AS SUM(s.qty),
+    s.w AS AVG(total) OVER (PARTITION BY store) + 100
+)
+----
+Unexpected text '+ 100' after the OVER clause
+
+# A prefix before the window function was stored VERBATIM as the function name
+# (`window_function == "1 + AVG"`).
+statement error
+CREATE SEMANTIC VIEW cr0808_w2 AS
+TABLES (s AS cr0808_sales PRIMARY KEY (id))
+DIMENSIONS (s.store AS s.store)
+METRICS (
+    s.total AS SUM(s.qty),
+    s.w AS 1 + AVG(total) OVER (PARTITION BY store)
+)
+----
+Window function before OVER must be a plain function call
+
+# A second OVER term was dropped wholesale.
+statement error
+CREATE SEMANTIC VIEW cr0808_w3 AS
+TABLES (s AS cr0808_sales PRIMARY KEY (id))
+DIMENSIONS (s.store AS s.store)
+METRICS (
+    s.total AS SUM(s.qty),
+    s.w AS AVG(total) OVER (PARTITION BY store) - SUM(total) OVER (PARTITION BY store)
+)
+----
+Unexpected text
+
+# Control: a plain window metric still creates and still computes. Per store:
+# store `a` totals 10 + 20 = 30 and store `b` totals 30, and each partition
+# holds one row, so the windowed sum is the store total itself.
+statement ok
+CREATE SEMANTIC VIEW cr0808_ok AS
+TABLES (s AS cr0808_sales PRIMARY KEY (id))
+DIMENSIONS (s.store AS s.store)
+METRICS (
+    s.total AS SUM(s.qty),
+    s.w AS SUM(total) OVER (PARTITION BY store)
+);
+
+query TI
+SELECT store, w FROM semantic_view(
+  'cr0808_ok',
+  dimensions := ['store'],
+  metrics := ['w']
+) ORDER BY store;
+----
+a	30
+b	30
+
+# Control: the window definition still round-trips through GET_DDL.
+query I
+SELECT count(*) FROM (SELECT GET_DDL('SEMANTIC_VIEW', 'cr0808_ok') AS d) WHERE d LIKE '%OVER (%'
+----
+1
+
+# ============================================================
+# PARSE-12: a member named like a literal introducer.
+# ============================================================
+
+statement ok
+CREATE TABLE cr0808_quoted (id INTEGER PRIMARY KEY, s VARCHAR, d DATE, amount INTEGER);
+
+statement ok
+INSERT INTO cr0808_quoted VALUES
+    (1, 'plain', DATE '2019-01-01', 10),
+    (2, '''',    DATE '2021-01-01', 20);
+
+# A FACT named `e` sitting next to an escape string. Before the fix the `e` of
+# `e'\''` scanned as a reference to that fact, so the inliner produced
+# `count_if(q.s = (q.s)'\'')` -- a query-time syntax error from a valid
+# definition -- and FIND reported a phantom dependency on it.
+statement ok
+CREATE SEMANTIC VIEW cr0808_e AS
+  TABLES (q AS cr0808_quoted PRIMARY KEY (id))
+  FACTS (q.e AS q.s)
+  DIMENSIONS (q.s AS q.s)
+  METRICS (
+    q.n_quote AS count_if(q.s = e'\''),
+    q.total AS SUM(q.amount)
+  );
+
+query II
+SELECT n_quote, total FROM semantic_view(
+  'cr0808_e',
+  metrics := ['n_quote', 'total']
+);
+----
+1	30
+
+# The same shape with a typed literal and a fact named `date`.
+statement ok
+CREATE SEMANTIC VIEW cr0808_date AS
+  TABLES (q AS cr0808_quoted PRIMARY KEY (id))
+  FACTS (q.date AS q.d)
+  DIMENSIONS (q.s AS q.s)
+  METRICS (
+    q.recent AS count_if(q.d > DATE'2020-01-01'),
+    q.total AS SUM(q.amount)
+  );
+
+query II
+SELECT recent, total FROM semantic_view(
+  'cr0808_date',
+  metrics := ['recent', 'total']
+);
+----
+1	30

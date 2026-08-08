@@ -1,6 +1,7 @@
 //! Window-metric OVER clause parsing and the shared ORDER-BY modifier loop.
 
 use super::cursor::Cursor;
+use super::lexer::TokenKind;
 use super::scan::{is_ident_continuation, is_quoting_balanced};
 use super::split_at_depth0_commas;
 use crate::errors::ParseError;
@@ -49,6 +50,26 @@ pub(super) fn parse_window_over_clause(
         });
     };
 
+    // PARSE-10 (code-review 2026-08-08): everything after the OVER body's `)`
+    // used to be dropped on the floor. Emission rebuilds the SQL from the
+    // `WindowSpec` alone (`expand::window`), so `AVG(w) OVER (...) + 100`
+    // computed without the `+ 100` while `GET_DDL` round-tripped the text that
+    // still had it — definition and behaviour disagreeing, with no diagnostic.
+    // Same "reject, don't discard" rule as the USING / NON ADDITIVE BY residues
+    // (P-2 / F-3). Composition around a window function is rejected rather than
+    // supported — see TECH-DEBT "window-metric composition".
+    if let Some(residue_tok) = cur.peek() {
+        let residue = expr[residue_tok.start..].trim_end();
+        return Err(ParseError {
+            message: format!(
+                "Unexpected text '{residue}' after the OVER clause in expression '{expr}'. \
+                 A window metric must be exactly FUNC(args) OVER (...); combining it with \
+                 other expressions is not supported."
+            ),
+            position: Some(base_offset + residue_tok.start),
+        });
+    }
+
     // The function call before OVER: `FUNC(inner_metric[, extra_args...])`.
     let mut fcur = Cursor::new(func_part, base_offset);
     let Some(fparen) = fcur.find_symbol(b'(') else {
@@ -60,6 +81,21 @@ pub(super) fn parse_window_over_clause(
         });
     };
     let window_function = func_part[..fparen.start].trim().to_string();
+    // PARSE-10: the text before the first `(` became `window_function`
+    // VERBATIM, so `1 + AVG(w) OVER (...)` stored the function name
+    // `"1 + AVG"` and emitted `1 + AVG(...) OVER (...)`-shaped nonsense (or, in
+    // the qualified-metric paths, an arbitrary prefix silently reinterpreted).
+    // The name must be exactly one identifier chain.
+    if !is_identifier_chain(&window_function) {
+        return Err(ParseError {
+            message: format!(
+                "Window function before OVER must be a plain function call, found \
+                 '{func_part}'. A window metric must be exactly FUNC(args) OVER (...); \
+                 combining it with other expressions is not supported."
+            ),
+            position: Some(base_offset),
+        });
+    }
     let paren_start = fparen.start;
     fcur.advance_past_byte(paren_start);
     let Some(func_args_content) = fcur.take_parens() else {
@@ -103,6 +139,31 @@ pub(super) fn parse_window_over_clause(
             frame_clause,
         }),
     ))
+}
+
+/// Is `text` exactly ONE identifier chain — a bare or double-quoted name,
+/// optionally qualified (`avg`, `main.avg`, `"my func"`, `main."my func"`)?
+///
+/// The shape test for a window function's name (PARSE-10). Anything else — an
+/// operator, a literal, a second call, a leading term — makes the text an
+/// *expression*, and this parser only models a bare `FUNC(args) OVER (...)`.
+/// Whitespace between the name and its argument parens is fine (`AVG (x)` is
+/// legal `DuckDB`); what is rejected is another TOKEN sitting in the name
+/// position.
+fn is_identifier_chain(text: &str) -> bool {
+    let mut cur = Cursor::new(text, 0);
+    loop {
+        if !matches!(cur.bump(), Some(t) if matches!(t.kind, TokenKind::Ident { .. })) {
+            return false;
+        }
+        if cur.peek().is_none() {
+            return true;
+        }
+        if !cur.peek_is_symbol(b'.') {
+            return false;
+        }
+        cur.bump();
+    }
 }
 
 /// Parsed components of an OVER clause.
@@ -437,3 +498,106 @@ pub(super) fn parse_order_by_modifiers(
 // migration: dims/order regions are now sliced between keyword TOKEN offsets
 // (`content[dims_start..dims_end]`), which are exact by construction, so the
 // uppercase-twin offset bookkeeping the helper served is gone.
+
+#[cfg(test)]
+mod tests {
+    use super::parse_window_over_clause;
+
+    /// Parse at a non-zero base offset so every caret assertion below also
+    /// proves the error position is anchored in the ORIGINAL query, not in the
+    /// re-sliced expression.
+    const BASE: usize = 100;
+
+    fn err(expr: &str) -> (String, Option<usize>) {
+        match parse_window_over_clause(expr, BASE) {
+            Ok((_, spec)) => panic!("expected a ParseError, got Ok({spec:?}) for {expr:?}"),
+            Err(e) => (e.message, e.position),
+        }
+    }
+
+    // PARSE-10 (code-review 2026-08-08): text AFTER the OVER body's `)` was
+    // never inspected, so `+ 100` vanished — the stored definition text kept it
+    // while the emitted SQL (rebuilt from the WindowSpec) dropped it, and the
+    // metric silently returned a number 100 too small.
+    #[test]
+    fn trailing_arithmetic_after_the_over_clause_is_rejected() {
+        let (msg, pos) = err("AVG(w) OVER (PARTITION BY d) + 100");
+        assert!(msg.contains("+ 100"), "{msg}");
+        assert!(
+            msg.contains("Unexpected text") && msg.contains("after the OVER clause"),
+            "{msg}"
+        );
+        // Caret at the `+`, which is byte 29 of the expression.
+        assert_eq!(pos, Some(BASE + 29));
+    }
+
+    // PARSE-10: `func_part` was everything before OVER and its text before the
+    // first `(` became `window_function` verbatim, so this stored the function
+    // name `"1 + AVG"`.
+    #[test]
+    fn an_expression_prefix_before_the_window_function_is_rejected() {
+        let (msg, pos) = err("1 + AVG(w) OVER (PARTITION BY d)");
+        assert!(msg.contains("must be a plain function call"), "{msg}");
+        assert_eq!(pos, Some(BASE), "caret at the start of the function part");
+    }
+
+    // PARSE-10: a second `FUNC(...) OVER (...)` term was dropped wholesale —
+    // only the first OVER is parsed and the rest was residue.
+    #[test]
+    fn a_second_over_term_is_rejected() {
+        let (msg, _) = err("AVG(w) OVER (PARTITION BY d) - SUM(w) OVER (PARTITION BY d)");
+        assert!(msg.contains("Unexpected text"), "{msg}");
+        assert!(msg.contains("SUM(w)"), "{msg}");
+    }
+
+    /// Control: a plain window metric still parses, with the spec intact.
+    #[test]
+    fn a_plain_window_metric_still_parses() {
+        let (expr, spec) =
+            parse_window_over_clause("AVG(qty) OVER (PARTITION BY EXCLUDING d ORDER BY t)", BASE)
+                .expect("valid window metric");
+        assert_eq!(expr, "AVG(qty) OVER (PARTITION BY EXCLUDING d ORDER BY t)");
+        let spec = spec.expect("a WindowSpec");
+        assert_eq!(spec.window_function, "AVG");
+        assert_eq!(spec.inner_metric, "qty");
+        assert_eq!(spec.excluding_dims, vec!["d".to_string()]);
+        assert_eq!(spec.order_by.len(), 1);
+    }
+
+    /// Control: the accepted function-part shapes — a qualified name, a quoted
+    /// name, extra arguments, and whitespace before the argument parens (which
+    /// `DuckDB` accepts) — must all keep parsing. The new rule is "one identifier
+    /// chain then the arg list", not "no whitespace anywhere".
+    #[test]
+    fn qualified_quoted_and_spaced_function_names_still_parse() {
+        for (expr, want_fn) in [
+            ("main.avg(qty) OVER (PARTITION BY d)", "main.avg"),
+            ("\"my func\"(qty) OVER (PARTITION BY d)", "\"my func\""),
+            ("AVG (qty) OVER (PARTITION BY d)", "AVG"),
+            ("lead(qty, 1) OVER (PARTITION BY d ORDER BY t)", "lead"),
+        ] {
+            let (_, spec) = parse_window_over_clause(expr, BASE)
+                .unwrap_or_else(|e| panic!("{expr:?} must parse, got {}", e.message));
+            assert_eq!(spec.expect("a WindowSpec").window_function, want_fn);
+        }
+    }
+
+    /// Control: an expression with no OVER at all is returned untouched (this
+    /// is the non-window metric path — every ordinary metric expression flows
+    /// through here and must NOT be subjected to the function-call shape rule).
+    #[test]
+    fn an_expression_without_over_is_untouched() {
+        let (expr, spec) = parse_window_over_clause("SUM(revenue) - SUM(cost) + 100", BASE)
+            .expect("a non-window expression is not a window metric");
+        assert_eq!(expr, "SUM(revenue) - SUM(cost) + 100");
+        assert!(spec.is_none());
+    }
+
+    /// Control: the pre-existing "no parenthesized arguments" error still fires
+    /// for a bare name before OVER.
+    #[test]
+    fn a_window_function_without_arguments_is_still_rejected() {
+        let (msg, _) = err("row_number OVER (PARTITION BY d)");
+        assert!(msg.contains("parenthesized arguments"), "{msg}");
+    }
+}
