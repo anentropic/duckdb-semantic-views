@@ -688,7 +688,7 @@ fn has_constant_arg_aggregate(expr: &str) -> bool {
 /// throughout ([`crate::util::QuoteState`]), so `'count(1)'` and
 /// `"sum(1) col"` are left alone.
 ///
-/// Two residuals are recorded in TECH-DEBT #61: the NULL-RETAINING aggregates
+/// Two residuals are recorded in TECH-DEBT #67: the NULL-RETAINING aggregates
 /// (`list` / `array_agg` / `first` / `last` / `arbitrary`, which keep a NULL
 /// element rather than skipping it, so the phantom leaves a NULL in the list
 /// instead of a value), and the case where the source table declares no
