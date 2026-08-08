@@ -351,6 +351,7 @@ fn build_def(func: WFunc, mode: &PartMode) -> SemanticViewDefinition {
         dimensions,
         metrics,
         joins: vec![],
+        // PIN: a window metric is an aggregate shape; FACTS returns unaggregated rows. TECH-DEBT #66
         facts: vec![],
         materializations: vec![],
         created_on: None,
@@ -466,6 +467,7 @@ proptest! {
             dimensions: case.sel_dims.iter().map(|&i| DimensionName::new(dim_name(i))).collect(),
             // Always query the (single) window metric so the window path fires.
             metrics: vec![MetricName::new("w")],
+            // PIN: a window metric is an aggregate shape; FACTS returns unaggregated rows. TECH-DEBT #66
             facts: vec![],
         };
 

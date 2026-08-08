@@ -103,6 +103,26 @@ has, and the field being *present* in a struct literal is not coverage: the
 generator has to vary it. If a feature genuinely cannot be oracled, say so in
 the PR and record why.
 
+**When a change adds a capability, list the fences it walks past.** Any change
+that makes a new table reachable (join emission, reference inlining,
+`source_tables`), accepts new syntax, or opens a new ingress path must name — in
+the PR description — each existing guard that assumed the old, smaller set, and
+say for each: extended, or why not applicable. The guards worth enumerating are
+the fan-trap checks, the role-playing ambiguity check, the scanner set, and the
+validation choke points.
+
+This is not hypothetical process. It is now the second and third time a fix has
+opened a hole in a fence that did not know about the new edge: #207 (EXP-23)
+taught `where_clause` members to reach facts on other tables and joined those
+tables, but neither `check_where_clause_fan_traps` nor
+`check_where_clause_role_playing_path` was told — converting a loud binder error
+into a silent 2× (EXP-27) and a silent wrong-role binding (EXP-31). PARSE-7 made
+escape strings first-class in the scanners without teaching `scan_chains` that a
+chain abutting a quote is a literal introducer (PARSE-12). In each case the fix
+was correct and the fence was correct; only the pairing was missed, and a
+one-paragraph enumeration in the PR would have caught it more cheaply than the
+review round that did.
+
 **A deliberately-degraded interim state needs a TECH-DEBT entry in the same
 change.** Sometimes the right call is to ship a partial behaviour and finish it
 later — removing an inference pass before its replacement lands, accepting a
