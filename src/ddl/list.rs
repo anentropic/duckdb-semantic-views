@@ -71,9 +71,17 @@ use crate::model::SemanticViewDefinition;
 /// Under the per-call connection model that probe can't be done at LOAD
 /// time anymore (the per-call conn doesn't exist yet). We probe inline
 /// here on every bind: cheap (single `information_schema.tables` lookup)
-/// and correct against schema drift mid-session. The probe runs on the
-/// same per-call connection so it shares the caller's catalog/search-path
-/// view (matches the Phase 63 read-only short-circuit behavior).
+/// and correct against schema drift mid-session.
+///
+/// The probe runs on the same per-call connection the subsequent catalog
+/// read uses, so probe and read agree with each other. It does **not**
+/// share the caller's catalog / search-path view — that connection is a
+/// fresh `Connection(*context.db)` on the primary catalog with its own
+/// transaction, which is the whole premise of TECH-DEBT #19 (reads see
+/// committed state and the primary catalog; unqualified names are resolved
+/// by the `search_path` argument the parser override injects, not by this
+/// connection's own session state). This comment claimed the opposite until
+/// the 2026-08-08 review.
 #[cfg(feature = "extension")]
 #[no_mangle]
 pub unsafe extern "C" fn sv_list_semantic_views_bind_rust(
