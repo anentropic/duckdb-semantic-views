@@ -317,6 +317,87 @@ fn exp29_dims_only_distinct_on_a_child_dimension_has_no_phantom_null() {
     assert_eq!(rows, vec![Some(2), Some(3)], "SQL:\n{sql}");
 }
 
+// ---------------------------------------------------------------------------
+// Direction control: a member ABOVE the base is an attribute, not a grain.
+//
+// The same LEFT JOIN NULL-extends a base row whose foreign key is NULL or
+// dangling — but that row is a genuine row of the view whose parent attribute is
+// simply unknown, so filtering it would DELETE data.
+// `multi_hop_join_proptest` catches an over-eager filter here immediately; these
+// pin it at the unit level too.
+// ---------------------------------------------------------------------------
+
+/// Base `li` (the child) with parent `o` — the direction reversed.
+fn parent_def() -> SemanticViewDefinition {
+    let mut def = child_def();
+    def.tables.reverse(); // `li` becomes the base table
+    def.dimensions.clear();
+    def.with_dimension("region", "o.region", Some("o"))
+        .with_fact("orate", "o.rate", "o")
+}
+
+/// `li` row 2 is an ORPHAN: its `order_id` is NULL, so the LEFT JOIN up to `o`
+/// NULL-extends it.
+fn orphan_db() -> duckdb::Connection {
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+    conn.execute_batch(
+        "CREATE TABLE o (id INTEGER, region VARCHAR, rate INTEGER); \
+         CREATE TABLE li (id INTEGER, order_id INTEGER, qty INTEGER); \
+         INSERT INTO o VALUES (1,'E',10); \
+         INSERT INTO li VALUES (1,1,2),(2,NULL,7);",
+    )
+    .expect("load fixture");
+    conn
+}
+
+#[test]
+fn dims_only_distinct_on_a_parent_dimension_keeps_the_unmatched_base_row() {
+    let def = parent_def();
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![DimensionName::new("region")],
+        metrics: vec![],
+    };
+    let sql = expand("v", &def, &req).unwrap();
+    let conn = orphan_db();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT region FROM ({sql}) q ORDER BY 1 NULLS LAST"
+        ))
+        .unwrap_or_else(|e| panic!("prepare failed: {e}\nSQL:\n{sql}"));
+    let rows: Vec<Option<String>> = stmt
+        .query_map([], |r| r.get::<_, Option<String>>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows, vec![Some("E".to_string()), None], "SQL:\n{sql}");
+}
+
+#[test]
+fn facts_query_on_a_parent_fact_keeps_the_unmatched_base_row() {
+    let def = parent_def();
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![FactName::new("orate")],
+        dimensions: vec![],
+        metrics: vec![],
+    };
+    let sql = expand("v", &def, &req).unwrap();
+    let conn = orphan_db();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT orate FROM ({sql}) q ORDER BY 1 NULLS LAST"
+        ))
+        .unwrap_or_else(|e| panic!("prepare failed: {e}\nSQL:\n{sql}"));
+    let rows: Vec<Option<i64>> = stmt
+        .query_map([], |r| r.get::<_, Option<i64>>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows, vec![Some(10), None], "SQL:\n{sql}");
+}
+
 /// A dimensions-only DISTINCT that mixes a base dimension with a child one is
 /// NOT filtered: the base row is a legitimate member of the result even without
 /// a child, and the queried members no longer live on one non-base table.

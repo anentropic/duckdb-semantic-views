@@ -196,14 +196,26 @@ fn resolve_names<'a, T: Resolvable, N: AsRef<str>>(
 ///
 /// `member_tables` are the `source_table`s of the queried members (`None` means
 /// the base table, which is never NULL-extended). The guard applies only when
-/// they all name ONE non-base table with a declared PRIMARY KEY: that is the
-/// query's grain, and filtering to its real rows is exactly "anchor at the
-/// common grain table, joining up for the rest" — which stays fan-free because
-/// the walk from a child to its parents is many-to-one. When the members span
-/// several tables the natural grain is ambiguous (a base member legitimately
-/// keeps its row even with no child), and when the table declares no PRIMARY
-/// KEY there is no column that distinguishes a phantom; both keep today's
-/// behaviour. See TECH-DEBT #58.
+/// they all name ONE table that is **below** the base — reached by following
+/// foreign keys INTO the base, so it sits at a finer grain — and that table
+/// declares a PRIMARY KEY. That table is then the query's grain, and filtering
+/// to its real rows is exactly "anchor at the common grain table, joining up
+/// for the rest", which stays fan-free because the walk from a child to its
+/// parents is many-to-one.
+///
+/// The direction is load-bearing. A member on a table ABOVE the base (a parent,
+/// reached by the base's own foreign key) is an ATTRIBUTE of each base row: a
+/// base row whose foreign key is NULL or dangling is still a row of the view,
+/// and its NULL attribute is part of the answer, not a join artifact. Filtering
+/// there would delete real rows — `multi_hop_join_proptest` catches it
+/// immediately. Below the base the situation is reversed: the base row has no
+/// counterpart at the finer grain at all, so the NULL-extended row is
+/// manufactured.
+///
+/// When the members span several tables the natural grain is ambiguous (a base
+/// member legitimately keeps its row even with no child), and when the table
+/// declares no PRIMARY KEY there is no column that distinguishes a phantom;
+/// both keep today's behaviour. See TECH-DEBT #58.
 fn phantom_row_filter(
     def: &SemanticViewDefinition,
     member_tables: &[Option<String>],
@@ -221,7 +233,7 @@ fn phantom_row_filter(
         }
     }
     let alias = grain?;
-    if alias == base {
+    if alias == base || !reaches_base_by_foreign_key(def, &alias, &base) {
         return None;
     }
     let pk = def
@@ -235,6 +247,33 @@ fn phantom_row_filter(
         quote_ident(&alias),
         quote_ident(pk)
     ))
+}
+
+/// Whether `alias` sits BELOW `base` in the relationship graph — i.e. following
+/// its declared foreign keys upwards (`from_alias` -> `table`, the referencing
+/// side to the referenced side) reaches the base table.
+///
+/// Breadth-first with a visited set, so a diamond costs no more than a chain and
+/// a mis-declared cycle terminates instead of looping.
+fn reaches_base_by_foreign_key(def: &SemanticViewDefinition, alias: &str, base: &str) -> bool {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::from([alias.to_ascii_lowercase()]);
+    while let Some(current) = queue.pop_front() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        for join in &def.joins {
+            if join.from_alias.to_ascii_lowercase() != current {
+                continue;
+            }
+            let referenced = join.table.to_ascii_lowercase();
+            if referenced == base {
+                return true;
+            }
+            queue.push_back(referenced);
+        }
+    }
+    false
 }
 
 /// `AND` the phantom-row guard onto the query's own predicate.

@@ -405,10 +405,18 @@ fn test_child_count_of_a_doubly_parenthesized_constant_is_guarded_by_the_pk() {
     );
 }
 
-// The control that keeps the stripping honest: a non-pair `(`...`)` must stay
-// unguarded rather than be peeled into nonsense and misread as constant.
+// The control that keeps the stripping honest: a non-pair `(`...`)` must not be
+// peeled into nonsense and misread as constant.
+//
+// Since EXP-25 the guard no longer decides by argument shape — every aggregate
+// argument is wrapped — so the classification is only load-bearing where the
+// guard is IMPOSSIBLE: with no PRIMARY KEY on the joined table, a
+// constant-argument aggregate must error while a row-dependent one must still
+// answer. Both halves are asserted here so the paren-peeling stays covered.
 #[test]
-fn test_child_sum_of_a_non_constant_paren_expression_is_left_alone() {
+fn test_a_non_constant_paren_expression_is_not_misread_as_constant() {
+    // With a PK, the argument is guarded whatever it is (the neutrality of that
+    // wrap on real rows is pinned numerically in `tests_phantom_row_guard`).
     let sql = expand(
         "orders",
         &constant_arg_def("SUM((\"li\".\"qty\") + (1))"),
@@ -416,8 +424,38 @@ fn test_child_sum_of_a_non_constant_paren_expression_is_left_alone() {
     )
     .unwrap();
     assert!(
-        !sql.contains("CASE WHEN \"li\".\"id\" IS NOT NULL"),
-        "an expression reading a real column is row-dependent and must not be guarded: {sql}"
+        sql.contains("SUM(CASE WHEN \"li\".\"id\" IS NOT NULL THEN (\"li\".\"qty\") + (1) END)"),
+        "every aggregate argument is guarded once a PK exists: {sql}"
+    );
+
+    // Without a PK there is nothing to guard with. `(x) + (1)` reads a real
+    // column, so the phantom row is already excluded by its own NULL and the
+    // query must still answer — peeling the non-pair parens would have
+    // classified it as the constant `qty") + (1` and failed it loudly.
+    let no_pk = |expr: &str| {
+        orders_view()
+            .clear_dimensions()
+            .clear_metrics()
+            .with_table("li", "line_items", &[]) // no PK declared
+            .with_metric("item_count", expr, Some("li"))
+            .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"])
+    };
+    let sql = expand(
+        "orders",
+        &no_pk("SUM((\"li\".\"qty\") + (1))"),
+        &count_req(),
+    )
+    .expect("a row-dependent argument needs no PK");
+    assert!(
+        !sql.contains("CASE WHEN"),
+        "there is no PK to guard with: {sql}"
+    );
+    // …while the genuinely parenthesized constant still trips the no-PK error.
+    let err = expand("orders", &no_pk("SUM(( ( 1 ) ))"), &count_req())
+        .expect_err("a constant argument with no PK is unguardable");
+    assert!(
+        matches!(err, ExpandError::CountStarRequiresPrimaryKey { .. }),
+        "expected CountStarRequiresPrimaryKey, got: {err:?}"
     );
 }
 
@@ -445,8 +483,10 @@ fn test_child_count_one_without_a_pk_errors() {
     );
 }
 
-// Controls: the guard must fire on the constant-argument-on-a-joined-table
-// shape only. Each of these would break if the rewrite were applied bluntly.
+// Controls: the guard must fire on a JOINED table only, and never on the base
+// table. Before EXP-25 it also had to fire on constant arguments only; that
+// half is gone — the wrap is neutral on real rows for ANY argument, and
+// restricting it by argument shape is exactly what leaked four ways.
 
 #[test]
 fn test_base_table_count_one_unchanged() {
@@ -469,24 +509,29 @@ fn test_base_table_count_one_unchanged() {
 }
 
 #[test]
-fn test_child_count_of_a_column_unchanged() {
-    // A column argument is already NULL on a NULL-extended row — the
-    // aggregate excludes it unaided, and wrapping would be noise.
+fn test_child_count_of_a_column_is_guarded_too() {
+    // A column argument is already NULL on a NULL-extended row, so the guard
+    // changes nothing here — which is the point: EXP-26 showed that deciding
+    // guard-or-not by inspecting the argument is what lets
+    // `SUM(COALESCE(li.qty, 99))` through, and "already NULL" is a property of
+    // the column, not of every expression built from it.
     let sql = expand("orders", &constant_arg_def("COUNT(li.sku)"), &count_req()).unwrap();
     assert!(
-        sql.contains("COUNT(li.sku)") && !sql.contains("CASE WHEN"),
-        "a column argument needs no guard: {sql}"
+        sql.contains("COUNT(CASE WHEN \"li\".\"id\" IS NOT NULL THEN li.sku END)"),
+        "a column argument is guarded like any other: {sql}"
     );
 }
 
 #[test]
-fn test_child_min_of_a_constant_unchanged() {
-    // MIN/MAX/AVG over a constant are multiplicity-invariant, so they are
-    // deliberately outside the rewrite's list — keeping it to the aggregates
-    // where duplicate rows actually change the number.
+fn test_child_min_of_a_constant_is_guarded_by_the_pk() {
+    // EXP-25: MIN/MAX/AVG over a constant ARE multiplicity-invariant — and
+    // still wrong, because the phantom row is not a duplicate but a row that
+    // should not exist. `MIN(1)` on a childless parent returned 1 where the
+    // empty-group answer is NULL (pinned numerically in
+    // `tests_phantom_row_guard::exp25_min_constant_is_null_for_a_childless_parent`).
     let sql = expand("orders", &constant_arg_def("MIN(1)"), &count_req()).unwrap();
     assert!(
-        !sql.contains("CASE WHEN"),
-        "MIN(<constant>) is unaffected by row multiplicity: {sql}"
+        sql.contains("MIN(CASE WHEN \"li\".\"id\" IS NOT NULL THEN 1 END)"),
+        "MIN over a constant needs the existence guard: {sql}"
     );
 }
