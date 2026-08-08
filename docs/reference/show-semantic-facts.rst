@@ -148,7 +148,7 @@ Given a semantic view ``orders_sv`` with one fact:
    │ memory        │ main        │ orders_sv            │ orders     │ raw_amount │                │          │         │
    └───────────────┴─────────────┴──────────────────────┴────────────┴────────────┴────────────────┴──────────┴─────────┘
 
-The ``data_type`` column reports the declared output type only. A fact created through SQL DDL has none -- v0.10.0 removed the CREATE-time ``typeof`` pass and the read side does not probe -- so the column is empty. It is populated for a fact whose :ref:`YAML <ref-yaml-format>` definition sets ``output_type``.
+The ``data_type`` column reports the declared output type only, and no surface declares one: v0.10.0 removed the CREATE-time ``typeof`` pass, the read side does not probe, and the :ref:`YAML <ref-yaml-format>` ``output_type`` field was withdrawn because ``GET_DDL`` could not carry it. The column is empty for every newly created view, and populated only for views stored before that change -- see TECH-DEBT #51.
 
 **List facts across all views:**
 

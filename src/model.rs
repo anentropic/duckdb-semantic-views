@@ -744,6 +744,54 @@ fn validate_yaml_joins(def: &SemanticViewDefinition) -> Result<(), String> {
 /// the rest of a member's payload. Comments, synonyms and `output_type` were
 /// probed with quotes, newlines, parens and empty values, and all round-trip,
 /// so none of them is checked here.
+/// What EVERY free-form SQL slot must satisfy — a member expression, a window
+/// function's extra argument, a window frame clause.
+///
+/// Two rules, both of them about what the RENDERER can carry. Unlike an
+/// identifier a free expression cannot be quote-protected on the way out: it is
+/// emitted verbatim, so whatever structure it carries is structure the clause
+/// parser will read.
+///
+/// 1. `column_roundtrips_verbatim` — balanced quotes and brackets that never
+///    dip negative (an unbalanced `)` closes the enclosing clause early), no
+///    depth-0 comma (which would split one member or argument into two), and no
+///    surrounding whitespace (which the parser trims, silently storing a
+///    different string than the one given).
+/// 2. No SQL comment marker (RT-8, code-review 2026-08-08). This is the rule
+///    `slot_common` has always applied to identifier slots and that
+///    `member_expr` was missing: `column_roundtrips_verbatim` has no comment
+///    awareness (`crate::body_parser::scan` documents that itself), so
+///    `o.a -- x` passed. The front door blanks comments BEFORE parsing, so on
+///    replay everything from the `--` to end-of-line disappeared — including
+///    the comma separating the member from the next one. Executed at 57e38fd:
+///    two dimensions came back as ONE, the second's definition absorbed into
+///    the first's expression, with no error anywhere.
+///
+/// Block comments are refused on the same rule rather than a narrower one.
+/// `/* x */` inside a single member does not move a member boundary, but
+/// blanking still replaces it with spaces, so the replayed expression is a
+/// different string — drift, just quieter. `blank_sql_comments` is string- and
+/// dollar-quote-aware, so a `--` inside a literal is not a comment and is not
+/// refused (pinned by a control test).
+fn free_expr_common(kind: &str, what: &str, expr: &str) -> Result<(), String> {
+    if !crate::body_parser::column_roundtrips_verbatim(expr) {
+        return Err(format!(
+            "{kind} {what} the DDL grammar cannot carry ('{expr}'); an expression \
+             must have balanced quotes and brackets, no top-level comma, and no \
+             surrounding whitespace"
+        ));
+    }
+    if crate::util::blank_sql_comments(expr) != expr {
+        return Err(format!(
+            "{kind} {what} containing a SQL comment marker ('{expr}'); comments are \
+             blanked before the DDL body is parsed, so a comment inside an \
+             expression silently deletes the rest of the line — including the \
+             comma that ends the entry"
+        ));
+    }
+    Ok(())
+}
+
 fn member_expr(kind: &str, name: &str, expr: &str) -> Result<(), String> {
     if expr.trim().is_empty() {
         return Err(format!(
@@ -764,20 +812,130 @@ fn member_expr(kind: &str, name: &str, expr: &str) -> Result<(), String> {
     // shape the fuzzer found, `AS )   P ; rip`), no depth-0 comma (which would
     // split one member into two), and no surrounding whitespace (which the
     // parser trims, silently storing a different expression than the one given).
-    if !crate::body_parser::column_roundtrips_verbatim(expr) {
+    free_expr_common(kind, &format!("'{name}' has an expression"), expr)
+}
+
+/// `output_type` has NO DDL surface: no clause declares it and
+/// [`crate::render_ddl`] has no emit site for it, so `GET_DDL` drops it
+/// silently and the replayed view loses the `CAST(expr AS <type>)` the field
+/// asks for (`expand/materialization.rs`, `expand/per_grain.rs`,
+/// `expand/sql_gen.rs`, `expand/window.rs`, `expand/semi_additive.rs`) along
+/// with the `data_type` every SHOW / DESCRIBE surface reports from it.
+///
+/// RT-7 (code-review 2026-08-08). Rejecting is the honest answer, and the
+/// alternative was MEASURED rather than assumed: rendering the field as
+/// `CAST(expr AS T)` inside the expression would ALSO change what referencing
+/// members compute, because `expand::facts::inline_facts` and
+/// `inline_derived_metrics` splice a member's RAW `expr` into its referrers and
+/// never apply the cast (pinned by
+/// `tests/yaml_proptest.rs::output_type_is_not_applied_when_a_member_is_inlined`).
+/// So `CAST`-rendering would silently change numbers for every referrer — and
+/// it would still not restore `output_type`, leaving this contract false.
+///
+/// Existing stored definitions are unaffected: they load through `from_json`,
+/// which does not run this validator. Only new YAML ingest is refused, and the
+/// message names the workaround that is exactly equivalent for the member
+/// itself.
+fn reject_output_type(kind: &str, name: &str, output_type: Option<&str>) -> Result<(), String> {
+    if let Some(t) = output_type {
         return Err(format!(
-            "{kind} '{name}' has an expression the DDL grammar cannot carry \
-             ('{expr}'); an expression must have balanced quotes and brackets, \
-             no top-level comma, and no surrounding whitespace"
+            "{kind} '{name}' declares output_type '{t}', which no DDL clause can \
+             express — GET_DDL would drop it and the restored view would lose the \
+             cast. Write the cast into the expression instead \
+             (expr: CAST(<expr> AS {t}))"
         ));
     }
     Ok(())
+}
+
+/// A `WindowSpec` is emitted RAW, field by field, by
+/// `render_ddl::emit_window_expr`, and re-read by the OVER-clause parser. That
+/// makes every one of its fields an RT-6 slot, and MODEL-1's model-changing
+/// repro lived in the least identifier-like of them: a `frame_clause` of
+/// `'ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) , junk AS ('` rendered DDL that
+/// replayed to THREE metrics — one injected out of a frame-clause string.
+///
+/// Two layers, deliberately:
+///
+/// 1. Per-slot rules the round-trip cannot see. Comment markers survive a
+///    render → parse round trip untouched (the parser does not blank comments;
+///    the front door does, upstream), so they must be refused by name. The
+///    identifier slots additionally get their usual emptiness / single-token
+///    checks, which produce a message naming the offending value.
+/// 2. The round trip itself: render the spec and re-parse it with the REAL
+///    OVER-clause parser, then require the result to equal what was stored.
+///    This is what makes the check complete rather than a growing list of
+///    hazards — a partition dimension named `rows`, an extra argument carrying
+///    a depth-0 comma and the frame-clause injection above are all caught by
+///    the same comparison, and anything that genuinely round-trips is accepted.
+fn validate_window_spec(metric_name: &str, ws: &WindowSpec) -> Result<(), String> {
+    let kind = "metric";
+    slot_qualified(
+        kind,
+        &format!("'{metric_name}' window function"),
+        &ws.window_function,
+    )?;
+    slot_reference(
+        kind,
+        &format!("'{metric_name}' window inner metric"),
+        &ws.inner_metric,
+    )?;
+    for arg in &ws.extra_args {
+        free_expr_common(kind, &format!("'{metric_name}' has a window argument"), arg)?;
+    }
+    for dim in ws.excluding_dims.iter().chain(&ws.partition_dims) {
+        slot_reference(
+            kind,
+            &format!("'{metric_name}' window PARTITION BY dimension"),
+            dim,
+        )?;
+    }
+    for ob in &ws.order_by {
+        slot_reference(
+            kind,
+            &format!("'{metric_name}' window ORDER BY dimension"),
+            &ob.expr,
+        )?;
+    }
+    if let Some(ref frame) = ws.frame_clause {
+        free_expr_common(
+            kind,
+            &format!("'{metric_name}' has a window frame clause"),
+            frame,
+        )?;
+    }
+
+    let rendered = crate::render_ddl::render_window_spec(ws);
+    let replayed = crate::body_parser::reparse_window_expr(&rendered).map_err(|e| {
+        format!(
+            "metric '{metric_name}' has a window specification the DDL grammar \
+             cannot carry: rendered as '{rendered}', which does not parse back ({})",
+            e.message
+        )
+    })?;
+    if replayed.as_ref() == Some(ws) {
+        Ok(())
+    } else {
+        // Both specs go in the message. The rejections this fires on are
+        // subtle by nature — a `frame_clause` that escapes its parentheses, a
+        // partition dimension named `rows` that reads back as a frame — and
+        // "reads back as something different" without saying *what* leaves the
+        // author diffing two invisible values. `{:?}` on both is verbose but it
+        // is the only thing that makes a whitespace or keyword-boundary case
+        // diagnosable from the error alone.
+        Err(format!(
+            "metric '{metric_name}' has a window specification that does not \
+             round-trip: it renders as '{rendered}', which reads back as a \
+             DIFFERENT window specification.\n  stored:   {ws:?}\n  re-parsed: {replayed:?}"
+        ))
+    }
 }
 
 fn validate_yaml_members(def: &SemanticViewDefinition) -> Result<(), String> {
     for d in &def.dimensions {
         slot_single("dimension", "name", &d.name)?;
         member_expr("dimension", &d.name, &d.expr)?;
+        reject_output_type("dimension", &d.name, d.output_type.as_deref())?;
         let Some(src) = d.source_table.as_deref() else {
             return Err(format!(
                 "dimension '{}' has no source_table; a dimension must name its table \
@@ -790,6 +948,7 @@ fn validate_yaml_members(def: &SemanticViewDefinition) -> Result<(), String> {
     for f in &def.facts {
         slot_single("fact", "name", &f.name)?;
         member_expr("fact", &f.name, &f.expr)?;
+        reject_output_type("fact", &f.name, f.output_type.as_deref())?;
         let Some(src) = f.source_table.as_deref() else {
             return Err(format!(
                 "fact '{}' has no source_table; a fact must name its table \
@@ -802,6 +961,10 @@ fn validate_yaml_members(def: &SemanticViewDefinition) -> Result<(), String> {
     for m in &def.metrics {
         slot_single("metric", "name", &m.name)?;
         member_expr("metric", &m.name, &m.expr)?;
+        reject_output_type("metric", &m.name, m.output_type.as_deref())?;
+        if let Some(ref ws) = m.window_spec {
+            validate_window_spec(&m.name, ws)?;
+        }
         if let Some(src) = m.source_table.as_deref() {
             slot_single("metric", "source_table", src)?;
         } else {
@@ -848,6 +1011,18 @@ fn validate_yaml_materializations(def: &SemanticViewDefinition) -> Result<(), St
         }
         for m in &mat.metrics {
             slot_reference("materialization", "metric reference", m)?;
+        }
+        // MODEL-1: `parse_materializations_clause` requires at least one of the
+        // two sub-clauses, and renders nothing for an empty list — so a
+        // materialization with neither renders `MATERIALIZATIONS ( m AS TABLE t
+        // )`, which its own parser refuses. Kept here rather than in
+        // `cross_refs` because it is a clause-STRUCTURE rule (the parser
+        // enforces it while reading one entry, not by resolving names).
+        if mat.dimensions.is_empty() && mat.metrics.is_empty() {
+            return Err(format!(
+                "Materialization '{}': must specify at least one of DIMENSIONS or METRICS.",
+                mat.name
+            ));
         }
     }
     Ok(())
@@ -911,7 +1086,18 @@ pub fn validate_ddl_representable(def: &SemanticViewDefinition) -> Result<(), St
     validate_yaml_tables(def)?;
     validate_yaml_joins(def)?;
     validate_yaml_members(def)?;
-    validate_yaml_materializations(def)
+    validate_yaml_materializations(def)?;
+    // MODEL-1 (code-review 2026-08-08): the semantic cross-reference checks —
+    // NON ADDITIVE BY, a window metric's dimensions and inner metric,
+    // materialization names and references — lived only in
+    // `parse_keyword_body`, so YAML skipped every one of them. They are the
+    // same function now, so a definition that imports is one whose GET_DDL its
+    // own parser accepts.
+    crate::body_parser::cross_refs::validate_cross_references(
+        &def.dimensions,
+        &def.metrics,
+        &def.materializations,
+    )
 }
 
 #[cfg(test)]
@@ -1185,16 +1371,25 @@ mod tests {
     #[test]
     fn yaml_member_payloads_that_do_round_trip_still_import() {
         // Control for the three above: the renderer handles quotes, newlines
-        // and parens in comments / synonyms / types, so none of those may be
-        // swept up by an over-broad "payload must be tame" rule.
+        // and parens in comments and synonyms, so neither may be swept up by an
+        // over-broad "payload must be tame" rule.
+        //
+        // `output_type: 'DECIMAL(10, 2)'` used to be asserted here too, under a
+        // comment claiming types "round-trip". They never did — RT-7
+        // (code-review 2026-08-08) found that `render_ddl` has no emit site for
+        // the field at all, so `GET_DDL` DROPS it and the replayed view loses
+        // its casts. The probe behind the old assertion had checked that the
+        // value survives YAML import, not that it survives the round trip, so a
+        // passing test read as coverage of something it never touched. The
+        // field is now refused at import (`reject_output_type`); the three
+        // `yaml_output_type_on_a_*_is_rejected` tests own that behaviour.
         let yaml = "tables:\n  - alias: o\n    table: orders\n    pk_columns: [id]\n\
                     dimensions: []\n\
                     metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n\
                     \x20   comment: \"it's a metric\"\n\
-                    \x20   synonyms: [\"a)\", \"it's\"]\n\
-                    \x20   output_type: 'DECIMAL(10, 2)'\n";
+                    \x20   synonyms: [\"a)\", \"it's\"]\n";
         SemanticViewDefinition::from_yaml_with_size_cap("v", yaml)
-            .expect("comments, synonyms and types with punctuation all round-trip");
+            .expect("comments and synonyms with punctuation all round-trip");
     }
 
     #[test]
@@ -1314,6 +1509,344 @@ mod tests {
                     metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n";
         SemanticViewDefinition::from_yaml_with_size_cap("v", yaml)
             .expect("a well-formed quoted identifier is a legal slot value");
+    }
+
+    // -----------------------------------------------------------------------
+    // Code review 2026-08-08 §6 — the YAML-ingress class RT-5/RT-6 did not
+    // reach. RT-5/RT-6 enumerated identifier SLOTS; every shape below sits in
+    // a field that is not a slot. Each was executed at 57e38fd: it passed the
+    // full YAML gate, and replaying its own `GET_DDL` through the front door
+    // then produced a DIFFERENT model, or none at all.
+    // -----------------------------------------------------------------------
+
+    // --- RT-8: comment markers in a free-form member expression ---
+    //
+    // `member_expr` checked `column_roundtrips_verbatim`, which has no comment
+    // awareness (`model.rs` documents that itself), while `slot_common` — the
+    // rule for every identifier slot — rejects comment markers outright. So a
+    // `--` in a YAML expression passed, and the front door, which blanks
+    // comments BEFORE parsing, then blanked from the `--` through the comma
+    // that separates one member from the next: two dimensions came back as
+    // ONE, with the second's definition absorbed into the first's expression.
+    // Silent model corruption through the documented dump/restore path.
+
+    #[test]
+    fn yaml_dimension_expression_with_a_line_comment_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d1\n    expr: 'o.a -- x'\n    source_table: o\n  \
+             - name: d2\n    expr: o.b\n    source_table: o\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(
+            e.contains("d1") && e.contains("comment"),
+            "the error must name the member and say a comment marker is the problem: {e}"
+        );
+    }
+
+    #[test]
+    fn yaml_metric_expression_with_a_line_comment_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: total\n    expr: 'sum(o.amount) -- oops'\n    source_table: o\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(
+            e.contains("total") && e.contains("comment"),
+            "the error must name the metric and the comment marker: {e}"
+        );
+    }
+
+    #[test]
+    fn yaml_fact_expression_with_a_block_comment_is_rejected() {
+        // Block comments are refused on the same rule rather than a narrower
+        // one: `blank_sql_comments` replaces them with spaces, so the replayed
+        // expression is a DIFFERENT string even when no member boundary moves.
+        let yaml = format!(
+            "{VALID_TABLES}facts:\n  - name: net\n    expr: 'o.a /* x */ * 2'\n    source_table: o\n\
+             dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(
+            e.contains("net") && e.contains("comment"),
+            "the error must name the fact and the comment marker: {e}"
+        );
+    }
+
+    #[test]
+    fn yaml_expression_with_a_double_dash_inside_a_string_literal_still_imports() {
+        // Control for the three above. `blank_sql_comments` is string-aware, so
+        // a `--` inside a literal is not a comment and the expression survives
+        // the front door unchanged. A rule that rejected it would refuse valid
+        // SQL for no round-trip gain.
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: \"o.a || '--'\"\n    source_table: o\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n"
+        );
+        SemanticViewDefinition::from_yaml_with_size_cap("v", &yaml)
+            .expect("a double dash inside a string literal is not a comment");
+    }
+
+    // --- MODEL-1: semantic cross-references ---
+    //
+    // These checks lived ONLY in `parse_keyword_body`, so the YAML path never
+    // ran them. Each definition below is YAML-valid and renders `GET_DDL` that
+    // this project's own parser rejects.
+
+    #[test]
+    fn yaml_non_additive_by_naming_an_undeclared_dimension_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n\
+             \x20   non_additive_by:\n      - dimension: ghost\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("ghost"), "{e}");
+    }
+
+    #[test]
+    fn yaml_window_inner_metric_naming_an_undeclared_metric_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: base\n    expr: sum(o.amount)\n    source_table: o\n  \
+             - name: w\n    expr: AVG(ghost) OVER ()\n    source_table: o\n\
+             \x20   window_spec:\n      window_function: AVG\n      inner_metric: ghost\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("ghost"), "{e}");
+    }
+
+    #[test]
+    fn yaml_window_partition_dim_naming_an_undeclared_dimension_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: base\n    expr: sum(o.amount)\n    source_table: o\n  \
+             - name: w\n    expr: AVG(base) OVER (PARTITION BY ghost)\n    source_table: o\n\
+             \x20   window_spec:\n      window_function: AVG\n      inner_metric: base\n\
+             \x20     partition_dims: [ghost]\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("ghost"), "{e}");
+    }
+
+    #[test]
+    fn yaml_window_order_by_naming_an_undeclared_dimension_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: base\n    expr: sum(o.amount)\n    source_table: o\n  \
+             - name: w\n    expr: AVG(base) OVER (ORDER BY ghost)\n    source_table: o\n\
+             \x20   window_spec:\n      window_function: AVG\n      inner_metric: base\n\
+             \x20     order_by:\n        - expr: ghost\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("ghost"), "{e}");
+    }
+
+    #[test]
+    fn yaml_materialization_naming_an_undeclared_dimension_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n\
+             materializations:\n  - name: m\n    table: mt\n    dimensions: [ghost]\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("ghost"), "{e}");
+    }
+
+    #[test]
+    fn yaml_materialization_naming_an_undeclared_metric_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n\
+             materializations:\n  - name: m\n    table: mt\n    metrics: [ghost]\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("ghost"), "{e}");
+    }
+
+    #[test]
+    fn yaml_duplicate_materialization_names_are_rejected() {
+        // Case-folded: `m1` and `M1` are one name to the parser, which refuses
+        // the pair. `graph/names.rs` folds MEMBER names the same way; the
+        // materialization-name gap is this one.
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n\
+             materializations:\n  - name: m1\n    table: mt\n    metrics: [total]\n  \
+             - name: M1\n    table: mt2\n    metrics: [total]\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(
+            e.to_ascii_lowercase().contains("duplicate"),
+            "the error must say the names collide: {e}"
+        );
+    }
+
+    #[test]
+    fn yaml_materialization_with_no_members_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n\
+             materializations:\n  - name: m\n    table: mt\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(
+            e.contains("DIMENSIONS") && e.contains("METRICS"),
+            "the error must name the required sub-clauses: {e}"
+        );
+    }
+
+    // --- MODEL-1, syntactic half: the whole `WindowSpec` payload is emitted
+    // RAW by `emit_window_expr`, so it is the RT-6 slot class, not the
+    // cross-reference class TECH-DEBT #60 consciously deferred.
+
+    #[test]
+    fn yaml_window_frame_clause_that_escapes_its_parens_is_rejected() {
+        // The model-CHANGING one. Rendered, this frame clause closes the OVER
+        // parenthesis and opens a new METRICS entry: replay parsed THREE
+        // metrics where the definition declared two — a metric injected out of
+        // a frame-clause string.
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: base\n    expr: sum(o.amount)\n    source_table: o\n  \
+             - name: w\n    expr: AVG(base) OVER ()\n    source_table: o\n\
+             \x20   window_spec:\n      window_function: AVG\n      inner_metric: base\n\
+             \x20     frame_clause: 'ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) , junk AS ('\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(
+            e.contains("'w'") && e.contains("junk"),
+            "the error must name the metric and quote the offending frame clause: {e}"
+        );
+    }
+
+    #[test]
+    fn yaml_window_frame_clause_with_a_comment_is_rejected() {
+        // Renders inside the OVER parens, where the front door's comment
+        // blanking erases it and everything after it on the line — including
+        // the `)` that closes OVER.
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: base\n    expr: sum(o.amount)\n    source_table: o\n  \
+             - name: w\n    expr: AVG(base) OVER ()\n    source_table: o\n\
+             \x20   window_spec:\n      window_function: AVG\n      inner_metric: base\n\
+             \x20     frame_clause: 'ROWS UNBOUNDED PRECEDING -- x'\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(
+            e.contains("'w'") && e.contains("comment"),
+            "the error must name the metric and the comment marker: {e}"
+        );
+    }
+
+    #[test]
+    fn yaml_window_partition_dim_named_like_a_frame_keyword_is_rejected() {
+        // Silent: `PARTITION BY rows` re-parses with an EMPTY dim list and
+        // `frame_clause: Some("rows")` — the partition key disappears and a
+        // frame appears, with no error anywhere.
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: rows\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: base\n    expr: sum(o.amount)\n    source_table: o\n  \
+             - name: w\n    expr: AVG(base) OVER (PARTITION BY rows)\n    source_table: o\n\
+             \x20   window_spec:\n      window_function: AVG\n      inner_metric: base\n\
+             \x20     partition_dims: [rows]\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(
+            e.contains("'w'") && e.contains("round-trip"),
+            "the error must name the metric and say the spec does not round-trip: {e}"
+        );
+    }
+
+    #[test]
+    fn yaml_window_extra_arg_with_a_top_level_comma_is_rejected() {
+        // `extra_args` are joined with `, ` inside the function-call parens, so
+        // one argument carrying a depth-0 comma comes back as two.
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: base\n    expr: sum(o.amount)\n    source_table: o\n  \
+             - name: w\n    expr: LAG(base, 1) OVER ()\n    source_table: o\n\
+             \x20   window_spec:\n      window_function: LAG\n      inner_metric: base\n\
+             \x20     extra_args: ['1, 2']\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(
+            e.contains("'w'") && e.contains("1, 2"),
+            "the error must name the metric and the offending argument: {e}"
+        );
+    }
+
+    #[test]
+    fn yaml_window_function_that_is_not_an_identifier_is_rejected() {
+        // `window_function` is emitted verbatim immediately before the argument
+        // parens; anything that is not a plain identifier chain there re-reads
+        // as something else.
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: base\n    expr: sum(o.amount)\n    source_table: o\n  \
+             - name: w\n    expr: AVG(base) OVER ()\n    source_table: o\n\
+             \x20   window_spec:\n      window_function: '1 + AVG'\n      inner_metric: base\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("1 + AVG"), "{e}");
+    }
+
+    #[test]
+    fn yaml_valid_window_metric_still_imports() {
+        // Control for the six window rejections: an ordinary window metric —
+        // partition, order, frame, extra argument — must still import, or
+        // "validate the window spec" has degenerated into "refuse it".
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: base\n    expr: sum(o.amount)\n    source_table: o\n  \
+             - name: w\n    expr: x\n    source_table: o\n\
+             \x20   window_spec:\n      window_function: LAG\n      inner_metric: base\n\
+             \x20     extra_args: ['1']\n      partition_dims: [d]\n\
+             \x20     order_by:\n        - expr: d\n\
+             \x20     frame_clause: 'ROWS BETWEEN 1 PRECEDING AND CURRENT ROW'\n"
+        );
+        SemanticViewDefinition::from_yaml_with_size_cap("v", &yaml)
+            .expect("an ordinary window metric must import");
+    }
+
+    // --- RT-7: `output_type` has no DDL surface at all ---
+
+    #[test]
+    fn yaml_output_type_on_a_dimension_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             \x20   output_type: 'VARCHAR(10)'\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(
+            e.contains("output_type") && e.contains("CAST"),
+            "the error must name the field and point at the workaround: {e}"
+        );
+    }
+
+    #[test]
+    fn yaml_output_type_on_a_metric_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n\
+             \x20   output_type: DOUBLE\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("output_type") && e.contains("total"), "{e}");
+    }
+
+    #[test]
+    fn yaml_output_type_on_a_fact_is_rejected() {
+        let yaml = format!(
+            "{VALID_TABLES}facts:\n  - name: net\n    expr: o.a\n    source_table: o\n\
+             \x20   output_type: 'DECIMAL(10, 2)'\n\
+             dimensions:\n  - name: d\n    expr: o.d\n    source_table: o\n\
+             metrics:\n  - name: total\n    expr: sum(o.amount)\n    source_table: o\n"
+        );
+        let e = yaml_err(&yaml);
+        assert!(e.contains("output_type") && e.contains("net"), "{e}");
     }
 
     // --- AR-4: schema_version probe + incomplete-relationship detection ---

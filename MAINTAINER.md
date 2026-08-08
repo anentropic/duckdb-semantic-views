@@ -70,6 +70,7 @@ src/
 │   ├── lexer.rs cursor.rs scan.rs clause_bounds.rs   #   token layer, cursor, clause bounds
 │   ├── tables.rs relationships.rs metrics.rs entries.rs
 │   ├── annotations.rs window.rs materializations.rs
+│   ├── cross_refs.rs          #   semantic cross-reference checks shared by the DDL and YAML paths
 │   └── mod.rs
 ├── parse/                     # Statement-level DDL orchestration + parser_override FFI (write side)
 │   ├── ffi.rs                 #   FFI entry points: sv_parser_override_rust / sv_parse_function_rust

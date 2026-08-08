@@ -67,37 +67,21 @@ fn ci_crash_input_no_longer_breaks_the_fixpoint() {
     // shape. Making it explicit immediately showed the escape was live rather
     // than defensive — the body does NOT parse today.
     //
-    // What matters here is the invariant the CI crash was about: a
-    // round-tripped definition must never yield a metric with no name. Both
-    // outcomes satisfy it, and both are now pinned, so neither can change
-    // unobserved:
-    //
-    //   Ok  — every parsed metric carries a name (the original assertion).
-    //   Err — the parser refuses LOUDLY, and for the one reason we know of.
-    //         The metric here is named `PRIVATE`; `render_create_ddl`
-    //         quote-protects names on lexing grounds only, so it emits it bare
-    //         and the parser peels entry-initial `PRIVATE` as the access
-    //         modifier. That is review finding RT-9 (2026-08-08), still open:
-    //         the arm below is pinning a *known-degraded* state, not a
-    //         contract. When RT-9 is fixed this test flips to the Ok arm on
-    //         its own and this arm becomes dead — delete it then.
-    match parse_keyword_body(body0, 0) {
-        Ok(kb1) => {
-            for m in &kb1.metrics {
-                assert!(
-                    !m.name.trim().is_empty(),
-                    "parser produced a nameless metric: {kb1:#?}"
-                );
-            }
-        }
-        Err(e) => {
-            assert!(
-                e.message.contains("Missing metric name"),
-                "the only rejection we accept for this fixed body is RT-9's \
-                 bare-`PRIVATE`-metric-name one; any other parse failure means \
-                 this replay stopped exercising what it was written for.\n\
-                 got: {e:?}\nrendered body: {body0}"
-            );
-        }
+    // When TC-14 first made this explicit the body did NOT parse: the metric is
+    // named `PRIVATE`, the renderer emitted it bare, and the parser peeled it as
+    // the access modifier (review finding RT-9). That was pinned in an `Err` arm
+    // as a knowingly-degraded state. RT-9 was fixed in the same review round —
+    // `emit_member_name` now quote-protects an entry-initial name colliding with
+    // PRIVATE/PUBLIC — so the body parses again and the degraded arm is gone.
+    // The invariant the CI crash was about is asserted unconditionally: a
+    // round-tripped definition must never yield a metric with no name.
+    let kb1 = parse_keyword_body(body0, 0).unwrap_or_else(|e| {
+        panic!("rendered body must re-parse (RT-9 quote protection): {e:?}\nbody: {body0}")
+    });
+    for m in &kb1.metrics {
+        assert!(
+            !m.name.trim().is_empty(),
+            "parser produced a nameless metric: {kb1:#?}"
+        );
     }
 }
