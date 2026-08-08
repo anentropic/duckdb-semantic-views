@@ -817,6 +817,25 @@ fn generator_reaches_both_where_clause_branches() {
     // could be generated only in accepted queries and the fence stay untested.
     let mut parent_metric_fact_chain_pred = 0usize;
     let mut accepted_fact_chain_pred = 0usize;
+    // PBT-15 (code-review 2026-08-08): the two metrics this harness added for
+    // specific past defects. Nothing asserted they are ever SELECTED, let alone
+    // that they reach the numeric comparison — the counts below were all about
+    // the predicate. `differential_proptest` pins its equivalent
+    // (`references_chained_fact`); this file's own doctrine is to assert reach,
+    // not assume it.
+    //   `svf` — PAR-6: a child-grain metric whose expression reaches a fact on
+    //           the parent, with a compound fact expression that catches a
+    //           paren-losing splice.
+    //   `dsv` — EXP-24: a derived metric referencing its base by the
+    //           own-qualified spelling `t.sv`.
+    // Both are only worth anything on the ORACLED path, so each is counted
+    // twice: selected at all, and selected in a case the property actually
+    // compares against the oracle.
+    let mut svf_selected = 0usize;
+    let mut svf_oracled = 0usize;
+    let mut dsv_selected = 0usize;
+    let mut dsv_oracled = 0usize;
+    let mut svf_and_dsv_oracled = 0usize;
     let mut distinct: HashSet<String> = HashSet::new();
 
     for _ in 0..400 {
@@ -826,6 +845,27 @@ fn generator_reaches_both_where_clause_branches() {
             .current();
         let selects_parent_metric = case.sel_metrics.iter().any(|&i| METS[i] == "sw");
         let selects_child_dim = case.sel_dims.iter().any(|&i| DIMS[i] == "td");
+
+        // The two rejection branches of the property, mirrored: everything else
+        // falls through to the differential comparison.
+        let pred_touches_child = case.where_pred.as_ref().is_some_and(Pred::touches_child);
+        let oracled = !(selects_parent_metric && (selects_child_dim || pred_touches_child));
+        let has = |name: &str| case.sel_metrics.iter().any(|&i| METS[i] == name);
+        if has("svf") {
+            svf_selected += 1;
+            if oracled {
+                svf_oracled += 1;
+            }
+        }
+        if has("dsv") {
+            dsv_selected += 1;
+            if oracled {
+                dsv_oracled += 1;
+            }
+        }
+        if oracled && has("svf") && has("dsv") {
+            svf_and_dsv_oracled += 1;
+        }
         match &case.where_pred {
             None => without_pred += 1,
             Some(p) => {
@@ -893,6 +933,25 @@ fn generator_reaches_both_where_clause_branches() {
         "the fact-chain member only ever appeared in REJECTED cases, so the \
          non-fanning half -- that resolving it still produces the right number \
          -- is never oracled"
+    );
+    // PBT-15: the metric-selection half of the same guard.
+    assert!(
+        svf_selected > 0 && svf_oracled > 0,
+        "the PAR-6 cross-table metric `svf` never reached the numeric \
+         comparison (selected={svf_selected}, oracled={svf_oracled}); its \
+         parent-fact splice has no randomized coverage here"
+    );
+    assert!(
+        dsv_selected > 0 && dsv_oracled > 0,
+        "the EXP-24 derived metric `dsv` never reached the numeric comparison \
+         (selected={dsv_selected}, oracled={dsv_oracled}); the own-qualified \
+         derived-metric reference has no randomized coverage here"
+    );
+    assert!(
+        svf_and_dsv_oracled > 0,
+        "`svf` and `dsv` were never oracled in the SAME query, so the \
+         cross-table fact splice and the derived-metric substitution are never \
+         exercised against each other"
     );
     assert!(
         distinct.len() > 50,
