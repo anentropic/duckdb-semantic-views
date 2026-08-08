@@ -74,7 +74,7 @@ fn scope_name_parts(
 /// Build optional WHERE and LIMIT suffix for a SHOW rewrite.
 ///
 /// LIKE maps to `name ILIKE '<escaped>'` (case-insensitive).
-/// STARTS WITH maps to `name LIKE '<escaped>%'` (case-sensitive).
+/// STARTS WITH maps to `starts_with(name, '<escaped>')` (case-sensitive).
 /// IN SCHEMA maps to `lower(schema_name) = lower('<escaped>')`.
 /// IN DATABASE maps to `lower(database_name) = lower('<escaped>')`.
 /// All conditions combined with AND. LIMIT appended last.
@@ -97,6 +97,16 @@ fn scope_name_parts(
 /// It stays an equality rather than becoming `ILIKE`: `SqlLit::escape` only
 /// doubles single quotes, so a `%` or `_` in a schema name would turn into a
 /// wildcard.
+///
+/// IDENT-6: `STARTS WITH` takes the same treatment for the same reason. It used
+/// to emit `name LIKE '<escaped>%'`, which handed the user's prefix to the
+/// pattern matcher — `STARTS WITH 'a_b'` also matched `axb`, and
+/// `STARTS WITH '100%'` matched every name beginning `100`. Snowflake's
+/// `STARTS WITH` is a literal prefix, so the predicate is now `DuckDB`'s
+/// `starts_with(name, '<escaped>')` scalar function: no metacharacters, nothing
+/// to escape beyond the quote doubling `SqlLit` already does, and no `ESCAPE`
+/// clause whose escape character would itself need escaping. `LIKE` keeps its
+/// pattern semantics — there the wildcards are the point.
 pub(crate) fn build_filter_suffix(
     like_pattern: Option<&str>,
     starts_with: Option<&str>,
@@ -111,7 +121,7 @@ pub(crate) fn build_filter_suffix(
     }
     if let Some(prefix) = starts_with {
         let escaped = SqlLit::escape(prefix);
-        parts.push(format!("name LIKE '{escaped}%'"));
+        parts.push(format!("starts_with(name, '{escaped}')"));
     }
     if let Some(schema) = in_schema {
         parts.push(schema.predicate("schema_name", "current_schema"));
@@ -559,7 +569,7 @@ mod tests {
         );
         assert_eq!(
             build_filter_suffix(None, Some("O'Br"), None, None, None),
-            " WHERE name LIKE 'O''Br%'"
+            " WHERE starts_with(name, 'O''Br')"
         );
         assert_eq!(
             build_filter_suffix(
@@ -580,5 +590,74 @@ mod tests {
             " WHERE name ILIKE 'cust%' LIMIT 10"
         );
         assert_eq!(build_filter_suffix(None, None, None, None, None), "");
+    }
+
+    /// IDENT-6 (code-review 2026-08-08): `STARTS WITH` is a **literal** prefix
+    /// in Snowflake, but the predicate used to be `name LIKE '<prefix>%'` with
+    /// only `SqlLit`'s quote-doubling applied — so a `_` or `%` inside the
+    /// prefix reached `LIKE` as a wildcard. `STARTS WITH 'a_b'` matched `axb`.
+    ///
+    /// The fix routes the prefix through `starts_with(name, '<literal>')`, the
+    /// same "don't hand a user value to a pattern matcher" choice
+    /// [`build_filter_suffix`]'s doc records for IN SCHEMA (equality, not
+    /// `ILIKE`). Nothing else changes: `starts_with` is case-sensitive, which
+    /// is what the clause already promised.
+    #[test]
+    fn starts_with_prefix_is_literal_not_a_like_pattern() {
+        assert_eq!(
+            build_filter_suffix(None, Some("a_b"), None, None, None),
+            " WHERE starts_with(name, 'a_b')"
+        );
+        assert_eq!(
+            build_filter_suffix(None, Some("100%"), None, None, None),
+            " WHERE starts_with(name, '100%')"
+        );
+        // Quote escaping still happens exactly once.
+        assert_eq!(
+            build_filter_suffix(None, Some("O'Br"), None, None, None),
+            " WHERE starts_with(name, 'O''Br')"
+        );
+        // LIKE is untouched: it is a pattern slot by contract.
+        assert_eq!(
+            build_filter_suffix(Some("a_b"), None, None, None, None),
+            " WHERE name ILIKE 'a_b'"
+        );
+    }
+
+    /// The behavioural half of IDENT-6: the emitted predicate must actually
+    /// discriminate `a_b` from `axb` when `DuckDB` runs it. A unit test on the
+    /// predicate string alone cannot tell a correct escape from a
+    /// plausible-looking one, so this executes it.
+    #[test]
+    fn starts_with_discriminates_underscore_from_wildcard_in_duckdb() {
+        let conn = duckdb::Connection::open_in_memory().expect("in-memory DuckDB opens");
+        conn.execute_batch(
+            "CREATE TABLE t(name VARCHAR); \
+             INSERT INTO t VALUES ('a_b'), ('axb'), ('a_bc'), ('100%x'), ('1005x');",
+        )
+        .expect("fixture rows insert");
+
+        let matches = |prefix: &str| -> Vec<String> {
+            let suffix = build_filter_suffix(None, Some(prefix), None, None, None);
+            let sql = format!("SELECT name FROM t{suffix} ORDER BY name");
+            let mut stmt = conn.prepare(&sql).expect("emitted predicate is valid SQL");
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .expect("query runs")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("rows read");
+            rows
+        };
+
+        assert_eq!(
+            matches("a_b"),
+            vec!["a_b".to_string(), "a_bc".to_string()],
+            "`_` in a STARTS WITH prefix is a literal underscore, not a single-char wildcard"
+        );
+        assert_eq!(
+            matches("100%"),
+            vec!["100%x".to_string()],
+            "`%` in a STARTS WITH prefix is a literal percent, not a match-anything wildcard"
+        );
     }
 }
