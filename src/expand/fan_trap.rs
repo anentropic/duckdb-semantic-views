@@ -4,6 +4,7 @@ use crate::model::{Cardinality, Metric, SemanticViewDefinition};
 
 use super::facts::{collect_derived_metric_grain, collect_referenced_facts};
 use super::types::{ExpandError, FanTrapError, MetricFanTrapError, ReferencedFactFanTrapError};
+use super::where_clause::WhereMember;
 
 /// Cardinality map: `(from_lower, to_lower)` -> (worst-case cardinality,
 /// name of a relationship carrying that cardinality).
@@ -654,10 +655,22 @@ fn fanning_edge_on_path(path: &[String], card_map: &CardMap) -> Option<String> {
 /// Skipped on the per-grain path for the same reason [`check_fan_traps`] skips
 /// its base-anchored-only checks there — though today the per-grain strategy
 /// rejects a `where_clause` outright, so this is belt and braces.
+///
+/// # What counts as "the member's table"
+///
+/// EXP-27 (code-review 2026-08-08). A member forces a join not only of the
+/// table it is *declared* on but of every table its expression reaches through
+/// a fact reference ([`WhereMember::fact_tables`], the set #207 added to
+/// `source_tables` for exactly that reason). Both are joined on the member's
+/// behalf and both multiply the metric's rows if the path fans, so both are
+/// walked here. Checking only the declared table meant `of AS li.liq * 2` on
+/// the base — whose expression lives entirely on a child table — passed the
+/// fence while its child table was joined anyway, doubling every base-grain
+/// metric. That shape was a loud binder error before #207 joined the table.
 pub(super) fn check_where_clause_fan_traps(
     view_name: &str,
     def: &SemanticViewDefinition,
-    where_members: &[(String, Option<String>)],
+    where_members: &[WhereMember],
     resolved_mets: &[&Metric],
 ) -> Result<(), ExpandError> {
     if def.joins.is_empty() || where_members.is_empty() {
@@ -669,26 +682,32 @@ pub(super) fn check_where_clause_fan_traps(
     let root = graph.root.clone();
 
     for met in resolved_mets {
+        // The metric's own grain is the anchor, not the member's table: a
+        // metric already AT the child grain is not multiplied by joining the
+        // child, so the same predicate is sound for it. This is why the fence
+        // is per-metric rather than a view-wide member check.
         let met_tables = metric_grain(met, def).anchored(&root);
-        for (member_name, member_table) in where_members {
-            let Some(member_table) = member_table else {
-                continue; // Unqualified member: base-table grain, nothing to fan.
-            };
-            for met_table in &met_tables {
-                if met_table == member_table {
-                    continue;
-                }
-                let Some(path) = find_path(met_table, member_table, &adjacency) else {
-                    continue; // Not connected (legacy joins carrying no FK metadata).
-                };
-                if let Some(rel_name) = fanning_edge_on_path(&path, &card_map) {
-                    return Err(ExpandError::WhereClauseFanTrap {
-                        view_name: view_name.to_string(),
-                        metric_name: met.name.clone(),
-                        member_name: member_name.clone(),
-                        member_table: member_table.clone(),
-                        relationship_name: rel_name,
-                    });
+        for member in where_members {
+            // A member declared without a table is base-table grain, so it
+            // forces no join of its own — but its fact chain still can.
+            let joined_tables = member.table.iter().chain(member.fact_tables.iter());
+            for member_table in joined_tables {
+                for met_table in &met_tables {
+                    if met_table == member_table {
+                        continue;
+                    }
+                    let Some(path) = find_path(met_table, member_table, &adjacency) else {
+                        continue; // Not connected (legacy joins carrying no FK metadata).
+                    };
+                    if let Some(rel_name) = fanning_edge_on_path(&path, &card_map) {
+                        return Err(ExpandError::WhereClauseFanTrap {
+                            view_name: view_name.to_string(),
+                            metric_name: met.name.clone(),
+                            member_name: member.name.clone(),
+                            member_table: member_table.clone(),
+                            relationship_name: rel_name,
+                        });
+                    }
                 }
             }
         }

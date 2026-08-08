@@ -1,0 +1,167 @@
+# Code review 2026-08-08, EXP-27: a `where_clause` member whose FACT CHAIN
+# reaches a fanning table had that table joined with no fan fence at all.
+#
+# #207 (EXP-23) taught `resolve_where_clause` to contribute the tables a
+# predicate member reaches THROUGH its fact references to `source_tables`, so
+# the join resolver joins them and the inlined expression binds. Correct for the
+# PARENT direction; unfenced for the CHILD direction. Neither fan check saw the
+# pair: `check_where_clause_fan_traps` walked only the member's own declared
+# table, and `check_referenced_fact_fan_traps` is handed the QUERIED dimensions
+# and metrics -- a `where_clause` member is neither.
+#
+# Numerically confirmed in the review and reproduced at the unit layer: with one
+# order and two line items, `rev = SUM(o.amount)` returned 200 instead of 100
+# because the emitted SQL was `FROM o LEFT JOIN li WHERE ((li.qty) * 2) > 0`.
+# Before #207 the same query was a loud binder error (`li` was never joined), so
+# this was a loud -> silent-wrong regression.
+#
+# The runner halts a file at its first failing statement, so the per-case red
+# proof lives at the unit layer (`expand::tests_fan_trap::exp27_*`, three cases
+# each individually observed failing) and in `star_schema_proptest`, whose
+# generator gained a parent-declared member reaching a child-side fact and was
+# verified to fail with the fence reverted.
+
+require semantic_views
+
+statement ok
+CREATE TABLE cr0808_o (id INTEGER PRIMARY KEY, region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO cr0808_o VALUES (1, 'east', 100);
+
+statement ok
+CREATE TABLE cr0808_li (id INTEGER PRIMARY KEY, order_id INTEGER, qty INTEGER);
+
+statement ok
+INSERT INTO cr0808_li VALUES (1, 1, 5), (2, 1, 6);
+
+# ============================================================
+# EXP-27 fact branch: a fact on the base whose expression reaches a fact on
+# the child table.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW cr0808_fan AS
+TABLES (
+    o AS cr0808_o PRIMARY KEY (id),
+    li AS cr0808_li PRIMARY KEY (id)
+)
+RELATIONSHIPS (li_to_o AS li(order_id) REFERENCES o)
+FACTS (
+    li.liq AS li.qty,
+    o.o_fact AS li.liq * 2
+)
+DIMENSIONS (
+    o.region AS o.region,
+    o.band AS CASE WHEN li.liq > 0 THEN 1 ELSE 0 END
+)
+METRICS (
+    o.rev AS SUM(o.amount),
+    li.li_qty AS SUM(li.qty)
+);
+
+# Control first: with no predicate the base-grain metric is the un-multiplied
+# 100, so the 200 below really is the join's doing.
+query I
+SELECT rev FROM semantic_view('cr0808_fan', metrics := ['rev']);
+----
+100
+
+# The fact branch. `o_fact` is declared on `o` but its expression lives entirely on
+# `li`, so resolving it joins the child and doubles SUM(o.amount) to 200.
+statement error
+SELECT rev FROM semantic_view(
+  'cr0808_fan',
+  dimensions := ['region'],
+  metrics := ['rev'],
+  where_clause := 'o_fact > 0'
+);
+----
+fan trap detected
+
+# The DIMENSION branch: same child-table fact, reached from a dimension's
+# expression instead of a fact's (TECH-DEBT #54 made dimension expressions
+# fact-inlined, so this hits the identical join).
+statement error
+SELECT rev FROM semantic_view(
+  'cr0808_fan',
+  dimensions := ['region'],
+  metrics := ['rev'],
+  where_clause := 'band = 1'
+);
+----
+fan trap detected
+
+# Anchored at the METRIC's grain, not the member's table: a metric already at
+# the child grain is not multiplied by joining the child, so the same predicate
+# is sound for it. Both line items have qty > 0, so li_qty = 5 + 6 = 11.
+query I
+SELECT li_qty FROM semantic_view(
+  'cr0808_fan',
+  metrics := ['li_qty'],
+  where_clause := 'o_fact > 0'
+);
+----
+11
+
+statement ok
+DROP SEMANTIC VIEW cr0808_fan
+
+# ============================================================
+# Control: the legitimate EXP-23 shape (#207's actual use case) must keep
+# working -- a fact chain reaching a PARENT table crosses the many-to-one edge
+# forwards, which does not fan, so the join is emitted and the query runs.
+# ============================================================
+
+statement ok
+CREATE TABLE cr0808_cust (id INTEGER PRIMARY KEY, rate DOUBLE);
+
+statement ok
+INSERT INTO cr0808_cust VALUES (1, 1.0), (2, 2.0);
+
+statement ok
+CREATE TABLE cr0808_sales (id INTEGER PRIMARY KEY, cust_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO cr0808_sales VALUES (1, 1, 10), (2, 2, 20), (3, 1, 30);
+
+statement ok
+CREATE SEMANTIC VIEW cr0808_safe AS
+TABLES (
+    s AS cr0808_sales PRIMARY KEY (id),
+    c AS cr0808_cust PRIMARY KEY (id)
+)
+RELATIONSHIPS (s_to_c AS s(cust_id) REFERENCES c)
+FACTS (
+    c.cust_rate AS c.rate,
+    s.weighted AS s.amount * cust_rate
+)
+DIMENSIONS (s.sid AS s.id)
+METRICS (s.total AS SUM(s.amount));
+
+# weighted per row: 10*1=10, 20*2=40, 30*1=30. Filtering weighted > 25 keeps
+# rows 2 and 3, so total = 20 + 30 = 50 -- unchanged from
+# cr20260806_inlining_gaps.test, which is the point.
+query I
+SELECT total FROM semantic_view(
+  'cr0808_safe',
+  metrics := ['total'],
+  where_clause := 'weighted > 25'
+);
+----
+50
+
+statement ok
+DROP SEMANTIC VIEW cr0808_safe
+
+statement ok
+DROP TABLE cr0808_sales
+
+statement ok
+DROP TABLE cr0808_cust
+
+statement ok
+DROP TABLE cr0808_li
+
+statement ok
+DROP TABLE cr0808_o
