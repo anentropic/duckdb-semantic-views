@@ -1,15 +1,27 @@
-# Phase 62 Wave 3 — extension re-LOAD idempotency.
+# Extension re-LOAD idempotency — end-to-end behaviour (Phase 62 Wave 3, B18).
 #
-# Loading the extension twice into the same DB exercises Risk A from
-# RESEARCH.md §3: each LOAD clones the ParserExtensions vector via
-# atomic-shared_ptr swap, so two SemanticViewsParserInfo objects exist
-# after a re-LOAD, each with its own OverrideContext. Both are iterated
-# by Parser::ParseQuery; the first to return success wins. Both are
-# structurally equivalent (same DB, same catalog) so behaviour stays
-# consistent.
+# What this file pins is only the user-visible half: loading the extension
+# twice into the same database must not crash, an already-created semantic
+# view must still be listed afterwards, and DDL against it must still work.
 #
-# Behavioural property pinned (from RESEARCH.md §6):
-#   B18: extension re-LOAD in same DB does not crash; subsequent DDL works.
+# It does NOT pin the registration mechanics, and cannot — a `.test` file has
+# no view of DBConfig. Those live where they can be observed:
+#
+#   * tests/parser_hook_idempotent.rs — counts entries in
+#     DBConfig::GetCallbackManager().ParserExtensions() whose parser_override
+#     is ours, across repeated sv_register_parser_hooks calls (via the
+#     sv_count_parser_extensions helper in cpp/src/shim.cpp).
+#   * test/integration/test_load_extension_twice_idempotent.py — the same
+#     property through a real Python session.
+#
+# The header here used to describe a pre-WR-09 architecture in which a re-LOAD
+# left two SemanticViewsParserInfo objects registered, "each with its own
+# OverrideContext". Both halves of that are gone: WR-09 (v0.10.0) added the
+# dedup guard so a repeat LOAD registers nothing new, and AR-7 retired
+# OverrideContext entirely (SemanticViewsParserInfo is now an empty marker).
+# The assertions below were always architecture-independent, which is why they
+# survived the change unaltered — but the description had rotted (code-review
+# 2026-08-08).
 
 require semantic_views
 
@@ -22,9 +34,9 @@ CREATE TABLE t(id INTEGER PRIMARY KEY);
 statement ok
 CREATE SEMANTIC VIEW v_reload AS TABLES (t AS t PRIMARY KEY (id)) DIMENSIONS (t.id AS id) METRICS (t.c AS COUNT(*));
 
-# B18: re-LOAD the extension. DuckDB may de-duplicate (LOAD is idempotent
-# at the Database level) or may compose two parser_info entries; either
-# way the existing view must still be visible and DROP must still work.
+# B18: re-LOAD the extension. Whatever the registration layer does with the
+# second call, the existing view must still be visible and DROP must still
+# work.
 statement ok
 LOAD semantic_views;
 
@@ -34,7 +46,7 @@ SELECT count(*) FROM list_semantic_views() WHERE name = 'v_reload';
 ----
 1
 
-# DROP succeeds after re-LOAD -- proves the extension info is still wired
-# correctly even with potentially duplicated parser_info registrations.
+# DROP succeeds after re-LOAD -- proves the parser hook is still wired
+# correctly after the second registration call.
 statement ok
 DROP SEMANTIC VIEW v_reload;
