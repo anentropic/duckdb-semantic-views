@@ -171,17 +171,17 @@ pub(super) fn check_fact_role_playing_path(
 pub(super) fn check_where_clause_role_playing_path(
     view_name: &str,
     def: &SemanticViewDefinition,
-    where_members: &[(String, Option<String>)],
+    where_members: &[super::where_clause::WhereMember],
 ) -> Result<(), ExpandError> {
-    for (member_name, member_table) in where_members {
-        let Some(member_table) = member_table else {
+    for member in where_members {
+        let Some(member_table) = member.table.as_ref() else {
             continue; // Unqualified member: base-table grain, no role to pick.
         };
         if let Some(rp) = role_playing_on_path(view_name, def, member_table)? {
             let available_relationships = relationships_to_table(def, &rp);
             return Err(ExpandError::AmbiguousWhereClausePath {
                 view_name: view_name.to_string(),
-                member_name: member_name.clone(),
+                member_name: member.name.clone(),
                 member_table: member_table.to_ascii_lowercase(),
                 role_playing_table: rp,
                 available_relationships,
