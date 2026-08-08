@@ -85,7 +85,11 @@ extern "C" {
     //   0 = success/unreachable (defensive)
     //   1 = ours-but-invalid (validation error or near-miss). error_buf
     //       gets the message, position_out gets the byte offset (or
-    //       UINT32_MAX if no position is available).
+    //       UINT32_MAX if no position is available). FF-16: a panic inside
+    //       the Rust hook also lands here (message
+    //       "internal error: panic inside sv_parse_function_rust",
+    //       position UINT32_MAX) so an extension bug surfaces as our own
+    //       error instead of DuckDB's generic prefix syntax error.
     //   2 = not ours; defer (DISPLAY_ORIGINAL_ERROR on the C++ side).
     //   3 = valid DDL but parser_override didn't fire (e.g. override
     //       setting reset by disable_peg_parser). error_buf gets an
@@ -471,7 +475,10 @@ static ParserOverrideResult sv_parser_override(
 //
 // We re-run validation through sv_parse_function_rust which returns:
 //   0 — defensive internal error; render as DISPLAY_EXTENSION_ERROR
-//   1 — ours-but-invalid: error_buf populated; position is byte offset
+//   1 — ours-but-invalid: error_buf populated; position is byte offset.
+//       FF-16: also covers a panic inside the Rust hook (position
+//       UINT32_MAX) — an extension bug must not masquerade as the user's
+//       syntax error, which is what rc=2 on panic used to produce.
 //   2 — not ours: DISPLAY_ORIGINAL_ERROR (let the default parser's error stand)
 //   3 — valid-but-override-disabled: actionable hint; position=0
 static ParserExtensionParseResult sv_parse_stub(
@@ -945,6 +952,39 @@ static unique_ptr<FunctionData> sv_create_from_yaml_bind(
     vector<LogicalType> &return_types,
     vector<string> &names) {
     auto bd = make_uniq<CreateFromYamlBindData>();
+    // FF-15 (code-review 2026-08-08): guard every positional argument before
+    // GetValue<string>(), the same up-front check FF-4 gave every other table
+    // function (see sv_run_varchar_bind_with_name / sv_semantic_view_bind).
+    // `Value::GetValue<string>()` on a NULL Value renders the literal text
+    // "NULL", so without this a NULL argument silently became a file named
+    // `NULL` / a view named `NULL` instead of an error.
+    //
+    // The rewriter (src/parse/native_sql.rs::rewrite_yaml_file_create) always
+    // emits string literals here, so this is only reachable by calling the
+    // helper TF directly — hence the function-name-prefixed FF-4 wording
+    // rather than the `"FROM YAML FILE failed: "` prefix the file-read paths
+    // below use (that prefix belongs to the user-facing DDL surface and is
+    // pinned by `test/sql/phase53_yaml_file.test`).
+    if (input.inputs.size() < 3) {
+        throw BinderException(
+            "__sv_compute_create_from_yaml: expected 3 arguments "
+            "(file_path, view_name, comment)");
+    }
+    if (input.inputs[0].IsNull()) {
+        throw BinderException(
+            "__sv_compute_create_from_yaml: file path is required "
+            "(positional arg 0)");
+    }
+    if (input.inputs[1].IsNull()) {
+        throw BinderException(
+            "__sv_compute_create_from_yaml: view name is required "
+            "(positional arg 1)");
+    }
+    if (input.inputs[2].IsNull()) {
+        throw BinderException(
+            "__sv_compute_create_from_yaml: comment is required "
+            "(positional arg 2; pass '' for no comment)");
+    }
     bd->file_path = input.inputs[0].GetValue<string>();
     bd->view_name = input.inputs[1].GetValue<string>();
     bd->comment   = input.inputs[2].GetValue<string>();
