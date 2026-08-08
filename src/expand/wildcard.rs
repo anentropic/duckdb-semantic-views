@@ -46,11 +46,16 @@ pub fn expand_wildcards(
         }
         if item.ends_with(".*") {
             let alias = &item[..item.len() - 2];
-            // Validate alias exists in tables
+            // EXP-30: match the qualifier the way DuckDB resolves identifiers —
+            // case-insensitively, quoted or not (CLAUDE.md; `ident_matches`).
+            // A raw `eq_ignore_ascii_case` made `"O".*` fail against alias `o`
+            // with "unknown table alias", the last production residue of the
+            // family PARSE-8 closed in the parse layer. All three comparisons
+            // below are of the same qualifier and move together.
             let alias_exists = def
                 .tables
                 .iter()
-                .any(|t| t.alias.eq_ignore_ascii_case(alias));
+                .any(|t| crate::ident::ident_matches(&t.alias, alias));
             if !alias_exists {
                 return Err(format!(
                     "unknown table alias '{alias}' in wildcard '{item}'. Available aliases: [{}]",
@@ -66,9 +71,9 @@ pub fn expand_wildcards(
             let is_base_alias = def
                 .tables
                 .first()
-                .is_some_and(|t| t.alias.eq_ignore_ascii_case(alias));
+                .is_some_and(|t| crate::ident::ident_matches(&t.alias, alias));
             let on_table = |source_table: Option<&str>| -> bool {
-                source_table.map_or(is_base_alias, |st| st.eq_ignore_ascii_case(alias))
+                source_table.map_or(is_base_alias, |st| crate::ident::ident_matches(st, alias))
             };
             match item_type {
                 WildcardItemType::Dimension => {
@@ -227,6 +232,69 @@ mod tests {
         let result = expand_wildcards(&items, &def, &WildcardItemType::Fact).unwrap();
         // hidden_fact is PRIVATE, should be excluded
         assert_eq!(result, vec!["line_total"]);
+    }
+
+    /// EXP-30 (code-review 2026-08-08): the wildcard qualifier was compared
+    /// with a raw `eq_ignore_ascii_case`, so a **quoted** qualifier failed to
+    /// match its own alias — `"O".*` reported "unknown table alias" against a
+    /// definition whose alias is `o`. DuckDB resolves identifiers
+    /// case-insensitively whether or not they are quoted (CLAUDE.md), which is
+    /// what `ident::ident_matches` implements; PARSE-8 migrated the parse layer
+    /// onto it and this was the surviving production site.
+    ///
+    /// Both spellings must expand identically, and the base-alias branch (which
+    /// picks up members declared with no `source_table`, SG-15) has to agree —
+    /// it is a second comparison of the same alias.
+    #[test]
+    fn quoted_wildcard_qualifier_matches_its_alias() {
+        let def = test_def();
+        let expected = vec!["region", "status"];
+        for spelling in ["o.*", "\"o\".*", "\"O\".*", "O.*"] {
+            let items = vec![spelling.to_string()];
+            let result = expand_wildcards(&items, &def, &WildcardItemType::Dimension)
+                .unwrap_or_else(|e| panic!("`{spelling}` names alias `o`: {e}"));
+            assert_eq!(result, expected, "spelling: {spelling}");
+        }
+    }
+
+    /// The SG-15 half of EXP-30: a member declared without a `source_table` is
+    /// a base-table member, and `base_alias.*` must include it however the base
+    /// alias is spelled. This is `is_base_alias`, the second of the three
+    /// quote-blind comparisons.
+    #[test]
+    fn quoted_base_alias_wildcard_includes_unqualified_members() {
+        let mut def = test_def();
+        def.dimensions.push(Dimension {
+            name: "unqualified".to_string(),
+            expr: "o.something".to_string(),
+            source_table: None,
+            ..Default::default()
+        });
+        for spelling in ["o.*", "\"O\".*"] {
+            let items = vec![spelling.to_string()];
+            let result = expand_wildcards(&items, &def, &WildcardItemType::Dimension)
+                .unwrap_or_else(|e| panic!("`{spelling}` names base alias `o`: {e}"));
+            assert_eq!(
+                result,
+                vec!["region", "status", "unqualified"],
+                "spelling: {spelling}"
+            );
+        }
+    }
+
+    /// The `unknown table alias` error must still fire for a genuinely unknown
+    /// qualifier when it is quoted — the fix widens matching, it does not make
+    /// every quoted qualifier match.
+    #[test]
+    fn quoted_unknown_wildcard_qualifier_still_errors() {
+        let def = test_def();
+        let items = vec!["\"nope\".*".to_string()];
+        let err = expand_wildcards(&items, &def, &WildcardItemType::Dimension)
+            .expect_err("an unknown alias stays an error however it is quoted");
+        assert!(
+            err.contains("unknown table alias"),
+            "Error should contain 'unknown table alias': {err}"
+        );
     }
 
     #[test]

@@ -1,0 +1,214 @@
+# Code review 2026-08-08 — small-finding regression guards.
+#
+# IDENT-6: `SHOW ... STARTS WITH` is a LITERAL prefix. It used to emit
+# `name LIKE '<prefix>%'`, so `_` and `%` inside the prefix reached the pattern
+# matcher as wildcards.
+
+require semantic_views
+
+statement ok
+CREATE TABLE cr0808_t (id INTEGER PRIMARY KEY, a_b VARCHAR, axb VARCHAR, pq VARCHAR, pzq VARCHAR);
+
+statement ok
+CREATE SEMANTIC VIEW cr0808_starts_with_sv AS
+  TABLES (
+    t AS cr0808_t PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    t.a_b AS t.a_b,
+    t.axb AS t.axb,
+    t."p%q" AS t.pq,
+    t.pzq AS t.pzq
+  )
+  METRICS (
+    t.n AS COUNT(t.id)
+  )
+
+# ============================================================
+# IDENT-6 case 1: `_` in the prefix is a literal underscore.
+# Pre-fix this also returned `axb`, because `_` was a LIKE
+# single-character wildcard.
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN cr0808_starts_with_sv STARTS WITH 'a_b'
+----
+memory	main	cr0808_starts_with_sv	cr0808_t	a_b	(empty)	[]	(empty)
+
+# ============================================================
+# IDENT-6 case 2: `%` in the prefix is a literal percent.
+# Pre-fix `p%` matched every name beginning with `p` — both
+# `p%q` and `pzq`.
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN cr0808_starts_with_sv STARTS WITH 'p%'
+----
+memory	main	cr0808_starts_with_sv	cr0808_t	p%q	(empty)	[]	(empty)
+
+# ============================================================
+# IDENT-6 control: an ordinary prefix still matches every name
+# that starts with it (the clause did not become an equality).
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN cr0808_starts_with_sv STARTS WITH 'a'
+----
+memory	main	cr0808_starts_with_sv	cr0808_t	a_b	(empty)	[]	(empty)
+memory	main	cr0808_starts_with_sv	cr0808_t	axb	(empty)	[]	(empty)
+
+# ============================================================
+# IDENT-6 control: STARTS WITH stays case-SENSITIVE (Snowflake's
+# rule for this clause, unlike LIKE which maps to ILIKE).
+# ============================================================
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN cr0808_starts_with_sv STARTS WITH 'A'
+----
+
+statement ok
+DROP SEMANTIC VIEW cr0808_starts_with_sv
+
+# ============================================================
+# EXP-31: a `where_clause` member whose FACT CHAIN reaches a
+# ROLE-PLAYING table had that table joined with no ambiguity
+# check — the role-playing twin of EXP-27.
+#
+# EXP-10 closed the case where the member is DECLARED on the
+# role-playing table. #207 (EXP-23) then taught
+# `resolve_where_clause` to contribute the tables a member
+# reaches THROUGH its fact references, so the join resolver
+# joins those too, while
+# `check_where_clause_role_playing_path` still read only
+# `member.table`. Observed pre-fix at the unit layer, the
+# emitted SQL was
+#   FROM "flights" AS "f"
+#   LEFT JOIN "airports" AS "a"
+#     ON "f"."departure_code" = "a"."airport_code"
+#   WHERE ((a.elevation) + 1) > 0
+# — bound to the FIRST-DECLARED relationship, so a filter the
+# user believes is about either airport silently became one
+# about the departure airport.
+#
+# The runner halts a file at its first failing statement, so
+# the per-case red proof lives at the unit layer
+# (`expand::tests_role_playing::exp31_*`, three cases each
+# individually observed emitting SQL before the fix).
+# ============================================================
+
+statement ok
+CREATE TABLE cr0808_flights (
+  flight_id INTEGER PRIMARY KEY,
+  departure_code VARCHAR,
+  arrival_code VARCHAR,
+  carrier VARCHAR
+);
+
+statement ok
+INSERT INTO cr0808_flights VALUES (1, 'JFK', 'LAX', 'AA');
+
+statement ok
+CREATE TABLE cr0808_airports (airport_code VARCHAR PRIMARY KEY, city VARCHAR, elevation INTEGER);
+
+statement ok
+INSERT INTO cr0808_airports VALUES ('JFK', 'New York', 13), ('LAX', 'Los Angeles', 125);
+
+statement ok
+CREATE SEMANTIC VIEW cr0808_rp AS
+TABLES (
+    f AS cr0808_flights PRIMARY KEY (flight_id),
+    a AS cr0808_airports PRIMARY KEY (airport_code)
+)
+RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a,
+    arr_airport AS f(arrival_code) REFERENCES a
+)
+FACTS (
+    a.ap_elev AS a.elevation,
+    f.f_elev AS ap_elev + 1
+)
+DIMENSIONS (
+    f.carrier AS f.carrier,
+    f.high_altitude AS CASE WHEN ap_elev > 5000 THEN 'hi' ELSE 'lo' END
+)
+METRICS (
+    f.flight_count AS COUNT(*)
+);
+
+# Control first: with no predicate the role-playing table is never
+# reached, so the query is unambiguous and runs.
+query I
+SELECT flight_count FROM semantic_view('cr0808_rp', metrics := ['flight_count']);
+----
+1
+
+# EXP-31 fact branch: `f_elev` is declared on `f` (unambiguous) but its
+# expression reaches `ap_elev` on the role-playing `a`.
+statement error
+SELECT flight_count FROM semantic_view(
+  'cr0808_rp',
+  metrics := ['flight_count'],
+  where_clause := 'f_elev > 0'
+);
+----
+is ambiguous
+
+# EXP-31 dimension branch: the same fact reached from a DIMENSION's
+# expression (TECH-DEBT #54 made those fact-inlined too).
+statement error
+SELECT flight_count FROM semantic_view(
+  'cr0808_rp',
+  metrics := ['flight_count'],
+  where_clause := 'high_altitude = ''hi'''
+);
+----
+is ambiguous
+
+# A predicate that stays on the base table's own dimension is still
+# unambiguous — the fix must not reject every where_clause.
+query I
+SELECT flight_count FROM semantic_view(
+  'cr0808_rp',
+  metrics := ['flight_count'],
+  where_clause := 'carrier = ''AA'''
+);
+----
+1
+
+statement ok
+DROP SEMANTIC VIEW cr0808_rp
+
+# EXP-31 control: the same fact chain against a table reached by a
+# SINGLE relationship has no role to disambiguate, so it must still
+# expand and return a number.
+statement ok
+CREATE SEMANTIC VIEW cr0808_rp_control AS
+TABLES (
+    f AS cr0808_flights PRIMARY KEY (flight_id),
+    a AS cr0808_airports PRIMARY KEY (airport_code)
+)
+RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a
+)
+FACTS (
+    a.ap_elev AS a.elevation,
+    f.f_elev AS ap_elev + 1
+)
+DIMENSIONS (
+    f.carrier AS f.carrier
+)
+METRICS (
+    f.flight_count AS COUNT(*)
+);
+
+query I
+SELECT flight_count FROM semantic_view(
+  'cr0808_rp_control',
+  metrics := ['flight_count'],
+  where_clause := 'f_elev > 0'
+);
+----
+1
+
+statement ok
+DROP SEMANTIC VIEW cr0808_rp_control

@@ -21,6 +21,69 @@ pub(crate) mod writes;
 // companion file is deleted and this constant is never referenced again at runtime.
 const V010_COMPANION_EXT: &str = "semantic_views";
 
+/// Path of the v0.1.0 companion file that would sit alongside `db_path`, or
+/// `None` for an in-memory database (which never has one).
+///
+/// The one place this shape is computed. Both readers of it — the writable
+/// import pass in [`init_catalog`] and the read-only refusal above it (CAT-8) —
+/// must agree byte-for-byte, or the read-only branch would refuse for a file
+/// the import pass would not have looked at (or, worse, stay silent for one it
+/// would).
+fn v010_companion_path(db_path: &str) -> Option<PathBuf> {
+    if db_path == ":memory:" {
+        return None;
+    }
+    let mut p = PathBuf::from(db_path);
+    let ext = match p.extension() {
+        Some(e) => format!("{}.{V010_COMPANION_EXT}", e.to_string_lossy()),
+        None => V010_COMPANION_EXT.to_string(),
+    };
+    p.set_extension(ext);
+    Some(p)
+}
+
+/// A unique temp-file path for a file-backed unit test (CAT-7).
+///
+/// File-backed tests used to hardcode a fixed name under `std::env::temp_dir()`.
+/// `cargo test` runs several test binaries **concurrently**, and this crate's
+/// tests are also run concurrently with other checkouts on a shared machine, so
+/// two processes could open the same DuckDB file — one taking a conflicting
+/// lock, and each `remove_file`-ing the other's live database on the way in.
+/// Observed live during the 2026-08-08 review: four tests failed on a
+/// conflicting-lock error and passed in isolation.
+///
+/// Uniqueness comes from the process id plus a nanosecond timestamp, the
+/// pattern `tc6_restart_persistence_survives_reopen` already used. `stem` keeps
+/// the failing file identifiable in a `ls /tmp` after a crash, and callers that
+/// need companion/WAL siblings derive them from the returned path so all of a
+/// test's files share the unique stem.
+#[cfg(test)]
+pub(crate) fn unique_temp_db_path(stem: &str) -> PathBuf {
+    // Three components, because two of them are individually insufficient:
+    //
+    // - the PID separates concurrent `cargo test` PROCESSES (the CAT-7
+    //   collision this helper exists to fix — a sibling run took a conflicting
+    //   DuckDB lock, and each test's up-front `remove_file` could delete the
+    //   other run's live database);
+    // - the counter separates callers WITHIN a process, which the PID cannot:
+    //   Rust runs tests on concurrent threads, so every caller here shares a
+    //   PID, and `SystemTime` resolution is coarser than nanoseconds on some
+    //   platforms — two threads in one tick would otherwise get one path, which
+    //   is CAT-7 again inside a single run;
+    // - the timestamp keeps names distinct across sequential runs of the same
+    //   process image, so a crashed run's leftover file cannot be mistaken for
+    //   the current one.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    std::env::temp_dir().join(format!(
+        "{stem}_{}_{nanos}_{seq}.duckdb",
+        std::process::id()
+    ))
+}
+
 /// Schema holding the semantic-view catalog table.
 pub const DEFINITIONS_SCHEMA: &str = "semantic_layer";
 /// Bare (unqualified) name of the semantic-view catalog table.
@@ -71,6 +134,26 @@ pub fn init_catalog(
                     .into(),
             );
         }
+        // CAT-8: the v0.1.0 companion-file import below is equally unreachable
+        // read-only — it INSERTs. Left unchecked the two un-migrated shapes
+        // behaved differently: the legacy *table* refused loudly (above), while
+        // a companion file was simply never looked at, so every view in it
+        // resolved as "does not exist" with no hint that a whole catalog was
+        // sitting unimported next to the database. Refuse with the same
+        // actionable wording instead.
+        if let Some(companion) = v010_companion_path(db_path) {
+            if companion.exists() {
+                return Err(format!(
+                    "semantic_views: this database has a v0.1.0 companion file \
+                     '{}' whose semantic views have not been imported yet, and \
+                     the database is open read-only, so it cannot be migrated. \
+                     Open it writable once (any LOAD will import it), then \
+                     reopen read-only.",
+                    companion.display()
+                )
+                .into());
+            }
+        }
         return Ok(());
     }
     // FF-10: `definition` is `NOT NULL`. A SQL-NULL definition is an
@@ -101,16 +184,7 @@ pub fn init_catalog(
 
     // One-time migration: if a v0.1.0 companion file exists alongside the database,
     // import its contents into the table then delete the file.
-    if db_path != ":memory:" {
-        let migration_path: PathBuf = {
-            let mut p = PathBuf::from(db_path);
-            let ext = match p.extension() {
-                Some(e) => format!("{}.{V010_COMPANION_EXT}", e.to_string_lossy()),
-                None => V010_COMPANION_EXT.to_string(),
-            };
-            p.set_extension(ext);
-            p
-        };
+    if let Some(migration_path) = v010_companion_path(db_path) {
         if migration_path.exists() {
             let contents = std::fs::read_to_string(&migration_path).map_err(|e| {
                 format!(
@@ -959,6 +1033,58 @@ mod tests {
     use super::*;
     #[cfg(not(feature = "extension"))]
     use duckdb::Connection;
+
+    /// CAT-7's helper must be unique WITHIN a process, not just across them.
+    ///
+    /// The first version used PID + `SystemTime` nanos only. Rust runs tests on
+    /// concurrent threads, so every caller shares a PID, and on a platform whose
+    /// clock is coarser than nanoseconds two callers in one tick get the same
+    /// path — CAT-7 again, inside a single run.
+    ///
+    /// This asserts the **counter**, not "1000 calls happened to differ". A
+    /// tight loop on a fine-grained clock (Linux here) produces distinct
+    /// timestamps anyway, so that version of the test passes with the counter
+    /// removed — vacuous exactly where it matters, since the bug only bites on
+    /// the coarse-clock platforms this cannot simulate. Pinning the monotonic
+    /// component instead is clock-independent: with the counter gone the
+    /// filename has three components rather than four and this fails outright.
+    #[test]
+    fn unique_temp_db_path_carries_a_clock_independent_counter() {
+        // Underscore-free stem so the components are countable: the name is
+        // exactly `<stem>_<pid>_<nanos>_<counter>`. Drop the counter and it is
+        // three fields, which is what makes this fail pre-fix — checking "the
+        // last field increases" would NOT, because the nanos field increases
+        // too and parses as an integer just as happily.
+        let fields = |p: PathBuf| -> Vec<String> {
+            p.file_stem()
+                .expect("stem")
+                .to_string_lossy()
+                .split('_')
+                .map(str::to_owned)
+                .collect()
+        };
+
+        let a = fields(unique_temp_db_path("cat7seq"));
+        let b = fields(unique_temp_db_path("cat7seq"));
+        assert_eq!(
+            a.len(),
+            4,
+            "expected <stem>_<pid>_<nanos>_<counter>, got {a:?} — without the \
+             counter, within-process uniqueness rests entirely on clock \
+             resolution, which is the CAT-7 collision"
+        );
+
+        let (sa, sb): (u64, u64) = (
+            a[3].parse().expect("counter"),
+            b[3].parse().expect("counter"),
+        );
+        assert_eq!(
+            sb,
+            sa + 1,
+            "counter must advance by exactly one per call, got {sa} then {sb}"
+        );
+        assert_eq!(a[1], b[1], "same process, so the PID field must match");
+    }
 
     // CAT-4 (code-review 2026-08-03): the read side's foreign-database rule.
     // The end-to-end coverage is `test/sql/cat4_read_foreign_database.test`,
@@ -1819,6 +1945,109 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    /// Bootstrap a valid, empty DuckDB file at `db_path` so it can be reopened
+    /// read-only (`open_with_flags` will not create a file in read-only mode).
+    #[cfg(not(feature = "extension"))]
+    fn bootstrap_empty_db_file(db_path: &str) {
+        let con = Connection::open(db_path).expect("open writable to create the file");
+        con.execute_batch("CREATE TABLE cat8_bootstrap(x INTEGER);")
+            .expect("write something so the file has real content");
+        con.execute_batch("CHECKPOINT;").expect("flush to disk");
+    }
+
+    #[cfg(not(feature = "extension"))]
+    fn open_read_only(db_path: &str) -> Connection {
+        let cfg = duckdb::Config::default()
+            .access_mode(duckdb::AccessMode::ReadOnly)
+            .expect("set access_mode");
+        Connection::open_with_flags(db_path, cfg).expect("open read-only")
+    }
+
+    /// CAT-8 (code-review 2026-08-08): a read-only open of a database that
+    /// still has an unimported v0.1.0 companion file used to succeed silently
+    /// — the companion detection lives *below* the `is_read_only` early return,
+    /// so it was unreachable, and every view in the file then resolved as
+    /// "does not exist" with nothing pointing at the un-migrated catalog next
+    /// to the database. The sibling un-migrated shape (a legacy `_definitions`
+    /// *table*) has always refused loudly; this makes the two agree.
+    #[cfg(not(feature = "extension"))]
+    #[test]
+    fn cat8_read_only_open_refuses_an_unimported_companion_file() {
+        let db_path_buf = unique_temp_db_path("test_cat8_ro_companion");
+        let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
+        let companion = PathBuf::from(format!("{db_path}.{V010_COMPANION_EXT}"));
+
+        bootstrap_empty_db_file(db_path);
+        std::fs::write(
+            &companion,
+            r#"{"orders": "{\"base_table\":\"orders\",\"dimensions\":[],\"metrics\":[]}"}"#,
+        )
+        .unwrap();
+
+        let con = open_read_only(db_path);
+        let err = init_catalog(&con, db_path, true)
+            .expect_err("an unimported companion file must be refused, not ignored");
+        let msg = err.to_string();
+        for expected in [
+            "v0.1.0 companion file",
+            "read-only",
+            "Open it writable once",
+        ] {
+            assert!(
+                msg.contains(expected),
+                "message must stay as actionable as the legacy-table refusal \
+                 (missing {expected:?}), got: {msg}"
+            );
+        }
+        assert!(
+            msg.contains(&companion.display().to_string()),
+            "message must name the file to act on, got: {msg}"
+        );
+        assert!(
+            companion.exists(),
+            "refusing must not delete the file — it is the only copy of those views"
+        );
+
+        drop(con);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(&companion);
+    }
+
+    /// The CAT-8 control: a read-only open with **no** companion file is still
+    /// a clean no-op. Without this the fix could refuse every read-only open
+    /// and the test above would not notice.
+    #[cfg(not(feature = "extension"))]
+    #[test]
+    fn cat8_read_only_open_without_a_companion_file_is_a_no_op() {
+        let db_path_buf = unique_temp_db_path("test_cat8_ro_clean");
+        let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
+
+        bootstrap_empty_db_file(db_path);
+        let con = open_read_only(db_path);
+        init_catalog(&con, db_path, true)
+            .expect("a read-only open with nothing to migrate must succeed");
+
+        drop(con);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    /// The companion path both branches compute has to be the same one, or the
+    /// read-only refusal fires for a file the writable import would never look
+    /// at. Pins the `set_extension` shape (`x.duckdb` -> `x.duckdb.semantic_views`,
+    /// extensionless `x` -> `x.semantic_views`) and the in-memory exemption.
+    #[test]
+    fn cat8_companion_path_shape() {
+        assert_eq!(
+            v010_companion_path("/tmp/x.duckdb"),
+            Some(PathBuf::from("/tmp/x.duckdb.semantic_views"))
+        );
+        assert_eq!(
+            v010_companion_path("/tmp/x"),
+            Some(PathBuf::from("/tmp/x.semantic_views"))
+        );
+        assert_eq!(v010_companion_path(":memory:"), None);
+    }
+
     #[cfg(not(feature = "extension"))]
     #[test]
     fn migration_corrupt_companion_file_errors_and_survives() {
@@ -1826,12 +2055,10 @@ mod tests {
         // v0.1.0 companion file was silently DELETED without importing —
         // permanent loss of pre-v0.2 definitions. Post-fix init_catalog must
         // error, and the file must be left in place for the user to repair.
-        let tmp = std::env::temp_dir();
-        let db_path_buf = tmp.join("test_ms2_corrupt.duckdb");
+        // CAT-7: unique per-invocation paths; see `unique_temp_db_path`.
+        let db_path_buf = unique_temp_db_path("test_ms2_corrupt");
         let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
-        let companion = tmp.join("test_ms2_corrupt.duckdb.semantic_views");
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(&companion);
+        let companion = PathBuf::from(format!("{db_path}.{V010_COMPANION_EXT}"));
 
         std::fs::write(&companion, "{not valid json").unwrap();
         let con = Connection::open(db_path).expect("open file-backed DB");
@@ -1853,12 +2080,10 @@ mod tests {
     #[cfg(not(feature = "extension"))]
     #[test]
     fn migration_valid_companion_file_imports_then_deletes() {
-        let tmp = std::env::temp_dir();
-        let db_path_buf = tmp.join("test_ms2_valid.duckdb");
+        // CAT-7: unique per-invocation paths; see `unique_temp_db_path`.
+        let db_path_buf = unique_temp_db_path("test_ms2_valid");
         let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
-        let companion = tmp.join("test_ms2_valid.duckdb.semantic_views");
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(&companion);
+        let companion = PathBuf::from(format!("{db_path}.{V010_COMPANION_EXT}"));
 
         std::fs::write(
             &companion,
@@ -1895,12 +2120,10 @@ mod tests {
         // with an empty schema in `SHOW SEMANTIC VIEWS`, and was missed
         // entirely by `SHOW SEMANTIC VIEWS IN SCHEMA main` — the listings read
         // the JSON, not the column.
-        let tmp = std::env::temp_dir();
-        let db_path_buf = tmp.join("test_cat3_backfill.duckdb");
+        // CAT-7: unique per-invocation paths; see `unique_temp_db_path`.
+        let db_path_buf = unique_temp_db_path("test_cat3_backfill");
         let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
-        let companion = tmp.join("test_cat3_backfill.duckdb.semantic_views");
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(&companion);
+        let companion = PathBuf::from(format!("{db_path}.{V010_COMPANION_EXT}"));
 
         std::fs::write(
             &companion,
@@ -1938,10 +2161,9 @@ mod tests {
     #[cfg(not(feature = "extension"))]
     #[test]
     fn pragma_database_list_returns_file_path() {
-        let tmp = std::env::temp_dir();
-        let tmpfile_buf = tmp.join("test_pragma_rust_check.duckdb");
+        // CAT-7: unique per-invocation paths; see `unique_temp_db_path`.
+        let tmpfile_buf = unique_temp_db_path("test_pragma_rust_check");
         let tmpfile = tmpfile_buf.to_str().expect("temp dir is UTF-8");
-        let _ = std::fs::remove_file(tmpfile);
         let con = Connection::open(tmpfile).expect("open file-backed connection");
         let mut stmt = con.prepare("PRAGMA database_list").expect("prepare PRAGMA");
         let paths: Vec<Option<String>> = stmt
@@ -1982,11 +2204,9 @@ mod tests {
     #[cfg(not(feature = "extension"))]
     #[test]
     fn persist_02_rollback_leaves_catalog_unchanged() {
-        let tmp = std::env::temp_dir();
-        let db_path_buf = tmp.join("test_persist02_rollback.duckdb");
+        // CAT-7: unique per-invocation paths; see `unique_temp_db_path`.
+        let db_path_buf = unique_temp_db_path("test_persist02_rollback");
         let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(format!("{db_path}.wal"));
 
         let con = Connection::open(db_path).expect("open file-backed DB");
         init_catalog(&con, db_path, false).unwrap();
@@ -2047,19 +2267,11 @@ mod tests {
     fn tc6_restart_persistence_survives_reopen() {
         // Unique per-invocation filename (pid + nanos) so concurrent `cargo test`
         // runs — in this binary or another process — cannot race on the same
-        // DB/WAL paths and flake via cross-deletion/reuse.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let tmp = std::env::temp_dir();
-        let db_path_buf = tmp.join(format!(
-            "test_tc6_restart_persistence_{}_{nanos}.duckdb",
-            std::process::id()
-        ));
+        // DB/WAL paths and flake via cross-deletion/reuse. CAT-7 lifted this
+        // out of here into `unique_temp_db_path` and put every other
+        // file-backed test on it.
+        let db_path_buf = unique_temp_db_path("test_tc6_restart_persistence");
         let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(format!("{db_path}.wal"));
 
         let json = r#"{"schema_version":1,"base_table":"sales","dimensions":[],"metrics":[]}"#;
 
