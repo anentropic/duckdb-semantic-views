@@ -338,6 +338,7 @@ fn build_def(order: SortOrder) -> SemanticViewDefinition {
         dimensions,
         metrics,
         joins: vec![],
+        // PIN: a snapshot is an aggregate shape; FACTS returns unaggregated rows and cannot express NON ADDITIVE BY. TECH-DEBT #66
         facts: vec![],
         materializations: vec![],
         created_on: None,
@@ -510,6 +511,7 @@ proptest! {
             where_clause: case.where_pred.as_ref().map(Pred::to_member_sql),
             dimensions: case.sel_dims.iter().map(|&i| DimensionName::new(DIMS[i])).collect(),
             metrics: case.sel_metrics.iter().map(|&i| MetricName::new(METS[i])).collect(),
+            // PIN: a snapshot is an aggregate shape; FACTS returns unaggregated rows and cannot express NON ADDITIVE BY. TECH-DEBT #66
             facts: vec![],
         };
 
@@ -664,6 +666,7 @@ fn predicate_is_applied_before_the_snapshot_not_after() {
         where_clause: Some("ts < 2".to_string()),
         dimensions: vec![DimensionName::new("ent")],
         metrics: vec![MetricName::new("bal")],
+        // PIN: a snapshot is an aggregate shape; FACTS returns unaggregated rows and cannot express NON ADDITIVE BY. TECH-DEBT #66
         facts: vec![],
     };
     let expanded = expand("semi", &def, &req).expect("single-table snapshot query must expand");
@@ -879,6 +882,7 @@ proptest! {
             where_clause: case.where_pred.as_ref().map(Pred::to_member_sql),
             dimensions: dims.iter().map(|d| DimensionName::new(*d)).collect(),
             metrics: vec![MetricName::new(metric)],
+            // PIN: a snapshot is an aggregate shape; FACTS returns unaggregated rows and cannot express NON ADDITIVE BY. TECH-DEBT #66
             facts: vec![],
         };
 
