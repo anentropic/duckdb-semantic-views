@@ -965,7 +965,11 @@ static unique_ptr<FunctionData> sv_create_from_yaml_bind(
     // rather than the `"FROM YAML FILE failed: "` prefix the file-read paths
     // below use (that prefix belongs to the user-facing DDL surface and is
     // pinned by `test/sql/phase53_yaml_file.test`).
-    if (input.inputs.size() < 3) {
+    // Exactly 3, not "at least 3": the message promises a fixed signature, and
+    // a 4-argument call silently ignoring the extra is the kind of quiet
+    // tolerance that makes a helper's contract untrue. DuckDB's own arity check
+    // should reject it first, so this is defence in depth either way.
+    if (input.inputs.size() != 3) {
         throw BinderException(
             "__sv_compute_create_from_yaml: expected 3 arguments "
             "(file_path, view_name, comment)");
