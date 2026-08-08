@@ -288,9 +288,10 @@ impl QuoteState {
 
 /// Blank SQL comments out of `input`, byte-for-byte length-preserving.
 ///
-/// Every byte of a comment — `-- ...` to end of line (the newline itself is
-/// kept), and `/* ... */` including the delimiters — is replaced with a
-/// space. Block comments NEST, matching `PostgreSQL`/`DuckDB` semantics (the SQL
+/// Every byte of a comment — `-- ...` to end of line (the line-ending byte
+/// itself is kept; a bare `\r` ends the comment as well as `\n`, matching
+/// `DuckDB`'s scanner, PARSE-13), and `/* ... */` including the delimiters — is
+/// replaced with a space. Block comments NEST, matching `PostgreSQL`/`DuckDB` semantics (the SQL
 /// standard): `/* a /* b */ c */` is one comment. An unterminated block
 /// comment blanks to end of input.
 ///
@@ -386,9 +387,15 @@ pub fn blank_sql_comments(input: &str) -> std::borrow::Cow<'_, str> {
                     }
                 }
                 b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
-                    // Line comment: blank to (not including) the newline.
+                    // Line comment: blank to (not including) the line ending.
+                    // PARSE-13: a bare `\r` ends the comment too — DuckDB
+                    // inherits the PostgreSQL scanner rule, and blanking past
+                    // it swallowed live code (a clause after `-- c\r`, or the
+                    // whole statement after a `-- note\r` prefix) while DuckDB
+                    // itself executed it. Both line-ending bytes are KEPT, so
+                    // the pass stays length-preserving.
                     let buf = out.get_or_insert_with(|| bytes.to_vec());
-                    while i < bytes.len() && bytes[i] != b'\n' {
+                    while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
                         buf[i] = b' ';
                         i += 1;
                     }
@@ -737,6 +744,29 @@ mod tests {
         // must still be blanked.
         let out = blank_sql_comments("WHERE x = $1 -- c");
         assert_eq!(out, "WHERE x = $1     ");
+    }
+
+    // PARSE-13 (code-review 2026-08-08): DuckDB's scanner (the PostgreSQL rule)
+    // ends a `--` comment at a bare `\r` as well as at `\n`. Blanking only to
+    // `\n` swallowed the CODE after a CR-terminated comment: DuckDB executed
+    // `b` while every downstream scanner saw spaces, so a clause after
+    // `-- c\r` vanished from a parsed body and a `-- note\r` prefix disabled
+    // search-path injection for the statement that followed.
+    #[test]
+    fn blank_comments_line_comment_ends_at_a_bare_carriage_return() {
+        let input = "a -- c\rb";
+        let out = blank_sql_comments(input);
+        assert_eq!(out, "a     \rb");
+        // Length preservation is load-bearing (error carets / raw re-slices).
+        assert_eq!(out.len(), input.len());
+    }
+
+    #[test]
+    fn blank_comments_line_comment_ends_at_crlf_keeping_both_bytes() {
+        let input = "a -- c\r\nb";
+        let out = blank_sql_comments(input);
+        assert_eq!(out, "a     \r\nb");
+        assert_eq!(out.len(), input.len());
     }
 
     #[test]
