@@ -359,15 +359,27 @@ mod extension {
             }
 
             /// Ordered `(human label, C++ registration wrapper)` table, iterated
-            /// by `init_extension`. Order is only significant in that the parser
-            /// hook (entry 0) must be registered before the table functions; the
-            /// read-side registrations are mutually independent.
+            /// by `init_extension`.
+            ///
+            /// LIFE-2: the parser hook is registered **last**. The read-side
+            /// registrations are mutually independent and are pure `DuckDB`
+            /// Catalog-API calls, so none of them needs the hook; the
+            /// dependency runs the other way, because the hook's rewrites emit
+            /// calls to those very functions (`list_semantic_views()`,
+            /// `describe_semantic_view(...)`,
+            /// `__sv_compute_create_from_yaml(...)`). Since `init_extension`
+            /// returns `Err` on the first failure and rolls nothing back,
+            /// registering the hook first meant a partial LOAD left
+            /// `parser_override` live — and
+            /// `allow_parser_override_extension` flipped to `FALLBACK` — with
+            /// the functions it rewrites to missing. Going last makes semantic
+            /// DDL inert on a failed LOAD instead of half-working.
+            /// `tests/registration_order_guard.rs` pins the order.
             const REGISTRATIONS: &[(&str, RegisterFn)] = &[ $( ($label, $sym) ),+ ];
         };
     }
 
     sv_registrations![
-        ("parser hooks", sv_register_parser_hooks),
         ("list_semantic_views", sv_register_list_semantic_views),
         (
             "list_terse_semantic_views",
@@ -415,6 +427,8 @@ mod extension {
         ),
         ("semantic_view", sv_register_semantic_view),
         ("explain_semantic_view", sv_register_explain_semantic_view),
+        // LIFE-2: must stay last — see the doc comment on `REGISTRATIONS`.
+        ("parser hooks", sv_register_parser_hooks),
     ];
 
     /// Decode a `[0u8; 1024]` registration error buffer into an owned `String`,
@@ -509,10 +523,15 @@ mod extension {
         // plan; `tests/no_long_lived_conn.rs` is the structural guard
         // that fails CI if anyone re-introduces one.
 
-        // Register the parser_override hook and every read-side table function
-        // / scalar via the C++ Catalog-API wrappers. `REGISTRATIONS` is ordered
-        // so the parser hook (entry 0) runs before the table functions (the
-        // one ordering constraint; the read-side registrations are independent).
+        // Register every read-side table function / scalar and then the
+        // parser_override hook via the C++ Catalog-API wrappers.
+        //
+        // LIFE-2: the loop returns on the first failure and rolls nothing back,
+        // so `REGISTRATIONS` puts the parser hook LAST — the read-side
+        // registrations are independent of it, while its own rewrites emit
+        // calls to them. See the `REGISTRATIONS` doc comment for the full
+        // argument and `tests/registration_order_guard.rs` for the guard.
+        //
         // Each wrapper writes a diagnostic into `error_buf` on failure, decoded
         // here so ADBC/JDBC/Python callers see the underlying DuckDB error.
         for &(label, register) in REGISTRATIONS {

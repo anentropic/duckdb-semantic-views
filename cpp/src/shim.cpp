@@ -3044,6 +3044,67 @@ extern "C" {
                 duckdb_destroy_result(&r);
             }
 
+            // Phase 65 Plan 04 (Task 2 Step B): register the
+            // `__sv_compute_create_from_yaml` helper TF via the C++ Catalog
+            // API so its bind callback receives a native `ClientContext &`
+            // and can open per-call `Connection(*context.db)` to read the
+            // YAML file. The outer parser_override INSERT in
+            // src/parse.rs::rewrite_yaml_file_create wraps the helper TF's
+            // `new_def` row with json_merge_patch + json_object to add
+            // now()/current_database()/current_schema() on the caller's
+            // connection, preserving D-21 transactional contract.
+            //
+            // LIFE-2 (code-review 2026-08-08): this block runs BEFORE the
+            // parser-extension registration below, for the same reason
+            // `REGISTRATIONS` in src/lib.rs puts the whole hook last — the
+            // dependency is one-way. The helper TF is a pure Catalog-API
+            // registration that never needs the hook, while the hook's own
+            // rewrite of `CREATE SEMANTIC VIEW ... FROM YAML FILE` emits a
+            // call to this TF. Registering the hook first meant a failure
+            // here returned false with `parser_override` already installed
+            // and `allow_parser_override_extension` already flipped to
+            // FALLBACK, so the YAML-file DDL form parsed and then failed on
+            // an unresolved function name.
+            {
+                // Phase 65.1 Plan 07 (IN-04 D-24): helper TF slimmed to
+                // 3 args — (file_path, view_name, comment). The previous
+                // `kind` INTEGER parameter was redundant with the outer
+                // parser_override INSERT shape (OR IGNORE / OR REPLACE /
+                // plain) and the Rust helper ignored it.
+                LogicalType arg_types[] = {
+                    LogicalType::VARCHAR,  // file_path
+                    LogicalType::VARCHAR,  // view_name
+                    LogicalType::VARCHAR,  // comment (empty = none)
+                };
+                // Phase 65.1 Plan 02a: sv_register_table_function requires a
+                // `(error_buf, error_buf_len)` trailing pair.
+                //
+                // Phase 65.1 Plan 10 (WR-06 D-13): sv_register_parser_hooks
+                // now carries its own error_buf; forward the helper TF's
+                // diagnostic into the parent buffer so the Rust caller
+                // surfaces it through `decode_register_err_buf`. The local
+                // buffer is needed because the helper writes via snprintf
+                // and may truncate independently of our outer buffer's size.
+                char helper_err[1024];
+                std::memset(helper_err, 0, sizeof(helper_err));
+                if (!sv_register_table_function(
+                        db_handle,
+                        "__sv_compute_create_from_yaml",
+                        arg_types, 3,
+                        sv_create_from_yaml_bind,
+                        sv_create_from_yaml_function,
+                        sv_create_from_yaml_init_local,
+                        helper_err, sizeof(helper_err))) {
+                    if (error_buf != nullptr && error_buf_len > 0) {
+                        snprintf(error_buf, error_buf_len,
+                            "sv_register_parser_hooks: failed to register "
+                            "__sv_compute_create_from_yaml helper TF: %s",
+                            helper_err);
+                    }
+                    return false;
+                }
+            }
+
             auto &config = DBConfig::GetConfig(db);
 
             // Phase 65.1 Plan 12 (WR-09 D-21): idempotence check across
@@ -3078,8 +3139,9 @@ extern "C" {
             // extension from two threads simultaneously, which is atypical for
             // DuckDB's extension-load API.
             //
-            // Helper-TF registrations below use `OnCreateConflict::ALTER_ON_CONFLICT`
-            // and are naturally idempotent — no analog guard needed there.
+            // The helper-TF registration above uses
+            // `OnCreateConflict::ALTER_ON_CONFLICT` and is naturally
+            // idempotent — no analog guard needed there.
             auto &cbmgr = config.GetCallbackManager();
             bool already_registered = false;
             for (auto &existing : cbmgr.ParserExtensions()) {
@@ -3127,55 +3189,6 @@ extern "C" {
                 // resolved by parse_function above — sv_parse_stub renders
                 // `LINE 1: ... ^` for every CREATE/DROP/ALTER validation error.
                 config.SetOption("allow_parser_override_extension", Value("FALLBACK"));
-            }
-
-            // Phase 65 Plan 04 (Task 2 Step B): register the
-            // `__sv_compute_create_from_yaml` helper TF via the C++ Catalog
-            // API so its bind callback receives a native `ClientContext &`
-            // and can open per-call `Connection(*context.db)` to read the
-            // YAML file. The outer parser_override INSERT in
-            // src/parse.rs::rewrite_yaml_file_create wraps the helper TF's
-            // `new_def` row with json_merge_patch + json_object to add
-            // now()/current_database()/current_schema() on the caller's
-            // connection, preserving D-21 transactional contract.
-            {
-                // Phase 65.1 Plan 07 (IN-04 D-24): helper TF slimmed to
-                // 3 args — (file_path, view_name, comment). The previous
-                // `kind` INTEGER parameter was redundant with the outer
-                // parser_override INSERT shape (OR IGNORE / OR REPLACE /
-                // plain) and the Rust helper ignored it.
-                LogicalType arg_types[] = {
-                    LogicalType::VARCHAR,  // file_path
-                    LogicalType::VARCHAR,  // view_name
-                    LogicalType::VARCHAR,  // comment (empty = none)
-                };
-                // Phase 65.1 Plan 02a: sv_register_table_function requires a
-                // `(error_buf, error_buf_len)` trailing pair.
-                //
-                // Phase 65.1 Plan 10 (WR-06 D-13): sv_register_parser_hooks
-                // now carries its own error_buf; forward the helper TF's
-                // diagnostic into the parent buffer so the Rust caller
-                // surfaces it through `decode_register_err_buf`. The local
-                // buffer is needed because the helper writes via snprintf
-                // and may truncate independently of our outer buffer's size.
-                char helper_err[1024];
-                std::memset(helper_err, 0, sizeof(helper_err));
-                if (!sv_register_table_function(
-                        db_handle,
-                        "__sv_compute_create_from_yaml",
-                        arg_types, 3,
-                        sv_create_from_yaml_bind,
-                        sv_create_from_yaml_function,
-                        sv_create_from_yaml_init_local,
-                        helper_err, sizeof(helper_err))) {
-                    if (error_buf != nullptr && error_buf_len > 0) {
-                        snprintf(error_buf, error_buf_len,
-                            "sv_register_parser_hooks: failed to register "
-                            "__sv_compute_create_from_yaml helper TF: %s",
-                            helper_err);
-                    }
-                    return false;
-                }
             }
 
             return true;
