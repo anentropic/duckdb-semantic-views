@@ -290,9 +290,8 @@ impl QuoteState {
 ///
 /// Every byte of a comment — `-- ...` to end of line (the line-ending byte
 /// itself is kept; a bare `\r` ends the comment as well as `\n`, matching
-/// `DuckDB`'s scanner — PARSE-13), and `/* ... */` including the delimiters — is
-/// replaced with a
-/// space. Block comments NEST, matching `PostgreSQL`/`DuckDB` semantics (the SQL
+/// `DuckDB`'s scanner, PARSE-13), and `/* ... */` including the delimiters — is
+/// replaced with a space. Block comments NEST, matching `PostgreSQL`/`DuckDB` semantics (the SQL
 /// standard): `/* a /* b */ c */` is one comment. An unterminated block
 /// comment blanks to end of input.
 ///

@@ -589,6 +589,14 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **PARSE-9:** name slots accept identifier garbage DuckDB would reject — `RENAME TO x,y` stores `x,y`.
 - **What would finish it:** route IDENT-1 through `ident_matches` (mechanical); give the scanner position-awareness for cast/EXTRACT slots (IDENT-3) and a quoted-name-aware literal rule (IDENT-4); make `normalize_ident_part` produce a structured key rather than a re-joined string (IDENT-5); tighten the name-slot grammar (PARSE-9). IDENT-2 needs a decision before a fix.
 
+### 73. ❌ A typed literal separated from its introducer by whitespace still scans as a reference (PARSE-12 residual) — OPEN
+
+- **Origin:** PARSE-12's fix (code review 2026-08-08), narrowed during review of that change. Recorded per the rule that a knowingly-partial behaviour gets an entry in the same change.
+- **What the fix does:** `expr_tokens::scan_chains` no longer emits an identifier chain as a *reference* when the chain is immediately followed by `'` — the adjacency rule `util::opens_escape_string` already uses. That covers `e'…'`, `E'…'` and the adjacent typed-literal form `DATE'2020-01-01'`, so a member named `e` or `date` can no longer corrupt those expressions.
+- **What is therefore missing:** DuckDB also accepts a typed literal with whitespace between the type name and the string — `DATE '2020-01-01'`, `INTERVAL '1 day'`, `TIMESTAMP '…'` — and the rule is adjacency-only, so the introducer is still scanned as a reference there. A view declaring a member named `date` or `interval` therefore still risks the inline corruption PARSE-12 closed for the adjacent spelling.
+- **Why it shipped narrow:** suppressing *every* identifier followed by whitespace and a string literal over-reaches badly — `SELECT foo 'bar'` is an alias, and ordinary expressions put identifiers before quoted text routinely. Doing it correctly needs a type-name registry so only real type introducers are suppressed, which is a larger change than the defect being fixed and carries its own false-positive risk.
+- **What would finish it:** a small set of recognized type-name introducers (the SQL standard's plus DuckDB's aliases) consulted when a chain is followed by optional ASCII whitespace and `'`. Guard with a pinned unit test for the spaced form, alongside PARSE-12's adjacent-form tests.
+
 ### 65. ❌ `USING` role context is not threaded into grain CTEs for the ambiguous-dimension case — OPEN
 
 - **Origin:** promoted 2026-08-08 from the "Still declined, deliberately" bullets of **resolved** entry #36, per the CLAUDE.md rule that a degraded behaviour's record must not live only in a test comment — and must not live only inside an entry marked ✅, which reads as finished. `test/sql/per_grain_role_playing.test` (Test 3) pins the degraded outcome with the comment "this still errors until USING context is threaded into the grain CTEs"; that comment should reference this entry.
