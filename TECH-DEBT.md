@@ -128,6 +128,13 @@ Constraints inherent to the current approach that affect users or maintainers.
 
 Areas where test coverage is reduced compared to ideal, with justification.
 
+> **The live gaps are in entry #66 below.**
+> The four entries in this section are pre-v0.5 items about *which harness type* covers a
+> feature; two are long resolved. They say nothing about the randomized-coverage axes that
+> have actually admitted wrong-number bugs (role-playing, FACTS requests, window/semi-additive
+> generator pins), which is why review after review has had to rediscover them. New coverage
+> gaps go in the numbered ledger below, not here.
+
 ### 1. ❓ Iceberg integration test uses Python instead of SQLLogicTest
 
 - **Origin:** Phase 4 audit item; decision [04-03] python-ducklake-test
@@ -547,6 +554,57 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **What the target asserts now:** the invariant its header always described and that is unconditionally true — render is a **fixpoint on a parser-produced definition**. Stage 0 renders the arbitrary def and parses it back purely to LAND in the parser's image; a failure there is a skip, because an arbitrary `SemanticViewDefinition` is not in that image and never was. From `d1` onward there is no escape. The `render_ddl.rs` mirror test matches, and both carry the reasoning inline.
 - **What is given up, explicitly:** the implication "YAML-storable ⇒ renders to parseable DDL" is no longer machine-checked over random definitions. It is still *enforced* — `validate_ddl_representable` is unchanged and still runs at the YAML choke point — and still tested, by the unit tests in `src/model.rs` and `test/sql/cr20260806_yaml_ddl_contract.test`. What is lost is randomized search for the next rule the validator does not yet know.
 - **What would finish it:** a target that fuzzes DDL **text**, not a struct — feed arbitrary bytes to `parse_keyword_body`, skip on parse failure (arbitrary bytes legitimately are not DDL), and assert that anything that DOES parse re-renders and re-parses to a fixpoint. That needs no precondition, since everything it asserts on came from the parser, and it searches the direction this target structurally cannot: what the parser *accepts*. It would subsume this entry and **#59**.
+
+### 61. ❌ Schema identity in the catalog is byte-equal for writes and case-folded for reads (CAT-5/CAT-6) — OPEN
+
+- **Origin:** code review 2026-08-06 (`_notes/code-review-2026-08-06.md`, CAT-5/CAT-6); re-confirmed unfixed by the 2026-08-08 review (`_notes/code-review-2026-08-08.md` §8). Recorded here because the 2026-08-06 review asked for ledger entries "in the next change that touches the area" and #203–#209 have since touched adjacent areas without opening one.
+- **CAT-5 — what is wrong:** the conflict key that makes `CREATE OR REPLACE` replace rather than duplicate is the byte-equal primary key `(schema_name, name)` (`src/parse/native_sql.rs:345,454`), while every read predicate and existence guard folds case (`src/catalog/writes.rs:166`, `src/catalog/mod.rs:692`). Drop a schema and recreate it under a different spelling (`main` → `MAIN`) and `INSERT OR REPLACE` no longer conflicts, so a second row is inserted for what reads consider the same view; qualified lookups then take `rows[0]` (`mod.rs:926-928`) and can resolve the stale definition. DuckDB's case-insensitive identifier convention (see CLAUDE.md) makes the folding side correct, so the PK is the side that is wrong.
+- **CAT-6 — what is wrong:** `DROP SCHEMA … CASCADE` is never intercepted, so `_definitions` rows for views in that schema survive the schema itself. They are unreachable but not gone, and a later recreate of the schema resurrects them.
+- **What would finish it:** store a folded (normalized) schema-name column as the PK component while keeping the user's spelling in a display column — the same split the catalog already uses for view names — so writes and reads agree on identity by construction; and either intercept `DROP SCHEMA` or make reads join against `duckdb_schemas()` so orphans cannot resolve.
+- **Coverage:** none. Both shapes are reachable from ordinary SQL and neither has a test; a fix must add them test-first.
+
+### 62. ❌ Query-path robustness: bind-time recursion and existence-check ordering (QRY-1/QRY-2) — OPEN
+
+- **Origin:** code review 2026-08-06 (QRY-1/QRY-2), re-confirmed unfixed 2026-08-08.
+- **QRY-1:** the bind-time `LIMIT 0` probe (`src/query/table_function.rs:243-256`) runs on a fresh connection per level (`cpp/src/shim.cpp:2759,2834`), so a SQL view that has been replaced to select from a semantic view that reads it back recurses at bind time with no depth counter. Constructible, and the failure mode is stack exhaustion rather than a diagnostic. Finishing it means threading a depth/visited-set through the bind context, or refusing to re-enter the bind path re-entrantly.
+- **QRY-2:** `EmptyRequest` is checked before the view is looked up (`table_function.rs:170-172`, `explain.rs:167-171`), so `semantic_view('does_not_exist')` reports the empty-request error rather than the missing view — the less useful of the two diagnostics. Finishing it is a reordering plus a test.
+- **Coverage:** none for either.
+
+### 63. ❌ FFI/wire defence-in-depth residues (FF-12/FF-13/FF-14) — OPEN
+
+- **Origin:** code review 2026-08-06 (FF-12/13/14), re-confirmed unfixed 2026-08-08. None is reachable from ordinary SQL — they are hardening items, recorded so they are not rediscovered as "new" a fourth time.
+- **FF-12:** the C++ wire readers `reserve()` a count read from the buffer before validating it (`cpp/src/shim.cpp:1251,1334,2785`). The Rust encoders never emit a bad count, so this only matters against a corrupted or hostile payload, but the Rust side clamps and the C++ side does not — an asymmetry worth closing.
+- **FF-13:** `sv_serialise_string_list` hardcodes the `explain_semantic_view:` error prefix (`shim.cpp:2324-2326`) although it is shared by `semantic_view` and, via `sv_search_path_payload` (`:1436-1442`), every named-parameter table function — so a NULL list element in any of them is attributed to `explain_semantic_view`.
+- **FF-14:** `read_column_string` truncates at an interior NUL (`src/catalog/mod.rs:656-668`), so a hand-tampered catalog row silently loses everything after it rather than being rejected.
+- **What would finish it:** clamp reserves against remaining buffer length in C++ as Rust already does; pass the caller's function name into the serializer; and reject (not truncate) interior NULs when decoding a stored definition.
+
+### 64. ❌ Identifier-matching residues outside `ident_matches`, and the reference scanner's blind spots (IDENT-1..5, PARSE-9) — OPEN
+
+- **Origin:** code review 2026-08-06 (IDENT-1..5, PARSE-9), re-confirmed unfixed 2026-08-08. Same family as #25/#28: sites that compare or key identifiers without the project's case-insensitive rule, plus scanner positions that mis-classify text as a reference.
+- **IDENT-1:** `alias_to_table_map` is exact-string keyed (`src/model.rs:492-497`) while alias matching is case-insensitive everywhere else, so a qualifier `o` misses an alias declared `O`. Re-executed 2026-08-08: still misses.
+- **IDENT-2:** `expr_tokens::scan_chain` splits a qualified reference at a spaced (or comment-blanked) dot — `o . region` scans as two chains. Currently *pinned as desired* by `dotted_chain_is_not_split_by_whitespace`, so changing it means changing that test deliberately.
+- **IDENT-3:** the scanner has no `::` / `CAST(… AS …)` / `EXTRACT(… FROM …)` context awareness, so a member named `date` or `year` corrupts sibling expressions when inlined. (PARSE-12, fixed 2026-08-08, is the distinct *literal-prefix* sibling of this defect, not this one.)
+- **IDENT-4:** a quoted all-digit name (`"0"`) collides with numeric literals, which the scanner assumes "can never be a declared name" (`expr_tokens.rs:541`).
+- **IDENT-5:** `normalize_ident_part` re-joins parts with `.` (`ident.rs:407-417`), so a quoted-dot single identifier and a two-part qualified reference produce the same match key.
+- **PARSE-9:** name slots accept identifier garbage DuckDB would reject — `RENAME TO x,y` stores `x,y`.
+- **What would finish it:** route IDENT-1 through `ident_matches` (mechanical); give the scanner position-awareness for cast/EXTRACT slots (IDENT-3) and a quoted-name-aware literal rule (IDENT-4); make `normalize_ident_part` produce a structured key rather than a re-joined string (IDENT-5); tighten the name-slot grammar (PARSE-9). IDENT-2 needs a decision before a fix.
+
+### 65. ❌ `USING` role context is not threaded into grain CTEs for the ambiguous-dimension case — OPEN
+
+- **Origin:** promoted 2026-08-08 from the "Still declined, deliberately" bullets of **resolved** entry #36, per the CLAUDE.md rule that a degraded behaviour's record must not live only in a test comment — and must not live only inside an entry marked ✅, which reads as finished. `test/sql/per_grain_role_playing.test` (Test 3) pins the degraded outcome with the comment "this still errors until USING context is threaded into the grain CTEs"; that comment should reference this entry.
+- **What is degraded:** a dimension on a role-played table reachable by two relationships, with no co-queried metric carrying `USING` to disambiguate, errors with `fan trap detected` rather than being answered. Erroring is the correct conservative call — a grain CTE would otherwise pick an edge by declaration order, which is the silent mis-binding the fence exists to prevent — but it is a capability gap, not a neutral choice, and Snowflake answers these.
+- **Also still declined for the same reason:** a `where_clause` member on a role-played table, a metric whose own grain table is one, and any table reachable only *through* one; the window path stays strict because `__sv_agg`'s SELECT list gets no scoped-alias rewrite.
+- **What would finish it:** the machinery exists — `role_playing::find_using_context`, `expr_tokens::rewrite_qualifier`, and `ResolvedJoin`'s `scoped` / `emit_alias` fields, which `anchor_joins` currently hardcodes to the bare alias. What is missing is a way to name the intended role when no metric supplies `USING`, i.e. per-dimension role context in the request or the definition.
+
+### 66. ❌ The randomized-coverage axis ledger is not maintained, and three axes with wrong-number history are unrandomized (PBT-8/10/11/12, TC-12/13) — OPEN
+
+- **Origin:** code-review test audits 2026-08-06 (PBT-8..12, TC-12/13) and 2026-08-08 (PBT-13/14/15, TC-14/15). Recorded here because the "Test Coverage Gaps" section above lists only four pre-v0.5 items and none of the live gaps — the review's TC-15: the record of what is actually uncovered lives in `_notes/` review documents, which is the "record sits where nobody re-reads" shape this file exists to prevent.
+- **The axes with no randomized numeric coverage, ranked by demonstrated risk:**
+  - **PBT-10 — role-playing.** No harness generates two edges to one table (`tests/common/mod.rs:242-259` emits at most one join per non-base table, all targeting `t0`). The feature with the worst regression history (EXP-4/5, EXP-10, F-18/T-15) has the emptiest coverage row, unchanged across three review rounds. Its independent oracle is genuinely hard to formulate, which is why it keeps not happening — see `_notes/proactive-defect-discovery.md` §2.1 for the self-checking-oracle approach that removes that blocker.
+  - **PBT-8 — row-level FACTS queries.** `QueryRequest.facts` was pinned at `vec![]` in every harness; EXP-28/EXP-29 (2026-08-08) landed in exactly that cell.
+  - **PBT-11/12 — pinned generator fields and fixed topologies:** window `order_by`/`frame_clause`/`extra_args` and a self-referential inner metric; semi-additive `nulls`/single-NA-dim/single-table; `ManyToOne` and single-column keys everywhere; hostile identifiers never reaching a numeric oracle; sibling-fan / fan-in / diamond topologies fixed-example-only.
+- **The vacuity residues (TC-12):** assertion-free match arms in `tests/parse_proptest.rs:831-848` under a comment claiming an invariant; two empty-expectation `statement error` blocks in `test/sql/quick_260430_vdz_leading_comments.test:74-83`; a stale "not yet written" comment in `tests/expand_proptest.rs:326-331`; `src/expand/tests_fact_query.rs:33-44` asserting on SQL substrings rather than numbers.
+- **What would finish it:** keep the pinned-field matrix (reproduced per review round in `_notes/code-review-2026-08-*.md` §6/§7) as a checked-in artifact verified by a meta-test, so adding a field to `QueryRequest` without deciding its generator story fails CI; require a `// PIN: <reason>, TECH-DEBT #<n>` comment on any inert generator default. See `_notes/proactive-defect-discovery.md` §2.5.
 
 ### 57. ❌ An unqualified `where_clause` member excludes a query from every re-anchoring path (EXP-22) — OPEN
 
