@@ -104,3 +104,4 @@ test/sql/cr20260806_yaml_ddl_contract.test
 test/sql/cat4_read_foreign_database.test
 test/sql/par6_cross_table_fact_join.test
 test/sql/member_reference_scoping.test
+test/sql/cr20260808_yaml_ingress.test
