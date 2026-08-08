@@ -691,6 +691,7 @@ proptest! {
                 .iter()
                 .map(|&i| MetricName::new(METS[i]))
                 .collect(),
+            // PIN: FACTS is oracled by child_grain_proptest and metamorphic_proptest; this harness oracles the fan-trap fence and per-grain math. TECH-DEBT #66
             facts: vec![],
         };
 

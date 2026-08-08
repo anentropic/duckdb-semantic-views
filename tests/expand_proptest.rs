@@ -91,6 +91,7 @@ fn simple_definition() -> SemanticViewDefinition {
         ],
 
         joins: vec![],
+        // PIN: structural harness -- asserts expand() shape/no-panic, not numbers; the numeric coverage for this field lives in the differential harnesses. TECH-DEBT #66
         facts: vec![],
         materializations: vec![],
 
@@ -233,6 +234,7 @@ fn joined_definition() -> SemanticViewDefinition {
                 ..Default::default()
             },
         ],
+        // PIN: structural harness -- asserts expand() shape/no-panic, not numbers; the numeric coverage for this field lives in the differential harnesses. TECH-DEBT #66
         facts: vec![],
         materializations: vec![],
 
@@ -321,12 +323,14 @@ fn arb_query_request(def: &SemanticViewDefinition) -> impl Strategy<Value = Quer
         .prop_map(|(dims, mets)| QueryRequest {
             dimensions: dims.into_iter().map(DimensionName::new).collect(),
             metrics: mets.into_iter().map(MetricName::new).collect(),
+            // PIN: structural harness -- asserts expand() shape/no-panic, not numbers; the numeric coverage for this field lives in the differential harnesses. TECH-DEBT #66
             facts: vec![],
             // No predicate: this generator covers the unfiltered shapes, and the
             // invariants asserted below are about dimension/metric expansion.
             // Property coverage for `where_clause` still needs its own generator
             // (predicates are arbitrary user text spliced into generated SQL, so
             // they want a fuzz/proptest of their own) — not yet written.
+            // PIN: structural harness -- asserts expand() shape/no-panic, not numbers; the numeric coverage for this field lives in the differential harnesses. TECH-DEBT #66
             where_clause: None,
         })
 }
@@ -532,9 +536,11 @@ proptest! {
     ) {
         let def = simple_definition();
         let req = QueryRequest {
+            // PIN: structural harness -- asserts expand() shape/no-panic, not numbers; the numeric coverage for this field lives in the differential harnesses. TECH-DEBT #66
             where_clause: None,
             dimensions: vec![],
             metrics: metrics.iter().map(MetricName::new).collect(),
+            // PIN: structural harness -- asserts expand() shape/no-panic, not numbers; the numeric coverage for this field lives in the differential harnesses. TECH-DEBT #66
             facts: vec![],
         };
         let sql = expand("test", &def, &req).unwrap();
