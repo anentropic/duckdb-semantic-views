@@ -215,7 +215,7 @@ fn resolve_names<'a, T: Resolvable, N: AsRef<str>>(
 /// When the members span several tables the natural grain is ambiguous (a base
 /// member legitimately keeps its row even with no child), and when the table
 /// declares no PRIMARY KEY there is no column that distinguishes a phantom;
-/// both keep today's behaviour. See TECH-DEBT #58.
+/// both keep today's behaviour. See TECH-DEBT #61.
 fn phantom_row_filter(
     def: &SemanticViewDefinition,
     member_tables: &[Option<String>],
