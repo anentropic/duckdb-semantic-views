@@ -47,6 +47,8 @@ mod tests_join_emission_regression;
 #[cfg(test)]
 mod tests_per_grain;
 #[cfg(test)]
+mod tests_phantom_row_guard;
+#[cfg(test)]
 mod tests_pkfk_expand;
 #[cfg(test)]
 mod tests_private_access;

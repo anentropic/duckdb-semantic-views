@@ -6,7 +6,7 @@ use super::facts::{
 };
 use super::fan_trap::{check_fan_traps, validate_fact_table_path};
 use super::join_resolver::resolve_joins_pkfk;
-use super::resolution::{find_dimension, find_metric, quote_stored_ident};
+use super::resolution::{find_dimension, find_metric, quote_ident, quote_stored_ident};
 use super::role_playing::{
     check_fact_role_playing_path, check_where_clause_role_playing_path, find_using_context,
 };
@@ -183,6 +183,74 @@ fn resolve_names<'a, T: Resolvable, N: AsRef<str>>(
     Ok(resolved)
 }
 
+/// The `<child pk> IS NOT NULL` predicate that removes phantom (NULL-extended)
+/// rows from a ROW-LEVEL query, or `None` when there is nothing to remove
+/// (EXP-28, EXP-29 — code-review 2026-08-08).
+///
+/// Every synthesized join is a LEFT JOIN anchored at the base table, so a base
+/// row with no matching child row survives as one all-NULL row. An AGGREGATE
+/// query fences that row inside each aggregate (SG-8 + `guard_aggregate_args`),
+/// but a fact query and a dimensions-only `SELECT DISTINCT` emit rows
+/// directly — the phantom becomes a result row that does not exist in the data,
+/// and its NULLs are indistinguishable from genuine ones.
+///
+/// `member_tables` are the `source_table`s of the queried members (`None` means
+/// the base table, which is never NULL-extended). The guard applies only when
+/// they all name ONE non-base table with a declared PRIMARY KEY: that is the
+/// query's grain, and filtering to its real rows is exactly "anchor at the
+/// common grain table, joining up for the rest" — which stays fan-free because
+/// the walk from a child to its parents is many-to-one. When the members span
+/// several tables the natural grain is ambiguous (a base member legitimately
+/// keeps its row even with no child), and when the table declares no PRIMARY
+/// KEY there is no column that distinguishes a phantom; both keep today's
+/// behaviour. See TECH-DEBT #58.
+fn phantom_row_filter(
+    def: &SemanticViewDefinition,
+    member_tables: &[Option<String>],
+) -> Option<String> {
+    let base = def.tables.first()?.alias.to_ascii_lowercase();
+    let mut grain: Option<String> = None;
+    for member in member_tables {
+        let alias = member
+            .as_ref()
+            .map_or_else(|| base.clone(), |source| source.to_ascii_lowercase());
+        match &grain {
+            None => grain = Some(alias),
+            Some(seen) if *seen == alias => {}
+            Some(_) => return None, // members span several tables
+        }
+    }
+    let alias = grain?;
+    if alias == base {
+        return None;
+    }
+    let pk = def
+        .tables
+        .iter()
+        .find(|t| t.alias.to_ascii_lowercase() == alias)?
+        .pk_columns
+        .first()?;
+    Some(format!(
+        "{}.{} IS NOT NULL",
+        quote_ident(&alias),
+        quote_ident(pk)
+    ))
+}
+
+/// `AND` the phantom-row guard onto the query's own predicate.
+///
+/// The user's predicate is parenthesized so an `OR` at its top level cannot
+/// swallow the guard. With no guard the predicate is passed through byte for
+/// byte — the emitted SQL of every query that has no phantom to remove is
+/// unchanged.
+fn and_phantom_filter(predicate: Option<String>, guard: Option<String>) -> Option<String> {
+    match (predicate, guard) {
+        (Some(p), Some(g)) => Some(format!("({p}) AND {g}")),
+        (Some(p), None) => Some(p),
+        (None, g) => g,
+    }
+}
+
 /// Expand a fact query into unaggregated SQL.
 ///
 /// Facts are row-level expressions — the generated SQL has no GROUP BY and no
@@ -316,8 +384,15 @@ fn expand_facts(
     // 7. A fact query is an unaggregated top-level SELECT over the base table
     //    (+ joins): no DISTINCT, no GROUP BY. The predicate is a plain WHERE —
     //    nothing is aggregated, so there is no "before" to be careful about.
+    //    EXP-28: when every queried fact lives on one LEFT-JOINed table, that
+    //    table is the query's grain and its phantom rows are filtered out.
+    let fact_member_tables: Vec<Option<String>> = resolved_facts
+        .iter()
+        .map(|f| f.source_table.clone())
+        .collect();
+    let phantom_guard = phantom_row_filter(def, &fact_member_tables);
     Ok(SelectSpec {
-        where_clause: resolved_where.map(|rw| rw.sql),
+        where_clause: and_phantom_filter(resolved_where.map(|rw| rw.sql), phantom_guard),
         distinct: false,
         items,
         from: FromSource::BaseTable { def, joins },
@@ -742,11 +817,27 @@ pub fn expand(
         GroupBy::None
     };
 
+    // EXP-29: a dimensions-only `SELECT DISTINCT` emits rows directly, so it has
+    // the same phantom-row exposure as a fact query — a childless parent
+    // contributes a manufactured NULL that reads as a genuine data NULL. Only
+    // that branch: with metrics present the phantom is fenced inside each
+    // aggregate instead. Role-played dimensions are skipped — their table is
+    // joined under a scoped alias the guard does not name.
+    let phantom_guard = if distinct && resolved.iter().all(|rd| rd.scoped_alias.is_none()) {
+        let dim_member_tables: Vec<Option<String>> = resolved_dims
+            .iter()
+            .map(|d| d.source_table.clone())
+            .collect();
+        phantom_row_filter(def, &dim_member_tables)
+    } else {
+        None
+    };
+
     Ok(SelectSpec {
         // Rendered between the joins and the GROUP BY, so rows are filtered on
         // their way INTO the aggregation — Snowflake's "applied before the
         // metrics are computed".
-        where_clause: resolved_where.map(|rw| rw.sql),
+        where_clause: and_phantom_filter(resolved_where.map(|rw| rw.sql), phantom_guard),
         distinct,
         items,
         from: FromSource::BaseTable { def, joins },
