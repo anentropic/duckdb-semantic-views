@@ -46,7 +46,13 @@ mod tests_fan_trap;
 mod tests_join_emission_regression;
 #[cfg(test)]
 mod tests_per_grain;
-#[cfg(test)]
+// These tests pin NUMBERS, not SQL text: every case executes the generated SQL
+// against an in-memory `DuckDB`. The `extension` feature swaps the bundled
+// DuckDB API for loadable-extension stubs, where `Connection::open_in_memory`
+// panics with "DuckDB API not initialized" — so the module is gated the same way
+// `semi_additive.rs`'s `execution` submodule and `catalog.rs`'s tests are. The
+// default-features run (the one that can execute SQL) is what covers this file.
+#[cfg(all(test, not(feature = "extension")))]
 mod tests_phantom_row_guard;
 #[cfg(test)]
 mod tests_pkfk_expand;
