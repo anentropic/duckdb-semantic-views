@@ -128,7 +128,7 @@ Constraints inherent to the current approach that affect users or maintainers.
 
 Areas where test coverage is reduced compared to ideal, with justification.
 
-> **The live gaps are in [#66](#66--the-randomized-coverage-axis-ledger-is-not-maintained-and-three-axes-with-wrong-number-history-are-unrandomized-pbt-81011121-tc-1213--open).**
+> **The live gaps are in entry #66 below.**
 > The four entries in this section are pre-v0.5 items about *which harness type* covers a
 > feature; two are long resolved. They say nothing about the randomized-coverage axes that
 > have actually admitted wrong-number bugs (role-playing, FACTS requests, window/semi-additive
