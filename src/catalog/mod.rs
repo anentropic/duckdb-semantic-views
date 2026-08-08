@@ -59,10 +59,29 @@ fn v010_companion_path(db_path: &str) -> Option<PathBuf> {
 /// test's files share the unique stem.
 #[cfg(test)]
 pub(crate) fn unique_temp_db_path(stem: &str) -> PathBuf {
+    // Three components, because two of them are individually insufficient:
+    //
+    // - the PID separates concurrent `cargo test` PROCESSES (the CAT-7
+    //   collision this helper exists to fix — a sibling run took a conflicting
+    //   DuckDB lock, and each test's up-front `remove_file` could delete the
+    //   other run's live database);
+    // - the counter separates callers WITHIN a process, which the PID cannot:
+    //   Rust runs tests on concurrent threads, so every caller here shares a
+    //   PID, and `SystemTime` resolution is coarser than nanoseconds on some
+    //   platforms — two threads in one tick would otherwise get one path, which
+    //   is CAT-7 again inside a single run;
+    // - the timestamp keeps names distinct across sequential runs of the same
+    //   process image, so a crashed run's leftover file cannot be mistaken for
+    //   the current one.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    std::env::temp_dir().join(format!("{stem}_{}_{nanos}.duckdb", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "{stem}_{}_{nanos}_{seq}.duckdb",
+        std::process::id()
+    ))
 }
 
 /// Schema holding the semantic-view catalog table.
@@ -1014,6 +1033,58 @@ mod tests {
     use super::*;
     #[cfg(not(feature = "extension"))]
     use duckdb::Connection;
+
+    /// CAT-7's helper must be unique WITHIN a process, not just across them.
+    ///
+    /// The first version used PID + `SystemTime` nanos only. Rust runs tests on
+    /// concurrent threads, so every caller shares a PID, and on a platform whose
+    /// clock is coarser than nanoseconds two callers in one tick get the same
+    /// path — CAT-7 again, inside a single run.
+    ///
+    /// This asserts the **counter**, not "1000 calls happened to differ". A
+    /// tight loop on a fine-grained clock (Linux here) produces distinct
+    /// timestamps anyway, so that version of the test passes with the counter
+    /// removed — vacuous exactly where it matters, since the bug only bites on
+    /// the coarse-clock platforms this cannot simulate. Pinning the monotonic
+    /// component instead is clock-independent: with the counter gone the
+    /// filename has three components rather than four and this fails outright.
+    #[test]
+    fn unique_temp_db_path_carries_a_clock_independent_counter() {
+        // Underscore-free stem so the components are countable: the name is
+        // exactly `<stem>_<pid>_<nanos>_<counter>`. Drop the counter and it is
+        // three fields, which is what makes this fail pre-fix — checking "the
+        // last field increases" would NOT, because the nanos field increases
+        // too and parses as an integer just as happily.
+        let fields = |p: PathBuf| -> Vec<String> {
+            p.file_stem()
+                .expect("stem")
+                .to_string_lossy()
+                .split('_')
+                .map(str::to_owned)
+                .collect()
+        };
+
+        let a = fields(unique_temp_db_path("cat7seq"));
+        let b = fields(unique_temp_db_path("cat7seq"));
+        assert_eq!(
+            a.len(),
+            4,
+            "expected <stem>_<pid>_<nanos>_<counter>, got {a:?} — without the \
+             counter, within-process uniqueness rests entirely on clock \
+             resolution, which is the CAT-7 collision"
+        );
+
+        let (sa, sb): (u64, u64) = (
+            a[3].parse().expect("counter"),
+            b[3].parse().expect("counter"),
+        );
+        assert_eq!(
+            sb,
+            sa + 1,
+            "counter must advance by exactly one per call, got {sa} then {sb}"
+        );
+        assert_eq!(a[1], b[1], "same process, so the PID field must match");
+    }
 
     // CAT-4 (code-review 2026-08-03): the read side's foreign-database rule.
     // The end-to-end coverage is `test/sql/cat4_read_foreign_database.test`,
