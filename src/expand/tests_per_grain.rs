@@ -103,7 +103,9 @@ fn parent_grain_metric_alone_aggregates_at_its_own_grain() {
         "the base table must not appear — joining it is what inflated the metric:\n{sql}"
     );
     assert!(
-        sql.contains(r#"SUM(c.balance) AS "total_balance""#),
+        sql.contains(
+            r#"SUM(CASE WHEN "c"."id" IS NOT NULL THEN c.balance END) AS "total_balance""#
+        ),
         "must emit the metric expression, got:\n{sql}"
     );
 }
