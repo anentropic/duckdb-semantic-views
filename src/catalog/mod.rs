@@ -21,6 +21,29 @@ pub(crate) mod writes;
 // companion file is deleted and this constant is never referenced again at runtime.
 const V010_COMPANION_EXT: &str = "semantic_views";
 
+/// A unique temp-file path for a file-backed unit test (CAT-7).
+///
+/// File-backed tests used to hardcode a fixed name under `std::env::temp_dir()`.
+/// `cargo test` runs several test binaries **concurrently**, and this crate's
+/// tests are also run concurrently with other checkouts on a shared machine, so
+/// two processes could open the same DuckDB file — one taking a conflicting
+/// lock, and each `remove_file`-ing the other's live database on the way in.
+/// Observed live during the 2026-08-08 review: four tests failed on a
+/// conflicting-lock error and passed in isolation.
+///
+/// Uniqueness comes from the process id plus a nanosecond timestamp, the
+/// pattern `tc6_restart_persistence_survives_reopen` already used. `stem` keeps
+/// the failing file identifiable in a `ls /tmp` after a crash, and callers that
+/// need companion/WAL siblings derive them from the returned path so all of a
+/// test's files share the unique stem.
+#[cfg(test)]
+pub(crate) fn unique_temp_db_path(stem: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    std::env::temp_dir().join(format!("{stem}_{}_{nanos}.duckdb", std::process::id()))
+}
+
 /// Schema holding the semantic-view catalog table.
 pub const DEFINITIONS_SCHEMA: &str = "semantic_layer";
 /// Bare (unqualified) name of the semantic-view catalog table.
@@ -1826,12 +1849,10 @@ mod tests {
         // v0.1.0 companion file was silently DELETED without importing —
         // permanent loss of pre-v0.2 definitions. Post-fix init_catalog must
         // error, and the file must be left in place for the user to repair.
-        let tmp = std::env::temp_dir();
-        let db_path_buf = tmp.join("test_ms2_corrupt.duckdb");
+        // CAT-7: unique per-invocation paths; see `unique_temp_db_path`.
+        let db_path_buf = unique_temp_db_path("test_ms2_corrupt");
         let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
-        let companion = tmp.join("test_ms2_corrupt.duckdb.semantic_views");
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(&companion);
+        let companion = PathBuf::from(format!("{db_path}.{V010_COMPANION_EXT}"));
 
         std::fs::write(&companion, "{not valid json").unwrap();
         let con = Connection::open(db_path).expect("open file-backed DB");
@@ -1853,12 +1874,10 @@ mod tests {
     #[cfg(not(feature = "extension"))]
     #[test]
     fn migration_valid_companion_file_imports_then_deletes() {
-        let tmp = std::env::temp_dir();
-        let db_path_buf = tmp.join("test_ms2_valid.duckdb");
+        // CAT-7: unique per-invocation paths; see `unique_temp_db_path`.
+        let db_path_buf = unique_temp_db_path("test_ms2_valid");
         let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
-        let companion = tmp.join("test_ms2_valid.duckdb.semantic_views");
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(&companion);
+        let companion = PathBuf::from(format!("{db_path}.{V010_COMPANION_EXT}"));
 
         std::fs::write(
             &companion,
@@ -1895,12 +1914,10 @@ mod tests {
         // with an empty schema in `SHOW SEMANTIC VIEWS`, and was missed
         // entirely by `SHOW SEMANTIC VIEWS IN SCHEMA main` — the listings read
         // the JSON, not the column.
-        let tmp = std::env::temp_dir();
-        let db_path_buf = tmp.join("test_cat3_backfill.duckdb");
+        // CAT-7: unique per-invocation paths; see `unique_temp_db_path`.
+        let db_path_buf = unique_temp_db_path("test_cat3_backfill");
         let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
-        let companion = tmp.join("test_cat3_backfill.duckdb.semantic_views");
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(&companion);
+        let companion = PathBuf::from(format!("{db_path}.{V010_COMPANION_EXT}"));
 
         std::fs::write(
             &companion,
@@ -1938,10 +1955,9 @@ mod tests {
     #[cfg(not(feature = "extension"))]
     #[test]
     fn pragma_database_list_returns_file_path() {
-        let tmp = std::env::temp_dir();
-        let tmpfile_buf = tmp.join("test_pragma_rust_check.duckdb");
+        // CAT-7: unique per-invocation paths; see `unique_temp_db_path`.
+        let tmpfile_buf = unique_temp_db_path("test_pragma_rust_check");
         let tmpfile = tmpfile_buf.to_str().expect("temp dir is UTF-8");
-        let _ = std::fs::remove_file(tmpfile);
         let con = Connection::open(tmpfile).expect("open file-backed connection");
         let mut stmt = con.prepare("PRAGMA database_list").expect("prepare PRAGMA");
         let paths: Vec<Option<String>> = stmt
@@ -1982,11 +1998,9 @@ mod tests {
     #[cfg(not(feature = "extension"))]
     #[test]
     fn persist_02_rollback_leaves_catalog_unchanged() {
-        let tmp = std::env::temp_dir();
-        let db_path_buf = tmp.join("test_persist02_rollback.duckdb");
+        // CAT-7: unique per-invocation paths; see `unique_temp_db_path`.
+        let db_path_buf = unique_temp_db_path("test_persist02_rollback");
         let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(format!("{db_path}.wal"));
 
         let con = Connection::open(db_path).expect("open file-backed DB");
         init_catalog(&con, db_path, false).unwrap();
@@ -2047,19 +2061,11 @@ mod tests {
     fn tc6_restart_persistence_survives_reopen() {
         // Unique per-invocation filename (pid + nanos) so concurrent `cargo test`
         // runs — in this binary or another process — cannot race on the same
-        // DB/WAL paths and flake via cross-deletion/reuse.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let tmp = std::env::temp_dir();
-        let db_path_buf = tmp.join(format!(
-            "test_tc6_restart_persistence_{}_{nanos}.duckdb",
-            std::process::id()
-        ));
+        // DB/WAL paths and flake via cross-deletion/reuse. CAT-7 lifted this
+        // out of here into `unique_temp_db_path` and put every other
+        // file-backed test on it.
+        let db_path_buf = unique_temp_db_path("test_tc6_restart_persistence");
         let db_path = db_path_buf.to_str().expect("temp dir is UTF-8");
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(format!("{db_path}.wal"));
 
         let json = r#"{"schema_version":1,"base_table":"sales","dimensions":[],"metrics":[]}"#;
 

@@ -829,8 +829,11 @@ mod tests {
         // the lowercased enum form ("read_only"), not "READ_ONLY".
         // If a future DuckDB version changes this rendering, this test
         // catches it at CI bump time rather than in production.
-        let tmp = std::env::temp_dir().join("phase63_access_mode_pin.duckdb");
-        let _ = std::fs::remove_file(&tmp);
+        // CAT-7: unique per-invocation path — a fixed `/tmp` name collides with
+        // a concurrent `cargo test` process, which then takes a conflicting
+        // DuckDB lock (and the up-front `remove_file` could delete the other
+        // run's live database). See `catalog::unique_temp_db_path`.
+        let tmp = crate::catalog::unique_temp_db_path("phase63_access_mode_pin");
         // Bootstrap an empty file with valid header bytes by opening
         // writable then closing.
         {
