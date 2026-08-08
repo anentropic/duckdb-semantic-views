@@ -168,24 +168,42 @@ pub(super) fn check_fact_role_playing_path(
 /// guess (several metrics may name several roles, and a predicate is not bound
 /// to any of them), and guessing is what produces a wrong number instead of an
 /// error — the reasoning behind EXP-4/EXP-5.
+///
+/// # What counts as "the member's table"
+///
+/// EXP-31 (code-review 2026-08-08). A member forces a join not only of the
+/// table it is *declared* on but of every table its expression reaches through
+/// a fact reference ([`WhereMember::fact_tables`], the set #207 added to
+/// `ResolvedWhere::source_tables` so those joins are emitted at all). Reading
+/// only the declared table meant a member on an unambiguous base table whose
+/// fact chain lands on a role-playing one sailed through and bound to
+/// `tree_parent`, the first-declared relationship — the exact silent,
+/// declaration-order-dependent binding this check exists to prevent, one hop
+/// further along. Same blind spot #207 opened for fan traps (EXP-27), at a
+/// different fence, so both walk the pair the same way.
+///
+/// [`WhereMember::fact_tables`]: super::where_clause::WhereMember::fact_tables
 pub(super) fn check_where_clause_role_playing_path(
     view_name: &str,
     def: &SemanticViewDefinition,
     where_members: &[super::where_clause::WhereMember],
 ) -> Result<(), ExpandError> {
     for member in where_members {
-        let Some(member_table) = member.table.as_ref() else {
-            continue; // Unqualified member: base-table grain, no role to pick.
-        };
-        if let Some(rp) = role_playing_on_path(view_name, def, member_table)? {
-            let available_relationships = relationships_to_table(def, &rp);
-            return Err(ExpandError::AmbiguousWhereClausePath {
-                view_name: view_name.to_string(),
-                member_name: member.name.clone(),
-                member_table: member_table.to_ascii_lowercase(),
-                role_playing_table: rp,
-                available_relationships,
-            });
+        // A member declared without a table is base-table grain and picks no
+        // role of its own — but its fact chain still can, so the chain is
+        // walked either way.
+        let joined_tables = member.table.iter().chain(member.fact_tables.iter());
+        for member_table in joined_tables {
+            if let Some(rp) = role_playing_on_path(view_name, def, member_table)? {
+                let available_relationships = relationships_to_table(def, &rp);
+                return Err(ExpandError::AmbiguousWhereClausePath {
+                    view_name: view_name.to_string(),
+                    member_name: member.name.clone(),
+                    member_table: member_table.to_ascii_lowercase(),
+                    role_playing_table: rp,
+                    available_relationships,
+                });
+            }
         }
     }
     Ok(())

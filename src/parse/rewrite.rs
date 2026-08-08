@@ -1341,7 +1341,7 @@ mod tests {
         let sql = passthrough_sql("SHOW SEMANTIC VIEWS STARTS WITH 'a' LIMIT 5");
         assert_eq!(
             sql,
-            "SELECT * FROM list_semantic_views() WHERE name LIKE 'a%' LIMIT 5"
+            "SELECT * FROM list_semantic_views() WHERE starts_with(name, 'a') LIMIT 5"
         );
     }
 
@@ -2070,7 +2070,7 @@ mod tests {
         fn test_build_filter_suffix_starts_with_only() {
             assert_eq!(
                 build_filter_suffix(None, Some("total"), None, None, None),
-                " WHERE name LIKE 'total%'"
+                " WHERE starts_with(name, 'total')"
             );
         }
 
@@ -2086,7 +2086,7 @@ mod tests {
         fn test_build_filter_suffix_all_three() {
             assert_eq!(
                 build_filter_suffix(Some("%x%"), Some("a"), Some(10), None, None),
-                " WHERE name ILIKE '%x%' AND name LIKE 'a%' LIMIT 10"
+                " WHERE name ILIKE '%x%' AND starts_with(name, 'a') LIMIT 10"
             );
         }
 
@@ -2163,7 +2163,7 @@ mod tests {
             );
             assert_eq!(
                 sql,
-                "SELECT * FROM show_semantic_dimensions('v') WHERE name ILIKE '%c%' AND name LIKE 'cust%' LIMIT 2"
+                "SELECT * FROM show_semantic_dimensions('v') WHERE name ILIKE '%c%' AND starts_with(name, 'cust') LIMIT 2"
             );
         }
 
@@ -2172,7 +2172,7 @@ mod tests {
             let sql = passthrough_sql("SHOW SEMANTIC METRICS STARTS WITH 'total' LIMIT 1");
             assert_eq!(
                 sql,
-                "SELECT * FROM show_semantic_metrics_all() WHERE name LIKE 'total%' LIMIT 1"
+                "SELECT * FROM show_semantic_metrics_all() WHERE starts_with(name, 'total') LIMIT 1"
             );
         }
 
@@ -2189,7 +2189,7 @@ mod tests {
             );
             assert_eq!(
                 sql,
-                "SELECT * FROM show_semantic_dimensions_for_metric('v', 'm') WHERE name ILIKE '%x%' AND name LIKE 'a%' LIMIT 3"
+                "SELECT * FROM show_semantic_dimensions_for_metric('v', 'm') WHERE name ILIKE '%x%' AND starts_with(name, 'a') LIMIT 3"
             );
         }
 
@@ -2238,7 +2238,7 @@ mod tests {
             let sql = passthrough_sql("SHOW SEMANTIC VIEWS STARTS WITH 'sales' LIMIT 5");
             assert_eq!(
                 sql,
-                "SELECT * FROM list_semantic_views() WHERE name LIKE 'sales%' LIMIT 5"
+                "SELECT * FROM list_semantic_views() WHERE starts_with(name, 'sales') LIMIT 5"
             );
         }
 
@@ -2247,7 +2247,7 @@ mod tests {
             let sql = passthrough_sql("SHOW SEMANTIC VIEWS LIKE '%x%' STARTS WITH 'a' LIMIT 3");
             assert_eq!(
                 sql,
-                "SELECT * FROM list_semantic_views() WHERE name ILIKE '%x%' AND name LIKE 'a%' LIMIT 3"
+                "SELECT * FROM list_semantic_views() WHERE name ILIKE '%x%' AND starts_with(name, 'a') LIMIT 3"
             );
         }
 
@@ -4001,7 +4001,7 @@ $$"#;
             assert_eq!(
                 passthrough_sql("SHOW SEMANTIC VIEWS IN SCHEMA STARTS WITH 'a'"),
                 "SELECT * FROM list_semantic_views() \
-                 WHERE name LIKE 'a%' AND lower(schema_name) = lower(current_schema())"
+                 WHERE starts_with(name, 'a') AND lower(schema_name) = lower(current_schema())"
             );
         }
 
