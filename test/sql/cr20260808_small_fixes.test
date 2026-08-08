@@ -18,6 +18,7 @@ CREATE SEMANTIC VIEW cr0808_starts_with_sv AS
     t.a_b AS t.a_b,
     t.axb AS t.axb,
     t."p%q" AS t.pq,
+    t.pq AS t.pq,
     t.pzq AS t.pzq
   )
   METRICS (
@@ -41,10 +42,27 @@ memory	main	cr0808_starts_with_sv	cr0808_t	a_b	(empty)	[]	(empty)
 # `p%q` and `pzq`.
 # ============================================================
 
+#
+# The prefix is what carries the metacharacter here, not the name: a name
+# containing `%` has to be written quoted, and a quoted name is reported WITH
+# its quotes (pinned by show_quoted_name_slots.test), so it could never match a
+# bare `p%` prefix either way. Pre-fix this emitted `name LIKE 'p%%'` and
+# returned BOTH `pq` and `pzq`; post-fix no name literally starts with `p%`, so
+# the correct answer is no rows at all.
+
 query TTTTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN cr0808_starts_with_sv STARTS WITH 'p%'
 ----
-memory	main	cr0808_starts_with_sv	cr0808_t	p%q	(empty)	[]	(empty)
+
+# The same prefix without the metacharacter still matches both, so the empty
+# result above is the wildcard being neutralised — not the filter matching
+# nothing for an unrelated reason.
+
+query TTTTTTTT rowsort
+SHOW SEMANTIC DIMENSIONS IN cr0808_starts_with_sv STARTS WITH 'p'
+----
+memory	main	cr0808_starts_with_sv	cr0808_t	pq	(empty)	[]	(empty)
+memory	main	cr0808_starts_with_sv	cr0808_t	pzq	(empty)	[]	(empty)
 
 # ============================================================
 # IDENT-6 control: an ordinary prefix still matches every name
