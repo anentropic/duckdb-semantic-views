@@ -749,6 +749,16 @@ fn predicate_is_applied_before_the_snapshot_not_after() {
 //
 // The second branch is what stops the first from being satisfiable by erroring
 // on everything.
+//
+// PBT-14 (code-review 2026-08-08): the window half of that second branch used
+// to `return Ok(())` before the numeric comparison, deferring to
+// `window_metric_proptest` — whose inner metric is always the self-referential
+// `w`. A window wrapping a DIFFERENT (here semi-additive-classified) inner
+// metric therefore had numeric coverage nowhere: EXP-19's fence was randomized,
+// EXP-20's arithmetic was not. `wbal` is now oracled with the same
+// correlated-subquery formulation `window_metric_proptest` uses (the partition
+// key `ent` is fixed here, so it is mechanical), and the early return is gone.
+// The same change un-pins the harness's `where_clause: None`.
 
 /// [`build_def`] plus the two dependent metrics: `dbal = bal * 2` (derived) and
 /// `wbal = SUM(bal) OVER (PARTITION BY ent)` (window over the same inner).
@@ -783,21 +793,90 @@ fn build_def_with_dependents(order: SortOrder) -> SemanticViewDefinition {
     def
 }
 
+/// One generated dependent-metric case. A struct rather than four bare
+/// `proptest!` arguments so [`dependent_generator_reaches_every_branch`] can
+/// sample the same strategy and count what it actually produces (PBT-14).
+#[derive(Debug, Clone)]
+struct DependentCase {
+    inst: Instance,
+    order: SortOrder,
+    /// Whether the NA dimension `ts` is queried — the dichotomy's switch.
+    na_dim_queried: bool,
+    /// `true` selects the WINDOW dependent `wbal`, `false` the DERIVED `dbal`.
+    pick_window: bool,
+    /// PBT-14: previously pinned at `None` here, the shape CLAUDE.md names as
+    /// how EXP-9/EXP-10 reached `main`. A predicate is the most direct way to
+    /// break a dependent metric's grain: it changes which rows reach the inner
+    /// aggregate, and for `wbal` it can empty a group and so remove a row from
+    /// the partition the window then sums over.
+    where_pred: Option<Pred>,
+}
+
+fn arb_dependent_case() -> impl Strategy<Value = DependentCase> {
+    (
+        arb_instance(),
+        prop_oneof![Just(SortOrder::Asc), Just(SortOrder::Desc)],
+        any::<bool>(),
+        any::<bool>(),
+        prop_oneof![1 => Just(None), 3 => arb_pred().prop_map(Some)],
+    )
+        .prop_map(
+            |(inst, order, na_dim_queried, pick_window, where_pred)| DependentCase {
+                inst,
+                order,
+                na_dim_queried,
+                pick_window,
+                where_pred,
+            },
+        )
+}
+
+/// Independent oracle for the effectively-regular branch, per dependent metric.
+///
+/// The predicate belongs PRE-aggregation in both formulations: it decides which
+/// rows reach `sum(s.balance)`, and — for the window metric — emptying a group
+/// removes that row from the partition entirely, which is why the correlated
+/// subquery reads from the already-filtered CTE rather than filtering after.
+///
+/// `dbal` is the direct arithmetic. `wbal` is deliberately NOT written as
+/// `SUM(...) OVER (PARTITION BY ...)`: that would restate the extension's own
+/// construct and agree with it by construction. It uses the correlated-subquery
+/// formulation from `window_metric_proptest` — pre-aggregate by every queried
+/// dim, then aggregate over the rows sharing the partition key, matched with
+/// `IS NOT DISTINCT FROM` so NULL keys group together exactly as `PARTITION BY`
+/// does.
+fn dependent_oracle_sql(case: &DependentCase) -> String {
+    let where_sql = case
+        .where_pred
+        .as_ref()
+        .map_or_else(String::new, |p| format!(" WHERE {}", p.to_raw_sql()));
+    if case.pick_window {
+        format!(
+            "WITH agg AS (SELECT s.entity AS ent, s.ts AS ts, sum(s.balance) AS bal \
+             FROM s{where_sql} GROUP BY 1, 2) \
+             SELECT a1.ent, a1.ts, \
+             (SELECT SUM(a2.bal) FROM agg a2 \
+              WHERE a2.ent IS NOT DISTINCT FROM a1.ent) AS wbal \
+             FROM agg a1"
+        )
+    } else {
+        format!(
+            "SELECT s.entity AS ent, s.ts AS ts, sum(s.balance) * 2 AS dbal \
+             FROM s{where_sql} GROUP BY 1, 2"
+        )
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
 
     #[test]
-    fn a_dependent_metric_never_silently_drops_the_snapshot(
-        inst in arb_instance(),
-        order in prop_oneof![Just(SortOrder::Asc), Just(SortOrder::Desc)],
-        na_dim_queried in any::<bool>(),
-        pick_window in any::<bool>(),
-    ) {
-        let def = build_def_with_dependents(order);
-        let metric = if pick_window { "wbal" } else { "dbal" };
-        let dims: Vec<&str> = if na_dim_queried { vec!["ent", "ts"] } else { vec!["ent"] };
+    fn a_dependent_metric_never_silently_drops_the_snapshot(case in arb_dependent_case()) {
+        let def = build_def_with_dependents(case.order);
+        let metric = if case.pick_window { "wbal" } else { "dbal" };
+        let dims: Vec<&str> = if case.na_dim_queried { vec!["ent", "ts"] } else { vec!["ent"] };
         let req = QueryRequest {
-            where_clause: None,
+            where_clause: case.where_pred.as_ref().map(Pred::to_member_sql),
             dimensions: dims.iter().map(|d| DimensionName::new(*d)).collect(),
             metrics: vec![MetricName::new(metric)],
             facts: vec![],
@@ -807,7 +886,7 @@ proptest! {
             Err(e) => {
                 let msg = e.to_string();
                 prop_assert!(
-                    !na_dim_queried,
+                    !case.na_dim_queried,
                     "with the NA dimension queried '{metric}' is effectively regular \
                      and must expand, got error: {msg}"
                 );
@@ -818,40 +897,152 @@ proptest! {
             }
             Ok(sql) => {
                 prop_assert!(
-                    na_dim_queried,
+                    case.na_dim_queried,
                     "without the NA dimension the snapshot cannot be composed through \
                      '{metric}' and must not be silently dropped, got SQL:\n{sql}"
                 );
-                // Effectively-regular branch: check the number, not just the
-                // absence of an error. Only the derived metric has a
-                // formulation simple enough to oracle independently here; the
-                // window metric's numeric coverage lives in
-                // `window_metric_proptest`.
-                if pick_window {
-                    return Ok(());
-                }
-                let oracle = "SELECT s.entity AS ent, s.ts AS ts, \
-                              sum(s.balance) * 2 AS dbal FROM s GROUP BY 1, 2";
+                // Effectively-regular branch: check the NUMBER, not just the
+                // absence of an error. PBT-14: this now covers the window
+                // dependent too — it used to return here, leaving a window over
+                // a non-self-referential inner metric unoracled anywhere.
+                let oracle = dependent_oracle_sql(&case);
                 let cmp = format!(
                     "SELECT \
-                       (SELECT count(*) FROM (SELECT dbal, ent, ts FROM ({sql}) qa \
+                       (SELECT count(*) FROM (SELECT {metric}, ent, ts FROM ({sql}) qa \
                                               EXCEPT ALL \
-                                              SELECT dbal, ent, ts FROM ({oracle}) qb) e1) \
-                     + (SELECT count(*) FROM (SELECT dbal, ent, ts FROM ({oracle}) qc \
+                                              SELECT {metric}, ent, ts FROM ({oracle}) qb) e1) \
+                     + (SELECT count(*) FROM (SELECT {metric}, ent, ts FROM ({oracle}) qc \
                                               EXCEPT ALL \
-                                              SELECT dbal, ent, ts FROM ({sql}) qd) e2) AS diff"
+                                              SELECT {metric}, ent, ts FROM ({sql}) qd) e2) AS diff"
                 );
-                let conn = make_db(&inst);
+                let conn = make_db(&case.inst);
                 let diff: i64 = conn.query_row(&cmp, [], |r| r.get(0)).unwrap_or_else(|e| {
                     panic!("comparison failed: {e}\n--- expanded:\n{sql}\n--- oracle:\n{oracle}")
                 });
                 prop_assert_eq!(
                     diff, 0,
-                    "an effectively-regular derived metric disagrees with the oracle\
-                     \n--- expanded:\n{}\n--- oracle:\n{}",
-                    sql, oracle
+                    "an effectively-regular dependent metric ('{}') disagrees with the \
+                     independent oracle\n--- expanded:\n{}\n--- oracle:\n{}",
+                    metric, sql, oracle
                 );
             }
         }
     }
+}
+
+/// PBT-14 anti-vacuity guard for the dependent-metric property.
+///
+/// The property is a dichotomy over four independent switches, and every one of
+/// its `prop_assert!`s sits inside a branch. A branch that is never generated is
+/// exactly as green as a correct one — the same reasoning as
+/// `generator_reaches_both_where_clause_branches` in the sibling harnesses — so
+/// the branch counts are asserted directly here. In particular
+/// `window_effectively_regular` is the cell PBT-14 opened: before the fix that
+/// combination returned before comparing anything.
+#[test]
+fn dependent_generator_reaches_every_branch() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    use std::collections::HashSet;
+
+    let mut runner = TestRunner::deterministic();
+    let mut window = 0usize;
+    let mut derived = 0usize;
+    let mut window_effectively_regular = 0usize;
+    let mut window_rejected = 0usize;
+    let mut derived_effectively_regular = 0usize;
+    let mut derived_rejected = 0usize;
+    let mut with_pred = 0usize;
+    let mut without_pred = 0usize;
+    let mut window_regular_with_pred = 0usize;
+    let mut pred_touches_ts = 0usize;
+    let mut pred_uses_filter_member = 0usize;
+    let mut distinct: HashSet<String> = HashSet::new();
+
+    for _ in 0..400 {
+        let case = arb_dependent_case()
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+        match (case.pick_window, case.na_dim_queried) {
+            (true, true) => {
+                window += 1;
+                window_effectively_regular += 1;
+            }
+            (true, false) => {
+                window += 1;
+                window_rejected += 1;
+            }
+            (false, true) => {
+                derived += 1;
+                derived_effectively_regular += 1;
+            }
+            (false, false) => {
+                derived += 1;
+                derived_rejected += 1;
+            }
+        }
+        match &case.where_pred {
+            None => without_pred += 1,
+            Some(p) => {
+                with_pred += 1;
+                if p.touches_ts() {
+                    pred_touches_ts += 1;
+                }
+                if p.references_filter() {
+                    pred_uses_filter_member += 1;
+                }
+                if case.pick_window && case.na_dim_queried {
+                    window_regular_with_pred += 1;
+                }
+                distinct.insert(p.to_member_sql());
+            }
+        }
+    }
+
+    assert!(
+        window > 0 && derived > 0,
+        "both dependent metrics must be generated (window={window}, derived={derived})"
+    );
+    assert!(
+        window_effectively_regular > 0,
+        "no case reached the window + NA-dim-queried cell — the numeric \
+         comparison PBT-14 added is unreachable and therefore vacuous"
+    );
+    assert!(
+        window_rejected > 0,
+        "no case reached the window + NA-dim-absent cell — the EXP-19 rejection \
+         assertion is never exercised for the window dependent"
+    );
+    assert!(
+        derived_effectively_regular > 0 && derived_rejected > 0,
+        "both derived cells must be reached (regular={derived_effectively_regular}, \
+         rejected={derived_rejected})"
+    );
+    assert!(
+        with_pred > 0 && without_pred > 0,
+        "where_clause must be both present and absent (present={with_pred}, \
+         absent={without_pred}) — a field pinned at its inert default is not \
+         coverage"
+    );
+    assert!(
+        window_regular_with_pred > 0,
+        "no case combined a predicate with the window metric on the oracled \
+         branch, so the predicate never reaches the partition the window sums \
+         over"
+    );
+    assert!(
+        pred_touches_ts > 0,
+        "no generated predicate constrained the NA dimension `ts`"
+    );
+    assert!(
+        pred_uses_filter_member > 0,
+        "no generated predicate named a FILTER member, so the member-substitution \
+         surface is untested here"
+    );
+    assert!(
+        distinct.len() > 50,
+        "generator produced only {} distinct predicates; search space collapsed",
+        distinct.len()
+    );
 }
