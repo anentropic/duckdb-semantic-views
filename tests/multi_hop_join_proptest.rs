@@ -372,6 +372,7 @@ fn build_def() -> SemanticViewDefinition {
         dimensions,
         metrics,
         joins,
+        // PIN: FACTS is a row-level shape with no per-grain meaning; this harness oracles the three-table per-grain chain. TECH-DEBT #66
         facts: vec![],
         materializations: vec![],
         created_on: None,
@@ -626,6 +627,7 @@ proptest! {
                 .iter()
                 .map(|&i| MetricName::new(METS[i]))
                 .collect(),
+            // PIN: FACTS is a row-level shape with no per-grain meaning; this harness oracles the three-table per-grain chain. TECH-DEBT #66
             facts: vec![],
         };
 
