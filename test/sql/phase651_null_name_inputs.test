@@ -5,6 +5,11 @@
 # VARCHAR argument. When the argument is NULL the function MUST short-
 # circuit to NULL rather than raise or treat the literal string "NULL"
 # as a lookup key.
+#
+# The second half of the file (FF-15) covers the *table*-function side, where
+# a NULL argument must raise at bind time instead: `Value::GetValue<string>()`
+# renders a NULL Value as the literal text "NULL", so an unguarded bind turns
+# `NULL` into a real file path / view name.
 
 require semantic_views
 
@@ -29,3 +34,37 @@ query I
 SELECT get_ddl('SEMANTIC_VIEW', NULL) IS NULL
 ----
 true
+
+# --- FF-15: __sv_compute_create_from_yaml — NULL positional args ------------
+#
+# Every other table function got an up-front IsNull() -> BinderException guard
+# with FF-4; this helper TF (the execution-time half of
+# `CREATE SEMANTIC VIEW ... FROM YAML FILE`) was missed. Unguarded,
+# `GetValue<string>()` rendered a NULL argument as the literal string "NULL",
+# so arg 0 opened a file literally named `NULL` and arg 1 created a view named
+# `NULL`. Each argument is asserted separately so a regression in any one of
+# the three is visible on its own.
+
+statement error
+SELECT * FROM __sv_compute_create_from_yaml(NULL, 'v', '')
+----
+file path is required (positional arg 0)
+
+statement error
+SELECT * FROM __sv_compute_create_from_yaml('__TEST_DIR__/ff15_unused.yaml', NULL, '')
+----
+view name is required (positional arg 1)
+
+statement error
+SELECT * FROM __sv_compute_create_from_yaml('__TEST_DIR__/ff15_unused.yaml', 'v', NULL)
+----
+comment is required (positional arg 2
+
+# The guards fire only on NULL: a non-NULL path that does not exist must still
+# reach the file-read stage and keep the `FROM YAML FILE failed: ` prefix that
+# `test/sql/phase53_yaml_file.test` pins, so the new checks did not swallow the
+# existing error surface.
+statement error
+SELECT * FROM __sv_compute_create_from_yaml('__TEST_DIR__/ff15_nonexistent.yaml', 'v', '')
+----
+FROM YAML FILE failed

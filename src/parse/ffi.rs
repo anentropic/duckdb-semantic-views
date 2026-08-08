@@ -248,7 +248,7 @@ pub unsafe extern "C" fn sv_parse_function_rust(
     error_out_len: usize,
     position_out: *mut u32,
 ) -> u8 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    parse_function_panic_guard(error_out, error_out_len, position_out, || {
         // Initialise position_out to UINT32_MAX (no-position sentinel).
         if !position_out.is_null() {
             *position_out = u32::MAX;
@@ -329,9 +329,63 @@ pub unsafe extern "C" fn sv_parse_function_rust(
                 1_u8
             }
         }
-    }));
+    })
+}
 
-    result.unwrap_or(2) // on panic: not ours
+/// Run `body` under `catch_unwind` and convert a panic into the
+/// `parse_function` return-code contract.
+///
+/// Split out of [`sv_parse_function_rust`] so the panic arm is reachable from
+/// a unit test with a real unwinding panic (the production body has no
+/// injectable fault), and so the arm's diagnostic lives next to the wording
+/// the read dispatchers use.
+///
+/// FF-16 (code-review 2026-08-08): this arm used to return rc=2 ("not ours"),
+/// which routed a Rust-side panic straight into `DISPLAY_ORIGINAL_ERROR` — the
+/// user saw `DuckDB`'s generic `syntax error at or near "SEMANTIC"` and the
+/// extension's internal failure left no trace anywhere, indistinguishable from
+/// "extension not loaded". The 17 read dispatchers
+/// (`crate::ddl::read_ffi::run_dispatcher`) surface their panics as
+/// `internal error: panic inside <name>`; this one now does the same, returning
+/// rc=1 so `sv_parse_stub` renders it through `DISPLAY_EXTENSION_ERROR`.
+///
+/// The override side (`sv_parser_override_rust`) deliberately keeps rc=2 on
+/// panic: it runs *before* the default parser, and a panic there must still let
+/// the `parse_function` pass have its chance at the statement.
+///
+/// # Safety
+///
+/// `error_out` must be null or point to `error_out_len` writable bytes;
+/// `position_out` must be null or point to a writable `u32`.
+#[cfg(any(feature = "extension", test))]
+unsafe fn parse_function_panic_guard<F>(
+    error_out: *mut u8,
+    error_out_len: usize,
+    position_out: *mut u32,
+    body: F,
+) -> u8
+where
+    F: FnOnce() -> u8,
+{
+    // `if let ... else` rather than `match`, mirroring
+    // `crate::ddl::read_ffi::run_dispatcher`'s shape (and satisfying
+    // clippy::single_match_else).
+    if let Ok(rc) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        rc
+    } else {
+        // No caret position is meaningful for an internal failure: the fault
+        // is ours, not a location in the user's statement.
+        if !position_out.is_null() {
+            *position_out = u32::MAX;
+        }
+        write_error_to_buffer(
+            error_out,
+            error_out_len,
+            "semantic_views: internal error: panic inside \
+             sv_parse_function_rust (please report this bug)",
+        );
+        1
+    }
 }
 
 /// Re-run validation for the `parse_function` path. Mirrors what
@@ -356,4 +410,105 @@ fn run_validation_for_parse_function(query: &str) -> Result<Option<String>, Pars
 #[cfg(all(not(feature = "extension"), test))]
 fn run_validation_for_parse_function(query: &str) -> Result<Option<String>, ParseError> {
     plan_rewrite(query).map(|opt| opt.map(|_| String::new()))
+}
+
+// ---------------------------------------------------------------------------
+// Tests — FF-16 panic-arm contract
+// ---------------------------------------------------------------------------
+//
+// The panic arm of `sv_parse_function_rust` cannot be reached through the
+// public entry point (no injectable fault in the validation body), so
+// `parse_function_panic_guard` exists as the seam these tests drive with a
+// real unwinding panic. Everything else about the entry point — the rc=0/1/2/3
+// contract for well-formed inputs — is covered in `super::rewrite`'s test
+// module (`call_sv_parse_function`).
+
+#[cfg(test)]
+mod tests {
+    use super::parse_function_panic_guard;
+
+    /// Call the guard with `body`, returning `(rc, message, position)`.
+    fn call_guard(body: impl FnOnce() -> u8) -> (u8, String, u32) {
+        let mut error_buf = vec![0_u8; 1024];
+        let mut position: u32 = 7; // sentinel that is neither 0 nor u32::MAX
+        let rc = unsafe {
+            parse_function_panic_guard(
+                error_buf.as_mut_ptr(),
+                error_buf.len(),
+                &raw mut position,
+                body,
+            )
+        };
+        let nul = error_buf.iter().position(|&b| b == 0).unwrap_or(0);
+        let msg = String::from_utf8_lossy(&error_buf[..nul]).into_owned();
+        (rc, msg, position)
+    }
+
+    /// FF-16: a panic inside the parser-hook Rust code must reach the user as
+    /// the extension's own internal error (rc=1 → `DISPLAY_EXTENSION_ERROR`),
+    /// not as rc=2 "not ours" — which routed it into DuckDB's generic
+    /// `syntax error at or near "SEMANTIC"` with no trace of the real failure,
+    /// indistinguishable from the extension not being loaded at all.
+    #[test]
+    fn panic_surfaces_as_an_extension_error_not_as_not_ours() {
+        // Silence the default panic hook for the duration: the panic is
+        // deliberate and its backtrace would otherwise pollute test output.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let (rc, msg, pos) = call_guard(|| panic!("deliberate test panic"));
+        std::panic::set_hook(prev);
+
+        assert_eq!(
+            rc, 1,
+            "a panic must take the DISPLAY_EXTENSION_ERROR channel (rc=1), \
+             not defer as 'not ours' (rc=2); msg={msg}"
+        );
+        assert!(
+            msg.contains("internal error: panic inside sv_parse_function_rust"),
+            "panic diagnostic must match the read dispatchers' wording \
+             (`internal error: panic inside <name>`); got: {msg:?}"
+        );
+        assert_eq!(
+            pos,
+            u32::MAX,
+            "no caret position is meaningful for an internal failure"
+        );
+    }
+
+    /// Null out-parameters must not turn the panic arm into UB or a different
+    /// return code — the C++ side is allowed to pass either as null.
+    #[test]
+    fn panic_arm_tolerates_null_out_parameters() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rc = unsafe {
+            parse_function_panic_guard(std::ptr::null_mut(), 0, std::ptr::null_mut(), || {
+                panic!("deliberate test panic")
+            })
+        };
+        std::panic::set_hook(prev);
+        assert_eq!(
+            rc, 1,
+            "null out-params must not change the panic return code"
+        );
+    }
+
+    /// The guard is transparent on the non-panicking path: it must return the
+    /// body's rc verbatim and leave both out-parameters exactly as the body
+    /// left them (the rc=0/1/2/3 contract is the body's to define).
+    #[test]
+    fn non_panicking_body_passes_through_untouched() {
+        for expected in [0_u8, 1, 2, 3] {
+            let (rc, msg, pos) = call_guard(|| expected);
+            assert_eq!(rc, expected, "guard must not rewrite a non-panic rc");
+            assert!(
+                msg.is_empty(),
+                "guard must not write a diagnostic on the non-panic path; got {msg:?}"
+            );
+            assert_eq!(
+                pos, 7,
+                "guard must not touch position_out on the non-panic path"
+            );
+        }
+    }
 }
