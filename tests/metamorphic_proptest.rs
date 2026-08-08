@@ -49,7 +49,7 @@
 //!
 //! # Findings this harness produced, and the properties that are `#[ignore]`d
 //!
-//! Three real defects fell out of the cells above. Per the project rule that a
+//! Four real defects fell out of the cells above. Per the project rule that a
 //! finding is recorded rather than quietly fixed inside a test change, each has
 //! a property that states the CORRECT invariant, is `#[ignore]`d, and carries
 //! the reproduction inline:
@@ -468,7 +468,16 @@ struct DerivedSpec {
     rhs: Term,
 }
 
-/// The chain `dm0 … dm{k-1}`, where `dm_i` may name `dm_j` for `j < i`.
+/// The chain `dm0 … dm{k-1}`, where a derived metric may name the one directly
+/// before it (`dm_i` lifts to `dm{i-1}`) or the base metrics.
+///
+/// The *shape* the type can express is any back-reference `dm_j`, `j < i`, and
+/// `depth`/`collect_leaves`/`recompute` all handle that generally — but the
+/// generator only ever emits `i-1`, so chains are linear rather than branching.
+/// That is enough to reach depth 3, which is what the property needs; widening
+/// it to an arbitrary `j < i` would re-roll the fixed-seed sample the
+/// anti-vacuity guards are calibrated against, so it is a deliberate next step
+/// rather than an oversight.
 #[derive(Debug, Clone)]
 struct Chain {
     specs: Vec<DerivedSpec>,
