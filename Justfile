@@ -76,10 +76,21 @@ fmt:
 coverage:
     cargo llvm-cov nextest --fail-under-lines 80
 
-# Ensure the Python venv's duckdb pip package matches .duckdb-version.
-# Called automatically by test recipes that use the venv runner.
+# Ensure the Python venv exists and its duckdb pip package matches
+# .duckdb-version. Called automatically by test recipes that use the venv runner.
+#
+# The `make configure` guard makes those recipes self-contained. `test-sql`
+# reaches the venv via `build` (which fails loudly on `check_configure`), but
+# `test-sql-prebuilt` and `test-ducklake-ci` do not build first, so without this
+# a fresh checkout hit a confusing `configure/venv/bin/python: not found` from
+# the version probe below instead of the real cause. `make configure` is a no-op
+# when configure/venv already exists, so this costs nothing on the common path.
 [private]
 _ensure-test-deps:
+    @if [ ! -d configure/venv ]; then \
+      echo "configure/venv missing — running make configure first..."; \
+      make configure; \
+    fi
     @VER=$(cat .duckdb-version | sed 's/^v//'); \
     INSTALLED=$(configure/venv/bin/python -c "import duckdb; print(duckdb.__version__)" 2>/dev/null || echo ""); \
     if [ "$INSTALLED" = "$VER" ]; then \
@@ -93,8 +104,13 @@ _ensure-test-deps:
 # There is no standalone DuckDB CLI available in this project; SQL logic tests
 # are run via the Python-based duckdb_sqllogictest runner (installed by
 # `make configure` into its Python venv).  This recipe builds the debug extension
-# and delegates to `make test_debug`, which invokes the runner against the full
-# test/sql/ directory.  All files matching test/sql/**/*.test are executed.
+# and delegates to `make test_debug`.
+#
+# Only the files ENUMERATED IN test/sql/TEST_LIST are executed — the runner is
+# invoked with `--file-list`, not a directory glob. A new .test file that is not
+# added to TEST_LIST is silently skipped: never run, never red. `just
+# check-test-list` (and the CodeQuality job that calls it) exists to make that a
+# hard error rather than a quiet gap.
 #
 # The test/sql/phase2_ddl.test file exercises the full DDL round-trip:
 #   define_semantic_view, list_semantic_views, describe_semantic_view, drop_semantic_view.
