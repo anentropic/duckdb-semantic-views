@@ -165,6 +165,14 @@ test_extension_release_internal: patch-runner
 #     retire the per-file loop and route test-sql back to the single-process
 #     TEST_RUNNER_FILE_LIST_DEBUG path.
 # Requires a debug build (`just build`). Run via `just probe-isolation-workaround`.
+#
+# STATUS 2026-08-09: this probe currently reports UNEXPECTED PASS on DuckDB
+# v1.5.5 (Linux, debug) — the single-process run completes with 111/111 files
+# SUCCESS, so the crash below appears fixed and the loop is retirable. It has
+# NOT been retired because the evidence is Linux-only and
+# `test_extension_release_internal` is what BuildAll runs on Windows and
+# macOS-arm64. See TECH-DEBT #74 for what finishing it requires; do not wire the
+# probe into CI before then, as it would be red from its first run.
 probe_isolation_debug_internal: patch-runner
 	@echo "Probing whether the DuckDB 1.5 multi-file isolation workaround is still needed.."
 	@if $(TEST_RUNNER_FILE_LIST_DEBUG) >/dev/null 2>&1; then \

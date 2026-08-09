@@ -91,6 +91,9 @@ src/
 ├── expand/                    # Query expansion: definition + QueryRequest → SQL (pure, always compiled)
 │   ├── mod.rs resolution.rs join_resolver.rs sql_gen.rs select_spec.rs types.rs
 │   ├── facts.rs fan_trap.rs semi_additive.rs window.rs wildcard.rs role_playing.rs materialization.rs
+│   ├── where_clause.rs        #   pre-aggregation `where_clause :=` predicate: resolves the members it
+│   │                          #   names and the tables its FACT CHAINS reach (`WhereMember::fact_tables`),
+│   │                          #   which both fan-trap and role-playing fences must walk (EXP-27 / EXP-31)
 │   ├── per_grain.rs           #   multi-grain queries: one CTE per metric grain, joined (Snowflake parity);
 │   │                          #   also `window_cte_anchor`, which picks the grain window.rs anchors __sv_agg at
 │   └── tests_*.rs             #   behaviour-named extracted test modules
@@ -124,7 +127,8 @@ test/
 └── integration/               # Python integration suites (test_ducklake_ci.py, test_differential.py, …)
 
 .github/workflows/             # CI pipelines — see the CI Workflows section for triggers
-├── BuildQuick.yml BuildAll.yml            #   extension build, no tests (branch / main)
+├── BuildQuick.yml BuildAll.yml            #   extension build (PR / main); BuildAll also
+│                                          #   sqllogictests Windows + macOS-arm64
 ├── CodeQuality.yml IntegrationChecks.yml  #   lint+coverage / DuckLake+Python+sqllogictest
 ├── DocsCheck.yml Docs.yml                 #   docs build check (branches) / build+deploy (main)
 └── Fuzz.yml DuckDBVersionMonitor.yml PublishExtension.yml
@@ -522,9 +526,15 @@ just test-all
 
 ### CI Coverage
 
-Both branches run the full build pipeline on push (`BuildAll` on `main`, `BuildQuick` on
-other branches), plus `CodeQuality` and `IntegrationChecks`. The DuckDB Version Monitor
-checks for new releases of both the latest and LTS version lines (weekly, Monday 09:00 UTC).
+Both branches get the same CI. `BuildAll` runs on **push to the branch tip** (`main` /
+`v1.4-lts`); `BuildQuick` runs on **pull requests only** — it has no `push` trigger, so a
+branch pushed with no open PR gets no extension build. `CodeQuality` and
+`IntegrationChecks` run on both pull requests and pushes to the branch tip. The DuckDB
+Version Monitor checks for new releases of both the latest and LTS version lines (weekly,
+Monday 09:00 UTC).
+
+See [CI Workflows](#ci-workflows) for the per-workflow trigger table and for which
+platforms actually execute sqllogictest.
 
 ## Fuzzing
 

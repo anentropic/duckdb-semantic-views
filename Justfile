@@ -120,7 +120,26 @@ test-sql-prebuilt: _ensure-test-deps
 # in ONE process; exits 0 while the DuckDB 1.5 multi-DB crash still reproduces
 # (workaround required) and exits 1 loudly if it ever stops crashing (time to
 # retire the workaround). Requires a debug build.
-probe-isolation-workaround: build
+#
+# As of 2026-08-09 on DuckDB v1.5.5 this FAILS — i.e. the crash is fixed and the
+# workaround is retirable on Linux. It is not wired into CI for that reason; see
+# TECH-DEBT #74.
+probe-isolation-workaround: build probe-isolation-prebuilt
+
+# The body of `probe-isolation-workaround`, minus the build — same split, and
+# for the same reason, as `test-sql` / `test-sql-prebuilt` above: CI's probe job
+# reuses the debug extension built once by `build-debug-extension` rather than
+# building its own.
+#
+# `_ensure-test-deps` is a dependency here where the pre-split recipe had none.
+# The probe drives the same sqllogictest runner as `test-sql`, so a venv whose
+# `duckdb` pip package has drifted from `.duckdb-version` could make the
+# single-process run fail for that reason rather than the DuckDB 1.5 crash the
+# probe is watching for — which would report "workaround still required" for the
+# wrong reason, the one answer this expected-fail probe must not give quietly.
+#
+# Requires build/debug/semantic_views.duckdb_extension to exist already.
+probe-isolation-prebuilt: _ensure-test-deps
     make probe_isolation_debug_internal
 
 # Download jaffle-shop data and create DuckLake/Iceberg catalog for integration tests.
