@@ -110,49 +110,36 @@ TEST_RUNNER_FILE_LIST_RELEASE := $(TEST_RUNNER) --test-dir test/sql --file-list 
 # SKIP_TESTS platforms (musl, mingw) resolve to tests_skipped before reaching these
 # targets, so patch-runner is never called on those platforms — which is correct.
 #
-# DuckDB 1.5.0 changed parser extension lifecycle (ExtensionCallbackManager).
-# Running all test files in a single sqllogictest process causes a segfault
-# when the runner creates/destroys multiple databases sequentially. Work around
-# by running each test file in a separate process. Each test passes in isolation.
-# Uses mktemp instead of /dev/stdin because the Python sqllogictest runner
-# resolves /dev/stdin to /proc/self/fd/0, which doesn't exist on Windows.
+# HISTORY (TC-10): these targets used to run each .test file in its OWN
+# sqllogictest process. DuckDB 1.5.0 changed the parser-extension lifecycle
+# (ExtensionCallbackManager) such that one process creating and destroying
+# several databases in sequence segfaulted, so the per-file loop was the only
+# way to get a green suite. `probe_isolation_debug_internal` existed to detect
+# the upstream fix rather than let the workaround outlive its cause.
 #
-# The `probe_isolation_debug_internal` target below (TC-10) is the expected-fail
-# probe that tells us when this workaround can be retired: it runs the whole
-# TEST_LIST in one process and fails loudly if that ever stops crashing.
+# The probe fired on DuckDB v1.5.5 (2026-08-09): the single-process run no
+# longer crashes. Both targets are back on the single-process
+# TEST_RUNNER_FILE_LIST_* path, which is simpler and stops spawning one process
+# per file. Evidence: 3/3 local runs at 111/111 SUCCESS (~33 s vs ~39 s for the
+# loop), plus a workflow_dispatch BuildAll run confirming windows_amd64 and
+# osx_arm64 — the two platforms that actually execute the release suite.
+#
+# If the crash ever returns, the loop is in this file's history; restore it
+# along with the probe rather than papering over an intermittent segfault.
+#
+# The `@echo` after each run is deliberate: without it a passing single-process
+# run prints only per-file SUCCESS lines, and the "did the suite actually run,
+# or did it silently skip?" question this project has been bitten by twice
+# (see MAINTAINER.md, CI Workflows) needs a greppable end-of-run marker.
 test_extension_debug_internal: patch-runner
 	@echo "Running DEBUG tests.."
-	@FAILED=0; \
-	TOTAL=0; \
-	TMPLIST=$$(mktemp); \
-	while IFS= read -r testfile; do \
-		TOTAL=$$((TOTAL + 1)); \
-		echo "$$testfile" > "$$TMPLIST"; \
-		if ! $(TEST_RUNNER) --test-dir test/sql --file-list "$$TMPLIST" $(EXTRA_EXTENSIONS_PARAM) --external-extension build/debug/$(EXTENSION_NAME).duckdb_extension; then \
-			echo "FAILED: $$testfile"; \
-			FAILED=$$((FAILED + 1)); \
-		fi; \
-	done < $(TEST_LIST_PATH); \
-	rm -f "$$TMPLIST"; \
-	echo "$$TOTAL tests run, $$FAILED failed"; \
-	[ $$FAILED -eq 0 ]
+	@$(TEST_RUNNER_FILE_LIST_DEBUG)
+	@echo "$$(wc -l < $(TEST_LIST_PATH) | tr -d ' ') test files passed (single process)"
 
 test_extension_release_internal: patch-runner
 	@echo "Running RELEASE tests.."
-	@FAILED=0; \
-	TOTAL=0; \
-	TMPLIST=$$(mktemp); \
-	while IFS= read -r testfile; do \
-		TOTAL=$$((TOTAL + 1)); \
-		echo "$$testfile" > "$$TMPLIST"; \
-		if ! $(TEST_RUNNER) --test-dir test/sql --file-list "$$TMPLIST" $(EXTRA_EXTENSIONS_PARAM) --external-extension build/release/$(EXTENSION_NAME).duckdb_extension; then \
-			echo "FAILED: $$testfile"; \
-			FAILED=$$((FAILED + 1)); \
-		fi; \
-	done < $(TEST_LIST_PATH); \
-	rm -f "$$TMPLIST"; \
-	echo "$$TOTAL tests run, $$FAILED failed"; \
-	[ $$FAILED -eq 0 ]
+	@$(TEST_RUNNER_FILE_LIST_RELEASE)
+	@echo "$$(wc -l < $(TEST_LIST_PATH) | tr -d ' ') test files passed (single process)"
 
 # TC-10 expected-fail probe. The per-file isolation loop above exists solely to
 # dodge a DuckDB 1.5.0 crash when one sqllogictest process creates/destroys
