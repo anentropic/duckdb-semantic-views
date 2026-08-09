@@ -484,6 +484,7 @@ proptest! {
                 .iter()
                 .map(|i| MetricName::new(format!("m{i}")))
                 .collect(),
+            // PIN: the row-level FACTS path is oracled by child_grain_proptest (below-base grain) and metamorphic_proptest; this harness oracles single-table aggregation. TECH-DEBT #66
             facts: vec![],
         };
 
