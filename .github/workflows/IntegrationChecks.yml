@@ -26,18 +26,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # All three suites below load the SAME debug extension, so it is built once
-  # here and downloaded by each of them, instead of three jobs running an
-  # identical ~6-minute `make configure debug` in parallel. That is ~14 minutes
-  # less runner occupancy per PR. It costs ~1 minute of wall clock (the
-  # consumers cannot start until this finishes), which is the right trade for
-  # this repo: runner minutes are free on a public repo, but jobs have queued
-  # for over an hour when several run at once, and demand is what causes that.
+  # The DuckLake and sqllogictest jobs load the SAME debug extension, so it is
+  # built once here and downloaded by both, instead of each running its own
+  # identical ~6-minute `make configure debug`. That is ~6 minutes less runner
+  # occupancy per PR, at the cost of ~1 minute of wall clock (they cannot start
+  # until this finishes) — the right trade for this repo, where runner minutes
+  # are free on a public repo but jobs have queued for over an hour when several
+  # run at once, and concurrent demand is what causes that.
+  #
+  # `python-integration` deliberately does NOT share it; see the comment on that
+  # job. Attempting to share it is what broke this workflow the first time.
   #
   # Only the extension itself is shared. `configure/venv` is NOT: the DuckLake
-  # and Python suites run under `uv` with their own PEP 723 dependencies and
-  # never touch it, and the sqllogictest job rebuilds it with a bare
-  # `make configure` (seconds) because the runner lives inside it.
+  # suite runs under `uv` with its own PEP 723 dependencies and never touches
+  # it, and the sqllogictest job recreates it with a bare `make configure`
+  # (seconds) because the runner lives inside it.
   build-debug-extension:
     name: Build debug extension (Linux x86_64)
     runs-on: ubuntu-latest
@@ -94,23 +97,43 @@ jobs:
         env:
           SEMANTIC_VIEWS_EXTENSION_PATH: build/debug/semantic_views.duckdb_extension
 
+  # No `needs:` — this job builds its own extension, so making it wait for
+  # `build-debug-extension` would add ~6 minutes of wall clock for an artifact
+  # it never downloads.
   python-integration:
     name: Python integration suites (Linux x86_64)
     runs-on: ubuntu-latest
-    needs: build-debug-extension
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: true
 
-      # These suites resolve the extension through
-      # test_ducklake_helpers.get_extension_path(), whose fallback is exactly
-      # build/debug/semantic_views.duckdb_extension — the path this restores.
-      - name: Download debug extension
-        uses: actions/download-artifact@v4
-        with:
-          name: debug-extension
-          path: build/debug
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      # Pre-install the toolchain pinned in rust-toolchain.toml before `make`
+      # runs cargo, so cargo's flake-prone lazy rustup install is a no-op. See
+      # the composite action for the full rationale.
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/setup-pinned-rust
+
+      # This job builds its own extension rather than downloading the shared
+      # artifact, unlike the other two. `just test-integration` fans out to ~19
+      # leaf recipes (test-caret, test-adbc, …) and EACH of them declares
+      # `build` as a dependency, so the recipe graph re-enters `make debug`
+      # whatever CI does first. Downloading the artifact and skipping the build
+      # step therefore failed with `check_configure` ("The configure step
+      # appears to not be run") — and even with `make configure` added it would
+      # have rebuilt from an empty target/, saving nothing.
+      #
+      # Making this shareable means moving the `build` dependency off the 19
+      # leaves and onto a single `test-integration` entry point, so a
+      # `-prebuilt` variant can exist the way `test-sql-prebuilt` does. That is
+      # a behaviour change for anyone running one leaf directly (`just
+      # test-caret` would stop building first), so it is left alone here rather
+      # than bundled into a CI change.
+      - name: Build extension
+        run: make configure debug
 
       - name: Install uv
         run: pip install uv
@@ -172,4 +195,3 @@ jobs:
       # extension this job just downloaded.
       - name: Run SQL logic tests
         run: just test-sql-prebuilt
-
