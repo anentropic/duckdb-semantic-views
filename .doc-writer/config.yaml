@@ -38,5 +38,8 @@ paths:
 
 detected:
   language: "rust"
-  doc_system: "plain-markdown"
-  existing_docs: false
+  doc_system: "sphinx-shibuya"
+  doc_format: "restructuredtext"
+  existing_docs: true
+  # Globs must exclude docs/.venv/ and docs/_build/ -- a naive docs/**/*.md
+  # returns vendored package READMEs and build output, not documentation.

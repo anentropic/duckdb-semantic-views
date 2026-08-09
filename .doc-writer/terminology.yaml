@@ -98,5 +98,43 @@ project_terms:
     variants: []
   - canonical: "window metric"
     variants: []
+  - canonical: "non-additive"
+    variants: ["Non-additive", "Non-Additive"]
+  - canonical: "grain"
+    variants: []
+  - canonical: "multi-grain query"
+    variants: []
+  - canonical: "computed per grain"
+    variants: ["computed per-grain"]
+    note: >-
+      Adverbial "per grain" stays open; attributive "per-grain path",
+      "per-grain assembly" stays hyphenated.
+  - canonical: "named filter"
+    variants: []
+  - canonical: "where_clause"
+    variants: []
+    source: "named parameter on semantic_view() / explain_semantic_view()"
+  - canonical: "define-time inference pass"
+    variants: ["CREATE-time typeof pass", "define-time type inference pass"]
+    note: >-
+      The v0.10.0 removal. Do not describe it as still running, and do not
+      reintroduce the CREATE-time LIMIT 0 probe: that probe now exists only
+      on the query bind path (see reference/semantic-view-function.rst).
+  - canonical: "semantic view '<name>' does not exist"
+    variants: ["Semantic view '<name>' not found"]
+    source: "catalog::view_not_found_msg in src/catalog/mod.rs:105"
+
+# Punctuation and markup conventions enforced across docs/
+conventions:
+  - rule: "Parenthetical dashes are written -- (RST), never a literal em dash."
+  - rule: >-
+      NON ADDITIVE BY and USING precede AS in a metric entry:
+      <alias>.<name> [USING (...)] [NON ADDITIVE BY (...)] AS <expr>.
+      Verified in src/body_parser/mod.rs:461. The after-AS form is a
+      define-time error and must appear in docs only as a counter-example.
+  - rule: >-
+      The data_type column reports a declared type only; no surface declares
+      one and nothing infers one. Empty for every view created since v0.10.0.
+  - rule: "No internal tracker IDs (TECH-DEBT #NN, RT-N, C-N) in docs/."
 
 overrides: {}

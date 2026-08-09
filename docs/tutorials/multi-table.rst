@@ -267,3 +267,5 @@ Next, learn how to build a complete model with facts and derived metrics in the 
 - :ref:`howto-facts` -- reusable row-level expressions
 - :ref:`howto-derived-metrics` -- metric-on-metric composition
 - :ref:`howto-role-playing` -- same table joined via multiple relationships
+
+Every metric in ``shop`` is declared on ``o`` (orders), so every query in this tutorial was computed at a single grain. :ref:`explanation-metric-grain` explains what that means, what changes once a view carries metrics on more than one table, and why the table a metric is declared on decides the numbers it returns.

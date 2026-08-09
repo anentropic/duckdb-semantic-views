@@ -84,7 +84,7 @@ Syntax
    To make porting Snowflake DDL easier, several Snowflake spellings are now
    accepted in addition to the canonical forms above:
 
-   - The table alias in ``TABLES`` is **optional** — ``TABLES (orders PRIMARY
+   - The table alias in ``TABLES`` is **optional** -- ``TABLES (orders PRIMARY
      KEY (id))`` defaults the alias to the table name, matching Snowflake's
      ``[alias AS] table``.
    - A view-level ``COMMENT = '<text>'`` may be written in Snowflake's
@@ -144,21 +144,21 @@ All three variants work with both the ``AS`` keyword body and the ``FROM YAML`` 
 
 .. note::
 
-   **View name case.** A ``<name>`` is folded to lowercase before it is stored, whether written quoted or not, and every later reference — ``DROP`` / ``DESCRIBE`` / ``ALTER`` / ``SHOW COLUMNS`` statements and the :ref:`semantic_view() <ref-semantic-view-function>` lookup argument — folds the same way, so ``CREATE SEMANTIC VIEW Sales``, ``DROP SEMANTIC VIEW SALES``, and ``DROP SEMANTIC VIEW "sales"`` all refer to the same view. This follows DuckDB's identifier semantics, where double-quoted identifiers are case-insensitive too; quoting a name only lets it contain whitespace or other special characters, it does not make it case-sensitive.
+   **View name case.** A ``<name>`` is folded to lowercase before it is stored, whether written quoted or not, and every later reference -- ``DROP`` / ``DESCRIBE`` / ``ALTER`` / ``SHOW COLUMNS`` statements and the :ref:`semantic_view() <ref-semantic-view-function>` lookup argument -- folds the same way, so ``CREATE SEMANTIC VIEW Sales``, ``DROP SEMANTIC VIEW SALES``, and ``DROP SEMANTIC VIEW "sales"`` all refer to the same view. This follows DuckDB's identifier semantics, where double-quoted identifiers are case-insensitive too; quoting a name only lets it contain whitespace or other special characters, it does not make it case-sensitive.
 
-   *Migration:* lookups fold the requested name to lowercase and match the stored catalog name exactly, so a view is only reachable if its **stored** name is lowercase. Unquoted ``CREATE`` always stored a lowercase name, so those views are unaffected. Only a view created before v0.11 via a *quoted* mixed-case identifier (e.g. ``CREATE SEMANTIC VIEW "Sales"``) kept its original casing in the catalog, and it is no longer reachable by any spelling — ``sales``, ``Sales``, and ``"Sales"`` all fold to ``sales``, which does not match the stored ``Sales``. Drop and recreate it, or rename its catalog row to lowercase, to make it reachable again.
+   *Migration:* lookups fold the requested name to lowercase and match the stored catalog name exactly, so a view is only reachable if its **stored** name is lowercase. Unquoted ``CREATE`` always stored a lowercase name, so those views are unaffected. Only a view created before v0.11 via a *quoted* mixed-case identifier (e.g. ``CREATE SEMANTIC VIEW "Sales"``) kept its original casing in the catalog, and it is no longer reachable by any spelling -- ``sales``, ``Sales``, and ``"Sales"`` all fold to ``sales``, which does not match the stored ``Sales``. Drop and recreate it, or rename its catalog row to lowercase, to make it reachable again.
 
 .. note::
 
-   **Semantic views live in a schema.** ``<name>`` may carry a ``<schema>.`` (or ``<database>.<schema>.``) qualifier, and that qualifier decides where the view is created — ``CREATE SEMANTIC VIEW analytics.sales`` puts the view in ``analytics`` regardless of which schema the session is currently in. Without a qualifier the view is created in the session's current schema, exactly as an unqualified ``CREATE TABLE`` would be. Naming a schema that does not exist is an error rather than a silent fall back to the current schema.
+   **Semantic views live in a schema.** ``<name>`` may carry a ``<schema>.`` (or ``<database>.<schema>.``) qualifier, and that qualifier decides where the view is created -- ``CREATE SEMANTIC VIEW analytics.sales`` puts the view in ``analytics`` regardless of which schema the session is currently in. Without a qualifier the view is created in the session's current schema, exactly as an unqualified ``CREATE TABLE`` would be. Naming a schema that does not exist is an error rather than a silent fall back to the current schema.
 
-   Two schemas may each hold a view of the same name, so ``analytics.sales`` and ``staging.sales`` are two different views. A reference that names neither — ``DROP SEMANTIC VIEW sales``, ``semantic_view('sales')`` — resolves through the session's ``search_path``, exactly as an unqualified table reference does: the first schema on the path holding a view of that name wins. A view that is the only one of its name resolves whether or not its schema is on the path, so an ordinary single-schema setup needs no ``search_path`` at all. Reads and writes resolve identically — ``DROP SEMANTIC VIEW v`` removes the view ``semantic_view('v')`` returns.
+   Two schemas may each hold a view of the same name, so ``analytics.sales`` and ``staging.sales`` are two different views. A reference that names neither -- ``DROP SEMANTIC VIEW sales``, ``semantic_view('sales')`` -- resolves through the session's ``search_path``, exactly as an unqualified table reference does: the first schema on the path holding a view of that name wins. A view that is the only one of its name resolves whether or not its schema is on the path, so an ordinary single-schema setup needs no ``search_path`` at all. Reads and writes resolve identically -- ``DROP SEMANTIC VIEW v`` removes the view ``semantic_view('v')`` returns.
 
-   A name that exists only in schemas *off* the path is a miss: the error names the schemas it does live in, the path that was searched, and the two ways out (qualify the reference, or add the schema to ``search_path``). ``IF EXISTS`` does not absorb it — that clause means "do not complain if the view is absent", and a view sitting off the path is not absent.
+   A name that exists only in schemas *off* the path is a miss: the error names the schemas it does live in, the path that was searched, and the two ways out (qualify the reference, or add the schema to ``search_path``). ``IF EXISTS`` does not absorb it -- that clause means "do not complain if the view is absent", and a view sitting off the path is not absent.
 
    Two exceptions: :ref:`ref-get-ddl` and ``READ_YAML_FROM_SEMANTIC_VIEW`` are scalar functions, which cannot be handed the search path, so they resolve a bare name to the unique match and raise an error naming the candidate schemas when several hold it.
 
-   Unqualified table names in the body resolve in the **creating session's** schema, not in the view's — so a semantic view in ``analytics`` built over ``main.orders`` can be written as ``CREATE SEMANTIC VIEW analytics.sales AS TABLES (o AS orders ...)`` from a session in ``main``. This follows DuckDB's rule for a view body.
+   Unqualified table names in the body resolve in the **creating session's** schema, not in the view's -- so a semantic view in ``analytics`` built over ``main.orders`` can be written as ``CREATE SEMANTIC VIEW analytics.sales AS TABLES (o AS orders ...)`` from a session in ``main``. This follows DuckDB's rule for a view body.
 
 .. note::
 
@@ -197,7 +197,7 @@ Declares the physical tables available to the semantic view. Each entry assigns 
 
 **Parameters:**
 
-- ``<alias>``, a short name used to reference this table in all other clauses. Optional — ``AS <table_name>`` may be omitted (``TABLES (orders PRIMARY KEY (id))``), in which case the alias defaults to the table name.
+- ``<alias>``, a short name used to reference this table in all other clauses. Optional -- ``AS <table_name>`` may be omitted (``TABLES (orders PRIMARY KEY (id))``), in which case the alias defaults to the table name.
 - ``<table_name>``, the physical table name. Supports catalog-qualified names (``catalog.schema.table``).
 - ``PRIMARY KEY (<column>, ...)``, optional. One or more columns forming the table's primary key. Used for JOIN synthesis and cardinality inference. This is semantic metadata, not a DuckDB constraint. Omit for fact tables that do not need to be join targets.
 - ``COMMENT = '<text>'``, optional. A human-readable description of the table.
@@ -275,11 +275,11 @@ Declares named row-level expressions. Facts are inlined into metric expressions 
 **Parameters:**
 
 - ``PRIVATE``, optional. When present, the fact cannot be queried directly via ``facts := [...]`` but can still be referenced in metric expressions.
-- ``<alias>.<fact_name>``, the table alias and fact name, appearing **before** ``AS``. Facts are scoped to a single table. The fact name is what you query (``facts := ['net_price']``) and what ``DESCRIBE`` returns as the output column. As in Snowflake, the entry reads ``name AS expression`` — the reverse of a plain SQL ``expression AS alias``.
+- ``<alias>.<fact_name>``, the table alias and fact name, appearing **before** ``AS``. Facts are scoped to a single table. The fact name is what you query (``facts := ['net_price']``) and what ``DESCRIBE`` returns as the output column. As in Snowflake, the entry reads ``name AS expression`` -- the reverse of a plain SQL ``expression AS alias``.
 - ``<row_level_expression>``, the SQL expression **after** ``AS``: any expression that operates on individual rows. Must not contain aggregate functions. A fact may be named after its own backing column (``s.unit_price AS s.unit_price``), giving a passthrough fact.
 - ``COMMENT = '<text>'``, optional. A human-readable description.
 - ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability.
-- ``LABELS = (FILTER)``, optional. Declares the fact a :ref:`named filter <howto-annotations-filters>` — a boolean-valued member meant for reuse in a query's ``where_clause``. Metadata only: it does not restrict querying, and the ``BOOLEAN`` requirement is enforced by DuckDB's binder at query time. ``FILTER`` is the only accepted label.
+- ``LABELS = (FILTER)``, optional. Declares the fact a :ref:`named filter <howto-annotations-filters>` -- a boolean-valued member meant for reuse in a query's ``where_clause``. Metadata only: it does not restrict querying, and the ``BOOLEAN`` requirement is enforced by DuckDB's binder at query time. ``FILTER`` is the only accepted label.
 
 **Fact chaining:**
 
@@ -289,6 +289,10 @@ Facts can reference other facts by name. The extension resolves dependencies in 
 
 - Aggregate functions (``SUM``, ``COUNT``, ``AVG``, ``MIN``, ``MAX``, etc.) in fact expressions are rejected.
 - Circular references between distinct facts are rejected (a fact referencing its own name resolves to the physical column).
+
+**Reported data type:**
+
+As with dimensions and metrics, ``CREATE`` records no output type for a fact. The ``data_type`` column reported by :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is empty for every view created since v0.10.0, and populated only for views stored before that change. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 
 .. _ref-create-dimensions:
@@ -313,26 +317,27 @@ Declares named grouping expressions available for queries.
 - ``<expression>``, any SQL expression. Can be a simple column reference (``o.region``) or a computed expression (``date_trunc('month', o.ordered_at)``).
 - ``COMMENT = '<text>'``, optional. A human-readable description.
 - ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability.
-- ``LABELS = (FILTER)``, optional. Declares the dimension a :ref:`named filter <howto-annotations-filters>` — a boolean-valued member meant for reuse in a query's ``where_clause``. Metadata only: it does not hide the dimension from output, and the ``BOOLEAN`` requirement is enforced by DuckDB's binder at query time. ``FILTER`` is the only accepted label.
+- ``LABELS = (FILTER)``, optional. Declares the dimension a :ref:`named filter <howto-annotations-filters>` -- a boolean-valued member meant for reuse in a query's ``where_clause``. Metadata only: it does not hide the dimension from output, and the ``BOOLEAN`` requirement is enforced by DuckDB's binder at query time. ``FILTER`` is the only accepted label.
 
 .. note::
 
-   **Column qualification in expressions.** The ``<alias>.<dim_name>`` on the left of ``AS`` (the logical name) must always carry its table-alias prefix. Column references *inside the expression* on the right of ``AS`` may be either qualified (``o.region``) or unqualified (``region``). Unqualified references resolve fine in single-table views, but in multi-table views they can raise an ambiguity error when more than one joined table exposes the same column name. Qualifying expression columns (``alias.column``) is recommended — it is unambiguous in every case, which is why all examples in these docs use it. The same rule applies to ``METRICS`` and ``FACTS`` expressions.
+   **Column qualification in expressions.** The ``<alias>.<dim_name>`` on the left of ``AS`` (the logical name) must always carry its table-alias prefix. Column references *inside the expression* on the right of ``AS`` may be either qualified (``o.region``) or unqualified (``region``). Unqualified references resolve fine in single-table views, but in multi-table views they can raise an ambiguity error when more than one joined table exposes the same column name. Qualifying expression columns (``alias.column``) is recommended -- it is unambiguous in every case, which is why all examples in these docs use it. The same rule applies to ``METRICS`` and ``FACTS`` expressions.
 
 **Validation rules:**
 
-- Dimension names must be unique within the view (case-insensitive, quoted or not — DuckDB treats double-quoted identifiers as case-insensitive too). For example, ``region`` and ``Region`` cannot both appear in the same ``DIMENSIONS`` clause. See :ref:`ref-err-name-uniqueness`.
-- A dimension name cannot collide with any metric name (case-insensitive, quoted or not — DuckDB treats double-quoted identifiers as case-insensitive too). See :ref:`ref-err-name-uniqueness`.
+- Dimension names must be unique within the view (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). For example, ``region`` and ``Region`` cannot both appear in the same ``DIMENSIONS`` clause. See :ref:`ref-err-name-uniqueness`.
+- A dimension name cannot collide with any metric name (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). See :ref:`ref-err-name-uniqueness`.
 
-**Type inference:**
+**Reported data type:**
 
-When creating a semantic view on a file-backed database, the extension infers the ``DATA_TYPE`` for each dimension at define time. It executes a ``LIMIT 0`` query against the underlying tables to detect the output type. Most scalar types are inferred, including ``VARCHAR``, ``INTEGER``, ``BIGINT``, ``DOUBLE``, ``DATE``, ``TIMESTAMP``, ``BOOLEAN``, ``FLOAT``, ``UUID``, and others. Types where inference would be lossy, such as ``DECIMAL``, ``LIST``, and ``ARRAY``, show an empty data type.
+``CREATE`` does not record an output type for a dimension, and no surface can declare one: the DDL grammar above has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`ref-get-ddl` could not carry it (a restored view silently lost the cast). The ``data_type`` column reported by :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is therefore empty for every view created since v0.10.0, and populated only for views stored before that change.
 
-The inferred type is visible in :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>` (``data_type`` column) and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` (``output_type`` field in the JSON).
+Query results are still fully typed -- :ref:`semantic_view() <ref-semantic-view-function>` infers each output column when the query is bound. Only the catalog metadata is silent about types. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
-.. note::
+.. versionchanged:: 0.10.0
 
-   Type inference requires a file-backed database. In-memory databases skip inference, leaving ``DATA_TYPE`` empty.
+   The define-time type inference pass was removed. Views created before this
+   change keep whatever ``data_type`` they were stored with.
 
 
 .. _ref-create-metrics:
@@ -341,6 +346,8 @@ METRICS
 -------
 
 Declares named aggregation expressions, derived metrics, semi-additive metrics, and window metrics.
+
+**Clause order.** A metric entry reads ``[ PRIVATE ] <alias>.<name> [ USING (...) ] [ NON ADDITIVE BY (...) ] AS <expr>``. Both ``USING`` and ``NON ADDITIVE BY`` belong **before** ``AS``, never after it. Writing either after ``AS`` is rejected at define time -- ``CREATE`` fails with an error naming the misplaced clause rather than absorbing it into the aggregate expression, where its meaning would be silently lost. Wrapping the expression in parentheses does not change this.
 
 **Base metrics** (with table alias, containing aggregate functions):
 
@@ -387,8 +394,7 @@ A derived metric is an unqualified name (no table alias) whose expression combin
 .. code-block:: sql
 
    METRICS (
-       a.total_balance AS SUM(a.balance)
-           NON ADDITIVE BY (report_date)
+       a.total_balance NON ADDITIVE BY (report_date) AS SUM(a.balance)
    )
 
 When a query does not include the non-additive dimension, the extension generates a CTE with ``RANK`` to select the snapshot rows per group before aggregating (rows tied at the snapshot ordering value all aggregate). The default (ascending) direction selects the latest snapshot; ``DESC`` selects the earliest. When the non-additive dimension is included in the query, the metric behaves as a standard additive metric.
@@ -442,8 +448,8 @@ See :ref:`howto-window-metrics` for details on both modes.
 
 **Validation rules:**
 
-- Metric names must be unique within the view (case-insensitive, quoted or not — DuckDB treats double-quoted identifiers as case-insensitive too), across both base and derived metrics. See :ref:`ref-err-name-uniqueness`.
-- A metric name cannot collide with any dimension name (case-insensitive, quoted or not — DuckDB treats double-quoted identifiers as case-insensitive too). See :ref:`ref-err-name-uniqueness`.
+- Metric names must be unique within the view (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too), across both base and derived metrics. See :ref:`ref-err-name-uniqueness`.
+- A metric name cannot collide with any dimension name (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). See :ref:`ref-err-name-uniqueness`.
 - Derived metrics must not contain aggregate functions.
 - Circular derived metric references are rejected.
 - ``USING`` relationship names must match declared relationships.
@@ -454,6 +460,10 @@ See :ref:`howto-window-metrics` for details on both modes.
 - Window metric ``ORDER BY`` dimension names must match declared dimensions.
 - ``NON ADDITIVE BY`` and ``OVER`` cannot both appear on the same metric.
 - ``OVER`` cannot appear on a derived metric (one without a table alias). Only qualified metrics (``alias.name``) can use ``OVER``.
+
+**Reported data type:**
+
+As with dimensions, ``CREATE`` does not record an output type for a metric. The ``data_type`` column reported by :ref:`SHOW SEMANTIC METRICS <ref-show-semantic-metrics>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is empty for every view created since v0.10.0, and populated only for views stored before that change. The metric's result column is typed when the query is bound, not when the view is defined. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 
 .. _ref-create-materializations:
@@ -547,10 +557,6 @@ The file path must be single-quoted. DuckDB reads the file contents and parses a
 See :ref:`howto-yaml-definitions` for a detailed workflow guide.
 
 **YAML size limit:** YAML definitions are capped at 1 MiB. Definitions exceeding this limit are rejected with an error.
-
-**Type inference:**
-
-As with dimensions, the extension infers ``DATA_TYPE`` for each metric at define time on file-backed databases. ``COUNT(*)`` infers as ``BIGINT``, ``SUM`` on integer columns infers as ``BIGINT``, ``SUM`` on float/double columns infers as ``DOUBLE``, and so on. The inferred type is visible in :ref:`SHOW SEMANTIC METRICS <ref-show-semantic-metrics>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>`.
 
 
 .. _ref-create-examples:
@@ -656,8 +662,7 @@ Examples
        a.report_date AS a.report_date
    )
    METRICS (
-       a.total_balance AS SUM(a.balance)
-           NON ADDITIVE BY (report_date)
+       a.total_balance NON ADDITIVE BY (report_date) AS SUM(a.balance)
    );
 
 **Window metric with PARTITION BY EXCLUDING:**

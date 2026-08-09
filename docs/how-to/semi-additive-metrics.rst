@@ -42,10 +42,10 @@ If you query ``SUM(balance)`` grouped by ``customer_id`` across both dates, you 
 Define a Semi-Additive Metric
 =============================
 
-Add ``NON ADDITIVE BY (<dimension>)`` to a metric to declare which dimensions it should not be summed across. The extension selects the most recent (or earliest) snapshot row before aggregating.
+Add ``NON ADDITIVE BY (<dimension>)`` to a metric to declare which dimensions it should not be summed across. The clause sits between the metric name and the ``AS``. The extension selects the most recent (or earliest) snapshot row before aggregating.
 
 .. code-block:: sql
-   :emphasize-lines: 11
+   :emphasize-lines: 10
 
    CREATE SEMANTIC VIEW account_metrics AS
    TABLES (
@@ -56,11 +56,50 @@ Add ``NON ADDITIVE BY (<dimension>)`` to a metric to declare which dimensions it
        a.report_date AS a.report_date
    )
    METRICS (
-       a.total_balance AS SUM(a.balance)
-           NON ADDITIVE BY (report_date)
+       a.total_balance NON ADDITIVE BY (report_date) AS SUM(a.balance)
    );
 
 This declares that ``total_balance`` is non-additive by ``report_date``. When a query requests ``total_balance`` grouped by ``customer_id`` (without ``report_date``), the extension selects the latest snapshot row per customer before summing. The default direction (ascending) selects the **latest** snapshot, matching Snowflake -- no ``DESC`` is needed.
+
+
+.. _howto-semi-additive-clause-order:
+
+Clause Order: NON ADDITIVE BY Comes Before AS
+=============================================
+
+.. important::
+
+   ``NON ADDITIVE BY (...)`` is part of the metric's *declaration*, not part of
+   its expression, so it goes **before** the ``AS``. The full metric form is:
+
+   .. code-block:: sqlgrammar
+
+      [ PRIVATE ] <alias>.<metric_name>
+          [ USING ( <rel_name> [, ...] ) ]
+          [ NON ADDITIVE BY ( <dim_name> [ ASC | DESC ] [ NULLS FIRST | NULLS LAST ] [, ...] ) ]
+          AS <aggregate_expression>
+
+   Writing the clause after the ``AS`` is a define-time error. ``CREATE
+   SEMANTIC VIEW`` reports:
+
+   .. code-block:: text
+
+      'NON ADDITIVE BY (...)' must come BEFORE 'AS' in a metric entry.
+      Form: 'alias.name [USING (...)] [NON ADDITIVE BY (...)] AS expr'.
+
+   The same rule and the same error apply to the ``USING (...)`` clause used by
+   :ref:`role-playing dimensions <howto-role-playing>`. Only ``OVER (...)``
+   legitimately follows the ``AS`` -- see :ref:`howto-window-metrics`.
+
+.. versionchanged:: 0.12.0
+
+   The after-``AS`` form used to be *accepted*. The clause was absorbed into
+   the metric expression, so the metric was stored as an ordinary additive
+   metric with its snapshot semantics silently dropped: ``DESCRIBE SEMANTIC
+   VIEW`` reported no non-additive dimensions, ``GET_DDL`` round-tripped the
+   malformed text, and the only complaint arrived at query time as a parser
+   error pointing inside generated SQL. If you have definitions written that
+   way, move the clause ahead of the ``AS`` -- they will no longer create.
 
 
 .. _howto-semi-additive-sort:
@@ -75,15 +114,15 @@ Each dimension in ``NON ADDITIVE BY`` accepts an optional sort order and NULLS p
 - ``NULLS FIRST`` -- a NULL dimension value wins (outranks every real snapshot)
 - ``NULLS LAST`` -- a NULL dimension value never wins; the latest (or earliest) real snapshot is chosen
 
-The default NULLS placement follows the sort direction, matching DuckDB and Snowflake: ``ASC`` defaults to ``NULLS LAST`` and ``DESC`` defaults to ``NULLS FIRST``. So a bare ``NON ADDITIVE BY (report_date)`` (latest, ``NULLS LAST``) never lets a NULL date win, whereas ``NON ADDITIVE BY (report_date DESC)`` (earliest, ``NULLS FIRST``) *does* — add an explicit ``NULLS LAST`` if you want to exclude NULL keys regardless of direction.
+The default NULLS placement follows the sort direction, matching DuckDB and Snowflake: ``ASC`` defaults to ``NULLS LAST`` and ``DESC`` defaults to ``NULLS FIRST``. So a bare ``NON ADDITIVE BY (report_date)`` (latest, ``NULLS LAST``) never lets a NULL date win, whereas ``NON ADDITIVE BY (report_date DESC)`` (earliest, ``NULLS FIRST``) *does* -- add an explicit ``NULLS LAST`` if you want to exclude NULL keys regardless of direction.
 
 .. code-block:: sql
 
    -- Latest balance (most recent report_date wins) -- the default
-   a.total_balance AS SUM(a.balance) NON ADDITIVE BY (report_date)
+   a.total_balance NON ADDITIVE BY (report_date) AS SUM(a.balance)
 
    -- Earliest balance (oldest report_date wins)
-   a.opening_balance AS SUM(a.balance) NON ADDITIVE BY (report_date DESC)
+   a.opening_balance NON ADDITIVE BY (report_date DESC) AS SUM(a.balance)
 
 .. versionchanged:: 0.11.0
 
@@ -109,15 +148,15 @@ The default NULLS placement follows the sort direction, matching DuckDB and Snow
 
 .. _howto-semi-additive-multiple:
 
-Multiple Non-Additive Dimensions
+Multiple non-additive Dimensions
 =================================
 
-A metric can be non-additive by more than one dimension. Each gets its own sort specification:
+A metric can be non-additive by more than one dimension. Each gets its own sort specification, and the whole list still precedes the ``AS``:
 
 .. code-block:: sql
 
-   a.snapshot_balance AS SUM(a.balance)
-       NON ADDITIVE BY (report_date, fiscal_period)
+   a.snapshot_balance NON ADDITIVE BY (report_date, fiscal_period)
+       AS SUM(a.balance)
 
 
 .. _howto-semi-additive-behavior:
@@ -127,7 +166,7 @@ Snapshot Behavior
 
 The semi-additive expansion depends on whether the non-additive dimensions are present in the query:
 
-**Non-additive dimension NOT in query (active):**
+**non-additive dimension NOT in query (active):**
    The extension generates a CTE with ``RANK() OVER (PARTITION BY <queried dims> ORDER BY <NA dims>)`` to select the snapshot rows per group, then aggregates over the filtered rows. ``RANK()`` means every row tied at the snapshot ordering value (e.g. several accounts sharing the same latest date within a group) shares rank 1 and is included in the aggregation. This is the snapshot selection behavior.
 
 .. code-block:: sql
@@ -138,7 +177,7 @@ The semi-additive expansion depends on whether the non-additive dimensions are p
        metrics := ['total_balance']
    );
 
-**Non-additive dimension in query (effectively regular):**
+**non-additive dimension in query (effectively regular):**
    When all non-additive dimensions are included in the query, the metric behaves as a standard additive metric -- no CTE, no snapshot selection. This matches Snowflake's behavior: "When the non-additive dimension is included in the query, the metric is calculated as a standard additive metric."
 
 .. code-block:: sql
@@ -207,11 +246,17 @@ Restrictions
 Troubleshooting
 ===============
 
+**NON ADDITIVE BY must come BEFORE AS**
+   The clause belongs between the metric name and the ``AS``, not after the aggregate
+   expression. Rewrite ``a.balance AS SUM(a.v) NON ADDITIVE BY (d)`` as
+   ``a.balance NON ADDITIVE BY (d) AS SUM(a.v)``. Parenthesising the expression does
+   not change this -- the clause is still rejected.
+
 **NON ADDITIVE BY dimension not found**
    The dimension name in ``NON ADDITIVE BY`` must match a declared dimension in the view. The error message identifies which dimension name is unrecognized: ``NON ADDITIVE BY dimension 'X' on metric 'Y' does not match any declared dimension``.
 
 **Unexpected aggregation results**
-   Use :ref:`explain_semantic_view() <ref-explain-semantic-view>` to verify whether the CTE is generated. If all Non-additive dimensions are in the query, the metric behaves as a regular additive metric and no CTE is produced. Remove the Non-additive dimension from the query to activate snapshot selection.
+   Use :ref:`explain_semantic_view() <ref-explain-semantic-view>` to verify whether the CTE is generated. If all non-additive dimensions are in the query, the metric behaves as a regular additive metric and no CTE is produced. Remove the non-additive dimension from the query to activate snapshot selection.
 
-**Performance with multiple Non-Additive dimension sets**
+**Performance with multiple non-additive dimension sets**
    When multiple semi-additive metrics have different ``NON ADDITIVE BY`` dimensions, each gets its own ``RANK`` column in the CTE (``__sv_rn_1``, ``__sv_rn_2``, etc.). This is functionally correct but adds window function overhead.

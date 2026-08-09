@@ -97,13 +97,17 @@ Query the view to verify it works:
 
 .. code-block:: text
 
-   ┌──────────┬─────────┬────────┐
-   │ customer │ revenue │  cost  │
-   ├──────────┼─────────┼────────┤
-   │ Bob      │  178.00 │  82.00 │
-   │ Alice    │  236.00 │  95.00 │
-   │ Carol    │   60.00 │  25.00 │
-   └──────────┴─────────┴────────┘
+   ┌──────────┬──────────┬───────┐
+   │ customer │ revenue  │ cost  │
+   ├──────────┼──────────┼───────┤
+   │ Alice    │ 236.0000 │ 95.00 │
+   │ Bob      │ 176.0000 │ 82.00 │
+   │ Carol    │  60.0000 │ 25.00 │
+   └──────────┴──────────┴───────┘
+
+Alice's 236 is the sum of her three line items -- 50.00, 36.00 and 150.00 -- where each is ``price * quantity * (1 - discount)``. Bob's two line items give 24.00 + 152.00 = 176.00, and Carol's single item is 60.00.
+
+``revenue`` comes back with four decimal places while ``cost`` has two. Neither is rounded: DuckDB widens the scale of a ``DECIMAL`` product, and ``revenue`` multiplies by ``discount``, itself a ``DECIMAL(4,2)``, so the result carries the combined scale. ``cost`` multiplies only by an integer quantity and keeps its original two.
 
 The metrics work, but look at the expressions. ``li.price * li.quantity * (1 - li.discount)`` computes the net line total, and ``li.unit_cost * li.quantity`` computes the total cost. If you added more metrics (average net price, gross total before discount), you would repeat these row-level calculations in each metric expression.
 
@@ -157,13 +161,13 @@ Now the metrics read as ``SUM(li.net_total)`` and ``SUM(li.line_cost)`` instead 
 
 .. code-block:: text
 
-   ┌──────────┬─────────┬────────┐
-   │ customer │ revenue │  cost  │
-   ├──────────┼─────────┼────────┤
-   │ Bob      │  178.00 │  82.00 │
-   │ Alice    │  236.00 │  95.00 │
-   │ Carol    │   60.00 │  25.00 │
-   └──────────┴─────────┴────────┘
+   ┌──────────┬──────────┬───────┐
+   │ customer │ revenue  │ cost  │
+   ├──────────┼──────────┼───────┤
+   │ Alice    │ 236.0000 │ 95.00 │
+   │ Bob      │ 176.0000 │ 82.00 │
+   │ Carol    │  60.0000 │ 25.00 │
+   └──────────┴──────────┴───────┘
 
 
 .. _tutorial-bm-derived-metrics:
@@ -220,13 +224,15 @@ Query the complete model:
 
 .. code-block:: text
 
-   ┌──────────┬─────────┬────────┬────────┬───────────────────┐
-   │ customer │ revenue │  cost  │ profit │      margin       │
-   ├──────────┼─────────┼────────┼────────┼───────────────────┤
-   │ Alice    │  236.00 │  95.00 │ 141.00 │ 59.74576271186440 │
-   │ Bob      │  178.00 │  82.00 │  96.00 │ 53.93258426966292 │
-   │ Carol    │   60.00 │  25.00 │  35.00 │ 58.33333333333300 │
-   └──────────┴─────────┴────────┴────────┴───────────────────┘
+   ┌──────────┬──────────┬───────┬──────────┬────────────────────┐
+   │ customer │ revenue  │ cost  │  profit  │       margin       │
+   ├──────────┼──────────┼───────┼──────────┼────────────────────┤
+   │ Alice    │ 236.0000 │ 95.00 │ 141.0000 │   59.7457627118644 │
+   │ Carol    │  60.0000 │ 25.00 │  35.0000 │ 58.333333333333336 │
+   │ Bob      │ 176.0000 │ 82.00 │  94.0000 │  53.40909090909091 │
+   └──────────┴──────────┴───────┴──────────┴────────────────────┘
+
+Carol now sorts above Bob: she has the smallest revenue but the second-best ratio of profit to revenue. ``margin`` is a floating-point division, so the trailing digits are the usual DOUBLE representation rather than a rounded percentage.
 
 You can query derived metrics with any dimension, just like base metrics. The extension includes all the tables needed to compute the underlying aggregations:
 
@@ -239,13 +245,15 @@ You can query derived metrics with any dimension, just like base metrics. The ex
 
 .. code-block:: text
 
-   ┌────────────┬─────────┬────────┬───────────────────┐
-   │   month    │ revenue │ profit │      margin       │
-   ├────────────┼─────────┼────────┼───────────────────┤
-   │ 2024-01-01 │  236.00 │ 141.00 │ 59.74576271186440 │
-   │ 2024-02-01 │  178.00 │  96.00 │ 53.93258426966292 │
-   │ 2024-03-01 │   60.00 │  35.00 │ 58.33333333333300 │
-   └────────────┴─────────┴────────┴───────────────────┘
+   ┌─────────────────────┬──────────┬──────────┬────────────────────┐
+   │        month        │ revenue  │  profit  │       margin       │
+   ├─────────────────────┼──────────┼──────────┼────────────────────┤
+   │ 2024-01-01 00:00:00 │ 236.0000 │ 141.0000 │   59.7457627118644 │
+   │ 2024-02-01 00:00:00 │ 176.0000 │  94.0000 │  53.40909090909091 │
+   │ 2024-03-01 00:00:00 │  60.0000 │  35.0000 │ 58.333333333333336 │
+   └─────────────────────┴──────────┴──────────┴────────────────────┘
+
+The monthly numbers match the per-customer ones here because each customer happens to order in a single month.
 
 
 .. _tutorial-bm-inspect:

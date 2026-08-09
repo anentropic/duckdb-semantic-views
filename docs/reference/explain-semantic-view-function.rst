@@ -20,7 +20,9 @@ Syntax
    SELECT * FROM explain_semantic_view(
        '<view_name>',
        [ dimensions := [ '<dim_name>' [, ...] ] , ]
-       [ metrics := [ '<metric_name>' [, ...] ] ]
+       [ metrics := [ '<metric_name>' [, ...] ] , ]
+       [ facts := [ '<fact_name>' [, ...] ] , ]
+       [ where_clause := '<predicate>' ]
    )
 
 
@@ -28,6 +30,8 @@ Syntax
 
 Parameters
 ==========
+
+``explain_semantic_view()`` accepts the same parameter set as :ref:`semantic_view() <ref-semantic-view-function>` -- the two functions share one registration, so a query you can run you can also explain.
 
 .. list-table::
    :header-rows: 1
@@ -38,19 +42,28 @@ Parameters
      - Description
    * - ``<view_name>``
      - VARCHAR (positional)
-     - The name of the semantic view to explain. Matched case-insensitively (folded to lowercase per DuckDB identifier semantics), quoted or not.
+     - The name of the semantic view to explain. Matched case-insensitively (folded to lowercase per DuckDB identifier semantics), quoted or not. May carry a ``<schema>.`` (or ``<database>.<schema>.``) qualifier; an unqualified name resolves through the session's ``search_path``, exactly as in :ref:`semantic_view() <ref-semantic-view-function>`.
    * - ``dimensions``
      - LIST (named)
      - Optional list of dimension names. Supports ``alias.*`` wildcard patterns.
    * - ``metrics``
      - LIST (named)
      - Optional list of metric names. Supports ``alias.*`` wildcard patterns.
+   * - ``facts``
+     - LIST (named)
+     - Optional list of fact names. Supports ``alias.*`` wildcard patterns. The expanded SQL shows each fact expression inlined, which makes this the quickest way to check how a chained fact resolved.
+   * - ``where_clause``
+     - VARCHAR (named)
+     - Optional predicate applied **before** metrics are aggregated -- the equivalent of Snowflake's ``SEMANTIC_VIEW( … WHERE <predicate> )``. See :ref:`ref-sv-pre-agg-filtering`. An omitted, empty, or whitespace-only value is treated as absent.
+   * - ``search_path``
+     - LIST (named)
+     - The session's schema resolution order, used to resolve an unqualified ``<view_name>``. **Supplied automatically** -- the extension's parser override injects the caller's search path into every ``explain_semantic_view()`` call it rewrites. Not intended to be written by hand.
 
-At least one of ``dimensions`` or ``metrics`` must be specified.
+At least one of ``dimensions``, ``metrics``, or ``facts`` must be specified. ``where_clause`` alone is not a query.
 
-.. note::
+.. warning::
 
-   ``explain_semantic_view()`` does not support the ``facts`` parameter. To inspect fact definitions, use :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>`.
+   ``facts`` and ``metrics`` cannot be combined in the same query. Use ``facts := [...]`` or ``metrics := [...]``, not both. The restriction is enforced during expansion, so ``explain_semantic_view()`` reports it exactly as ``semantic_view()`` would.
 
 
 .. _ref-explain-output:
@@ -125,6 +138,28 @@ Sample output:
    │           ...               │
    └─────────────────────────────┘
 
+**Fact query (row-level, no aggregation):**
+
+.. code-block:: sql
+
+   SELECT * FROM explain_semantic_view('analytics',
+       facts := ['net_price', 'tax_amount']
+   );
+
+The expanded SQL shows each fact expression inlined in place of its name, with chained facts resolved recursively.
+
+**Pre-aggregation filtering:**
+
+.. code-block:: sql
+
+   SELECT * FROM explain_semantic_view('order_metrics',
+       dimensions := ['region'],
+       metrics := ['revenue'],
+       where_clause := 'ordered_at >= DATE ''2024-01-01'''
+   );
+
+The expanded SQL shows where the predicate lands relative to the ``GROUP BY``, which is the fastest way to confirm that a filtered metric is recomputed rather than filtered after aggregation.
+
 **Materialization routing match:**
 
 .. code-block:: sql
@@ -162,4 +197,12 @@ Sample output when a materialization covers the exact requested dimensions and m
    Use ``explain_semantic_view()`` to verify that the extension generates the SQL
    you expect, especially when debugging join paths, fact inlining,
    role-playing dimension scoped aliases, semi-additive CTE expansion,
-   window function CTE expansion, or materialization routing decisions.
+   window function CTE expansion, pre-aggregation predicate placement, or
+   materialization routing decisions.
+
+.. note::
+
+   ``explain_semantic_view()`` reports how a query *would* run. To inspect the
+   stored definition itself -- fact expressions, comments, synonyms, declared
+   keys -- use :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` or
+   :ref:`ref-get-ddl`.

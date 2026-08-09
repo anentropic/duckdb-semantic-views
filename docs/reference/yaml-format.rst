@@ -7,7 +7,7 @@
 YAML Definition Format
 ======================
 
-Specification of the YAML schema accepted by ``CREATE SEMANTIC VIEW ... FROM YAML``. Every semantic view definition — whether created from inline YAML, a YAML file, or exported via :ref:`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>` — follows this format.
+Specification of the YAML schema accepted by ``CREATE SEMANTIC VIEW ... FROM YAML``. Every semantic view definition -- whether created from inline YAML, a YAML file, or exported via :ref:`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>` -- follows this format.
 
 .. versionadded:: 0.7.0
 
@@ -25,7 +25,7 @@ The YAML format maps directly to the internal ``SemanticViewDefinition`` structu
      -
    * - ``RELATIONSHIPS``
      - ``joins``
-     - Different name — YAML uses the internal ``joins`` key
+     - Different name -- YAML uses the internal ``joins`` key
    * - ``FACTS``
      - ``facts``
      -
@@ -48,7 +48,7 @@ The YAML format maps directly to the internal ``SemanticViewDefinition`` structu
 Complete Example
 ================
 
-A comprehensive YAML definition covering all supported features:
+A YAML definition covering all supported features:
 
 .. code-block:: yaml
 
@@ -123,6 +123,9 @@ A comprehensive YAML definition covering all supported features:
 
 
 .. _ref-yaml-format-minimal:
+
+Minimal Definition
+==================
 
 A minimal definition requires only ``tables``, and at least one of ``dimensions`` or ``metrics``:
 
