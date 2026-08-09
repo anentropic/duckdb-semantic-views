@@ -80,9 +80,44 @@ jobs:
       - name: Install just
         uses: taiki-e/install-action@just
 
-      # Runs the same suite list as local `just test-all` (minus test-rust /
-      # test-sql / test-ducklake-ci, which have their own CI jobs). The list
-      # itself lives in the Justfile's `test-integration` recipe so local dev
-      # and CI cannot drift.
+      # Runs the same suite list as local `just test-all`, minus the three
+      # suites with their own jobs in this file / CodeQuality.yml: test-rust
+      # (CodeQuality's "Doctests & extension unit tests" + "Coverage"),
+      # test-sql (the `sqllogictest` job below) and test-ducklake-ci (the
+      # `ducklake-ci-check` job above). The list itself lives in the Justfile's
+      # `test-integration` recipe so local dev and CI cannot drift.
       - name: Run Python integration suites
         run: just test-integration
+
+  sqllogictest:
+    name: SQL logic tests (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      # Pre-install the toolchain pinned in rust-toolchain.toml before `make`
+      # runs cargo, so cargo's flake-prone lazy rustup install is a no-op. See
+      # the composite action for the full rationale.
+      - name: Install pinned Rust toolchain
+        uses: ./.github/actions/setup-pinned-rust
+
+      - name: Build extension
+        run: make configure debug
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      # `just test-sql` rather than `make test_debug` directly, for the same
+      # anti-drift reason as `just test-integration` above: the recipe also runs
+      # `_ensure-test-deps`, which reinstalls the venv's `duckdb` pip package
+      # when it does not match `.duckdb-version`. Running the bare make target
+      # would let CI test against a different DuckDB than the one the extension
+      # was built for. Its `build` dependency re-enters `make debug`, which is a
+      # no-op against the step above.
+      - name: Run SQL logic tests
+        run: just test-sql

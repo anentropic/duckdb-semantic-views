@@ -124,8 +124,8 @@ test/
 └── integration/               # Python integration suites (test_ducklake_ci.py, test_differential.py, …)
 
 .github/workflows/             # CI pipelines — see the CI Workflows section for triggers
-├── BuildQuick.yml BuildAll.yml            #   extension build + sqllogictest (branch / main)
-├── CodeQuality.yml IntegrationChecks.yml  #   lint+coverage / DuckLake+Python integration
+├── BuildQuick.yml BuildAll.yml            #   extension build, no tests (branch / main)
+├── CodeQuality.yml IntegrationChecks.yml  #   lint+coverage / DuckLake+Python+sqllogictest
 ├── DocsCheck.yml Docs.yml                 #   docs build check (branches) / build+deploy (main)
 └── Fuzz.yml DuckDBVersionMonitor.yml PublishExtension.yml
 ```
@@ -871,10 +871,10 @@ Do **not** set a directory-level nightly override (`rustup override set nightly`
 
 | Workflow | Trigger | What It Does |
 |----------|---------|--------------|
-| **BuildQuick** | Pull requests (skips doc-only changes) | Fast feedback: extension build + full sqllogictest suite on Linux x86_64 only, via the DuckDB extension-ci-tools reusable workflow. No `push` trigger (runs on PRs + manual dispatch) — `main` gets the full platform matrix from BuildAll. |
-| **BuildAll** | Push to `main` (skips doc-only changes) | Full build across 5 platforms: Linux x86_64/arm64, macOS x86_64/arm64, Windows x86_64. Runs sqllogictest on each built platform except `linux_arm64`. Excludes WASM, musl, mingw variants. |
+| **BuildQuick** | Pull requests (skips doc-only changes) | Fast feedback: extension **build** on Linux x86_64 only, via the DuckDB extension-ci-tools reusable workflow. No `push` trigger (runs on PRs + manual dispatch) — `main` gets the full platform matrix from BuildAll. **Runs no tests**, despite invoking `make test_release`: see the note below. |
+| **BuildAll** | Push to `main` (skips doc-only changes) | Full build across 5 platforms: Linux x86_64/arm64, macOS x86_64/arm64, Windows x86_64. Excludes WASM, musl, mingw variants. **Runs no tests** — same `make test_release` no-op as BuildQuick. |
 | **CodeQuality** | Push to `main` + pull requests (skips doc-only changes) | `TEST_LIST` sync check; fuzz-target registration sync check (`.rs` files vs `fuzz/Cargo.toml` `[[bin]]` entries vs the `Fuzz.yml` matrix); `cargo fmt --check`; clippy (default **and** `--features extension`); doctests (default + the FFI `compile_fail` ABI guard); extension-feature unit tests; `cargo-deny` (license/advisory audit); 80%-line coverage floor via `cargo-llvm-cov`. Runs as **three parallel jobs** — `Lint & format`, `Doctests & extension unit tests`, `Coverage (80% minimum)` — so their three separate cold compiles of the bundled DuckDB amalgamation (clippy=check, doctests=build, coverage=instrumented) overlap on different runners instead of running serially (~32 min → ~12 min). |
-| **IntegrationChecks** | Push to `main` + pull requests (skips doc-only changes) | DuckLake CI integration test **and** the full Python integration suite (`just test-integration`), each building the debug extension. |
+| **IntegrationChecks** | Push to `main` + pull requests (skips doc-only changes) | Three jobs, each building the debug extension: the DuckLake CI integration test, the full Python integration suite (`just test-integration`), and the **sqllogictest suite** (`just test-sql`). |
 | **DocsCheck** | Pull requests | Sphinx docs build with `-W` (warnings as errors). Deliberately **not** path-filtered, so documentation/text-only changes are still validated when the heavier workflows skip. No `push` trigger (runs on PRs + manual dispatch) — `main` gets the build+deploy from Docs. |
 | **Docs** | Push to `main` | Same `-W` Sphinx build, then deploys the site to GitHub Pages. |
 | **Fuzz** | Push touching `src/**`, `fuzz/**`, or the Cargo manifests | Runs all nine fuzz targets for 10 minutes each. Detects crashes via artifact files (not exit codes), uploads them, opens a `bug`/`fuzzing` issue, and fails the job on any crash. A `changes` guard job re-checks the push's **net** diff and skips the matrix when the trigger fired only because of the push-range quirk below. |
@@ -884,6 +884,15 @@ Do **not** set a directory-level nightly override (`rustup override set nightly`
 Most workflows also accept a manual `workflow_dispatch` trigger for debugging.
 
 **PR vs push triggers (CI-2).** The PR-validating workflows run on `pull_request` — **every** PR, same-repo **and** fork — so PRs from forks / non-collaborators, which never fire this repo's `push` events, get full CI (they previously got none). `CodeQuality` and `IntegrationChecks` also run on `push` to `main` to validate the merged state; because that `push` is `main`-only, a same-repo PR's branch push does **not** trigger them, so each PR runs exactly **once** via `pull_request` — no fork-detection guard or double-run logic. `BuildQuick` and `DocsCheck` have no `push` trigger (they run on `pull_request` plus manual `workflow_dispatch`), because `main` is already covered by `BuildAll` (full matrix) and `Docs` (build + deploy). `Fuzz` stays `push`-triggered: it needs `issues: write` to file crash issues (which fork PRs cannot grant) and fuzzing untrusted fork code is best avoided, so it runs on same-repo branch pushes and `main`, never on fork PRs. Trade-off: a branch pushed with **no open PR** gets no CI — the check runs the moment a PR exists (and re-runs on every new commit via `pull_request: synchronize`).
+
+**The build workflows run no tests, despite invoking `make test_release` (#222).** `BuildQuick` / `BuildAll` delegate to the extension-ci-tools reusable workflow `_extension_distribution.yml`, whose final step is `make test_release`. That invocation is a **no-op**: this project's `Makefile` overrides `test_extension_release_internal` (the per-file sqllogictest isolation loop), but the reusable workflow re-enters `make` in a context where `base.Makefile`'s own recipe wins, and the target resolves to `tests_skipped`. The job log shows
+
+```
+base.Makefile:165: warning: ignoring old recipe for target 'test_extension_release_internal'
+Skipping tests..
+```
+
+with no `Running RELEASE tests..` and no `N tests run, M failed` summary — i.e. **zero** `.test` files executed. Because the step exits 0, this reads as a green build, so the gap is invisible from the checks list. It went unnoticed long enough for an incorrect assertion to reach `main` in #217 (an `IDENT-6` case asserting a quoted name is reported unquoted, corrected in #219). The `sqllogictest` job in `IntegrationChecks` exists to run the suite for real and is the authoritative sqllogictest gate; treat the build workflows as build-only. Do **not** "simplify" that job away on the assumption that BuildQuick covers it.
 
 **Documentation-only skip.** `BuildAll`, `BuildQuick`, `CodeQuality`, and `IntegrationChecks` carry a shared `paths-ignore` (`**/*.md`, `_notes/**`, `docs/**`, `LICENSE`), so a change that touches only documentation/text does not run the extension build, sqllogictest, Rust lint/coverage, or the integration suites. `Fuzz` achieves the same via its `paths` allowlist. `DocsCheck` is intentionally exempt so prose changes still get the `-W` docs build. A change that also touches any non-doc file runs everything as normal. When editing these triggers, keep the four `paths-ignore` lists in sync.
 
