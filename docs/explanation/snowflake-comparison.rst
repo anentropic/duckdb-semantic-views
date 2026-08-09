@@ -317,11 +317,13 @@ Snowflake populates the ``data_type`` column of ``SHOW SEMANTIC DIMENSIONS`` /
 ``METRICS`` / ``FACTS`` (and the ``DATA_TYPE`` rows of ``DESCRIBE``) with the
 member's actual data type.
 
-Here the column reports the **declared** output type and nothing else. There is
-no type inference: ``CREATE`` no longer probes the underlying tables (v0.10.0
-removed the ``typeof`` pass), and the read side does not probe either. Only a
-:ref:`YAML <ref-yaml-format>` definition can declare an ``output_type``, so for
-a view created through SQL DDL the column is always empty. Populating it needs a
+Here the column reports the **declared** output type and nothing else, and no
+surface declares one. There is no type inference: ``CREATE`` no longer probes the
+underlying tables (v0.10.0 removed the ``typeof`` pass), and the read side does
+not probe either. A :ref:`YAML <ref-yaml-format>` definition could once declare
+an ``output_type``, but that field was withdrawn because no DDL clause can carry
+it -- ``GET_DDL`` dropped it silently and a restored view lost the cast. The
+column is therefore empty for every newly created view. Populating it needs a
 bind-time probe on the read path; that work is tracked as TECH-DEBT #51.
 
 

@@ -152,7 +152,7 @@ Given a semantic view ``orders_sv`` with three dimensions:
 
 The ``table_name`` column shows the actual physical table name, not the alias used in the DDL.
 
-``data_type`` is empty here because the view was created through SQL DDL, which has no way to declare an output type. It is populated only for members whose YAML definition sets ``output_type``.
+``data_type`` is empty here because no surface can declare a member's output type: SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because ``GET_DDL`` could not carry it (a restored view silently lost the cast). The column is populated only for views stored before that change. Reporting the type the expression actually produces requires probing it on the read side -- see TECH-DEBT #51.
 
 **List dimensions across all views:**
 
