@@ -78,7 +78,7 @@ fn sg2_two_parent_child_picks_connecting_edge() {
     let expected = "\
 SELECT
     o.region AS \"region\",
-    sum(li.qty) AS \"qty\"
+    sum(CASE WHEN \"li\".\"id\" IS NOT NULL THEN li.qty END) AS \"qty\"
 FROM \"orders\" AS \"o\"
 LEFT JOIN \"line_items\" AS \"li\" ON \"li\".\"order_id\" = \"o\".\"id\"
 GROUP BY
@@ -118,7 +118,7 @@ fn sg10_fk_side_chain_includes_intermediate_join() {
     let expected = "\
 SELECT
     o.region AS \"region\",
-    sum(ld.qty) AS \"detail_qty\"
+    sum(CASE WHEN \"ld\".\"id\" IS NOT NULL THEN ld.qty END) AS \"detail_qty\"
 FROM \"orders\" AS \"o\"
 LEFT JOIN \"line_items\" AS \"li\" ON \"li\".\"order_id\" = \"o\".\"id\"
 LEFT JOIN \"line_item_details\" AS \"ld\" ON \"ld\".\"line_item_id\" = \"li\".\"id\"
@@ -145,12 +145,16 @@ fn sg10_fact_source_chain_includes_intermediate_join() {
         metrics: vec![],
     };
     let sql = expand("test", &ld_li_o_def(), &req).unwrap();
+    // EXP-28: the queried fact lives on `ld` alone, so `ld` is the query's
+    // grain and the two LEFT JOINs above it would otherwise manufacture one
+    // all-NULL row per orderless/detail-less ancestor.
     let expected = "\
 SELECT
     ld.amount AS \"detail_amount\"
 FROM \"orders\" AS \"o\"
 LEFT JOIN \"line_items\" AS \"li\" ON \"li\".\"order_id\" = \"o\".\"id\"
-LEFT JOIN \"line_item_details\" AS \"ld\" ON \"ld\".\"line_item_id\" = \"li\".\"id\"";
+LEFT JOIN \"line_item_details\" AS \"ld\" ON \"ld\".\"line_item_id\" = \"li\".\"id\"
+WHERE \"ld\".\"id\" IS NOT NULL";
     assert_eq!(sql, expected);
 }
 

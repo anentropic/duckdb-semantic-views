@@ -391,16 +391,105 @@ pub(super) fn rewrite_count_star(expr: &str, replacement_arg: &str) -> Option<St
     Some(out)
 }
 
-/// Aggregates whose value changes when a row is duplicated or a phantom row is
-/// added, and which therefore cannot be left alone over a constant argument on
-/// a NULL-extended (LEFT-JOINed) table.
+/// `DuckDB`'s aggregate function names (`duckdb_functions()` where
+/// `function_type = 'aggregate'`), minus the pure *window* functions that share
+/// that catalog classification (`rank`, `row_number`, `lag`, `lead`,
+/// `first_value`, …) and minus `count_star`, which takes no argument.
 ///
-/// MIN/MAX/AVG are deliberately absent: over a constant they return that
-/// constant no matter how many rows they see, so the NULL-extended row cannot
-/// move them. `STRING_AGG` and friends take a second argument and are excluded
-/// by the top-level-comma check in [`constant_aggregate_arg`] rather than by
-/// this list — see TECH-DEBT #56.
-const MULTIPLICITY_SENSITIVE_AGGS: [&str; 5] = ["COUNT", "SUM", "PRODUCT", "LIST", "ARRAY_AGG"];
+/// Every entry is guarded by [`guard_aggregate_args`]: on a NULL-extended
+/// (LEFT-JOINed) source table the phantom row must not reach ANY aggregate,
+/// whatever its argument. EXP-21 fenced only a five-name whitelist over
+/// recognized constant literals; EXP-25/EXP-26 (code-review 2026-08-08) showed
+/// that whitelist leaking four ways — `COUNT(DISTINCT 1)`, `COUNT(1+0)`,
+/// `MIN(1)`, and any NULL-insensitive expression such as
+/// `SUM(COALESCE(li.qty, 99))` or a fact reference reaching another table.
+///
+/// Lower-case here; matching is case-insensitive over the whole identifier
+/// word, so `sum_no_overflow(` matches as itself rather than as `sum` (a
+/// prefix-scan would have missed it entirely).
+const AGGREGATE_FUNCTIONS: &[&str] = &[
+    "any_value",
+    "approx_count_distinct",
+    "approx_quantile",
+    "approx_top_k",
+    "arbitrary",
+    "arg_max",
+    "arg_max_null",
+    "arg_max_nulls_last",
+    "arg_min",
+    "arg_min_null",
+    "arg_min_nulls_last",
+    "argmax",
+    "argmin",
+    "array_agg",
+    "avg",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "bitstring_agg",
+    "bool_and",
+    "bool_or",
+    "corr",
+    "count",
+    "count_if",
+    "countif",
+    "covar_pop",
+    "covar_samp",
+    "entropy",
+    "favg",
+    "first",
+    "fsum",
+    "group_concat",
+    "histogram",
+    "histogram_exact",
+    "kahan_sum",
+    "kurtosis",
+    "kurtosis_pop",
+    "last",
+    "list",
+    "listagg",
+    "mad",
+    "max",
+    "max_by",
+    "mean",
+    "median",
+    "min",
+    "min_by",
+    "mode",
+    "product",
+    "quantile",
+    "quantile_cont",
+    "quantile_disc",
+    "regr_avgx",
+    "regr_avgy",
+    "regr_count",
+    "regr_intercept",
+    "regr_r2",
+    "regr_slope",
+    "regr_sxx",
+    "regr_sxy",
+    "regr_syy",
+    "reservoir_quantile",
+    "sem",
+    "skewness",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "string_agg",
+    "sum",
+    "sum_no_overflow",
+    "sumkahan",
+    "var_pop",
+    "var_samp",
+    "variance",
+];
+
+/// Whether `word` names one of [`AGGREGATE_FUNCTIONS`], case-insensitively.
+fn is_aggregate_name(word: &str) -> bool {
+    AGGREGATE_FUNCTIONS
+        .iter()
+        .any(|agg| word.eq_ignore_ascii_case(agg))
+}
 
 /// Whether `arg` is a SQL constant: a numeric literal, a single-quoted string
 /// literal, or `TRUE`/`FALSE`/`NULL` — each optionally wrapped in redundant
@@ -474,102 +563,225 @@ fn is_constant_literal(arg: &str) -> bool {
     seen_digit
 }
 
-/// The argument text of the aggregate call opening at `open` in `expr`, when
-/// that call is one of [`MULTIPLICITY_SENSITIVE_AGGS`] over a single constant.
+/// The span of an aggregate call's FIRST argument inside `inner` (the text
+/// between the call's parentheses), as `(quantifier_end, arg_end)` byte
+/// offsets.
 ///
-/// Returns `(close_paren_index, argument_text)`. A top-level comma disqualifies
-/// the call: a second argument means the constant is not the whole argument
-/// list, and wrapping the lot in one `CASE` would produce invalid SQL.
-fn constant_aggregate_arg(expr: &str, open: usize) -> Option<(usize, &str)> {
-    let close = super::semi_additive::find_matching_paren(expr, open)?;
-    let inner = &expr[open + 1..close];
-    // Top-level comma check, quote-aware so a comma inside a string literal
-    // does not disqualify a genuine single-argument call.
+/// `inner[..quantifier_end]` is a leading `DISTINCT` / `ALL` set quantifier
+/// (empty when absent) and `inner[quantifier_end..arg_end]` is the first
+/// argument. `inner[arg_end..]` is everything the guard must leave verbatim:
+/// further arguments (`STRING_AGG(x, ',')` — the separator is a parameter of
+/// the CALL, not a value being aggregated) and a trailing in-call `ORDER BY`
+/// (`ARRAY_AGG(x ORDER BY y)` — wrapping that inside the `CASE` would be a
+/// syntax error).
+///
+/// Returns `None` when there is no argument to guard: an empty argument list,
+/// or the `*` of `COUNT(*)` (SG-8's [`rewrite_count_star`] owns that spelling —
+/// guarding it too would emit `COUNT(CASE WHEN pk IS NOT NULL THEN pk END)`).
+fn first_aggregate_arg_span(inner: &str) -> Option<(usize, usize)> {
     let bytes = inner.as_bytes();
+    let quantifier_end = leading_quantifier_end(inner);
+    // Scan from 0 (not `quantifier_end`) so `QuoteState` sees the whole string;
+    // a quantifier keyword contains no quote bytes, so nothing before
+    // `quantifier_end` can match the terminators below.
     let mut quotes = crate::util::QuoteState::default();
     let mut depth = 0i32;
+    let mut arg_end = bytes.len();
     let mut i = 0;
     while i < bytes.len() {
         let (next, is_live_code) = quotes.step(bytes, i);
         if is_live_code {
+            if depth == 0 && i >= quantifier_end && (bytes[i] == b',' || is_order_by_at(bytes, i)) {
+                arg_end = i;
+                break;
+            }
             match bytes[i] {
                 b'(' => depth += 1,
                 b')' => depth -= 1,
-                b',' if depth == 0 => return None,
                 _ => {}
             }
         }
         i = next;
     }
-    is_constant_literal(inner).then_some((close, inner.trim()))
+    let arg = inner.get(quantifier_end..arg_end)?.trim();
+    if arg.is_empty() || arg == "*" {
+        return None;
+    }
+    Some((quantifier_end, arg_end))
 }
 
-/// Guard every multiplicity-sensitive aggregate over a constant in `expr` with
-/// `pk_ref`, so a NULL-extended LEFT JOIN row contributes nothing (EXP-21).
+/// Byte offset just past a leading `DISTINCT` / `ALL` set quantifier in an
+/// aggregate's argument list, or 0 when there is none.
+fn leading_quantifier_end(inner: &str) -> usize {
+    let lead = inner.len() - inner.trim_start().len();
+    let rest = &inner.as_bytes()[lead..];
+    for kw in [b"DISTINCT".as_slice(), b"ALL".as_slice()] {
+        if rest.len() >= kw.len()
+            && rest[..kw.len()].eq_ignore_ascii_case(kw)
+            && rest.get(kw.len()).is_none_or(|b| is_word_boundary_char(*b))
+        {
+            return lead + kw.len();
+        }
+    }
+    0
+}
+
+/// Whether an in-call `ORDER BY` clause starts at byte `i` — the `ORDER` of
+/// `ARRAY_AGG(x ORDER BY y)`, at a word boundary and followed by `BY`.
+fn is_order_by_at(bytes: &[u8], i: usize) -> bool {
+    if !(i == 0 || is_word_boundary_char(bytes[i - 1])) {
+        return false;
+    }
+    if i + 5 > bytes.len() || !bytes[i..i + 5].eq_ignore_ascii_case(b"ORDER") {
+        return false;
+    }
+    let mut j = i + 5;
+    let ws_start = j;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j == ws_start {
+        return false; // `ORDERED`, `ORDER_ID`, … — not the keyword
+    }
+    j + 2 <= bytes.len()
+        && bytes[j..j + 2].eq_ignore_ascii_case(b"BY")
+        && bytes.get(j + 2).is_none_or(|b| is_word_boundary_char(*b))
+}
+
+/// Whether `expr` contains an aggregate call over a recognized CONSTANT
+/// literal — the subset of the phantom-row hazard that is provably wrong when
+/// [`guard_aggregate_args`] cannot run at all because the source table declares
+/// no PRIMARY KEY.
 ///
-/// `COUNT(1)` becomes `COUNT(CASE WHEN <pk> IS NOT NULL THEN 1 END)`: the
-/// argument evaluates to NULL exactly on the phantom row, and every standard
-/// aggregate ignores NULL arguments. This also restores empty-group semantics
-/// a childless parent should have had — `NULL` for `SUM(1)`, `0` for
-/// `COUNT(1)` — instead of the count of phantom rows.
+/// Used only to decide whether to raise the no-PK error (see
+/// [`inline_derived_metrics`]); the guard itself is not selective.
+fn has_constant_arg_aggregate(expr: &str) -> bool {
+    scan_aggregate_calls(expr, |inner, (quantifier_end, arg_end)| {
+        is_constant_literal(&inner[quantifier_end..arg_end])
+    })
+}
+
+/// Guard the first argument of EVERY aggregate call in `expr` with `pk_ref`, so
+/// a NULL-extended LEFT JOIN row contributes nothing (EXP-21, EXP-25, EXP-26).
 ///
-/// Returns `None` when the expression contains no such call, matching
-/// [`rewrite_count_star`]'s contract. Quoted regions are inert throughout
-/// ([`crate::util::QuoteState`]), so `'count(1)'` and `"sum(1) col"` are left
-/// alone.
-pub(super) fn guard_constant_arg_aggregates(expr: &str, pk_ref: &str) -> Option<String> {
-    let bytes = expr.as_bytes();
+/// `COUNT(1)` becomes `COUNT(CASE WHEN <pk> IS NOT NULL THEN 1 END)` and
+/// `SUM(COALESCE(li.qty, 99))` becomes
+/// `SUM(CASE WHEN <pk> IS NOT NULL THEN COALESCE(li.qty, 99) END)`: the
+/// argument evaluates to NULL exactly on the phantom row, and a NULL first
+/// argument drops the row from every aggregate in [`AGGREGATE_FUNCTIONS`]. On a
+/// real row the PK is non-NULL by definition, so the `CASE` returns the
+/// original value — the rewrite is semantically neutral on real data whatever
+/// the argument is, which is why it no longer needs to RECOGNIZE the argument
+/// (the EXP-21 whitelist did, and leaked four ways: EXP-25/EXP-26). It also
+/// restores the empty-group semantics a childless parent should have had —
+/// `NULL` for `SUM(1)` / `MIN(1)`, `0` for `COUNT(1)`.
+///
+/// Only the FIRST argument is guarded: a later argument is a parameter of the
+/// call rather than a value being aggregated (`STRING_AGG`'s separator,
+/// `QUANTILE`'s fraction), and every multi-argument aggregate drops a row whose
+/// first argument is NULL anyway. A trailing in-call `ORDER BY` and an outer
+/// `FILTER (WHERE …)` clause (which sits outside the parentheses) are likewise
+/// left verbatim.
+///
+/// Returns `None` when the expression contains no guardable aggregate call,
+/// matching [`rewrite_count_star`]'s contract. Quoted regions are inert
+/// throughout ([`crate::util::QuoteState`]), so `'count(1)'` and
+/// `"sum(1) col"` are left alone.
+///
+/// Two residuals are recorded in TECH-DEBT #67: the NULL-RETAINING aggregates
+/// (`list` / `array_agg` / `first` / `last` / `arbitrary`, which keep a NULL
+/// element rather than skipping it, so the phantom leaves a NULL in the list
+/// instead of a value), and the case where the source table declares no
+/// PRIMARY KEY, where there is no column to guard with at all.
+pub(super) fn guard_aggregate_args(expr: &str, pk_ref: &str) -> Option<String> {
     let mut out = String::with_capacity(expr.len() + pk_ref.len() + 32);
     let mut copied = 0usize;
-    let mut pos = 0usize;
-    let mut quotes = crate::util::QuoteState::default();
     let mut changed = false;
-
-    while pos < bytes.len() {
-        let (next, is_live_code) = quotes.step(bytes, pos);
-        if !is_live_code {
-            pos = next;
-            continue;
+    scan_aggregate_calls(expr, |inner, (quantifier_end, arg_end)| {
+        // `inner` is a subslice of `expr`, so its start converts back by
+        // pointer offset — `scan_aggregate_calls` cuts it from `expr` itself.
+        let inner_start = inner.as_ptr() as usize - expr.as_ptr() as usize;
+        out.push_str(&expr[copied..inner_start]);
+        let quantifier = inner[..quantifier_end].trim();
+        if !quantifier.is_empty() {
+            out.push_str(quantifier);
+            out.push(' ');
         }
-        let Some(name) = MULTIPLICITY_SENSITIVE_AGGS.iter().find(|agg| {
-            let end = pos + agg.len();
-            end <= bytes.len()
-                && bytes[pos..end].eq_ignore_ascii_case(agg.as_bytes())
-                && (pos == 0 || is_word_boundary_char(bytes[pos - 1]))
-        }) else {
-            pos += 1;
-            continue;
-        };
-        let mut open = pos + name.len();
-        while open < bytes.len() && bytes[open].is_ascii_whitespace() {
-            open += 1;
-        }
-        if open >= bytes.len() || bytes[open] != b'(' {
-            pos += 1;
-            continue;
-        }
-        let Some((close, arg)) = constant_aggregate_arg(expr, open) else {
-            pos += 1;
-            continue;
-        };
-        // Every scanned offset sits on an ASCII byte, so slicing is
-        // char-boundary safe.
-        out.push_str(&expr[copied..=open]);
         out.push_str("CASE WHEN ");
         out.push_str(pk_ref);
         out.push_str(" IS NOT NULL THEN ");
-        out.push_str(arg);
-        out.push_str(" END)");
-        copied = close + 1;
-        pos = close + 1;
+        out.push_str(inner[quantifier_end..arg_end].trim());
+        out.push_str(" END");
+        copied = inner_start + arg_end;
         changed = true;
-    }
-
+        false // never stop early: every call has to be guarded
+    });
     if !changed {
         return None;
     }
     out.push_str(&expr[copied..]);
     Some(out)
+}
+
+/// Walk every aggregate call in `expr`, in source order, invoking `visit` with
+/// the text between its parentheses and the [`first_aggregate_arg_span`] of
+/// that text. Stops early (returning `true`) as soon as `visit` returns `true`.
+///
+/// Shared by [`guard_aggregate_args`] (which rewrites, ignoring the answer) and
+/// [`has_constant_arg_aggregate`] (which only asks a question), so the two
+/// cannot disagree about what counts as an aggregate call.
+///
+/// A function name is matched as a WHOLE identifier word at a word boundary,
+/// never as a prefix: `sum_no_overflow(` reads as itself rather than as `sum`
+/// followed by junk (which the prefix scan it replaces skipped entirely), and
+/// `miscount(*)` matches nothing.
+fn scan_aggregate_calls(expr: &str, mut visit: impl FnMut(&str, (usize, usize)) -> bool) -> bool {
+    let bytes = expr.as_bytes();
+    let mut quotes = crate::util::QuoteState::default();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let (next, is_live_code) = quotes.step(bytes, pos);
+        if !is_live_code || !crate::util::is_ident_byte(bytes[pos]) {
+            pos = next;
+            continue;
+        }
+        // An identifier run: every byte in it is ordinary live code, so jumping
+        // over the run leaves `quotes` in the same (idle) state.
+        let word_start = pos;
+        let mut word_end = pos;
+        while word_end < bytes.len() && crate::util::is_ident_byte(bytes[word_end]) {
+            word_end += 1;
+        }
+        pos = word_end;
+        if word_start != 0 && !is_word_boundary_char(bytes[word_start - 1]) {
+            continue;
+        }
+        if !is_aggregate_name(&expr[word_start..word_end]) {
+            continue;
+        }
+        let mut open = word_end;
+        while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+            open += 1;
+        }
+        if open >= bytes.len() || bytes[open] != b'(' {
+            continue;
+        }
+        let Some(close) = super::semi_additive::find_matching_paren(expr, open) else {
+            continue;
+        };
+        // Every scanned offset sits on an ASCII byte, so slicing is
+        // char-boundary safe.
+        let inner = &expr[open + 1..close];
+        if let Some(span) = first_aggregate_arg_span(inner) {
+            if visit(inner, span) {
+                return true;
+            }
+        }
+        // The parenthesized region is balanced and every quote inside it is
+        // closed, so resuming after `)` keeps `quotes` idle.
+        pos = close + 1;
+    }
+    false
 }
 
 /// Resolved metric expressions plus SG-8 rewrite failures.
@@ -729,18 +941,21 @@ pub(super) fn inline_derived_metrics(
                     .and_then(|t| t.pk_columns.first());
                 if let Some(pk) = pk {
                     let qualified_pk = format!("{}.{}", quote_ident(&st_lower), quote_ident(pk));
+                    // EXP-21/25/26: `COUNT(*)` is only the best-known spelling
+                    // of the hazard — EVERY aggregate over the NULL-extended
+                    // table needs its argument fenced. The argument guard runs
+                    // FIRST and skips the bare `*`, so `COUNT(*)` reaches the
+                    // star rewrite untouched and comes out as the plain
+                    // `COUNT(<pk>)` SG-8 has always emitted rather than
+                    // double-wrapped in a `CASE` over its own PK.
+                    if let Some(rewritten) = guard_aggregate_args(&expr, &qualified_pk) {
+                        expr = rewritten;
+                    }
                     if let Some(rewritten) = rewrite_count_star(&expr, &qualified_pk) {
                         expr = rewritten;
                     }
-                    // EXP-21: `COUNT(*)` is only the best-known spelling of the
-                    // hazard. Run after the star rewrite, which has by now
-                    // turned any `COUNT(*)` into `COUNT(<pk>)` — a column
-                    // argument, so this pass leaves it alone.
-                    if let Some(rewritten) = guard_constant_arg_aggregates(&expr, &qualified_pk) {
-                        expr = rewritten;
-                    }
                 } else if rewrite_count_star(&expr, "*").is_some()
-                    || guard_constant_arg_aggregates(&expr, "*").is_some()
+                    || has_constant_arg_aggregate(&expr)
                 {
                     // No PK declared (or unknown alias): rewrite impossible.
                     // EXP-24: keyed like `resolved`, so a QUALIFIED reference

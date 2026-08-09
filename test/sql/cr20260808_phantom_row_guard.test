@@ -1,0 +1,200 @@
+# Code review 2026-08-08: the phantom (NULL-extended LEFT JOIN) row escapes,
+# end to end through the extension-load -> DDL -> query pipeline.
+#
+# Every synthesized join is a LEFT JOIN anchored at the base table, so a base
+# row with no matching child row survives as one all-NULL "phantom" row.
+#   EXP-25  the EXP-21 constant-argument fence was a whitelist: COUNT(DISTINCT 1),
+#           COUNT(1+0) and MIN(1) all walked past it.
+#   EXP-26  a NULL-insensitive argument (COALESCE, a cross-table fact reference)
+#           had no fence at all.
+#   EXP-28  a FACTS query on a child fact returned one phantom row per childless
+#           parent.
+#   EXP-29  a dimensions-only DISTINCT on a child dimension emitted a
+#           join-manufactured NULL.
+#
+# Each defect also has an independent unit test (sqllogictest stops a file at
+# its first failing statement, so N cases here yield only one observed red) in
+# src/expand/tests_phantom_row_guard.rs, plus randomized coverage in
+# tests/child_grain_proptest.rs.
+
+require semantic_views
+
+statement ok
+CREATE TABLE cr0808_orders (id INTEGER, region VARCHAR, rate INTEGER);
+
+statement ok
+INSERT INTO cr0808_orders VALUES (1, 'East', 10), (2, 'North', 5);
+
+statement ok
+CREATE TABLE cr0808_items (id INTEGER, order_id INTEGER, qty INTEGER);
+
+# Order 2 is CHILDLESS -- the only row that can expose any of these.
+statement ok
+INSERT INTO cr0808_items VALUES (1, 1, 2), (2, 1, 3);
+
+statement ok
+CREATE SEMANTIC VIEW cr0808_sales AS
+  TABLES (
+    o AS cr0808_orders PRIMARY KEY (id),
+    li AS cr0808_items PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o
+  )
+  FACTS (
+    li.liqty AS li.qty,
+    o.orate AS o.rate
+  )
+  DIMENSIONS (
+    o.region AS o.region,
+    li.item_qty AS li.qty
+  )
+  METRICS (
+    li.n_star AS COUNT(*),
+    li.n_distinct_one AS COUNT(DISTINCT 1),
+    li.n_expr AS COUNT(1+0),
+    li.min_one AS MIN(1),
+    li.max_one AS MAX(1),
+    li.s_coalesce AS SUM(COALESCE(li.qty, 99)),
+    li.s_parent AS SUM(orate),
+    li.s_qty AS SUM(li.qty)
+  );
+
+# ============================================================
+# EXP-25: the constant-argument fence leaked three ways.
+#
+# Grouped by region, the childless North order has NO line items, so every
+# line-item metric must report the empty-group value: 0 for COUNT, NULL for
+# MIN/MAX. Before the fix each returned 1 -- the phantom row.
+# ============================================================
+
+query TIIIII rowsort
+SELECT region, n_star, n_distinct_one, n_expr, min_one, max_one
+FROM semantic_view(
+  'cr0808_sales',
+  dimensions := ['region'],
+  metrics := ['n_star', 'n_distinct_one', 'n_expr', 'min_one', 'max_one']
+);
+----
+East	2	1	2	1	1
+North	0	0	0	NULL	NULL
+
+# ============================================================
+# EXP-26: NULL-insensitive arguments that are not constants at all.
+#
+# SUM(COALESCE(li.qty, 99)) returned 99 for the childless order (the phantom's
+# NULL qty fired the fallback); SUM(orate) -- a line-item-grain metric reaching
+# a fact on the PARENT table -- returned the parent's own rate, 5.
+# ============================================================
+
+query TII rowsort
+SELECT region, s_coalesce, s_parent
+FROM semantic_view(
+  'cr0808_sales',
+  dimensions := ['region'],
+  metrics := ['s_coalesce', 's_parent']
+);
+----
+East	5	20
+North	NULL	NULL
+
+# Ungrouped, the cross-table fact reference totalled 25 (20 real + the
+# childless order's 5) where 20 is correct.
+query I
+SELECT s_parent FROM semantic_view('cr0808_sales', metrics := ['s_parent']);
+----
+20
+
+# The control: an ordinary column aggregate was already correct and stays so.
+query I
+SELECT s_qty FROM semantic_view('cr0808_sales', metrics := ['s_qty']);
+----
+5
+
+# ============================================================
+# EXP-28: a FACTS query on a child fact.
+#
+# Returned [2, 3, NULL] -- a spurious all-NULL row at line-item grain for the
+# childless order.
+# ============================================================
+
+query I
+SELECT liqty FROM semantic_view('cr0808_sales', facts := ['liqty']) ORDER BY 1;
+----
+2
+3
+
+# Joining UP to a base dimension is fan-free, so the dimension rides along on
+# the two real rows and no phantom is manufactured.
+query TI
+SELECT region, liqty
+FROM semantic_view('cr0808_sales', facts := ['liqty'], dimensions := ['region'])
+ORDER BY 2;
+----
+East	2
+East	3
+
+# A fact on the BASE table keeps every base row: the base table is never
+# NULL-extended, so nothing is filtered.
+query I
+SELECT orate FROM semantic_view('cr0808_sales', facts := ['orate']) ORDER BY 1;
+----
+5
+10
+
+# ============================================================
+# EXP-29: dimensions-only DISTINCT on a child dimension.
+#
+# Returned [2, 3, NULL]; the NULL is indistinguishable from a genuine data NULL.
+# ============================================================
+
+query I
+SELECT item_qty FROM semantic_view('cr0808_sales', dimensions := ['item_qty']) ORDER BY 1;
+----
+2
+3
+
+# Mixing a base dimension with a child one is NOT filtered: the base row is a
+# legitimate member of the result even with no child, so all three rows stand.
+query TI rowsort
+SELECT region, item_qty FROM semantic_view('cr0808_sales', dimensions := ['region', 'item_qty']);
+----
+East	2
+East	3
+North	NULL
+
+# ============================================================
+# The no-PRIMARY-KEY case stays a loud error rather than a silent number: with
+# no PK on the child there is no column that tells a phantom row from a real
+# one, so a constant-argument aggregate cannot be guarded at all. MIN(1) joined
+# that family in EXP-25.
+# ============================================================
+
+statement ok
+CREATE SEMANTIC VIEW cr0808_nopk AS
+  TABLES (
+    o AS cr0808_orders PRIMARY KEY (id),
+    li AS cr0808_items
+  )
+  RELATIONSHIPS (
+    li_to_order AS li(order_id) REFERENCES o
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    li.min_one AS MIN(1),
+    li.s_qty AS SUM(li.qty)
+  );
+
+statement error
+SELECT * FROM semantic_view('cr0808_nopk', metrics := ['min_one']);
+----
+has no PRIMARY KEY declared
+
+# An unguardable-by-construction metric does not poison its neighbours: a plain
+# column aggregate on the same PK-less table still answers.
+query I
+SELECT s_qty FROM semantic_view('cr0808_nopk', metrics := ['s_qty']);
+----
+5
