@@ -141,35 +141,3 @@ test_extension_release_internal: patch-runner
 	@$(TEST_RUNNER_FILE_LIST_RELEASE)
 	@echo "$$(wc -l < $(TEST_LIST_PATH) | tr -d ' ') test files passed (single process)"
 
-# TC-10 expected-fail probe. The per-file isolation loop above exists solely to
-# dodge a DuckDB 1.5.0 crash when one sqllogictest process creates/destroys
-# multiple databases sequentially. Nothing pins that motivating crash, so the
-# workaround would silently outlive its cause. This target runs the ENTIRE
-# TEST_LIST in a SINGLE process (the exact trigger) and INVERTS the result:
-#   - while the bug still reproduces, the single-process run crashes/fails and
-#     the probe exits 0 ("workaround still required" -- expected);
-#   - if the run ever SUCCEEDS, the probe exits 1 and tells the maintainer to
-#     retire the per-file loop and route test-sql back to the single-process
-#     TEST_RUNNER_FILE_LIST_DEBUG path.
-# Requires a debug build (`just build`). Run via `just probe-isolation-workaround`.
-#
-# STATUS 2026-08-09: this probe currently reports UNEXPECTED PASS on DuckDB
-# v1.5.5 (Linux, debug) — the single-process run completes with 111/111 files
-# SUCCESS, so the crash below appears fixed and the loop is retirable. It has
-# NOT been retired because the evidence is Linux-only and
-# `test_extension_release_internal` is what BuildAll runs on Windows and
-# macOS-arm64. See TECH-DEBT #74 for what finishing it requires; do not wire the
-# probe into CI before then, as it would be red from its first run.
-probe_isolation_debug_internal: patch-runner
-	@echo "Probing whether the DuckDB 1.5 multi-file isolation workaround is still needed.."
-	@if $(TEST_RUNNER_FILE_LIST_DEBUG) >/dev/null 2>&1; then \
-		echo "UNEXPECTED PASS: running all TEST_LIST files in one sqllogictest process no longer crashes"; \
-		echo "-- the DuckDB 1.5 multi-DB lifecycle segfault appears fixed."; \
-		echo "Retire the per-file isolation loop in test_extension_debug_internal /"; \
-		echo "test_extension_release_internal and route test-sql back to the single-process"; \
-		echo "TEST_RUNNER_FILE_LIST_DEBUG path."; \
-		exit 1; \
-	else \
-		echo "OK: single-process run still fails; the per-file isolation workaround is still"; \
-		echo "required (expected)."; \
-	fi

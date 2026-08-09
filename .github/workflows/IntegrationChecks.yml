@@ -173,10 +173,3 @@ jobs:
       - name: Run SQL logic tests
         run: just test-sql-prebuilt
 
-  # NOTE: the TC-10 isolation probe (`just probe-isolation-prebuilt`) is
-  # deliberately NOT wired in as a job yet. Running it locally against
-  # DuckDB v1.5.5 already reports UNEXPECTED PASS — the multi-database crash it
-  # guards against appears fixed, so the probe would be red from its first run.
-  # A permanently-red check on `main` trains people to ignore the checks list,
-  # which costs more than the probe gains. See TECH-DEBT #74 for the evidence
-  # and for what retiring the workaround requires.
