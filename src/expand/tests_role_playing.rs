@@ -663,3 +663,174 @@ fn where_clause_on_non_role_playing_table_still_allowed() {
         result.err()
     );
 }
+
+// ---------------------------------------------------------------------------
+// EXP-31 (code-review 2026-08-08): the role-playing twin of EXP-27. A
+// `where_clause` member whose FACT CHAIN reaches a ROLE-PLAYING table had that
+// table joined with no ambiguity check at all.
+//
+// EXP-10 (above) closed the case where the member is *declared* on the
+// role-playing table. #207 (EXP-23) then taught `resolve_where_clause` to
+// contribute the tables a member reaches THROUGH its fact references to
+// `source_tables`, so the join resolver joins those too — and
+// `check_where_clause_role_playing_path` still read only `member.table`. The
+// reached table therefore rode `fact_source_tables` straight to `tree_parent`,
+// the first-declared relationship: exactly the silent, declaration-order-
+// dependent binding EXP-10 exists to prevent, reached one hop further along.
+//
+// Same blind spot #207 opened for fan traps (EXP-27) at a different fence,
+// which is why both now walk `WhereMember::fact_tables` alongside
+// `WhereMember::table`.
+// ---------------------------------------------------------------------------
+
+/// `flights_airports_def` plus a fact on the ROLE-PLAYING table `a` and a fact
+/// on the base whose expression reaches it, so a predicate naming the base
+/// fact pulls `a` in without ever naming it.
+///
+/// A fact on `a` is not itself illegal: `check_fact_role_playing_path` rejects
+/// one when it is *queried*, and a `where_clause` member is not queried.
+fn flights_airports_fact_chain_def() -> SemanticViewDefinition {
+    flights_airports_def()
+        // A plain metric with no USING, so nothing else in the query supplies a
+        // role and the ambiguity is the member's alone.
+        .with_metric("flight_count", "COUNT(*)", Some("f"))
+        .with_fact("ap_elev", "a.elevation", "a")
+        .with_fact("f_elev", "ap_elev + 1", "f")
+}
+
+/// The FACT branch: the predicate names a fact on the base whose expression
+/// reaches a fact on the role-playing table.
+#[test]
+fn exp31_where_member_fact_chain_to_a_role_playing_table_is_rejected() {
+    let def = flights_airports_fact_chain_def();
+    let req = QueryRequest {
+        where_clause: Some("f_elev > 0".to_string()),
+        facts: vec![],
+        dimensions: vec![],
+        metrics: vec![MetricName::new("flight_count")],
+    };
+    match expand("flights_sv", &def, &req) {
+        Err(ExpandError::AmbiguousWhereClausePath {
+            member_name,
+            member_table,
+            role_playing_table,
+            available_relationships,
+            ..
+        }) => {
+            assert_eq!(member_name, "f_elev");
+            assert_eq!(
+                member_table, "a",
+                "the error must name the table joined on the member's behalf; \
+                 the table the member is declared on is unambiguous"
+            );
+            assert_eq!(role_playing_table, "a");
+            assert_eq!(
+                available_relationships,
+                vec!["dep_airport".to_string(), "arr_airport".to_string()],
+                "the message must list the roles the user has to choose between"
+            );
+        }
+        Err(other) => panic!(
+            "expected AmbiguousWhereClausePath — a different error means this \
+             case stopped guarding EXP-31: {other}"
+        ),
+        Ok(sql) => panic!(
+            "EXP-31: the role-playing table was joined for a where_clause fact \
+             chain with no ambiguity check, so the predicate binds to the \
+             first-declared relationship (dep_airport) silently.\n\
+             emitted SQL:\n{sql}"
+        ),
+    }
+}
+
+/// The DIMENSION branch: TECH-DEBT #54 made predicate dimensions' expressions
+/// fact-inlined too, so a dimension on the base reaching the same fact takes
+/// the identical unchecked path.
+#[test]
+fn exp31_where_member_dimension_reaching_a_role_playing_fact_is_rejected() {
+    let def = flights_airports_fact_chain_def().with_dimension(
+        "high_altitude",
+        "CASE WHEN ap_elev > 5000 THEN 'hi' ELSE 'lo' END",
+        Some("f"),
+    );
+    let req = QueryRequest {
+        where_clause: Some("high_altitude = 'hi'".to_string()),
+        facts: vec![],
+        dimensions: vec![],
+        metrics: vec![MetricName::new("flight_count")],
+    };
+    match expand("flights_sv", &def, &req) {
+        Err(ExpandError::AmbiguousWhereClausePath {
+            member_name,
+            member_table,
+            ..
+        }) => {
+            assert_eq!(member_name, "high_altitude");
+            assert_eq!(member_table, "a");
+        }
+        Err(other) => panic!("expected AmbiguousWhereClausePath, got: {other}"),
+        Ok(sql) => panic!(
+            "EXP-31 (dimension branch): a where_clause DIMENSION whose \
+             expression reaches a fact on the role-playing table joined it \
+             unchecked.\nemitted SQL:\n{sql}"
+        ),
+    }
+}
+
+/// Transitivity: the reached set walks the whole chain, so a two-hop chain
+/// that only arrives at the role-playing table at its far end is rejected too.
+/// A check that looked at the directly-named fact alone would miss this.
+#[test]
+fn exp31_transitive_fact_chain_to_a_role_playing_table_is_rejected() {
+    let def = flights_airports_fact_chain_def().with_fact("f_elev2", "f_elev * 2", "f");
+    let req = QueryRequest {
+        where_clause: Some("f_elev2 > 0".to_string()),
+        facts: vec![],
+        dimensions: vec![],
+        metrics: vec![MetricName::new("flight_count")],
+    };
+    match expand("flights_sv", &def, &req) {
+        Err(ExpandError::AmbiguousWhereClausePath { member_name, .. }) => {
+            assert_eq!(member_name, "f_elev2");
+        }
+        Err(other) => panic!("expected AmbiguousWhereClausePath, got: {other}"),
+        Ok(sql) => panic!(
+            "EXP-31 (transitive): `f_elev2 -> f_elev -> ap_elev@a` reached the \
+             role-playing table through two hops unchecked.\n\
+             emitted SQL:\n{sql}"
+        ),
+    }
+}
+
+/// CONTROL — a fact chain reaching a NON-role-playing table must still expand.
+/// Without this the fix could be "reject every where_clause fact chain" and
+/// still look green. The same shape as the tests above with one relationship
+/// instead of two, so nothing but the role-playing multi-edge differs.
+#[test]
+fn exp31_control_fact_chain_to_a_non_role_playing_table_still_expands() {
+    let def = SemanticViewDefinition::default()
+        .with_table("f", "exp31_flights", &["flight_id"])
+        .with_table("a", "exp31_airports", &["airport_code"])
+        .with_metric("flight_count", "COUNT(*)", Some("f"))
+        .with_fact("ap_elev", "a.elevation", "a")
+        .with_fact("f_elev", "ap_elev + 1", "f")
+        .with_pkfk_join(
+            "dep_airport",
+            "f",
+            "a",
+            &["departure_code"],
+            &["airport_code"],
+        );
+    let req = QueryRequest {
+        where_clause: Some("f_elev > 0".to_string()),
+        facts: vec![],
+        dimensions: vec![],
+        metrics: vec![MetricName::new("flight_count")],
+    };
+    let sql = expand("flights_sv", &def, &req)
+        .expect("one relationship to the target means no role to disambiguate");
+    assert!(
+        sql.contains("exp31_airports"),
+        "the table reached through the fact chain must still be joined: {sql}"
+    );
+}
