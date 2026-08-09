@@ -98,7 +98,21 @@ _ensure-test-deps:
 #
 # The test/sql/phase2_ddl.test file exercises the full DDL round-trip:
 #   define_semantic_view, list_semantic_views, describe_semantic_view, drop_semantic_view.
-test-sql: build _ensure-test-deps
+test-sql: build test-sql-prebuilt
+
+# The body of `test-sql`, minus the build.
+#
+# CI's `SQL logic tests` job downloads a debug extension built once by an
+# earlier job rather than building its own, so it needs an entry point that
+# does NOT re-enter `make debug`. Splitting the recipe rather than letting CI
+# call `make test_debug` directly keeps `_ensure-test-deps` on both paths: it
+# reinstalls the venv's `duckdb` pip package when it does not match
+# `.duckdb-version`, without which the runner can test against a different
+# DuckDB than the extension was built for. Local `just test-sql` is unchanged —
+# it still builds first and then runs exactly this.
+#
+# Requires build/debug/semantic_views.duckdb_extension to exist already.
+test-sql-prebuilt: _ensure-test-deps
     make test_debug
 
 # TC-10 expected-fail probe: check whether the per-file sqllogictest process
