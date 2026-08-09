@@ -70,13 +70,22 @@ statement ok
 statement ok
 /* x */ DROP SEMANTIC VIEW sv_line
 
-# Comment-only must NOT be classified as semantic-view DDL.
-# (DuckDB will give its own error for the empty/comment-only statement.)
+# Comment-only must NOT be classified as semantic-view DDL: the hook blanks
+# comments, sees an empty statement, and defers. DuckDB then parses zero
+# statements, so `execute()` leaves no result set and the runner's following
+# `fetchall()` raises. The point of the case is that the error is DuckDB's own
+# empty-statement complaint and never ours — an expectation of "" would have
+# accepted a `syntax error at or near "SEMANTIC"` just as happily (TC-12).
 statement error
 /* nothing */
 ----
+No open result set
 
-# Unterminated block comment must NOT panic and must NOT match.
+# Unterminated block comment must NOT panic and must NOT match. `/*` with no
+# `*/` blanks to end of input, so the `CREATE SEMANTIC VIEW` text inside it is
+# invisible to both the prefix matcher and the near-miss detector; the hook
+# defers and DuckDB's own lexer reports the unterminated comment.
 statement error
 /* unterminated CREATE SEMANTIC VIEW broken AS TABLES (t AS t PRIMARY KEY (x)) DIMENSIONS (t.xx AS t.x) METRICS (t.sy AS SUM(t.y))
 ----
+unterminated /* comment
