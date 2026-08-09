@@ -647,6 +647,19 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **PARSE-9:** name slots accept identifier garbage DuckDB would reject — `RENAME TO x,y` stores `x,y`.
 - **What would finish it:** route IDENT-1 through `ident_matches` (mechanical); give the scanner position-awareness for cast/EXTRACT slots (IDENT-3) and a quoted-name-aware literal rule (IDENT-4); make `normalize_ident_part` produce a structured key rather than a re-joined string (IDENT-5); tighten the name-slot grammar (PARSE-9). IDENT-2 needs a decision before a fix.
 
+### 74. ✅ The sqllogictest per-file isolation workaround (TC-10) — RESOLVED 2026-08-09
+
+- **Origin:** CI audit 2026-08-09, while wiring the TC-10 probe into CI. Opened and closed in the same round: running the probe answered the question it existed to ask.
+- **What TC-10 was:** `test_extension_debug_internal` / `test_extension_release_internal` ran **each** `.test` file in its own sqllogictest process, to dodge a DuckDB 1.5.0 crash when one process created and destroyed several databases in sequence. `probe_isolation_debug_internal` was the expected-fail probe watching for the upstream fix, so the workaround could not outlive its cause unnoticed.
+- **What the probe reported:** on DuckDB **v1.5.5** — `UNEXPECTED PASS: running all TEST_LIST files in one sqllogictest process no longer crashes`.
+- **Resolution:** both targets are back on the single-process `TEST_RUNNER_FILE_LIST_*` path; the probe target and the `probe-isolation-workaround` / `probe-isolation-prebuilt` recipes are deleted, since with the loop gone `test-sql` *is* the single-process run and the probe would be tautological.
+- **Evidence, on every platform that executes the suite:**
+  - Linux debug, 3 consecutive local runs — exit 0, `111/111` SUCCESS, ~33 s (against ~39 s for the loop). Run three times because an intermittent segfault would be worse than a reliable one, and one green run cannot distinguish them.
+  - `windows_amd64` release — BuildAll run [31316526280](https://github.com/anentropic/duckdb-semantic-views/actions/runs/31316526280): 111 progress markers, all `[n/111]` (one process), `111 test files passed (single process)`, no skip and no crash. **28 s, down from 53 s.**
+  - `osx_arm64` release — same run, same markers and end line. **13 s, down from 29 s.**
+  - The remaining three platforms (`linux_amd64`, `linux_arm64`, `osx_amd64`) never execute the suite at all — see the CI Workflows section of MAINTAINER.md — so there is no platform left where the loop could still be needed.
+- **If the crash returns:** the loop and the probe are both in git history at commit `4e932d0`'s parent. Restore them together rather than papering over an intermittent segfault; a flaky crash would need the probe more, not less.
+
 ### 73. ❌ A typed literal separated from its introducer by whitespace still scans as a reference (PARSE-12 residual) — OPEN
 
 - **Origin:** PARSE-12's fix (code review 2026-08-08), narrowed during review of that change. Recorded per the rule that a knowingly-partial behaviour gets an entry in the same change.

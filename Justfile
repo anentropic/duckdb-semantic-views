@@ -76,10 +76,21 @@ fmt:
 coverage:
     cargo llvm-cov nextest --fail-under-lines 80
 
-# Ensure the Python venv's duckdb pip package matches .duckdb-version.
-# Called automatically by test recipes that use the venv runner.
+# Ensure the Python venv exists and its duckdb pip package matches
+# .duckdb-version. Called automatically by test recipes that use the venv runner.
+#
+# The `make configure` guard makes those recipes self-contained. `test-sql`
+# reaches the venv via `build` (which fails loudly on `check_configure`), but
+# `test-sql-prebuilt` and `test-ducklake-ci` do not build first, so without this
+# a fresh checkout hit a confusing `configure/venv/bin/python: not found` from
+# the version probe below instead of the real cause. `make configure` is a no-op
+# when configure/venv already exists, so this costs nothing on the common path.
 [private]
 _ensure-test-deps:
+    @if [ ! -d configure/venv ]; then \
+      echo "configure/venv missing — running make configure first..."; \
+      make configure; \
+    fi
     @VER=$(cat .duckdb-version | sed 's/^v//'); \
     INSTALLED=$(configure/venv/bin/python -c "import duckdb; print(duckdb.__version__)" 2>/dev/null || echo ""); \
     if [ "$INSTALLED" = "$VER" ]; then \
@@ -93,21 +104,32 @@ _ensure-test-deps:
 # There is no standalone DuckDB CLI available in this project; SQL logic tests
 # are run via the Python-based duckdb_sqllogictest runner (installed by
 # `make configure` into its Python venv).  This recipe builds the debug extension
-# and delegates to `make test_debug`, which invokes the runner against the full
-# test/sql/ directory.  All files matching test/sql/**/*.test are executed.
+# and delegates to `make test_debug`.
+#
+# Only the files ENUMERATED IN test/sql/TEST_LIST are executed — the runner is
+# invoked with `--file-list`, not a directory glob. A new .test file that is not
+# added to TEST_LIST is silently skipped: never run, never red. `just
+# check-test-list` (and the CodeQuality job that calls it) exists to make that a
+# hard error rather than a quiet gap.
 #
 # The test/sql/phase2_ddl.test file exercises the full DDL round-trip:
 #   define_semantic_view, list_semantic_views, describe_semantic_view, drop_semantic_view.
-test-sql: build _ensure-test-deps
-    make test_debug
+test-sql: build test-sql-prebuilt
 
-# TC-10 expected-fail probe: check whether the per-file sqllogictest process
-# isolation workaround (see Makefile) is still needed. Runs the whole TEST_LIST
-# in ONE process; exits 0 while the DuckDB 1.5 multi-DB crash still reproduces
-# (workaround required) and exits 1 loudly if it ever stops crashing (time to
-# retire the workaround). Requires a debug build.
-probe-isolation-workaround: build
-    make probe_isolation_debug_internal
+# The body of `test-sql`, minus the build.
+#
+# CI's `SQL logic tests` job downloads a debug extension built once by an
+# earlier job rather than building its own, so it needs an entry point that
+# does NOT re-enter `make debug`. Splitting the recipe rather than letting CI
+# call `make test_debug` directly keeps `_ensure-test-deps` on both paths: it
+# reinstalls the venv's `duckdb` pip package when it does not match
+# `.duckdb-version`, without which the runner can test against a different
+# DuckDB than the extension was built for. Local `just test-sql` is unchanged —
+# it still builds first and then runs exactly this.
+#
+# Requires build/debug/semantic_views.duckdb_extension to exist already.
+test-sql-prebuilt: _ensure-test-deps
+    make test_debug
 
 # Download jaffle-shop data and create DuckLake/Iceberg catalog for integration tests.
 # Idempotent — safe to run multiple times. Data files are gitignored.

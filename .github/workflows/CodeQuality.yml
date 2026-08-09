@@ -58,37 +58,32 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: ./.github/actions/setup-pinned-rust
 
-      # The sqllogictest runner executes ONLY files named in TEST_LIST; a
-      # .test file missing from it is silently skipped. Mirrors `just check-test-list`.
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      # Both sync checks below CALL the Justfile recipe rather than
+      # reimplementing it. They used to be inline copies that "mirrored" the
+      # recipes, which is two implementations of one rule — and a drift guard
+      # that can itself drift is worth little. The recipe owns the comparison
+      # and prints the diff; the `||` here only adds the GitHub `::error::`
+      # annotation, which is presentation, not logic.
+      #
+      # The sqllogictest runner executes ONLY files named in TEST_LIST, so a
+      # .test file missing from it is silently skipped — never run, never red.
       - name: Check test/sql/TEST_LIST is in sync with test/sql/*.test
         run: |
-          if ! diff <(find test/sql -maxdepth 1 -name '*.test' | sort) <(sort test/sql/TEST_LIST); then
-            echo "::error::test/sql/TEST_LIST is out of sync with test/sql/*.test ('<' = on disk only, '>' = in TEST_LIST only)"
-            exit 1
-          fi
+          just check-test-list \
+            || { echo "::error::test/sql/TEST_LIST is out of sync with test/sql/*.test (see diff above)"; exit 1; }
 
       # A fuzz target is registered in three places: the .rs file, a [[bin]]
       # entry in fuzz/Cargo.toml, and the Fuzz.yml matrix. `just fuzz-all`
       # derives its list from the manifest, but GitHub needs the matrix before
       # any job starts, so that copy is hand-written and can drift — it did,
-      # in the other direction, from #172 until 2026-08-04. Mirrors
-      # `just check-fuzz-list`.
+      # in the other direction, from #172 until 2026-08-04.
       - name: Check fuzz target registration is in sync
         run: |
-          disk=$(find fuzz/fuzz_targets -maxdepth 1 -name '*.rs' -exec basename {} .rs \; | sort)
-          manifest=$(sed -n 's|^path = "fuzz_targets/\(.*\)\.rs"$|\1|p' fuzz/Cargo.toml | sort)
-          matrix=$(sed -n 's/^ *target: \[\(.*\)\]$/\1/p' .github/workflows/Fuzz.yml \
-                   | tr ',' '\n' | tr -d ' ' | grep . | sort)
-          rc=0
-          if ! diff <(echo "$disk") <(echo "$manifest"); then
-            echo "::error::fuzz/fuzz_targets/*.rs and fuzz/Cargo.toml [[bin]] entries disagree ('<' = file with no [[bin]] entry, '>' = entry with no file)"
-            rc=1
-          fi
-          if ! diff <(echo "$manifest") <(echo "$matrix"); then
-            echo "::error::fuzz/Cargo.toml [[bin]] entries and the Fuzz.yml matrix disagree ('<' = target CI never fuzzes, '>' = matrix entry with no target)"
-            rc=1
-          fi
-          exit $rc
+          just check-fuzz-list \
+            || { echo "::error::fuzz target registration is out of sync across fuzz_targets/, fuzz/Cargo.toml and Fuzz.yml (see diff above)"; exit 1; }
 
       - name: Check formatting (rustfmt)
         run: cargo fmt --check
