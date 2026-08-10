@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [0.12.0] - 2026-08-10
+
 ### Added
 
 - **Each metric is now computed at its own grain, so multi-grain queries return results instead of a fan-trap error.** Until now every generated query was anchored `FROM <base table>` with `LEFT JOIN`s outward, which meant a metric whose table was not the base table could be aggregated over the multiplied join; v0.11.0 made those shapes raise `fan trap detected` rather than silently inflate. They are now *answered* the way Snowflake answers them — each metric pre-aggregated over its own table, the results joined on the queried dimensions. Three shapes become available:
@@ -204,7 +208,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known limitations
 
-- **`data_type` is empty for views created through SQL DDL.** No type is inferred at `CREATE` (v0.10.0 removed that pass) and none is probed on read, so `SHOW SEMANTIC DIMENSIONS` / `METRICS` / `FACTS`, `SHOW COLUMNS IN SEMANTIC VIEW`, and `DESCRIBE SEMANTIC VIEW` report only a type the definition declared — which today only a YAML definition can do. Snowflake populates this column.
+- **`data_type` is empty for every view created today.** No type is inferred at `CREATE` (v0.10.0 removed that pass) and none is probed on read, so `SHOW SEMANTIC DIMENSIONS` / `METRICS` / `FACTS`, `SHOW COLUMNS IN SEMANTIC VIEW`, and `DESCRIBE SEMANTIC VIEW` report only a type the definition declared — and no surface can declare one: the DDL grammar has no clause for it, and the YAML `output_type` field is now rejected at import because `GET_DDL` could not carry it (a restored view silently lost the cast). The column is populated only for views stored before that change. Snowflake populates it. Query results are unaffected — `semantic_view()` infers each output column's type when the query is bound; only the catalog metadata is silent.
 
 - A **dimension below a metric's own grain** (`SUM(customers.balance)` grouped by an order-grain dimension) remains an error in both engines: the metric's rows genuinely fan across the dimension's values, so there is no single correct value per group. Snowflake likewise requires dimensions to be reachable from a metric's table through many-to-one relationships.
 
@@ -566,7 +570,8 @@ Connection-lifecycle and ADBC fixes. Two downstream regressions reported against
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.4...v0.11.0
 [0.10.4]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.2...v0.10.3
