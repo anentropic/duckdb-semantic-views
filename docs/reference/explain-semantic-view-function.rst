@@ -126,8 +126,9 @@ Sample output:
    SELECT
        c.name AS "customer_name",
        sum(o.amount) AS "revenue"
-   FROM "orders" AS "o"
-   LEFT JOIN "customers" AS "c" ON "o"."customer_id" = "c"."id"
+   FROM "memory"."main"."orders" AS "o"
+   LEFT JOIN "memory"."main"."customers" AS "c"
+       ON "o"."customer_id" = "c"."id"
    GROUP BY
        1
 
