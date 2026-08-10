@@ -57,6 +57,11 @@ html_theme_options = {
                     "url": "tutorials/multi-table",
                     "summary": "Model multi-table schemas with relationships",
                 },
+                {
+                    "title": "Building a Model",
+                    "url": "tutorials/building-a-model",
+                    "summary": "Build a realistic model with facts and derived metrics",
+                },
             ],
         },
         {
@@ -87,6 +92,11 @@ html_theme_options = {
                     "title": "Data Sources",
                     "url": "how-to/data-sources",
                     "summary": "Connect CSV, Parquet, Iceberg, and database tables to semantic views",
+                },
+                {
+                    "title": "Filtering",
+                    "url": "how-to/filtering",
+                    "summary": "Filter before aggregation with where_clause or after it with an outer WHERE",
                 },
                 {
                     "title": "Metadata Annotations",
@@ -135,6 +145,11 @@ html_theme_options = {
                     "summary": "What semantic views add beyond standard SQL views",
                 },
                 {
+                    "title": "Metric Grain",
+                    "url": "explanation/metric-grain",
+                    "summary": "Why each metric aggregates at its own grain and how multi-grain queries are assembled",
+                },
+                {
                     "title": "Snowflake Comparison",
                     "url": "explanation/snowflake-comparison",
                     "summary": "Feature comparison with Snowflake SQL DDL semantic views",
@@ -143,6 +158,11 @@ html_theme_options = {
                     "title": "Databricks Comparison",
                     "url": "explanation/databricks-comparison",
                     "summary": "Feature comparison with Databricks metric views",
+                },
+                {
+                    "title": "Transactional DDL and Limitations",
+                    "url": "explanation/transactional-ddl-and-limitations",
+                    "summary": "How DDL participates in transactions, plus read-only and concurrency caveats",
                 },
             ],
         },

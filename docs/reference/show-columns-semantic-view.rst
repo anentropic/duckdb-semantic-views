@@ -57,7 +57,7 @@ Returns one row per queryable column with 8 columns:
      - The dimension, fact, or metric name.
    * - ``data_type``
      - VARCHAR
-     - The **declared** output type. Empty string unless the definition declares one, which only a :ref:`YAML <ref-yaml-format>` definition can do -- nothing infers a type. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+     - The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``kind``
      - VARCHAR
      - The column kind: ``DIMENSION``, ``FACT``, ``METRIC``, or ``DERIVED_METRIC``.
@@ -118,8 +118,9 @@ Examples
    FACTS (o.raw_amount AS o.quantity * o.price COMMENT = 'Line total')
    DIMENSIONS (o.region AS o.region)
    METRICS (
-       o.revenue AS SUM(o.quantity * o.price),
-       avg_order AS revenue / COUNT(*)
+       o.revenue     AS SUM(o.quantity * o.price),
+       o.order_count AS COUNT(o.id),
+       avg_order     AS revenue / order_count
    );
 
    SHOW COLUMNS IN SEMANTIC VIEW shop;
@@ -129,13 +130,16 @@ Examples
    ┌───────────────┬─────────────┬────────────────────┬─────────────┬───────────┬────────────────┬───────────────────────────┬────────────┐
    │ database_name │ schema_name │ semantic_view_name │ column_name │ data_type │ kind           │ expression                │ comment    │
    ├───────────────┼─────────────┼────────────────────┼─────────────┼───────────┼────────────────┼───────────────────────────┼────────────┤
-   │ memory        │ main        │ shop               │ avg_order   │           │ DERIVED_METRIC │ revenue / COUNT(*)        │            │
+   │ memory        │ main        │ shop               │ avg_order   │           │ DERIVED_METRIC │ revenue / order_count     │            │
    │ memory        │ main        │ shop               │ region      │           │ DIMENSION      │ o.region                  │            │
    │ memory        │ main        │ shop               │ raw_amount  │           │ FACT           │ o.quantity * o.price      │ Line total │
+   │ memory        │ main        │ shop               │ order_count │           │ METRIC         │ COUNT(o.id)               │            │
    │ memory        │ main        │ shop               │ revenue     │           │ METRIC         │ SUM(o.quantity * o.price) │            │
    └───────────────┴─────────────┴────────────────────┴─────────────┴───────────┴────────────────┴───────────────────────────┴────────────┘
 
-``data_type`` is empty for every row here: the view was created through SQL DDL, which has no way to declare an output type, and nothing infers one.
+``avg_order`` is a ``DERIVED_METRIC`` because it has no table alias and its expression names two other metrics. A derived metric may not contain an aggregate function of its own -- ``avg_order AS revenue / COUNT(*)`` is rejected at ``CREATE``, which is why the order count is declared as the base metric ``o.order_count`` first. See :ref:`howto-derived-metrics`.
+
+``data_type`` is empty for every row here because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because ``GET_DDL`` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 **Error: view does not exist:**
 
@@ -145,4 +149,4 @@ Examples
 
 .. code-block:: text
 
-   Error: Semantic view 'nonexistent' not found
+   Error: semantic view 'nonexistent' does not exist

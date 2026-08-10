@@ -178,7 +178,7 @@ Primary Key Declarations
 
    ``PRIMARY KEY`` declarations in the ``TABLES`` clause are optional at the syntax
    level, but any table used as the target of a ``RELATIONSHIPS`` entry needs a key
-   the join can resolve against — either a ``PRIMARY KEY`` / ``UNIQUE`` declaration on
+   the join can resolve against -- either a ``PRIMARY KEY`` / ``UNIQUE`` declaration on
    that table, or an explicit ``REFERENCES target(columns)`` list on the foreign side.
 
 Snowflake resolves PK/FK metadata directly from its catalog, so its SQL DDL does not
@@ -301,7 +301,7 @@ parameter, or a typo to be resolved.
 
 .. versionchanged:: 0.12.0
    Before, the definition was accepted and the reference surfaced at query time
-   as a DuckDB unknown-alias error — the same rule, enforced later.
+   as a DuckDB unknown-alias error -- the same rule, enforced later.
 
 Derived metrics are unaffected: a metric that references metrics on other tables
 (``m AS t1.metric_1 + t2.metric_2``) is supported in both systems, and is
@@ -319,12 +319,14 @@ member's actual data type.
 
 Here the column reports the **declared** output type and nothing else, and no
 surface declares one. There is no type inference: ``CREATE`` no longer probes the
-underlying tables (v0.10.0 removed the ``typeof`` pass), and the read side does
-not probe either. A :ref:`YAML <ref-yaml-format>` definition could once declare
-an ``output_type``, but that field was withdrawn because no DDL clause can carry
-it -- ``GET_DDL`` dropped it silently and a restored view lost the cast. The
-column is therefore empty for every newly created view. Populating it needs a
-bind-time probe on the read path; that work is tracked as TECH-DEBT #51.
+underlying tables (v0.10.0 removed the define-time inference pass), and the read
+side does not probe either. A :ref:`YAML <ref-yaml-format>` definition could once
+declare an ``output_type``, but that field was withdrawn because no DDL clause can
+carry it -- ``GET_DDL`` dropped it silently and a restored view lost the cast. The
+column is therefore empty for every view created since v0.10.0, and populated only
+for views stored before that release. Reporting the type an expression actually
+produces would need a probe on the read path, at ``SHOW`` / ``DESCRIBE`` bind
+time; that is a known limitation and is not implemented today.
 
 
 Metric Grain
@@ -333,9 +335,9 @@ Metric Grain
 .. versionchanged:: 0.12.0
 
 Like Snowflake, each metric is computed **at the grain of its own logical
-table**. When a query's metrics sit at different grains — a metric on a parent
+table**. When a query's metrics sit at different grains -- a metric on a parent
 table alongside one on the base table, two metrics on different child tables, or
-a single derived metric fusing two grains — each is aggregated separately over
+a single derived metric fusing two grains -- each is aggregated separately over
 its own table and the results are joined on the queried dimensions. A metric on
 a parent table is therefore not multiplied by the number of child rows, and a
 parent row with no children is not dropped.
@@ -345,7 +347,7 @@ these queries were rejected with a fan-trap error rather than silently inflated.
 Single-grain queries are unchanged: they are still a single base-anchored
 ``SELECT``.
 
-Two boundaries are worth knowing:
+Four boundaries are worth knowing:
 
 - A **dimension below a metric's grain** (``SUM(customers.balance)`` grouped by
   an order-grain dimension) is rejected in both systems. Snowflake's rule is
@@ -354,10 +356,10 @@ Two boundaries are worth knowing:
   <https://docs.snowflake.com/en/user-guide/views-semantic/querying>`_ and must
   have "an equal or lower level of granularity than the logical table for the
   metric"; our ``fan trap detected`` error enforces the same condition. Per-grain
-  aggregation does not make these answerable — the metric's rows genuinely fan
+  aggregation does not make these answerable -- the metric's rows genuinely fan
   across the dimension's values, so there is no single correct value per group.
 - A **window metric** whose inner aggregate lives on a non-base table is computed
-  at its own grain — the ``__sv_agg`` CTE anchors there, so the inner aggregate is
+  at its own grain -- the ``__sv_agg`` CTE anchors there, so the inner aggregate is
   not inflated by the base-table join. Window metrics whose inner aggregates sit
   at *different* grains still error, as those grains would need joining before the
   window runs.
@@ -378,11 +380,14 @@ Two boundaries are worth knowing:
   as the single-grain path already did. Without ``USING`` the query keeps the
   fan-trap error, since a grain CTE would otherwise choose among the
   relationship instances by declaration order. The rescue covers a queried
-  dimension's own table — a ``where_clause`` member on a role-played table, a
+  dimension's own table -- a ``where_clause`` member on a role-played table, a
   metric aggregated at one, or a table reachable only *through* one still error.
   A definition that merely *declares* role-playing does not lose per-grain
   emission: the test is what the query reaches, so unrelated grains in the same
-  view are computed normally.
+  view are computed normally. The one pairing that still declines is a role-played
+  dimension queried *together with* an active semi-additive metric: a snapshot
+  group cannot carry a role, so the two grains would bind different instances of
+  the same dimension and the outer join would compare them.
 
 
 USING RELATIONSHIPS

@@ -7,7 +7,7 @@
 SHOW SEMANTIC METRICS
 ========================
 
-Lists metrics registered in one or all semantic views. Each row describes a single metric with its name, source table, inferred data type, synonyms, and comment. Both base metrics and derived metrics are included.
+Lists metrics registered in one or all semantic views. Each row describes a single metric with its name, source table, declared data type, synonyms, and comment. Both base metrics and derived metrics are included.
 
 
 .. _ref-show-metrics-syntax:
@@ -58,7 +58,7 @@ Optional Filtering Clauses
    Filters metrics to those whose name matches the pattern. Uses SQL ``LIKE`` pattern syntax: ``%`` matches any sequence of characters, ``_`` matches a single character. Matching is **case-insensitive** (the extension maps ``LIKE`` to DuckDB's ``ILIKE``). The pattern must be enclosed in single quotes.
 
 ``IN ...``
-   Scopes the listing. The alternatives are mutually exclusive — ``IN`` appears at most once, so a view name and a schema cannot both be given.
+   Scopes the listing. The alternatives are mutually exclusive -- ``IN`` appears at most once, so a view name and a schema cannot both be given.
 
    ``IN <name>``
       Returns metrics for that semantic view only.
@@ -118,7 +118,7 @@ Returns one row per metric with 8 columns:
      - The metric name as declared in the ``METRICS`` clause.
    * - ``data_type``
      - VARCHAR
-     - The **declared** output type. Empty string unless the definition declares one, which only a :ref:`YAML <ref-yaml-format>` definition can do -- nothing infers a type. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+     - The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``synonyms``
      - VARCHAR
      - JSON array of synonym strings (e.g., ``["total_sales","gmv"]``). Empty string if no synonyms are set.
@@ -148,6 +148,8 @@ Given a semantic view ``orders_sv`` with two base metrics:
    │ memory        │ main        │ orders_sv          │ orders     │ order_count  │           │          │         │
    │ memory        │ main        │ orders_sv          │ orders     │ total_amount │           │          │         │
    └───────────────┴─────────────┴────────────────────┴────────────┴──────────────┴───────────┴──────────┴─────────┘
+
+``data_type`` is empty here because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because ``GET_DDL`` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. Reporting the type an expression actually produces would require probing it on the read side, at ``SHOW`` bind time; that is a known limitation and is not implemented today. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 **List metrics across all views:**
 
@@ -192,7 +194,7 @@ Derived metrics reference other metrics rather than a specific physical table. T
    │ memory        │ main        │ profit_analysis    │ line_items │ revenue │           │          │         │
    └───────────────┴─────────────┴────────────────────┴────────────┴─────────┴───────────┴──────────┴─────────┘
 
-Base metrics (``revenue``, ``cost``) show their physical table name. Derived metrics (``profit``, ``margin``) show an empty ``table_name`` because they reference other metrics rather than a specific table. ``data_type`` is empty for all four: the view was created through SQL DDL, which has no way to declare an output type, and nothing infers one.
+Base metrics (``revenue``, ``cost``) show their physical table name. Derived metrics (``profit``, ``margin``) show an empty ``table_name`` because they reference other metrics rather than a specific table. ``data_type`` is empty for all four, for the reason given above.
 
 **Error: view does not exist:**
 

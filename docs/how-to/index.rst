@@ -1,5 +1,5 @@
 .. meta::
-   :description: Goal-oriented guides for FACTS, derived metrics, role-playing dimensions, fan trap resolution, data source connectivity, metadata annotations, semi-additive metrics, window metrics, wildcard selection, fact queries, materializations, and YAML definitions
+   :description: Goal-oriented guides for FACTS, derived metrics, role-playing dimensions, fan trap and multi-grain resolution, data source connectivity, query filtering, metadata annotations, semi-additive metrics, window metrics, wildcard selection, fact queries, materializations, and YAML definitions
 
 .. _how-to-guides:
 
@@ -14,7 +14,7 @@ Goal-oriented guides for specific tasks with DuckDB Semantic Views.
 - :ref:`howto-facts` -- Define reusable row-level expressions that can be referenced inside metric aggregations.
 - :ref:`howto-derived-metrics` -- Compose metrics from other metrics using arithmetic without repeating aggregate logic.
 - :ref:`howto-role-playing` -- Join the same physical table multiple times under different aliases for distinct relationships.
-- :ref:`howto-fan-traps` -- Understand, detect, and resolve fan traps that inflate aggregation results in multi-table views.
+- :ref:`howto-fan-traps` -- Understand, detect, and resolve fan traps that inflate aggregation results in multi-table views, and see how queries spanning several grains are computed.
 
 **Advanced Metrics**
 
@@ -24,6 +24,7 @@ Goal-oriented guides for specific tasks with DuckDB Semantic Views.
 **Data & Queries**
 
 - :ref:`howto-data-sources` -- Connect semantic views to CSV, Parquet, Iceberg, and database tables.
+- :ref:`howto-filtering` -- Filter a query before aggregation with ``where_clause`` or after it with an outer ``WHERE``, and tell which one a filter needs.
 - :ref:`howto-query-facts` -- Query facts directly as row-level columns without aggregation.
 - :ref:`howto-wildcard-selection` -- Select all dimensions, metrics, or facts for a table alias using wildcard patterns in queries.
 
@@ -41,6 +42,7 @@ Goal-oriented guides for specific tasks with DuckDB Semantic Views.
    role-playing-dimensions
    fan-traps
    data-sources
+   filtering
    metadata-annotations
    semi-additive-metrics
    window-metrics

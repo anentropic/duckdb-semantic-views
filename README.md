@@ -19,6 +19,9 @@ Then you query by picking which dimensions and metrics you want. The extension g
 ## Quick start
 
 ```sql
+INSTALL semantic_views FROM community;
+LOAD semantic_views;
+
 CREATE TABLE orders (
     id INTEGER, region VARCHAR, category VARCHAR,
     amount DECIMAL(10,2)
@@ -57,6 +60,13 @@ SELECT * FROM semantic_view('order_metrics',
 SELECT * FROM semantic_view('order_metrics',
     dimensions := ['region'], metrics := ['revenue']
 ) WHERE region = 'East';
+
+-- ...but an outer WHERE filters AFTER aggregation. To scope what a metric
+-- measures, filter before it with where_clause:
+SELECT * FROM semantic_view('order_metrics',
+    dimensions := ['region'], metrics := ['revenue'],
+    where_clause := 'category = ''hardware'''
+);
 ```
 
 > **Read-only databases:** queries (`semantic_view`, `SHOW SEMANTIC VIEWS`, `DESCRIBE SEMANTIC VIEW <name>`, etc.) work against a database opened with `read_only=True`. `CREATE` / `DROP` / `ALTER SEMANTIC VIEW` require a writable database. See the [transactional DDL and limitations](https://anentropic.github.io/duckdb-semantic-views/explanation/transactional-ddl-and-limitations.html#read-only-databases) explanation page for the bootstrap-then-reopen workflow.
@@ -116,28 +126,30 @@ SELECT * FROM explain_semantic_view('analytics',
 ```
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                        explain_output                        │
-│                           varchar                            │
-├──────────────────────────────────────────────────────────────┤
-│ -- Semantic View: analytics                                  │
-│ -- Dimensions: customer_name                                 │
-│ -- Metrics: revenue                                          │
-│                                                              │
-│ -- Expanded SQL:                                             │
-│ SELECT                                                       │
-│     c.name AS "customer_name",                               │
-│     sum(o.amount) AS "revenue"                               │
-│ FROM "orders" AS "o"                                         │
-│ LEFT JOIN "customers" AS "c" ON "o"."customer_id" = "c"."id" │
-│ GROUP BY                                                     │
-│     1                                                        │
-│                                                              │
-│ -- DuckDB Plan:                                              │
-│ ...                                                          │
-├──────────────────────────────────────────────────────────────┤
-│ 15+ rows                                                     │
-└──────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                             explain_output                             │
+│                                varchar                                 │
+├────────────────────────────────────────────────────────────────────────┤
+│ -- Semantic View: analytics                                            │
+│ -- Dimensions: customer_name                                           │
+│ -- Metrics: revenue                                                    │
+│ -- Materialization: none                                               │
+│                                                                        │
+│ -- Expanded SQL:                                                       │
+│ SELECT                                                                 │
+│     c.name AS "customer_name",                                         │
+│     sum(o.amount) AS "revenue"                                         │
+│ FROM "memory"."main"."orders" AS "o"                                   │
+│ LEFT JOIN "memory"."main"."customers" AS "c"                           │
+│     ON "o"."customer_id" = "c"."id"                                    │
+│ GROUP BY                                                               │
+│     1                                                                  │
+│                                                                        │
+│ -- DuckDB Plan:                                                        │
+│ ...                                                                    │
+├────────────────────────────────────────────────────────────────────────┤
+│ 15+ rows                                                               │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## FACTS (reusable row-level expressions)
@@ -186,7 +198,9 @@ METRICS (
 
 ## Cardinality and fan trap detection
 
-Relationship cardinality is **inferred** from the PRIMARY KEY / UNIQUE constraints on the referenced table — you do not annotate it. A join to a table on its declared key is many-to-one (or one-to-one); a join that could inflate aggregates is detected as a fan trap, and the extension raises an error instead of returning incorrect results.
+Relationship cardinality is **inferred** from the PRIMARY KEY / UNIQUE constraints declared in `TABLES` — you do not annotate it. The rule looks at the *FK side*: if a relationship's FK columns are themselves a PK or UNIQUE key on the table they are declared on, the relationship is one-to-one; otherwise it is many-to-one.
+
+Traversing many-to-one is always safe. A query that would have to traverse a relationship in reverse (one-to-many) to reach a dimension is a fan trap, and the extension raises an error rather than returning an inflated number.
 
 ```sql
 RELATIONSHIPS (
@@ -195,7 +209,9 @@ RELATIONSHIPS (
 )
 ```
 
-The `o` and `c` tables declare their keys in `TABLES (... PRIMARY KEY (...))`, so each relationship's cardinality follows from the target key. (Explicit `ONE TO ONE` / `ONE TO MANY` / `MANY TO ONE` annotations were removed in v0.5.4 and are now rejected.)
+Here `li(order_id)` is not a key on `line_items`, so `li_to_order` is many-to-one; the same holds for `order_to_customer`. (Explicit `ONE TO ONE` / `ONE TO MANY` / `MANY TO ONE` annotations were removed in v0.5.4 and are now rejected.)
+
+Metrics that merely sit at *different grains from each other* are not an error: since v0.12.0 each is aggregated over its own table and the results are joined on the queried dimensions. See [metric grain](https://anentropic.github.io/duckdb-semantic-views/explanation/metric-grain.html) and [fan traps](https://anentropic.github.io/duckdb-semantic-views/how-to/fan-traps.html).
 
 ## Role-playing dimensions (USING RELATIONSHIPS)
 
@@ -226,27 +242,58 @@ Without `USING`, queries that involve an ambiguous join path will error.
 ## DDL reference
 
 ```sql
--- Full clause order (RELATIONSHIPS/FACTS optional; at least one of DIMENSIONS or METRICS required)
+-- Full clause order (all clauses after TABLES optional;
+-- at least one of DIMENSIONS or METRICS required)
 CREATE SEMANTIC VIEW name AS
   TABLES (...)
   RELATIONSHIPS (...)
   FACTS (...)
   DIMENSIONS (...)
-  METRICS (...);
+  METRICS (...)
+  MATERIALIZATIONS (...);
 
 CREATE OR REPLACE SEMANTIC VIEW name AS ...;
 CREATE SEMANTIC VIEW IF NOT EXISTS name AS ...;
-DROP SEMANTIC VIEW name;
-DROP SEMANTIC VIEW IF EXISTS name;
+CREATE SEMANTIC VIEW name FROM YAML '...';       -- define from YAML instead
+DROP SEMANTIC VIEW [IF EXISTS] name;
+
+ALTER SEMANTIC VIEW [IF EXISTS] name RENAME TO new_name;
+ALTER SEMANTIC VIEW [IF EXISTS] name SET COMMENT = '...';
+ALTER SEMANTIC VIEW [IF EXISTS] name UNSET COMMENT;
+
 DESCRIBE SEMANTIC VIEW name;
 SHOW SEMANTIC VIEWS;
+SHOW SEMANTIC DIMENSIONS [FOR METRIC m] [LIKE '...'] [IN name];
+SHOW SEMANTIC METRICS [LIKE '...'] [IN name];
+SHOW SEMANTIC FACTS [LIKE '...'] [IN name];
+SHOW SEMANTIC MATERIALIZATIONS [IN name];
+SHOW COLUMNS IN SEMANTIC VIEW name;
+
+SELECT get_ddl('SEMANTIC_VIEW', 'name');          -- round-trippable DDL
+SELECT read_yaml_from_semantic_view('name');      -- YAML export
 ```
+
+`CREATE`, `DROP` and `ALTER` participate in the surrounding transaction, so `BEGIN ... ROLLBACK` undoes them.
+
+## Other features
+
+Documented in full on the [docs site](https://anentropic.github.io/duckdb-semantic-views/):
+
+- **[Pre-aggregation filtering](https://anentropic.github.io/duckdb-semantic-views/how-to/filtering.html)** -- `where_clause :=` filters rows *before* metrics are aggregated, which an outer `WHERE` cannot express.
+- **[Multi-grain queries](https://anentropic.github.io/duckdb-semantic-views/explanation/metric-grain.html)** -- metrics at different grains are each aggregated over their own table and joined on the queried dimensions.
+- **[Semi-additive metrics](https://anentropic.github.io/duckdb-semantic-views/how-to/semi-additive-metrics.html)** -- `NON ADDITIVE BY` picks one snapshot row per group before aggregating (balances, inventory levels).
+- **[Window metrics](https://anentropic.github.io/duckdb-semantic-views/how-to/window-metrics.html)** -- `OVER (PARTITION BY ...)` for running totals and shares of parent.
+- **[Materializations](https://anentropic.github.io/duckdb-semantic-views/how-to/materializations.html)** -- route matching queries to a pre-aggregated table.
+- **[YAML definitions](https://anentropic.github.io/duckdb-semantic-views/how-to/yaml-definitions.html)** -- define views from YAML, and export back.
+- **[Metadata annotations](https://anentropic.github.io/duckdb-semantic-views/how-to/metadata-annotations.html)** -- `COMMENT`, `WITH SYNONYMS`, `PRIVATE`, and `LABELS = (FILTER)`.
+- **[Wildcard selection](https://anentropic.github.io/duckdb-semantic-views/how-to/wildcard-selection.html)** -- `dimensions := ['c.*']`.
+- **[Querying facts directly](https://anentropic.github.io/duckdb-semantic-views/how-to/query-facts.html)** -- `facts := [...]` returns row-level values without aggregating.
 
 ## Documentation
 
 Full documentation: [anentropic.github.io/duckdb-semantic-views](https://anentropic.github.io/duckdb-semantic-views/)
 
-Includes getting started tutorial, DDL and query reference, how-to guides for advanced features (FACTS, derived metrics, role-playing dimensions, fan traps), and architecture explanation.
+Includes getting-started and multi-table tutorials, full DDL and query reference, how-to guides for advanced features (FACTS, derived metrics, filtering, role-playing dimensions, fan traps, semi-additive and window metrics, materializations, YAML), and explanation pages covering metric grain, transactional DDL, and feature-by-feature comparisons with Snowflake and Databricks.
 
 ## Building
 

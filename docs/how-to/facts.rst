@@ -147,7 +147,7 @@ Reference a Fact on Another Table
 
 .. versionadded:: 0.12.0
 
-A fact, dimension or metric expression may reference a **declared fact** — on
+A fact, dimension or metric expression may reference a **declared fact** -- on
 its own table, or on another one given a relationship. This is Snowflake's
 documented way to cross tables, and the only one: define the fact where its
 columns live, then refer to it from the connected table.
@@ -155,7 +155,7 @@ columns live, then refer to it from the connected table.
 .. versionchanged:: 0.12.0
    Dimension expressions reference facts on the same footing as metrics. Before,
    facts were inlined only into metric and fact expressions, so a fact named in
-   a dimension was emitted verbatim and failed on the unknown column — including
+   a dimension was emitted verbatim and failed on the unknown column -- including
    when the fact was declared on the dimension's *own* table.
 
 .. code-block:: sql
@@ -241,7 +241,7 @@ Annotate Facts with Metadata
 
 .. versionadded:: 0.6.0
 
-Facts support the same metadata annotations as dimensions and metrics: ``COMMENT``, ``WITH SYNONYMS``, and ``PRIVATE``/``PUBLIC`` access modifiers.
+Facts accept four annotations: ``COMMENT``, ``WITH SYNONYMS``, the ``PRIVATE`` / ``PUBLIC`` access modifiers, and ``LABELS = (FILTER)``. They may appear in any order after the expression.
 
 .. code-block:: sql
    :emphasize-lines: 6,7
@@ -258,13 +258,17 @@ Facts support the same metadata annotations as dimensions and metrics: ``COMMENT
        li.region AS li.region
    )
    METRICS (
-       li.total_net AS SUM(li.net_price),
-       profit_margin AS total_net - SUM(li.raw_margin)
+       li.total_net    AS SUM(li.net_price),
+       li.total_margin AS SUM(li.raw_margin),
+       profit_margin   AS total_margin / total_net * 100
    );
 
 - ``COMMENT`` adds a human-readable description, visible in ``DESCRIBE SEMANTIC VIEW`` and ``SHOW SEMANTIC FACTS`` output.
 - ``WITH SYNONYMS`` adds informational alternative names for discoverability.
-- ``PRIVATE`` prevents a fact from being queried directly via ``facts := [...]``, while still allowing it to be referenced in metric expressions. Private facts are also excluded from wildcard expansion (``alias.*``).
+- ``PRIVATE`` prevents a fact from being queried directly via ``facts := [...]``, while still allowing it to be referenced in metric expressions -- here the base metric ``total_margin`` aggregates the private fact ``raw_margin``. Private facts are also excluded from wildcard expansion (``alias.*``).
+- ``LABELS = (FILTER)`` marks a boolean fact as a reusable named filter for :ref:`where_clause <howto-filtering>` predicates. See :ref:`howto-annotations-filters`.
+
+Note that ``profit_margin`` is a :ref:`derived metric <howto-derived-metrics>`: it has no table alias and combines two base metrics by name. A derived metric may not contain an aggregate of its own, so the aggregation over ``raw_margin`` has to live in the base metric ``li.total_margin`` rather than inline in ``profit_margin``.
 
 For more on metadata annotations, see :ref:`howto-metadata-annotations`.
 

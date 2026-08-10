@@ -9,11 +9,11 @@ Transactional DDL and Known Limitations
 
 .. versionadded:: 0.8.0
 
-``CREATE``, ``DROP``, and ``ALTER SEMANTIC VIEW`` are fully transactional: they participate in your surrounding ``BEGIN`` / ``COMMIT`` / ``ROLLBACK`` block the way ordinary DuckDB DDL does. ADBC, dbt-duckdb, and any other transaction-aware client behave the way you'd expect.
+``CREATE``, ``DROP``, and ``ALTER SEMANTIC VIEW`` are fully transactional: they participate in your surrounding ``BEGIN`` / ``COMMIT`` / ``ROLLBACK`` block the way ordinary DuckDB DDL does. ADBC, dbt-duckdb, and any other transaction-aware client see the same semantics.
 
-This page explains what to expect day to day, and a short list of edge cases worth knowing about. Most of the edge cases only surface in unusual situations -- multiple processes touching the same database file at the same time, or scripts that explicitly toggle DuckDB's experimental PEG parser.
+This page covers the everyday behaviour first, then the short list of edge cases worth knowing about. Most of those edge cases surface only in unusual situations -- multiple processes touching the same database file at the same time, or scripts that explicitly toggle DuckDB's experimental PEG parser.
 
-If your workload is "open a database, run some DDL at start-up, then query" you can read the next two sections and stop.
+For the common workload -- open a database, run DDL at start-up, then query -- the next two sections cover everything that applies.
 
 
 .. _explanation-txn-ddl-what-changed:
@@ -63,9 +63,9 @@ So this sequence:
 
 is expected. The same applies to in-flight ``DROP`` (the row keeps appearing until commit) and ``ALTER ... RENAME TO`` (the row appears under its old name until commit). If you need ``SHOW`` or ``DESCRIBE`` to reflect a change, commit first.
 
-A related point: when you query a semantic view with ``semantic_view(...)``, that query also reads committed state from your underlying tables. If you've inserted rows into ``orders`` inside an open transaction and then query a semantic view over ``orders`` in the same transaction, those new rows will not be included. Commit the data writes first, or do the data write and the semantic-view query in separate transactions.
+The same rule covers the data itself: when you query a semantic view with ``semantic_view(...)``, that query also reads committed state from your underlying tables. If you have inserted rows into ``orders`` inside an open transaction and then query a semantic view over ``orders`` in the same transaction, those new rows will not be included. Commit the data writes first, or do the data write and the semantic-view query in separate transactions.
 
-This limitation will go away when DuckDB exposes the hook the extension needs; until then, the rule is "commit before introspecting."
+This limitation will lift when DuckDB exposes the hook the extension needs. Until then the rule is: commit before introspecting.
 
 
 .. _explanation-txn-ddl-create-race:
@@ -75,7 +75,7 @@ CREATE IF NOT EXISTS Across Multiple Connections
 
 .. note::
 
-   This is mostly theoretical for typical DuckDB usage. DuckDB runs as an in-process library and most users have a single program talking to a database file. If that's you, ``CREATE SEMANTIC VIEW IF NOT EXISTS`` behaves exactly the way you'd expect, every time, and you can skip this section.
+   This section is mostly theoretical for typical DuckDB usage. DuckDB runs as an in-process library, and most deployments have a single program talking to a database file. In that setting ``CREATE SEMANTIC VIEW IF NOT EXISTS`` behaves as expected every time, and this section can be skipped.
 
 If two separate processes (or two separate connections from the same program) both run ``CREATE SEMANTIC VIEW IF NOT EXISTS my_view ...`` against the same database at the same time, and neither has committed yet when the other starts, both will try to create the view. One will win. The other will see:
 
@@ -83,9 +83,9 @@ If two separate processes (or two separate connections from the same program) bo
 
    Constraint Error: Duplicate key "name: my_view" violates primary key constraint
 
-This is the same error a plain ``CREATE SEMANTIC VIEW`` would produce in the same race. ``IF NOT EXISTS`` reliably absorbs duplicates within a single process or single transaction; it cannot absorb two processes that both genuinely thought the view didn't exist.
+This is the same error a plain ``CREATE SEMANTIC VIEW`` would produce in the same race. ``IF NOT EXISTS`` reliably absorbs duplicates within a single process or single transaction; it cannot absorb two processes that both found no existing view at check time.
 
-If you do run parallel bootstrap scripts -- multi-worker container start-up, parallel test set-up, that kind of thing -- catch the constraint error on your view name and treat it as success. Something like:
+If you do run parallel bootstrap scripts -- multi-worker container start-up, or parallel set-up in a test harness -- catch the constraint error on your view name and treat it as success:
 
 .. code-block:: python
 
@@ -94,7 +94,7 @@ If you do run parallel bootstrap scripts -- multi-worker container start-up, par
    except duckdb.ConstraintException as e:
        if 'name: my_view' not in str(e):
            raise
-       # someone else created it first; that's fine.
+       # Another process created the view first; treat that as success.
 
 The first writer wins, the second writer sees a clear error rather than silent corruption, and after the catch both processes are in the same state.
 
@@ -110,16 +110,16 @@ A non-``IF EXISTS`` ``DROP SEMANTIC VIEW my_view`` (or any non-``IF EXISTS`` ``A
 
    Invalid Input Error: semantic view 'my_view' does not exist
 
-rather than a silent success -- you asked for an operation on a specific view and it wasn't there. The ``IF EXISTS`` variants (``DROP SEMANTIC VIEW IF EXISTS my_view``, ``ALTER SEMANTIC VIEW IF EXISTS my_view ...``) keep their silent-no-op contract by design.
+rather than a silent success: the statement named a specific view, and that view was not there. The ``IF EXISTS`` variants (``DROP SEMANTIC VIEW IF EXISTS my_view``, ``ALTER SEMANTIC VIEW IF EXISTS my_view ...``) keep their silent-no-op contract by design.
 
-In a single-process workload there is no race to worry about. The rest of this section only matters when multiple processes issue DDL against the same database file at the same time.
+In a single-process workload there is no race. The rest of this section matters only when multiple processes issue DDL against the same database file at the same time.
 
 The check and the write are separate statements, and **whether they are atomic depends on your transaction**:
 
 - **Under autocommit (the default), they are not atomic.** DuckDB commits after each statement, so the existence check and the ``DELETE`` / ``UPDATE`` run in two separate transactions. A concurrent drop is caught only if it has already committed by the time your check runs. If another process drops the view in the small window *between* your check and your write, the check passes and then:
 
   - a plain ``DROP`` deletes 0 rows and reports success having removed nothing (a silent no-op);
-  - a plain ``ALTER RENAME`` whose target name was taken in that window surfaces a raw ``Constraint Error: Duplicate key`` from DuckDB rather than the friendly ``already exists`` message.
+  - a plain ``ALTER RENAME`` whose target name was taken in that window surfaces a raw ``Constraint Error: Duplicate key`` from DuckDB rather than the extension's ``already exists`` message.
 
 - **Inside an explicit transaction, they are atomic.** Wrap the DDL in ``BEGIN ... COMMIT`` (or use a connection with ``autocommit = false``) and the check and the write share one snapshot. A conflicting concurrent commit then makes your ``COMMIT`` fail with a transaction-conflict error you can retry, instead of slipping through the window.
 
@@ -131,7 +131,7 @@ So if you run parallel DDL and need the check to be reliable, wrap it in a trans
    DROP SEMANTIC VIEW my_view;
    COMMIT;
 
-This is the ``DROP`` / ``ALTER`` counterpart of the ``CREATE IF NOT EXISTS`` race above; both come down to the same rule -- concurrent DDL against one database file wants an explicit transaction. It is tracked as a known single-connection guard-window limitation.
+This is the ``DROP`` / ``ALTER`` counterpart of the ``CREATE IF NOT EXISTS`` race above; both come down to the same rule -- concurrent DDL against one database file needs an explicit transaction. Narrowing that window without one is a known limitation of the two-statement check-then-write sequence.
 
 
 .. _explanation-txn-ddl-readonly:
@@ -211,7 +211,7 @@ you get an actionable error rather than a confusing failure or a silently-lost v
 
 Reads (``SHOW SEMANTIC VIEWS``, ``semantic_view(...)``, ``DESCRIBE``) always resolve against the primary catalog regardless of ``USE``, so the rule is simply: **run semantic-view DDL from the database you loaded the extension into.** You can still reference tables from attached databases inside a view body by qualifying them (``TABLES (o AS other.main.orders ...)``) -- only the ``_definitions`` catalog is single-database.
 
-You never have to think about this if you don't ``ATTACH`` a second database, or if you keep the session on the primary catalog.
+None of this arises if you do not ``ATTACH`` a second database, or if the session stays on the primary catalog.
 
 .. note::
 
@@ -228,7 +228,7 @@ DuckDB's Experimental PEG Parser
 
 DuckDB ships an experimental alternative grammar called the "PEG parser" alongside its default parser. The extension supports both, so semantic-view DDL works either way.
 
-There is one quirk worth knowing about. If you turn the PEG parser **off** mid-session with ``CALL disable_peg_parser()``, that pragma also resets a related setting that the extension depends on. Subsequent semantic-view DDL on the same connection will then fail with:
+One interaction is worth knowing about. If you turn the PEG parser **off** mid-session with ``CALL disable_peg_parser()``, that pragma also resets a related setting that the extension depends on. Subsequent semantic-view DDL on the same connection will then fail with:
 
 .. code-block:: text
 
@@ -241,7 +241,7 @@ Restore the setting in one statement:
    CALL disable_peg_parser();
    SET allow_parser_override_extension = 'FALLBACK';
 
-If you don't touch ``disable_peg_parser`` you'll never see this. The extension installs the right setting at load time and keeps it that way.
+Sessions that never call ``disable_peg_parser`` are unaffected: the extension installs the setting at load time and leaves it in place.
 
 
 .. _explanation-txn-ddl-summary:

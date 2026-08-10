@@ -44,7 +44,7 @@ The extension infers cardinality from the ``PRIMARY KEY`` and ``UNIQUE`` declara
 
 A fan trap error is raised when a metric's source table must traverse a relationship in the reverse direction (one-to-many) to reach a queried **dimension**. Traversing many-to-one is always safe, because each row on the "many" side maps to at most one row on the "one" side.
 
-Metrics that merely sit at *different grains from each other* are not an error: since v0.12.0 they are computed one grain at a time and joined — see :ref:`howto-fan-per-grain`.
+Metrics that merely sit at *different grains from each other* are not an error: since v0.12.0 they are computed one grain at a time and joined -- see :ref:`howto-fan-per-grain`.
 
 
 .. _howto-fan-example:
@@ -157,7 +157,7 @@ Multi-Grain Queries: Each Metric at Its Own Grain
 
 .. versionchanged:: 0.12.0
 
-   Queries whose metrics sit at **different grains** are computed per-grain
+   Queries whose metrics sit at **different grains** are computed per grain
    instead of being rejected. Each metric is aggregated over its own table in a
    separate CTE and the results are joined on the queried dimensions, which is
    how Snowflake computes them.
@@ -170,7 +170,7 @@ table>``:
    ``SUM(customers.balance)`` in a view whose base table is ``orders``. Anchored
    at ``orders``, each customer row is counted once per order and customers with
    no orders vanish entirely. It is now aggregated over ``customers`` itself, so
-   the total is the plain customer-grain total — queried alone, or alongside
+   the total is the plain customer-grain total -- queried alone, or alongside
    dimensions at or above the customer grain.
 
 **Metrics at two different grains, queried together.**
@@ -184,9 +184,9 @@ table>``:
    denominator is the true order count rather than the fanned one.
 
 Dimension groups are combined with a NULL-safe ``FULL OUTER JOIN``, so a group
-present at one grain but not another is preserved with a ``NULL`` metric — a
+present at one grain but not another is preserved with a ``NULL`` metric -- a
 customer region with no orders keeps its balance and reports a ``NULL`` order
-count — rather than being dropped. Queries with no dimensions produce one row
+count -- rather than being dropped. Queries with no dimensions produce one row
 per grain, combined with ``CROSS JOIN``.
 
 A ``COUNT(*)`` metric on a table with no declared ``PRIMARY KEY`` is answerable
@@ -196,23 +196,49 @@ base-anchored join does not.
 
 .. note::
 
-   Single-grain queries are unaffected — they keep the same base-anchored SQL.
+   Single-grain queries are unaffected -- they keep the same base-anchored SQL.
    The per-grain path is entered only where the query would otherwise have been
    rejected.
+
+For why a metric's grain belongs to its table rather than to the query, and what
+that means when you are designing a model rather than debugging one, see
+:ref:`explanation-metric-grain`.
 
 A **window metric** whose inner aggregate lives on a non-base table *is*
 computed at its own grain: the ``__sv_agg`` CTE is anchored at that table, so the
 inner aggregate sees one row per record there instead of one per base-table row.
-The window function itself is unaffected — it runs over the already-grouped CTE.
+The window function itself is unaffected -- it runs over the already-grouped CTE.
 Two window metrics whose inner aggregates sit at **different** grains still raise
 the fan-trap error, because those grains would have to be joined before the
 window runs.
 
-Multi-grain queries involving **active semi-additive metrics** (``NON ADDITIVE
-BY`` with a snapshot dimension outside the query) or **role-playing** (``USING``)
-resolution are not computed per-grain and keep raising the fan-trap error. Their
-own strategies are anchored at the base table; query those metrics at a single
-grain.
+An **active semi-additive metric** (``NON ADDITIVE BY`` with a snapshot dimension
+outside the query) is also computed at its own grain: the snapshot CTE is
+anchored at the metric's own table, so the ``RANK()`` runs over one row per
+record there rather than over a join that has already duplicated them. A
+``NON ADDITIVE BY`` dimension declared on a different table is joined into that
+CTE so its ordering still resolves.
+
+**Role-playing** is decided per query rather than per view. A query that reaches
+a role-played table -- one table reached from the same source through two named
+relationships -- is computed per grain when a metric's ``USING`` names which
+relationship is meant, and raises the fan-trap error when nothing does. Picking a
+role silently would depend on declaration order, which is the mis-binding this
+fence exists to prevent.
+
+Two shapes still raise the error. A role-played dimension queried **together
+with** an active semi-additive metric declines, because a snapshot group cannot
+carry a role: it would join whichever relationship is declared first while a
+sibling grain CTE joins the one ``USING`` named, and the outer join would then
+compare two different instances of the same dimension -- a wrong answer rather
+than an error. And a query that reaches a role-played table with no ``USING`` to
+disambiguate it declines for the reason above. Query those at a single grain.
+
+.. versionchanged:: 0.12.0
+
+   Active semi-additive metrics and ``USING``-disambiguated role-playing were
+   both previously excluded from the per-grain path and raised the fan-trap
+   error in any multi-grain query.
 
 
 .. _howto-fan-other-shapes:
@@ -230,7 +256,7 @@ Other Shapes the Fence Rejects
    The classic case above (``order_count`` by ``li.status``), and its
    longer-range forms: ``SUM(customers.balance)`` grouped by an order-grain or
    line-item-grain dimension. Per-grain aggregation does not make these
-   answerable — each customer genuinely fans across their orders' statuses, so
+   answerable -- each customer genuinely fans across their orders' statuses, so
    there is no single correct value per group. Snowflake rejects the same shape:
    its rule is that `the logical table for the dimension must be related to the
    logical table for the metric
@@ -241,14 +267,14 @@ Other Shapes the Fence Rejects
 **A dimension on a sibling table.**
    .. versionchanged:: 0.12.0
 
-   When two tables both reference a third — ``line_items`` and ``shipments``
-   both referencing ``orders`` — a metric on one grouped by a dimension on the
+   When two tables both reference a third -- ``line_items`` and ``shipments``
+   both referencing ``orders`` -- a metric on one grouped by a dimension on the
    other is a fan trap: joining both children multiplies each one's rows by the
    other's (an order with 2 line items and 2 shipments produces 4 rows). Neither
    sibling is an ancestor of the other, so this pair used to be skipped by the
    check and the query returned inflated numbers. It is now rejected. Fix: query
-   the two sides separately — their *metrics* together are fine, and are
-   computed per-grain.
+   the two sides separately -- their *metrics* together are fine, and are
+   computed per grain.
 
 **An active semi-additive metric queried alongside a fanning child dimension.**
    A ``NON ADDITIVE BY`` metric queried together with a dimension on a fanning

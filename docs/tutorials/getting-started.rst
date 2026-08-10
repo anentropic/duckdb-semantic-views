@@ -191,6 +191,13 @@ Query the semantic view using the :ref:`semantic_view() <ref-semantic-view-funct
    │ East   │  125.00 │
    └────────┴─────────┘
 
+.. warning::
+
+   This ``WHERE`` runs on the result, **after** the metrics have been
+   aggregated, so it can only name columns the query returned -- to scope what a
+   metric measures, such as restricting ``revenue`` to a date range, use the
+   ``where_clause`` parameter described in :ref:`howto-filtering` instead.
+
 
 .. _tutorial-gs-inspect:
 

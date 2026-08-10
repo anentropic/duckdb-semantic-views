@@ -7,13 +7,13 @@
 Databricks Comparison
 =======================
 
-Databricks offers `Metric Views <https://docs.databricks.com/aws/en/metric-views/>`_ as part of its semantic layer. If you have used Databricks metric views, this page maps the key concepts to DuckDB Semantic Views, highlights the differences, and identifies features unique to each system.
+Databricks offers `Metric Views <https://docs.databricks.com/aws/en/uc-semantics/metric-views/>`_ as part of its Unity Catalog semantic layer. If you have used Databricks metric views, this page maps the key concepts to DuckDB Semantic Views, highlights the differences, and identifies features unique to each system.
 
 .. note::
 
-   Databricks metric views were announced in 2024 and are evolving rapidly. This comparison
-   reflects Databricks' documented surface as of early 2026. Feature availability may vary by
-   Databricks runtime version and workspace configuration.
+   This comparison reflects Databricks' documented metric view surface as of August 2026.
+   Creating a metric view requires Databricks Runtime 16.4 or above, and individual YAML
+   features require later runtimes.
 
 
 .. _explanation-db-concepts:
@@ -23,58 +23,64 @@ Concept Mapping
 
 .. list-table::
    :header-rows: 1
-   :widths: 30 35 35
+   :widths: 22 39 39
 
    * - Concept
      - Databricks Metric Views
      - DuckDB Semantic Views
    * - Define a semantic layer
-     - ``CREATE METRIC VIEW``
+     - ``CREATE VIEW ... WITH METRICS LANGUAGE YAML AS $$ ... $$``
      - ``CREATE SEMANTIC VIEW``
    * - Table declarations
-     - ``FROM`` clause with a single source table or subquery
+     - ``source:`` key naming one table, view, or SQL query
      - ``TABLES`` clause with aliases, optional ``PRIMARY KEY``
    * - Multi-table relationships
-     - Join logic embedded in the ``FROM`` clause (explicit JOINs)
-     - ``RELATIONSHIPS`` clause with FK REFERENCES (join synthesis)
+     - ``joins:`` list. Each entry has a ``name``, a ``source``, an ``on`` or ``using`` condition, and a ``cardinality`` (``many_to_one`` by default). Entries nest for snowflake schemas.
+     - ``RELATIONSHIPS`` clause declaring FK ``REFERENCES`` edges between tables. Join paths are derived from that graph per query.
    * - Dimensions
-     - ``DIMENSIONS`` clause
+     - ``fields:`` key. ``dimensions:`` is accepted as a synonym, and is what the Catalog Explorer low-code editor emits.
      - ``DIMENSIONS`` clause
    * - Metrics (measures)
-     - ``MEASURES`` clause
+     - ``measures:`` key
      - ``METRICS`` clause
    * - Reusable row-level expressions
-     - Not directly supported; use subqueries or pre-computed columns
-     - ``FACTS`` clause (queryable via ``facts := [...]``)
+     - ``fields:`` entries fill both roles: later fields and measures can reference a field by name, and a numeric field can be aggregated at query time.
+     - ``FACTS`` clause, declared separately from ``DIMENSIONS`` (queryable via ``facts := [...]``)
    * - Metric composition
-     - Measures can reference other measures
-     - Derived metrics (metric referencing other metrics)
+     - Measures reference earlier measures through the ``MEASURE()`` function
+     - Derived metrics (a metric referencing other metrics)
    * - Semi-additive metrics
-     - Not directly supported
-     - ``NON ADDITIVE BY`` (see :ref:`howto-semi-additive`)
+     - ``semiadditive: first`` or ``last`` on a window measure, collapsing along that window's ``order`` field
+     - ``NON ADDITIVE BY`` on the metric itself, with no window required (see :ref:`howto-semi-additive`)
    * - Window function metrics
-     - Not directly supported
+     - ``window:`` block on a measure, with ``order``, ``range``, ``semiadditive``, and an optional ``offset``
      - ``OVER`` clause with ``PARTITION BY EXCLUDING`` (see :ref:`howto-window-metrics`)
    * - Metadata annotations
-     - ``COMMENT``
-     - ``COMMENT``, ``WITH SYNONYMS``
+     - ``comment``, ``synonyms``, ``display_name``, and ``format`` on fields and measures
+     - ``COMMENT``, ``WITH SYNONYMS``, and ``LABELS = (FILTER)`` (see :ref:`howto-annotations-filters`)
    * - Access modifiers
-     - Column masking and row filters (workspace-level)
-     - ``PRIVATE`` / ``PUBLIC`` on metrics and facts
+     - Unity Catalog ``GRANT`` on the view, plus row filters and column masks
+     - ``PRIVATE`` / ``PUBLIC`` on metrics and facts (see :ref:`howto-annotations-access`)
    * - Materializations
-     - Not part of metric views (handled by Delta Lake materialized views separately)
-     - ``MATERIALIZATIONS`` clause for routing to pre-aggregated tables (see :ref:`howto-materializations`)
+     - ``materialization:`` block. Databricks builds and refreshes the materialized views and rewrites queries onto them automatically.
+     - ``MATERIALIZATIONS`` clause routing to a table you build and refresh yourself (see :ref:`howto-materializations`)
    * - YAML definitions
-     - Not supported for metric views
-     - ``FROM YAML`` import and :ref:`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>` export (see :ref:`howto-yaml-definitions`)
+     - The only definition language. The SQL statement wraps a YAML document.
+     - Optional alternative to the SQL DDL: ``FROM YAML`` import and :ref:`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>` export (see :ref:`howto-yaml-definitions`)
+   * - View-level filter
+     - ``filter:`` key, applied to every query against the view
+     - No definition-level filter. Filter per query with ``where_clause :=`` or in the outer ``SELECT`` (see :ref:`howto-filtering`).
+   * - Query-time parameters
+     - ``parameters:`` key, bound by calling the view as a table-valued function
+     - No equivalent
    * - Query interface
-     - Standard SQL against the metric view name
+     - Standard SQL against the metric view name, with every measure wrapped in ``MEASURE()``
      - :ref:`semantic_view() <ref-semantic-view-function>` table function
    * - View inspection
-     - ``DESCRIBE`` / ``SHOW``
+     - ``DESCRIBE TABLE EXTENDED``, or Catalog Explorer
      - :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>`, :ref:`SHOW SEMANTIC VIEWS <ref-show-semantic-views>`
-   * - DDL retrieval
-     - ``SHOW CREATE TABLE``
+   * - Definition retrieval
+     - ``DESCRIBE TABLE EXTENDED <name> AS JSON``, which returns the full YAML in the ``View Text`` field
      - :ref:`GET_DDL('SEMANTIC_VIEW', ...) <ref-get-ddl>`
 
 
@@ -83,7 +89,7 @@ Concept Mapping
 Syntax Comparison
 =================
 
-Databricks metric views use a different structural approach from DuckDB Semantic Views. Databricks embeds the source query in a ``FROM`` clause and separates output columns into ``DIMENSIONS`` and ``MEASURES``. DuckDB Semantic Views declare tables, relationships, and column definitions in distinct clauses.
+The two systems reach the same model through different surfaces. A Databricks metric view is a YAML document -- ``source``, ``joins``, ``fields``, ``measures`` -- embedded in a ``CREATE VIEW`` statement between ``$$`` delimiters. DuckDB Semantic Views declares tables, relationships, and column definitions as SQL clauses.
 
 .. tab-set::
    :sync-group: platform
@@ -91,16 +97,19 @@ Databricks metric views use a different structural approach from DuckDB Semantic
    .. tab-item:: Databricks
       :sync: databricks
 
-      .. code-block:: sql
+      .. code-block:: duckdb-sql
 
-         CREATE METRIC VIEW revenue_by_region AS
-         FROM orders
-         DIMENSIONS (
-             region
-         )
-         MEASURES (
-             revenue AS SUM(amount)
-         );
+         CREATE OR REPLACE VIEW main.analytics.revenue_by_region
+         WITH METRICS LANGUAGE YAML AS $$
+         version: 1.1
+         source: main.sales.orders
+         fields:
+           - name: region
+             expr: region
+         measures:
+           - name: revenue
+             expr: SUM(amount)
+         $$;
 
    .. tab-item:: DuckDB Semantic Views
       :sync: duckdb
@@ -127,23 +136,32 @@ Key Differences
 Multi-Table Handling
 --------------------
 
-Databricks metric views support a single ``FROM`` clause that can contain explicit JOINs:
+Databricks declares joins in the definition rather than writing them out as SQL. Each entry under ``joins:`` names the joined source, gives the condition, and may assert that the join does not fan out:
 
-.. code-block:: sql
+.. code-block:: duckdb-sql
 
-   -- Databricks: joins are explicit in FROM
-   CREATE METRIC VIEW analytics AS
-   FROM orders o
-   JOIN customers c ON o.customer_id = c.id
-   DIMENSIONS (
-       c.name AS customer_name,
-       o.region
-   )
-   MEASURES (
-       revenue AS SUM(o.amount)
-   );
+   -- Databricks: joins are a declarative list in the YAML definition
+   CREATE OR REPLACE VIEW main.analytics.analytics_mv
+   WITH METRICS LANGUAGE YAML AS $$
+   version: 1.1
+   source: main.sales.orders
+   joins:
+     - name: customer
+       source: main.sales.customers
+       'on': source.customer_id = customer.id
+       rely:
+         at_most_one_match: true
+   fields:
+     - name: customer_name
+       expr: customer.name
+     - name: region
+       expr: region
+   measures:
+     - name: revenue
+       expr: SUM(amount)
+   $$;
 
-DuckDB Semantic Views declare tables separately and let the extension synthesize JOINs based on declared relationships:
+DuckDB Semantic Views declares the tables separately and lets the extension synthesize JOINs from the declared relationships:
 
 .. code-block:: sql
 
@@ -164,7 +182,11 @@ DuckDB Semantic Views declare tables separately and let the extension synthesize
        o.revenue AS SUM(o.amount)
    );
 
-The DuckDB approach means the extension joins **only the tables needed** for each query. If a query requests only ``region`` and ``revenue`` (both from the ``orders`` table), the ``customers`` table is never joined. In Databricks, the ``FROM`` clause always includes all declared joins.
+Both systems join only what a query needs. Databricks joins the source and the dimension tables required by the selected fields and measures; this extension joins only the tables reached by the requested dimensions, facts, and metrics. If a query asks for ``region`` and ``revenue`` alone, neither system touches the customer table.
+
+The difference is in how the join graph is expressed. In Databricks the joins form a tree rooted at ``source``, and each edge carries its own ``on`` or ``using`` condition, so reaching another table means adding an entry -- nested under a dimension table for a snowflake schema. In this extension, ``RELATIONSHIPS`` declares FK/PK edges once, and the extension chooses a path through that graph per query, including multi-hop paths and role-played paths disambiguated with ``USING``.
+
+That difference carries through to fan-out. Databricks' ``rely.at_most_one_match: true`` is an assertion the engine trusts without checking: if the join does fan out, measures return inflated numbers and no error is raised. This extension infers cardinality from the declared ``PRIMARY KEY`` and ``UNIQUE`` constraints and, on a traversal that would fan out, either computes each metric at its own grain or raises a fan-trap error -- it does not return an inflated aggregate (see :ref:`howto-fan-traps`).
 
 
 Query Interface
@@ -174,13 +196,14 @@ Query Interface
 
    DuckDB Semantic Views uses a table function for queries, not direct SQL.
 
-Databricks metric views are queried with standard SQL, as if querying a regular table or view:
+Databricks metric views are queried with standard SQL, as if querying a regular table or view. Every measure must be wrapped in the ``MEASURE()`` aggregate function, and ``SELECT *`` is not available, so fields are listed explicitly:
 
 .. code-block:: sql
 
-   -- Databricks: standard SQL
-   SELECT region, revenue
-   FROM revenue_by_region;
+   -- Databricks: standard SQL, with MEASURE() around each measure
+   SELECT region, MEASURE(revenue) AS revenue
+   FROM main.analytics.revenue_by_region
+   GROUP BY region;
 
 DuckDB Semantic Views uses the :ref:`semantic_view() <ref-semantic-view-function>` table function with explicit dimension and metric names:
 
@@ -193,16 +216,16 @@ DuckDB Semantic Views uses the :ref:`semantic_view() <ref-semantic-view-function
    );
 
 
-Keyword: MEASURES vs METRICS
------------------------------
+Naming: measures vs metrics
+---------------------------
 
-Databricks uses ``MEASURES`` for aggregate columns. DuckDB Semantic Views uses ``METRICS``, following Snowflake's naming convention. The concept is the same: named aggregate expressions.
+Databricks names its aggregate columns under a ``measures:`` key. DuckDB Semantic Views uses a ``METRICS`` clause, following Snowflake's naming convention. The concept is the same: named aggregate expressions that the engine evaluates at whatever grain the query asks for.
 
 
 Dimension Expressions
 ---------------------
 
-In Databricks, dimensions can be simple column references (``region``) without explicit expressions. In DuckDB Semantic Views, every dimension is written as ``<logical_name> AS <expression>``, where the logical name (left of ``AS``) must carry a table-alias prefix: ``o.region AS o.region``. The expression on the right of ``AS`` is any SQL expression — its column references may be qualified (``o.region``) or unqualified (``region``), though qualifying them avoids ambiguity in multi-table views. Computed dimensions use any SQL expression: ``o.month AS date_trunc('month', o.order_date)``.
+In Databricks, every field carries both a ``name`` and an ``expr``, so a passthrough column is written as ``name: region`` with ``expr: region``. In DuckDB Semantic Views, every dimension is written as ``<logical_name> AS <expression>``, where the logical name (left of ``AS``) must carry a table-alias prefix: ``o.region AS o.region``. The expression on the right of ``AS`` is any SQL expression -- its column references may be qualified (``o.region``) or unqualified (``region``), though qualifying them avoids ambiguity in multi-table views. Computed dimensions use any SQL expression: ``o.month AS date_trunc('month', o.order_date)``.
 
 
 .. _explanation-db-unique-duckdb:
@@ -216,28 +239,18 @@ Features in DuckDB Semantic Views Not in Databricks
 
    * - Feature
      - Description
-   * - ``FACTS`` clause
-     - Named row-level expressions, queryable directly (``facts := [...]``) and reusable in metrics. Databricks has no equivalent.
    * - ``NON ADDITIVE BY``
-     - Semi-additive metric support for snapshot data. Databricks requires manual CTE or subquery logic.
-   * - Window metrics (``OVER``)
-     - Declarative window function metrics with ``PARTITION BY EXCLUDING``. Databricks metric views do not support window functions as measures.
-   * - ``MATERIALIZATIONS``
-     - Automatic routing to pre-aggregated tables when dims/metrics exactly match. Databricks handles materialization through separate Delta Lake materialized views.
-   * - ``WITH SYNONYMS``
-     - Alternative names for discoverability on tables, dimensions, metrics, and facts.
+     - Declares a metric non-additive across named dimensions, on the metric itself. Databricks expresses semi-additivity only as ``semiadditive: first`` or ``last`` inside a window measure, which collapses along that window's single ``order`` field.
    * - ``PRIVATE`` / ``PUBLIC``
-     - Access modifiers on metrics and facts at the semantic view level.
+     - Access modifiers on individual metrics and facts. Databricks controls access at the view level, through Unity Catalog privileges, row filters, and column masks.
    * - ``RELATIONSHIPS``
-     - Declarative FK/PK relationships with automatic join synthesis and cardinality inference. Databricks uses explicit JOINs.
-   * - Fan trap detection
-     - Automatic detection of one-to-many join traversals that would inflate aggregation results.
+     - FK/PK edges declared once between tables, with cardinality inferred from ``PRIMARY KEY`` and ``UNIQUE`` declarations and the join path chosen per query. Databricks joins are a tree rooted at ``source``, with each edge's condition written out and its cardinality asserted by hand.
+   * - Fan-trap detection
+     - Automatic detection of one-to-many traversals that would inflate an aggregate. The extension computes each metric at its own grain where it can, and raises a fan-trap error where it cannot, rather than returning an inflated number. Databricks does not validate ``rely.at_most_one_match``, and picks the first matching row when a many-to-one join turns out to be many-to-many.
    * - Role-playing dimensions
-     - ``USING`` clause on metrics to disambiguate multiple join paths to the same table.
-   * - YAML import/export
-     - ``FROM YAML`` definition import and :ref:`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>` export for version control and migration.
+     - ``USING`` clause on a metric to choose between multiple join paths to the same table at query time. In Databricks each role is a separate named join entry, fixed at definition time.
    * - :ref:`explain_semantic_view() <ref-explain-semantic-view>`
-     - Inspect the generated SQL and query plan before execution.
+     - Returns the SQL the extension generates for a request, before running it. Databricks exposes the compiled plan through the query profile rather than the generated SQL.
 
 
 .. _explanation-db-unique-databricks:
@@ -252,15 +265,21 @@ Features in Databricks Not in DuckDB Semantic Views
    * - Feature
      - Description
    * - Direct SQL query interface
-     - Query metric views with standard ``SELECT`` SQL. DuckDB uses a table function.
+     - Query metric views with standard ``SELECT`` SQL, wrapping each measure in ``MEASURE()``. DuckDB uses a table function.
    * - Unity Catalog integration
      - Metric views are first-class catalog objects with lineage tracking, access control, and governance.
    * - Row-level security / column masking
      - Databricks provides fine-grained access control at the workspace level. DuckDB defers access control to DuckDB's own mechanisms.
    * - AI/BI integration
-     - Metric views power Databricks AI/BI dashboards and natural-language queries through Genie.
-   * - Delta Lake materialized views
-     - Managed materialized views that automatically refresh when underlying data changes. Separate from metric views but complementary.
+     - Metric views power Databricks AI/BI dashboards and natural-language queries through Genie Agents, which apply ``MEASURE()`` and the declared agent metadata automatically.
+   * - Managed materialization
+     - Databricks builds and refreshes materialized views from the ``materialization:`` block through a managed pipeline, then rewrites queries onto them automatically -- on an exact match, a rollup to coarser dimensions, or an unaggregated match. This extension's ``MATERIALIZATIONS`` clause routes only on an exact dimension and metric name match, to a table you build and refresh.
+   * - View-level ``filter``
+     - A predicate in the definition that applies to every query against the view. This extension filters per query instead, with ``where_clause :=`` or an outer ``WHERE``.
+   * - Query-time parameters
+     - Named values declared with ``parameters:`` and passed by calling the metric view as a table-valued function, so one definition serves several query variants.
+   * - Display names and number formats
+     - ``display_name`` and ``format`` on fields and measures drive labels and value formatting in downstream tools. This extension carries ``COMMENT`` and ``WITH SYNONYMS``, but no display name or format.
 
 
 .. _explanation-db-choosing:
@@ -270,6 +289,6 @@ Choosing Between Them
 
 Databricks metric views are purpose-built for the Databricks ecosystem. They integrate with Unity Catalog, AI/BI dashboards, and the broader Databricks workspace. If your data already lives in Databricks and your team uses the Databricks platform, metric views fit naturally into the workflow.
 
-DuckDB Semantic Views targets a different use case: lightweight, local-first analytics with an open-source, embeddable engine. It is designed for data engineers who want a semantic layer that runs anywhere DuckDB runs -- inside an application server, in a notebook, against Iceberg tables, or on a developer laptop -- without depending on a cloud platform.
+DuckDB Semantic Views targets a different use case: lightweight, local-first analytics with an open-source, embeddable engine. It is designed for data engineers who want a semantic layer that runs anywhere DuckDB runs -- inside an application server, in a notebook, or on a developer laptop -- without depending on a cloud platform. The tables it models can be anything DuckDB can read, including Parquet files, Postgres, and Iceberg (see :ref:`howto-data-sources`).
 
 The two systems are not interchangeable. They solve the same conceptual problem (define metrics once, query flexibly) but for different deployment models and ecosystems.
