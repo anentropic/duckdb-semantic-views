@@ -74,6 +74,23 @@ MIN_BASELINE_S = 1.5
 # When the interrupt fires, relative to the start of the query.
 FIRE_AT_S = 0.4
 
+# An interrupted run must finish within this fraction of the uninterrupted one.
+# A regressed build reports only after the inner query completes, landing at
+# ~1.0; a working build stops as soon as the in-flight task ends. Placed to
+# leave room for a task that takes as long as the whole abort has been observed
+# to take under load, while still failing anything that ran to completion.
+ABORT_FRACTION = 0.6
+
+# Floor under the fraction above: never require an abort sooner than the fire
+# delay plus one `ExecuteTask()` chunk, however short the calibrated baseline.
+MIN_ABORT_SLACK_S = 1.5
+
+# The abort limit must stay this far below the uninterrupted baseline, or the
+# assertion cannot tell a working build from one that ran to completion. Checked
+# against the measured baseline, so a machine where the floor dominates fails
+# loudly instead of passing vacuously.
+VACUITY_MARGIN = 0.75
+
 
 def make_connection():
     """Create an in-memory DuckDB connection with the extension loaded."""
@@ -213,10 +230,27 @@ def run_tests() -> int:
     plain_baseline = time_query(con, control_sql)
     print(f"  plain-SQL twin baseline: {plain_baseline:.2f}s")
 
-    # An abort is "early" if it lands well before the full run would have. The
-    # allowance covers the fire delay plus task-granularity slack.
+    # An abort is "early" if it lands well before the full run would have.
+    #
+    # The tolerance is a fraction of the UNINTERRUPTED run, not `fire delay +
+    # fraction of it`. The regression this file guards makes the query run to
+    # completion, so the two outcomes to separate are "stopped partway" and
+    # "stopped at ~baseline" -- a fraction of the baseline sits between them by
+    # construction, whatever the machine.
+    #
+    # The earlier formula (`FIRE_AT_S + max(1.0, 0.30 * baseline)`) budgeted for
+    # the abort *delay* instead, and that delay does not scale with the
+    # baseline: it is bounded by how long one `ExecuteTask()` chunk takes, which
+    # is a property of the md5 depth, ~1.1s here and roughly constant across
+    # baselines from 3.7s to 4.8s. Under load it stretched to 1.8s against a
+    # 1.43s allowance and failed a build that had aborted at 46% of baseline --
+    # a false positive, not a caught regression. See TECH-DEBT (v0.12.0).
+    #
+    # The floor keeps the limit off the fire delay plus one task on a fast
+    # machine, where a small baseline would otherwise demand an impossibly
+    # prompt abort.
     def deadline(baseline):
-        return FIRE_AT_S + max(1.0, 0.30 * baseline)
+        return max(FIRE_AT_S + MIN_ABORT_SLACK_S, ABORT_FRACTION * baseline)
 
     ok = True
 
@@ -229,6 +263,28 @@ def run_tests() -> int:
     )
     if sv_baseline < MIN_BASELINE_S:
         # Everything below would be measuring noise.
+        return 1
+
+    # The abort limit is only meaningful if a build that never observed the
+    # interrupt would breach it. Assert that against the MEASURED uninterrupted
+    # run rather than trusting the constants: if calibration lands somewhere the
+    # floor dominates, the limit can creep up to the baseline itself and every
+    # assertion below starts passing vacuously -- including against the pre-fix
+    # build this file exists to catch. Loud failure, not a silent green.
+    sv_limit = deadline(sv_baseline)
+    ok &= check(
+        "the abort limit still discriminates a regressed build",
+        sv_limit <= VACUITY_MARGIN * sv_baseline,
+        f"limit {sv_limit:.2f}s <= {VACUITY_MARGIN:.0%} of baseline "
+        f"{sv_baseline:.2f}s (a build that ran to completion would report "
+        f"~{sv_baseline:.2f}s and fail, as intended)",
+    )
+    if sv_limit > VACUITY_MARGIN * sv_baseline:
+        print(
+            "  NOTE: the calibrated workload is too short for the abort floor "
+            f"({FIRE_AT_S}s + {MIN_ABORT_SLACK_S}s). Raise TARGET_BASELINE_S so "
+            "calibration picks a deeper md5 chain."
+        )
         return 1
 
     print("\nControl: plain SQL through the identical harness")
