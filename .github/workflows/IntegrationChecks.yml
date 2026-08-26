@@ -67,7 +67,7 @@ jobs:
       # build/debug/extension/...) that nothing downstream reads, and including
       # them would triple the transfer for no gain.
       - name: Upload debug extension
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: debug-extension
           path: build/debug/semantic_views.duckdb_extension
@@ -84,7 +84,7 @@ jobs:
           submodules: true
 
       - name: Download debug extension
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: debug-extension
           path: build/debug
@@ -172,7 +172,7 @@ jobs:
           submodules: true
 
       - name: Download debug extension
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: debug-extension
           path: build/debug
