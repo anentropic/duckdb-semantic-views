@@ -235,9 +235,10 @@ contract with whatever engine loads the result, so `make ensure_amalgamation`
    of `_extension_distribution.yml` does exactly that from `override_duckdb_repository`.
    When the tree is present it *is* the engine the extension will be loaded into, so the
    amalgamation is generated from it with the engine's own `scripts/amalgamation.py` (a
-   couple of seconds). This is what lets an alternative distribution — e.g.
-   [Haybarn](https://github.com/Query-farm-haybarn), whose fork adds fields to structs the
-   shim compiles against — build a correct binary. Upstream community-extensions supplies
+   couple of seconds). This is what keeps an alternative distribution — e.g.
+   [Haybarn](https://github.com/Query-farm-haybarn), whose fork adds fields to structs in
+   the headers the shim compiles against — building against the engine that will actually
+   load the result. Upstream community-extensions supplies
    no tree for a C-API extension, so our own builds never take this path.
 2. **The pinned upstream release** — `AMALGAMATION_URL`, the `libduckdb-src.zip` asset for
    `.duckdb-version`. This is the local-developer and upstream-CI path.

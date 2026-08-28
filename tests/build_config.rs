@@ -7,13 +7,13 @@
 //! bundled DuckDB and never reads `cpp/include/`, and sqllogictest only ever
 //! sees whichever engine the harness already chose. The failure they guard
 //! against is therefore not a wrong answer but a wrong *build*, and it shows up
-//! only in a downstream distribution's CI. Both were red there: the Haybarn
-//! build (an alternative DuckDB distribution that builds community extensions
-//! against its own engine fork) failed `make configure` on every platform
-//! because this Makefile pinned `DUCKDB_TEST_VERSION` to an upstream release
-//! number that does not exist in their package index, and would then have
-//! compiled the shim against upstream headers that disagree with the fork it
-//! gets loaded into.
+//! only in a downstream distribution's CI. The Haybarn build (an alternative
+//! DuckDB distribution that builds community extensions against its own engine
+//! fork) failed `make configure` on every platform, because this Makefile
+//! pinned `DUCKDB_TEST_VERSION` to an upstream release number that exists in no
+//! index of theirs — and had it got past that, it would have compiled the shim
+//! against upstream headers describing a different engine than the one loading
+//! the result.
 //!
 //! The tests drive the real `Makefile` and the real script in throwaway
 //! directories: no network (the release path is served over `file://`), no

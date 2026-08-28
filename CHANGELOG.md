@@ -18,10 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package was pinned to the exact upstream release number, which does not exist in a
   distribution's own package index, so `make configure` failed before compiling anything.
   That pin now applies only when the build actually targets the upstream release it names,
-  and yields to an explicit `DUCKDB_TEST_VERSION` either way. The second would have
-  produced a subtly wrong binary: the vendored DuckDB amalgamation the C++ parser shim is
-  compiled into is an ABI contract with the engine that loads it, but it was always
-  downloaded from the upstream release regardless of which engine the build targeted. It
+  and yields to an explicit `DUCKDB_TEST_VERSION` either way. The second was an ABI hazard rather
+  than a visible failure: the vendored DuckDB amalgamation the C++ parser shim is compiled
+  into is an ABI contract with the engine that loads it, but it was always downloaded from
+  the upstream release regardless of which engine the build targeted — so a distribution's
+  binary was compiled against headers describing a different engine than the one loading
+  it. It
   is now generated from the engine source tree the CI harness supplies (`./duckdb`) when
   there is one, verified to be the version this extension targets, and recorded in
   `cpp/include/.amalgamation_id` so switching engines rebuilds instead of silently reusing

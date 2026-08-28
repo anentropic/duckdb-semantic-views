@@ -662,11 +662,28 @@ Areas where test coverage is reduced compared to ideal, with justification.
   script over a stub engine tree and a `file://` release zip, so the *selection* rules,
   the version guard and the provenance stamp are guarded under `cargo test`. What no test
   in this repo can reach is the thing that matters most: that the binary built against a
-  real fork **loads and passes** in that fork's engine. That was verified by hand for
-  Haybarn v1.5.5-rc1 (generation reproduces their published `libhaybarn-src.zip` byte for
-  byte apart from the abbreviated source id; the resulting extension loads into
-  `haybarn-cli` and passes the sqllogictest suite) — a point-in-time check, not a standing
-  guard, so a later divergence in their fork would be found by their CI, not ours.
+  real fork loads and behaves in that fork's engine.
+- **What was measured by hand, 2026-08-28, against Haybarn v1.5.5-rc1** (a point-in-time
+  check, not a standing guard):
+  - Generating from their engine checkout reproduces their published `libhaybarn-src.zip`
+    byte for byte, apart from the abbreviated source-id string (`105edd3` vs `105edd31b5`).
+  - The fork-built extension loads into the `haybarn-cli` engine (which reports
+    `version() = v1.5.5`, source id `105edd31b5`) and behaves as it does upstream across
+    CREATE, a multi-grain query with a parent-grain metric, `where_clause`, `DESCRIBE`,
+    the unknown-member error path, and DROP.
+  - **The upstream-built binary also works in that engine today**, and the fork-built
+    binary also works in upstream DuckDB. So this is a latent ABI hazard, not a defect
+    that was observed failing: v1.5.5-rc1's header divergence
+    (`ExtensionInstallInfo::pinned_version`, the `ExtensionRepository` constants) is
+    confined to the extension-install path, which `cpp/src/shim.cpp` never touches. The
+    fix removes the mismatch rather than repairing a symptom — the exposure is that any
+    future fork divergence in the parser or catalog structures the shim *does* reach would
+    corrupt silently, with no diagnostic.
+  - The suite could not be pointed at their engine: `haybarn-cli` 1.5.5rc1 ships only the
+    CLI binary, with no `duckdb` Python module, so `duckdb_sqllogictest` cannot drive it
+    (and, since the runner declares `Requires-Dist: duckdb`, their own test leg installs
+    upstream DuckDB and tests extensions against *that*). The check above was driven
+    through their CLI instead.
 - **What would finish it:** a scheduled workflow that clones a distribution engine at its
   release tag, builds with `AMALGAMATION_SRC_DIR` pointed at it, and runs the suite against
   that distribution's own test runner — the same shape as `DuckDBVersionMonitor`, which
