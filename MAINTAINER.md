@@ -220,7 +220,46 @@ just build-release  # builds build/release/semantic_views.duckdb_extension (opti
   - `cdylib`: the `.duckdb_extension` shared library file (for DuckDB to load)
   - `lib`: a regular Rust library (for unit tests and fuzz targets to link against)
 
-The Makefile also handles downloading the correct DuckDB version, running the SQLLogicTest runner, and packaging the extension with metadata.
+The Makefile also handles installing the correct DuckDB amalgamation, running the SQLLogicTest runner, and packaging the extension with metadata.
+
+#### Which DuckDB the C++ shim compiles against
+
+`build.rs` compiles the DuckDB amalgamation (`cpp/include/duckdb.{hpp,cpp}`) *into*
+the extension binary alongside `cpp/src/shim.cpp`, because the parser hook the shim
+registers is C++ internals with no C-API equivalent. That makes the amalgamation an ABI
+contract with whatever engine loads the result, so `make ensure_amalgamation`
+(`scripts/ensure_amalgamation.py`) picks it in this order:
+
+1. **An engine source tree** — `AMALGAMATION_SRC_DIR`, default `./duckdb`. A distribution
+   that builds community extensions against its own engine clones it there: Haybarn's fork
+   of `_extension_distribution.yml` does exactly that from `override_duckdb_repository`.
+   When the tree is present it *is* the engine the extension will be loaded into, so the
+   amalgamation is generated from it with the engine's own `scripts/amalgamation.py` (a
+   couple of seconds). This is what keeps an alternative distribution — e.g.
+   [Haybarn](https://github.com/Query-farm-haybarn), whose fork adds fields to structs in
+   the headers the shim compiles against — building against the engine that will actually
+   load the result. Upstream community-extensions supplies
+   no tree for a C-API extension, so our own builds never take this path.
+2. **The pinned upstream release** — `AMALGAMATION_URL`, the `libduckdb-src.zip` asset for
+   `.duckdb-version`. This is the local-developer and upstream-CI path.
+
+An engine tree is checked against `.duckdb-version` from its **own** label — the harness's
+`OVERRIDE_GIT_DESCRIBE`, else `git describe --tags` — before it is used, and a mismatch
+fails the build rather than compiling. That evidence has to come from the tree, not from
+the amalgamation it produces: the generator takes the label it stamps into `DUCKDB_VERSION`
+from `OVERRIDE_GIT_DESCRIBE`, which this script sets, so checking the generated header
+would only ask the tree a question we had just answered for it. A tree with neither form of
+evidence is refused rather than relabelled. The download path is verified the same way,
+against the header in the zip.
+
+Whatever the source, it is staged and validated in a temporary directory before being
+promoted into `.amalgamation/<id>/` — otherwise a wrong URL would leave a complete-looking
+cache entry that every later run restores and fails on — and the installed pair is stamped
+in `cpp/include/.amalgamation_id`. The stamp is
+the provenance guard: a fork labels its amalgamation with the upstream version it is based
+on, so `DUCKDB_VERSION` alone cannot tell the two apart, and a rebuild after switching
+engines would otherwise be a silent no-op. `tests/build_config.rs` covers the selection
+rules; `just update-headers` re-installs from scratch.
 
 ### Common Build Errors
 
@@ -382,7 +421,8 @@ The DuckDB version is pinned in a single source of truth: **`.duckdb-version`** 
 | File | How It Gets the Version |
 |------|------------------------|
 | `.duckdb-version` | **Source** — single `vX.Y.Z` line |
-| `Makefile` | Reads `.duckdb-version` via `$(shell cat .duckdb-version)` |
+| `Makefile` | Reads `.duckdb-version` via `$(shell cat .duckdb-version)`. `DUCKDB_TEST_VERSION` (the runner's `duckdb` pip package) is pinned from it **only** when `DUCKDB_GIT_VERSION` is empty or names that same release — a harness building against another engine ships its own runner package under its own versioning |
+| `cpp/include/duckdb.{hpp,cpp}` | Installed by `scripts/ensure_amalgamation.py` — generated from the engine tree in `./duckdb` when a harness supplied one, else downloaded from the release for `.duckdb-version`; verified against it either way |
 | `Cargo.toml` | `duckdb` and `libduckdb-sys` `"=X.Y.Z"` — updated by monitor workflow |
 | `src/lib.rs` | `MINIMUM_DUCKDB_VERSION` — the version declared to DuckDB at extension init; updated by monitor workflow |
 | `test/**/*.py`, `configure/*.py` | PEP 723 `"duckdb==X.Y.Z"` — updated by monitor workflow |
@@ -393,7 +433,10 @@ The DuckDB version is pinned in a single source of truth: **`.duckdb-version`** 
 Every row above **except the submodule** is machine-guarded against drift by two unit tests in `src/lib.rs`:
 `tests::duckdb_version_pins_agree` (`.duckdb-version` ↔ `MINIMUM_DUCKDB_VERSION` ↔ the
 `libduckdb-sys` pin) and `tests::duckdb_derived_pins_agree` (the PEP 723 headers and the
-two build workflows). Miss a location and `cargo test` fails.
+two build workflows). Miss a location and `cargo test` fails. The two *conditional* rows —
+which runner gets pinned, and which engine the amalgamation comes from — are guarded by
+`tests/build_config.rs`, which drives the real `Makefile` and the real script in throwaway
+directories.
 
 The submodule cannot be guarded that way — the correct commit is a *remote* branch tip, so
 no offline test can know it. It is guarded instead by the monitor's submodule step failing

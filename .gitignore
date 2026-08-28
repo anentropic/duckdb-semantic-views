@@ -62,12 +62,18 @@ dbt/
 # Re-fetched in CI via: DuckDB Version Monitor workflow
 cpp/include/duckdb.hpp
 cpp/include/duckdb.cpp
+# Provenance of the installed amalgamation (written by scripts/ensure_amalgamation.py)
+cpp/include/.amalgamation_id
 
 # Extension build output (populated by just build / make release)
 build/
 
 # Versioned amalgamation cache (populated by build/update-headers, survives branch switches)
 .amalgamation/
+
+# Engine source tree supplied by a CI harness (community-extensions and its
+# Haybarn fork clone the DuckDB they build against into ./duckdb)
+/duckdb/
 
 # Python artifacts
 __pycache__/
