@@ -23,6 +23,11 @@ Two sources, in priority order:
 2. **The pinned upstream release** (`--url`), downloaded and cached. This is
    the local-developer and upstream-CI path, unchanged from before.
 
+An engine tree is checked against the release this extension targets *before*
+it is used, from the tree's own label (`OVERRIDE_GIT_DESCRIBE`, else `git
+describe`) rather than from the amalgamation it produces -- the generator takes
+that label from us, so the generated header cannot testify about its own source.
+
 Provenance is recorded in `cpp/include/.amalgamation_id` and compared on every
 build, so switching engines rebuilds and switching back is a cache hit. The
 identity is the engine commit for a source tree (`src-<sha>`) and the version
@@ -59,6 +64,7 @@ from typing import NoReturn
 DEFAULT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FILES = ("duckdb.hpp", "duckdb.cpp")
 STAMP_NAME = ".amalgamation_id"
+VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 # Stamp written when an install cannot be identified (an engine tree that is not
 # a git checkout). It never matches a computed identity, so such a tree is
 # regenerated on every build; what it does is mark the install as "known to be
@@ -115,15 +121,16 @@ def engine_source_tree(root: str, src_dir: str) -> str | None:
     return None
 
 
-def git_commit(tree: str) -> str | None:
-    """Short commit hash of `tree`, or None when it is not a git checkout."""
+def git_output(tree: str, *args: str) -> str | None:
+    """`git <args>` in `tree`, or None when git cannot answer.
+
+    `safe.directory=*` because CI hands the tree to the build across an ownership
+    boundary (the community-extensions Linux leg clones on the host and builds
+    inside a container), where git otherwise refuses the repository outright.
+    """
     try:
-        # `safe.directory=*` because CI hands the tree to the build across an
-        # ownership boundary (the community-extensions Linux leg clones on the
-        # host and builds inside a container), where git otherwise refuses the
-        # repository outright and the tree would look uncacheable.
         out = subprocess.run(
-            ["git", "-c", "safe.directory=*", "-C", tree, "rev-parse", "--short=10", "HEAD"],
+            ["git", "-c", "safe.directory=*", "-C", tree, *args],
             capture_output=True,
             text=True,
             check=True,
@@ -131,6 +138,38 @@ def git_commit(tree: str) -> str | None:
     except (OSError, subprocess.CalledProcessError):
         return None
     return out.stdout.strip() or None
+
+
+def git_commit(tree: str) -> str | None:
+    """Short commit hash of `tree`, or None when it is not a git checkout."""
+    return git_output(tree, "rev-parse", "--short=10", "HEAD")
+
+
+def core_version(label: str) -> str | None:
+    """The `vX.Y.Z` release embedded in a build label, or None.
+
+    `haybarn-v1.5.5-rc1` -> `v1.5.5`; `v1.5.5-0-g105edd31b5` -> `v1.5.5`.
+    """
+    m = VERSION_RE.search(label)
+    return f"v{m.group(1)}.{m.group(2)}.{m.group(3)}" if m else None
+
+
+def engine_tree_release(tree: str) -> tuple[str | None, str]:
+    """Which DuckDB release `tree` is based on, and the evidence for it.
+
+    This has to come from the tree itself, and never from the amalgamation it
+    produces: the generator takes the label it stamps into `DUCKDB_VERSION` from
+    `OVERRIDE_GIT_DESCRIBE`, which `generate_from_source` sets. Checking the
+    generated header would therefore only ask the tree a question we had just
+    answered on its behalf, and would accept an engine of any vintage.
+    """
+    override = os.environ.get("OVERRIDE_GIT_DESCRIBE", "").strip()
+    if override:
+        return core_version(override), f"OVERRIDE_GIT_DESCRIBE={override}"
+    described = git_output(tree, "describe", "--tags")
+    if described:
+        return core_version(described), f"`git describe --tags` = {described}"
+    return None, "no OVERRIDE_GIT_DESCRIBE, and not a tagged git checkout"
 
 
 def read_stamp(include_dir: str) -> str | None:
@@ -177,7 +216,6 @@ def download_release(url: str, cache: str) -> None:
             for name in FILES:
                 with zf.open(name) as src, open(os.path.join(cache, name), "wb") as dst:
                     shutil.copyfileobj(src, dst)
-    log(f"cached {cache}/duckdb.{{hpp,cpp}}")
 
 
 def generate_from_source(tree: str, cache: str, version: str) -> None:
@@ -216,7 +254,31 @@ def generate_from_source(tree: str, cache: str, version: str) -> None:
     os.makedirs(cache, exist_ok=True)
     for name in FILES:
         shutil.copyfile(os.path.join(generated, name), os.path.join(cache, name))
-    log(f"cached {cache}/duckdb.{{hpp,cpp}}")
+
+
+def verify_amalgamation(staged: str, version: str, origin: str) -> None:
+    """Refuse an amalgamation that is not labelled with the release we target."""
+    found = header_version(os.path.join(staged, "duckdb.hpp"))
+    if found != version:
+        fail(
+            f"{origin} produced an amalgamation labelled {found or 'unknown'}, but this "
+            f"extension targets {version} (.duckdb-version).\n"
+            "  Building the C++ shim against a different DuckDB than the one that will "
+            "load it is not supported."
+        )
+
+
+def promote(staged: str, cache: str) -> None:
+    """Move a validated pair into the cache, each file via a temporary name.
+
+    `cache_complete` only asks whether both files exist, so a copy interrupted
+    half way would look like a usable cache entry from then on.
+    """
+    os.makedirs(cache, exist_ok=True)
+    for name in FILES:
+        partial = os.path.join(cache, name + ".partial")
+        shutil.copyfile(os.path.join(staged, name), partial)
+        os.replace(partial, os.path.join(cache, name))
 
 
 def install(cache: str, include_dir: str) -> bool:
@@ -262,10 +324,30 @@ def main(argv: list[str] | None = None) -> int:
 
     tree = engine_source_tree(root, args.src_dir)
     if tree:
+        claimed, evidence = engine_tree_release(tree)
+        if claimed is None:
+            fail(
+                f"cannot tell which DuckDB release the engine tree {tree} is based on "
+                f"({evidence}).\n"
+                "  Label it the way the CI harnesses do -- export "
+                "OVERRIDE_GIT_DESCRIBE=vX.Y.Z naming the release it is based on --\n"
+                "  or point --src-dir at a tagged git checkout."
+            )
+        if claimed != version:
+            fail(
+                f"the engine tree {tree} is based on {claimed} ({evidence}), but this "
+                f"extension targets {version} (.duckdb-version).\n"
+                "  Building the C++ shim against a different DuckDB than the one that "
+                "will load it is not supported.\n"
+                "  Point --src-dir at a matching engine checkout, or update "
+                ".duckdb-version."
+            )
         commit = git_commit(tree)
-        # A non-git tree has no stable identity to cache under, so it is
-        # regenerated every build rather than silently reused after it changes.
-        amalgamation_id = f"src-{commit}" if commit else None
+        # Keyed on the target version as well as the commit: the version is an
+        # input to generation, so one engine commit can legitimately produce two
+        # different amalgamations, and keying on the commit alone would let the
+        # stamp match after a version bump and silently keep the old headers.
+        amalgamation_id = f"src-{version}-{commit}" if commit else None
     else:
         amalgamation_id = version
 
@@ -298,49 +380,42 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if tree:
-        log(f"engine source tree: {tree} (commit {commit or 'unknown'})")
+        log(f"engine source tree: {tree} ({evidence}, commit {commit or 'unknown'})")
 
     with contextlib.ExitStack() as stack:
         cache = cache_dir(root, amalgamation_id) if amalgamation_id else None
+        origin = f"the engine source tree {tree}" if tree else f"the download from {url}"
         if cache and cache_complete(cache) and not args.force:
             log(f"restoring from cache {cache}")
+            verify_amalgamation(cache, version, f"the cache {cache}")
+            source = cache
         else:
-            # Without a stable identity there is nothing to cache under, so
-            # stage into a temp dir that is discarded after installation.
-            staged = cache or stack.enter_context(
+            # Staged in a temp directory and validated there, so a wrong URL or a
+            # generator that emits the wrong version cannot leave a
+            # complete-looking cache entry behind -- which every later run would
+            # restore and fail on, without ever retrying the corrected source.
+            staged = stack.enter_context(
                 tempfile.TemporaryDirectory(prefix="dd-amalg-")
             )
             if tree:
                 generate_from_source(tree, staged, version)
             else:
                 download_release(url, staged)
-            cache = staged
-        _finish(include_dir, cache, amalgamation_id, version, tree)
-    return 0
-
-
-def _finish(
-    include_dir: str,
-    cache: str,
-    amalgamation_id: str | None,
-    version: str,
-    tree: str | None,
-) -> None:
-    """Verify the staged amalgamation, install it, and record its provenance."""
-    staged_version = header_version(os.path.join(cache, "duckdb.hpp"))
-    if staged_version != version:
-        origin = f"the engine source tree {tree}" if tree else "the release download"
-        fail(
-            f"{origin} produced an amalgamation labelled {staged_version or 'unknown'}, "
-            f"but this extension targets {version} (.duckdb-version).\n"
-            "  Building the C++ shim against a different DuckDB than the one that will "
-            "load it is not supported.\n"
-            "  Point --src-dir at a matching engine checkout, or update .duckdb-version."
+            verify_amalgamation(staged, version, origin)
+            if cache:
+                promote(staged, cache)
+                log(f"cached {cache}/duckdb.{{hpp,cpp}}")
+                source = cache
+            else:
+                source = staged
+        changed = install(source, include_dir)
+        write_stamp(include_dir, amalgamation_id or UNIDENTIFIED)
+        state = "installed" if changed else "already current"
+        log(
+            f"{state}: cpp/include/duckdb.{{hpp,cpp}} "
+            f"({version}, {amalgamation_id or UNIDENTIFIED})"
         )
-    changed = install(cache, include_dir)
-    write_stamp(include_dir, amalgamation_id or UNIDENTIFIED)
-    state = "installed" if changed else "already current"
-    log(f"{state}: cpp/include/duckdb.{{hpp,cpp}} ({version}, {amalgamation_id or UNIDENTIFIED})")
+    return 0
 
 
 if __name__ == "__main__":

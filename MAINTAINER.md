@@ -243,9 +243,19 @@ contract with whatever engine loads the result, so `make ensure_amalgamation`
 2. **The pinned upstream release** — `AMALGAMATION_URL`, the `libduckdb-src.zip` asset for
    `.duckdb-version`. This is the local-developer and upstream-CI path.
 
-Whichever source is used, the result is verified to be labelled with the version in
-`.duckdb-version` (a mismatched engine tree fails the build rather than compiling), cached
-under `.amalgamation/<id>/`, and stamped in `cpp/include/.amalgamation_id`. The stamp is
+An engine tree is checked against `.duckdb-version` from its **own** label — the harness's
+`OVERRIDE_GIT_DESCRIBE`, else `git describe --tags` — before it is used, and a mismatch
+fails the build rather than compiling. That evidence has to come from the tree, not from
+the amalgamation it produces: the generator takes the label it stamps into `DUCKDB_VERSION`
+from `OVERRIDE_GIT_DESCRIBE`, which this script sets, so checking the generated header
+would only ask the tree a question we had just answered for it. A tree with neither form of
+evidence is refused rather than relabelled. The download path is verified the same way,
+against the header in the zip.
+
+Whatever the source, it is staged and validated in a temporary directory before being
+promoted into `.amalgamation/<id>/` — otherwise a wrong URL would leave a complete-looking
+cache entry that every later run restores and fails on — and the installed pair is stamped
+in `cpp/include/.amalgamation_id`. The stamp is
 the provenance guard: a fork labels its amalgamation with the upstream version it is based
 on, so `DUCKDB_VERSION` alone cannot tell the two apart, and a rebuild after switching
 engines would otherwise be a silent no-op. `tests/build_config.rs` covers the selection
