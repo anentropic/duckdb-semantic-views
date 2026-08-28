@@ -647,6 +647,31 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **PARSE-9:** name slots accept identifier garbage DuckDB would reject — `RENAME TO x,y` stores `x,y`.
 - **What would finish it:** route IDENT-1 through `ident_matches` (mechanical); give the scanner position-awareness for cast/EXTRACT slots (IDENT-3) and a quoted-name-aware literal rule (IDENT-4); make `normalize_ident_part` produce a structured key rather than a re-joined string (IDENT-5); tighten the name-slot grammar (PARSE-9). IDENT-2 needs a decision before a fix.
 
+### 75. ❓ The alternative-distribution build path has no CI coverage — OPEN
+
+- **Origin:** 2026-08-28, fixing the Haybarn distribution's build of this extension (its
+  `make configure` failed on every platform, and its binary would then have been compiled
+  against upstream headers rather than the fork's).
+- **What ships:** `scripts/ensure_amalgamation.py` generates the amalgamation from an
+  engine source tree in `./duckdb` when a harness supplies one, and the `DUCKDB_TEST_VERSION`
+  pin stands down when `DUCKDB_GIT_VERSION` names an engine other than our pinned release.
+  Both paths are entered **only** by a CI harness we do not run: our own `BuildAll` /
+  `BuildQuick` workflows call upstream `_extension_distribution.yml`, which supplies no
+  engine tree, so every workflow in this repo exercises the *download* path exclusively.
+- **What is covered:** `tests/build_config.rs` drives the real `Makefile` and the real
+  script over a stub engine tree and a `file://` release zip, so the *selection* rules,
+  the version guard and the provenance stamp are guarded under `cargo test`. What no test
+  in this repo can reach is the thing that matters most: that the binary built against a
+  real fork **loads and passes** in that fork's engine. That was verified by hand for
+  Haybarn v1.5.5-rc1 (generation reproduces their published `libhaybarn-src.zip` byte for
+  byte apart from the abbreviated source id; the resulting extension loads into
+  `haybarn-cli` and passes the sqllogictest suite) — a point-in-time check, not a standing
+  guard, so a later divergence in their fork would be found by their CI, not ours.
+- **What would finish it:** a scheduled workflow that clones a distribution engine at its
+  release tag, builds with `AMALGAMATION_SRC_DIR` pointed at it, and runs the suite against
+  that distribution's own test runner — the same shape as `DuckDBVersionMonitor`, which
+  already exists to catch upstream drift on a schedule.
+
 ### 74. ✅ The sqllogictest per-file isolation workaround (TC-10) — RESOLVED 2026-08-09
 
 - **Origin:** CI audit 2026-08-09, while wiring the TC-10 probe into CI. Opened and closed in the same round: running the probe answered the question it existed to ask.

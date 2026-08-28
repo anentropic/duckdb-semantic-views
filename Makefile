@@ -9,7 +9,21 @@ TARGET_DUCKDB_VERSION=$(shell cat .duckdb-version)
 
 # Pin the test-runner DuckDB pip package to match the build version.
 # base.Makefile defaults to latest PyPI; strip `v` prefix for PEP 440 compliance.
-DUCKDB_TEST_VERSION=$(subst v,,$(TARGET_DUCKDB_VERSION))
+#
+# Scoped to builds against the upstream release we target. A downstream
+# distribution builds community extensions against its own engine, and its
+# ci-tools fork installs its own runner package under its own versioning
+# (Haybarn: `haybarn-cli`, published as pre-releases only). Pinning our release
+# number there asks pip for a version that exists in no index and fails `make
+# configure` on every platform, so leave the choice to the harness.
+#
+# DUCKDB_GIT_VERSION is the engine tag being built against: empty locally,
+# `vX.Y.Z` in upstream CI, `haybarn-v1.5.5-rc1` (or `main`, for a nightly) when
+# it is something else. `?=` so an explicit value from the environment wins
+# either way.
+ifeq ($(filter-out $(TARGET_DUCKDB_VERSION),$(DUCKDB_GIT_VERSION)),)
+DUCKDB_TEST_VERSION ?= $(subst v,,$(TARGET_DUCKDB_VERSION))
+endif
 
 all: configure debug
 
@@ -22,35 +36,33 @@ include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 # Rust owns the entry point (semantic_views_init_c_api), C++ helper registers hooks.
 UNSTABLE_C_API_FLAG=--abi-type C_STRUCT_UNSTABLE
 
-# Auto-download DuckDB amalgamation (gitignored, ~25MB) if not present or wrong version.
-# CI checks out the repo without these files; local devs fetch via `just update-headers`.
-# The version comes from .duckdb-version via TARGET_DUCKDB_VERSION.
-# A versioned cache under .amalgamation/<version>/ survives branch switches.
-AMALGAMATION_URL=https://github.com/duckdb/duckdb/releases/download/$(TARGET_DUCKDB_VERSION)/libduckdb-src.zip
-AMALGAMATION_CACHE=.amalgamation/$(TARGET_DUCKDB_VERSION)
+# The DuckDB the C++ shim is compiled against. build.rs links the amalgamation
+# INTO the extension binary (the parser hook the shim registers is C++ internals
+# with no C-API equivalent), so it is an ABI contract with whatever engine loads
+# the result -- not a convenience download.
+#
+# AMALGAMATION_SRC_DIR: an engine source tree supplied by the harness. A
+#   distribution that builds community extensions against its own engine clones
+#   it into ./duckdb (Haybarn's fork of _extension_distribution.yml does this
+#   from `override_duckdb_repository`); when it is there, that IS the engine the
+#   extension will be loaded into, so the amalgamation is generated from it.
+#   Upstream community-extensions hands a C-API extension no such tree, so that
+#   build keeps using the release below.
+# AMALGAMATION_URL: the pinned upstream release, used when no tree is present
+#   (local development, upstream CI). Gitignored, ~25 MB, cached under
+#   .amalgamation/<id>/ so it survives branch switches.
+#
+# Both are overridable from the environment; see scripts/ensure_amalgamation.py
+# for the selection rules, the provenance stamp and the version guard.
+AMALGAMATION_SRC_DIR ?= duckdb
+AMALGAMATION_URL ?= https://github.com/duckdb/duckdb/releases/download/$(TARGET_DUCKDB_VERSION)/libduckdb-src.zip
 
-# Check installed amalgamation matches TARGET_DUCKDB_VERSION; fetch/copy if not.
 .PHONY: ensure_amalgamation
 ensure_amalgamation:
-	@INSTALLED=$$(grep -m1 '#define DUCKDB_VERSION' cpp/include/duckdb.hpp 2>/dev/null | sed 's/.*"\(.*\)"/\1/'); \
-	if [ "$$INSTALLED" = "$(TARGET_DUCKDB_VERSION)" ]; then \
-		exit 0; \
-	fi; \
-	echo "Amalgamation version mismatch (have=$${INSTALLED:-none}, want=$(TARGET_DUCKDB_VERSION))"; \
-	if [ -f "$(AMALGAMATION_CACHE)/duckdb.cpp" ]; then \
-		echo "Restoring from cache $(AMALGAMATION_CACHE)/..."; \
-	else \
-		echo "Downloading DuckDB $(TARGET_DUCKDB_VERSION) amalgamation..."; \
-		mkdir -p "$(AMALGAMATION_CACHE)"; \
-		curl -sL -o /tmp/libduckdb-src.zip "$(AMALGAMATION_URL)"; \
-		unzip -o -j /tmp/libduckdb-src.zip "duckdb.hpp" "duckdb.cpp" -d "$(AMALGAMATION_CACHE)/"; \
-		rm -f /tmp/libduckdb-src.zip; \
-		echo "Cached $(AMALGAMATION_CACHE)/duckdb.{hpp,cpp}"; \
-	fi; \
-	mkdir -p cpp/include; \
-	cp "$(AMALGAMATION_CACHE)/duckdb.hpp" cpp/include/duckdb.hpp; \
-	cp "$(AMALGAMATION_CACHE)/duckdb.cpp" cpp/include/duckdb.cpp; \
-	echo "Installed cpp/include/duckdb.{hpp,cpp} ($(TARGET_DUCKDB_VERSION))"
+	@$(PYTHON_BIN) scripts/ensure_amalgamation.py \
+		--version "$(TARGET_DUCKDB_VERSION)" \
+		--src-dir "$(AMALGAMATION_SRC_DIR)" \
+		--url "$(AMALGAMATION_URL)"
 
 configure: venv platform extension_version
 

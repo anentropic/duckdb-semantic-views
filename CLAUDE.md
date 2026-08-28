@@ -162,10 +162,12 @@ At the end of every milestone, before tagging:
 
 ### Offline amalgamation fallback (blocked GitHub — agent/sandbox sessions only)
 
-`just build` → `make ensure_amalgamation` downloads the DuckDB amalgamation
-(`cpp/include/duckdb.{hpp,cpp}`) from the DuckDB **GitHub release**. This is the
-normal, canonical path — use it whenever GitHub is reachable (i.e. always, on a
-normal local machine).
+`just build` → `make ensure_amalgamation` (`scripts/ensure_amalgamation.py`)
+downloads the DuckDB amalgamation (`cpp/include/duckdb.{hpp,cpp}`) from the DuckDB
+**GitHub release**. This is the normal, canonical path — use it whenever GitHub is
+reachable (i.e. always, on a normal local machine). (The script prefers an engine
+source tree in `./duckdb` when a CI harness supplied one; locally there is none, so
+it downloads.)
 
 Some sandboxed agent sessions run behind an egress proxy that blocks
 `github.com/duckdb/duckdb` (the release fetch returns HTTP 403), so `just build`

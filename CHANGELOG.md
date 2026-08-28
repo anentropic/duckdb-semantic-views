@@ -9,7 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Fixed
+
+- **The extension builds correctly against an alternative DuckDB distribution.** Two
+  build-system assumptions silently assumed upstream DuckDB, and both broke the
+  [Haybarn](https://github.com/Query-farm-haybarn) distribution's build of this extension
+  on every platform. The first stopped the build outright: the test runner's `duckdb` pip
+  package was pinned to the exact upstream release number, which does not exist in a
+  distribution's own package index, so `make configure` failed before compiling anything.
+  That pin now applies only when the build actually targets the upstream release it names,
+  and yields to an explicit `DUCKDB_TEST_VERSION` either way. The second would have
+  produced a subtly wrong binary: the vendored DuckDB amalgamation the C++ parser shim is
+  compiled into is an ABI contract with the engine that loads it, but it was always
+  downloaded from the upstream release regardless of which engine the build targeted. It
+  is now generated from the engine source tree the CI harness supplies (`./duckdb`) when
+  there is one, verified to be the version this extension targets, and recorded in
+  `cpp/include/.amalgamation_id` so switching engines rebuilds instead of silently reusing
+  the other one's headers. Local builds and upstream CI are unchanged — with no engine tree
+  present the pinned release is downloaded exactly as before.
 
 ## [0.12.0] - 2026-08-10
 

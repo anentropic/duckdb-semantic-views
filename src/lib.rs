@@ -720,7 +720,18 @@ mod tests {
     /// monitor would not have fixed. Widening the monitor's exclusions instead —
     /// or narrowing these below the monitor's — would break that property.
     fn collect_py_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        const SKIP_DIRS: [&str; 4] = ["target", "build", "extension-ci-tools", "node_modules"];
+        // `duckdb` is an engine source tree, not ours: a CI harness clones the
+        // DuckDB it is building against into `./duckdb`, which
+        // `scripts/ensure_amalgamation.py` then generates the amalgamation
+        // from. Scanning it would judge *its* pins against *our*
+        // `.duckdb-version` — a file we neither own nor may rewrite.
+        const SKIP_DIRS: [&str; 5] = [
+            "target",
+            "build",
+            "extension-ci-tools",
+            "node_modules",
+            "duckdb",
+        ];
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };

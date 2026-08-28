@@ -377,27 +377,13 @@ fuzz-all time="300":
 fuzz-cmin target="fuzz_json_parse":
     cargo +nightly fuzz cmin {{target}}
 
-# Re-fetch vendored DuckDB amalgamation (duckdb.hpp + duckdb.cpp) from GitHub release.
-# Run after DuckDB version bump. Version is read from .duckdb-version.
-# Downloads to .amalgamation/<version>/ cache, then copies to cpp/include/.
+# Re-install the vendored DuckDB amalgamation (duckdb.hpp + duckdb.cpp).
+# Run after a DuckDB version bump. Version is read from .duckdb-version; the
+# source is the pinned upstream release, or an engine source tree in ./duckdb
+# when a CI harness supplied one (see scripts/ensure_amalgamation.py).
+# Caches under .amalgamation/<id>/, then installs into cpp/include/.
 update-headers:
-    @VER=$(cat .duckdb-version); \
-    CACHE=".amalgamation/$VER"; \
-    if [ -f "$CACHE/duckdb.cpp" ]; then \
-      echo "Cache hit: $CACHE/duckdb.hpp+cpp"; \
-    else \
-      echo "Fetching DuckDB $VER amalgamation..."; \
-      mkdir -p "$CACHE"; \
-      curl -sL -o /tmp/libduckdb-src.zip \
-        "https://github.com/duckdb/duckdb/releases/download/$VER/libduckdb-src.zip"; \
-      unzip -o -j /tmp/libduckdb-src.zip "duckdb.hpp" "duckdb.cpp" -d "$CACHE/"; \
-      rm /tmp/libduckdb-src.zip; \
-      echo "Cached $CACHE/duckdb.hpp+cpp"; \
-    fi; \
-    mkdir -p cpp/include; \
-    cp "$CACHE/duckdb.hpp" cpp/include/duckdb.hpp; \
-    cp "$CACHE/duckdb.cpp" cpp/include/duckdb.cpp; \
-    echo "Installed cpp/include/duckdb.hpp+cpp ($VER)"
+    @python3 scripts/ensure_amalgamation.py --force
 
 # Clean build artifacts
 clean:
