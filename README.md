@@ -127,28 +127,28 @@ SELECT * FROM explain_semantic_view('analytics',
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│                             explain_output                             │
-│                                varchar                                 │
+│                             explain_output                           │
+│                                varchar                               │
 ├────────────────────────────────────────────────────────────────────────┤
-│ -- Semantic View: analytics                                            │
-│ -- Dimensions: customer_name                                           │
-│ -- Metrics: revenue                                                    │
-│ -- Materialization: none                                               │
-│                                                                        │
-│ -- Expanded SQL:                                                       │
-│ SELECT                                                                 │
-│     c.name AS "customer_name",                                         │
-│     sum(o.amount) AS "revenue"                                         │
-│ FROM "memory"."main"."orders" AS "o"                                   │
-│ LEFT JOIN "memory"."main"."customers" AS "c"                           │
-│     ON "o"."customer_id" = "c"."id"                                    │
-│ GROUP BY                                                               │
-│     1                                                                  │
-│                                                                        │
-│ -- DuckDB Plan:                                                        │
-│ ...                                                                    │
+│ -- Semantic View: analytics                                          │
+│ -- Dimensions: customer_name                                         │
+│ -- Metrics: revenue                                                  │
+│ -- Materialization: none                                             │
+│                                                                      │
+│ -- Expanded SQL:                                                     │
+│ SELECT                                                               │
+│     c.name AS "customer_name",                                       │
+│     sum(o.amount) AS "revenue"                                       │
+│ FROM "memory"."main"."orders" AS "o"                                 │
+│ LEFT JOIN "memory"."main"."customers" AS "c"                         │
+│     ON "o"."customer_id" = "c"."id"                                  │
+│ GROUP BY                                                             │
+│     1                                                                │
+│                                                                      │
+│ -- DuckDB Plan:                                                      │
+│ ...                                                                  │
 ├────────────────────────────────────────────────────────────────────────┤
-│ 15+ rows                                                               │
+│ 15+ rows                                                             │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
