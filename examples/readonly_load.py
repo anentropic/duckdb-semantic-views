@@ -8,8 +8,8 @@ uv run examples/readonly_load.py
 
 Demonstrates v0.9.0 features:
   - LOAD semantic_views works on a read-only database.
-  - Previously-defined semantic views can be queried via list_semantic_views,
-    describe_semantic_view, and the semantic_view table function.
+  - Previously-defined semantic views can be queried via SHOW SEMANTIC VIEWS,
+    DESCRIBE SEMANTIC VIEW, and the semantic_view table function.
   - CREATE / DROP / ALTER SEMANTIC VIEW fail with DuckDB's standard
     read-only error rather than a confusing schema-create error at LOAD.
 
@@ -17,8 +17,8 @@ Two scenarios:
   1. Bootstrap a view in a subprocess (writable), then reopen the same
      file with read_only=True from the parent process and query it.
   2. Open a fresh (never-bootstrapped) database read-only and confirm
-     list_semantic_views() returns an empty list (no error) and
-     describe_semantic_view('missing') surfaces the standard
+     SHOW SEMANTIC VIEWS returns an empty list (no error) and
+     DESCRIBE SEMANTIC VIEW missing surfaces the standard
      "does not exist" error.
 
 Both scenarios end by attempting a CREATE / DROP on the read-only
@@ -56,8 +56,9 @@ CREATE_VIEW_SQL = (
 
 
 def list_views(con) -> list[str]:
-    rows = con.execute("SELECT name FROM list_semantic_views()").fetchall()
-    return [r[0] for r in rows]
+    cur = con.execute("SHOW SEMANTIC VIEWS")
+    name_idx = [d[0] for d in cur.description].index("name")
+    return [r[name_idx] for r in cur.fetchall()]
 
 
 def bootstrap_in_subprocess(db_path: str) -> None:
@@ -84,7 +85,7 @@ con.execute('''
 ''')
 con.execute({CREATE_VIEW_SQL!r})
 print('Defined views (writable subprocess):',
-      [r[0] for r in con.execute('SELECT name FROM list_semantic_views()').fetchall()])
+      [r[1] for r in con.execute('SHOW SEMANTIC VIEWS').fetchall()])  # col 1 = name
 con.close()
 """
     result = subprocess.run(
@@ -124,8 +125,8 @@ def bootstrapped_demo() -> None:
         print("LOAD on read-only DB:    OK\n")
 
         # Step 3 -- query.
-        print("list_semantic_views:    ", list_views(ro))
-        desc = ro.execute("FROM describe_semantic_view('orders_view')").fetchall()
+        print("SHOW SEMANTIC VIEWS:    ", list_views(ro))
+        desc = ro.execute("DESCRIBE SEMANTIC VIEW orders_view").fetchall()
         print(f"describe rows:           {len(desc)} metadata rows")
         rows = ro.execute(
             "SELECT region, total FROM semantic_view("
@@ -164,14 +165,14 @@ def fresh_readonly_demo() -> None:
         )
         ro.execute(f"LOAD '{EXTENSION_PATH}'")
         print("LOAD on fresh read-only DB:    OK")
-        print("list_semantic_views (no bootstrap):", list_views(ro))
+        print("SHOW SEMANTIC VIEWS (no bootstrap):", list_views(ro))
         print("  -> empty list, NOT a catalog error\n")
 
-        # describe_semantic_view on a missing view -> clean "does not exist".
+        # DESCRIBE SEMANTIC VIEW on a missing view -> clean "does not exist".
         try:
-            ro.execute("FROM describe_semantic_view('nonexistent')").fetchall()
+            ro.execute("DESCRIBE SEMANTIC VIEW nonexistent").fetchall()
         except duckdb.Error as e:
-            print(f"describe_semantic_view('nonexistent') -> {e}")
+            print(f"DESCRIBE SEMANTIC VIEW nonexistent -> {e}")
 
         # CREATE on a fresh read-only DB also fails (the rewrite emits an
         # INSERT against semantic_layer._definitions which doesn't exist).

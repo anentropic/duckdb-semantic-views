@@ -501,7 +501,7 @@ View not found
 
    Semantic view '<name>' not found. Did you mean '<suggestion>'?
    Available views: [<list>].
-   Run FROM list_semantic_views() to see all registered views.
+   Run SHOW SEMANTIC VIEWS to see all registered views.
 
 **Cause:** No semantic view with the given name exists.
 

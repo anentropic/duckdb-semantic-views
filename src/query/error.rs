@@ -52,10 +52,7 @@ impl fmt::Display for QueryError {
                 if !available.is_empty() {
                     write!(f, " Available views: [{}].", available.join(", "))?;
                 }
-                write!(
-                    f,
-                    " Run FROM list_semantic_views() to see all registered views."
-                )
+                write!(f, " Run SHOW SEMANTIC VIEWS to see all registered views.")
             }
             // R-16 (code-review 2026-07-11): delegate to `ExpandError::EmptyRequest`
             // so the two render identically and can't drift apart. The clone is
@@ -133,6 +130,24 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "semantic view 'orders': unknown alias 'x' in wildcard 'x.*'"
+        );
+    }
+
+    #[test]
+    fn view_not_found_points_at_show_semantic_views() {
+        // The listing hint names the documented DDL, not the table function
+        // `SHOW SEMANTIC VIEWS` lowers to (`list_semantic_views()` is an
+        // implementation detail of that statement).
+        let e = QueryError::ViewNotFound {
+            name: "ordrs".to_string(),
+            suggestion: Some("orders".to_string()),
+            available: vec!["orders".to_string()],
+        };
+        assert_eq!(
+            e.to_string(),
+            "Semantic view 'ordrs' not found. Did you mean 'orders'? \
+             Available views: [orders]. \
+             Run SHOW SEMANTIC VIEWS to see all registered views."
         );
     }
 
