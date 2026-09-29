@@ -167,6 +167,10 @@ GROUP BY
     "o"."region"
 ```
 
+#### Function registration and `duckdb_functions()` docs
+
+Every table and scalar function is registered through the C++ Catalog API helpers in `cpp/src/shim.cpp` (`sv_register_table_function_core` and `sv_register_scalar_function_set`). Each one attaches a `FunctionDescription` (description, parameter names, examples, categories) looked up by function name in `sv_function_docs`, so agents and tools can discover the function over SQL. **A function with no entry in that table fails to register**: adding a new function means adding its doc entry in the same change. A function that a SQL statement lowers to (the `SHOW` / `DESCRIBE` family) should say "Backs `<statement>`" and tell the caller to use the statement instead. `test/sql/function_descriptions.test` pins the rendered result and runs every example; extend its function list when you add one.
+
 #### Two FALLBACK_OVERRIDE quirks worth knowing
 
 1. **DuckDB silently drops `DISPLAY_EXTENSION_ERROR` from `parser_override` in FALLBACK mode** (`ParseInternal` in the v1.5.2 amalgamation). The success path is unaffected — `parser_override` rewrites recognised DDL into native SQL on the caller's connection. For *validation* errors (e.g. `semantic view 'X' does not exist`, unknown clause), `parser_override` instead returns `DISPLAY_ORIGINAL_ERROR`; the default parser then fails on the unrecognised DDL prefix; DuckDB calls our registered `parse_function`, which re-runs validation and returns `DISPLAY_EXTENSION_ERROR` with `error_location` set to the offending byte offset. `ParserException::SyntaxError` formats the caret automatically. See `sv_parse_function_rust` in `src/parse/ffi.rs`. (TECH-DEBT 22 was resolved by this mechanism in Phase 62; the older `sql_throwing` / synthesised-`SELECT error('...')` workaround was deleted.)
