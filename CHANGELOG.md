@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Every function the extension registers is documented in `duckdb_functions()`.** Each now
+  carries a description, real parameter names (`semantic_view(view_name, dimensions, …)`
+  rather than `col0`), and a runnable example, so tools and agents that discover functions
+  over a SQL connection can find and call them correctly. The table functions behind
+  `SHOW` / `DESCRIBE SEMANTIC …` say so and point to the statement to use instead, and every
+  table function notes that its `search_path` parameter is reserved for the extension.
+
 ### Changed
 
 - **The "semantic view not found" error now suggests `SHOW SEMANTIC VIEWS`** instead of
