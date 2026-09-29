@@ -579,10 +579,10 @@ static ParserExtensionPlanResult sv_plan_unreachable(
 // examples point at the statement, which is the documented interface.
 struct SvFunctionDoc {
     const char *name;
-    std::vector<std::string> positional_names;
+    vector<string> positional_names;
     const char *description;
-    std::vector<std::string> examples;
-    std::vector<std::string> categories;
+    vector<string> examples;
+    vector<string> categories;
 };
 
 static const std::vector<SvFunctionDoc> &sv_function_docs() {

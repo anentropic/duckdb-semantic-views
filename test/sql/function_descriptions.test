@@ -62,12 +62,14 @@ ORDER BY ALL;
 # --- Case 3b: functions behind a SQL statement redirect to it ------------
 # Every function that a SHOW / DESCRIBE / CREATE ... FROM YAML FILE
 # statement lowers to says so, and tells the caller to use the statement.
+# coalesce: a missing description must fail these, not drop out as NULL.
 
 query T
 SELECT function_name FROM sv_fns
 WHERE function_name NOT IN ('semantic_view', 'explain_semantic_view',
                             'get_ddl', 'read_yaml_from_semantic_view')
-  AND NOT (description LIKE 'Backs %' OR description LIKE 'Internal helper behind %')
+  AND NOT (coalesce(description, '') LIKE 'Backs %'
+           OR coalesce(description, '') LIKE 'Internal helper behind %')
 ORDER BY ALL;
 ----
 
@@ -75,7 +77,7 @@ query T
 SELECT function_name FROM sv_fns
 WHERE function_name NOT IN ('semantic_view', 'explain_semantic_view',
                             'get_ddl', 'read_yaml_from_semantic_view')
-  AND description NOT LIKE '%Use that statement%'
+  AND coalesce(description, '') NOT LIKE '%Use that statement%'
 ORDER BY ALL;
 ----
 
