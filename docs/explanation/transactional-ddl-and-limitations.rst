@@ -145,9 +145,9 @@ Loading the extension into a read-only DuckDB database works the same way as a w
 
 Three behaviours change between writable and read-only databases:
 
-1. **Reads work as usual on a bootstrapped database.** If the database already contains a ``semantic_layer._definitions`` table (because it was opened writable before and one or more semantic views were defined), then ``list_semantic_views()``, ``describe_semantic_view('name')``, ``FROM semantic_view('name', dimensions := [...], metrics := [...])``, and the SHOW / DESCRIBE / GET_DDL family all behave identically to writable mode.
+1. **Reads work as usual on a bootstrapped database.** If the database already contains a ``semantic_layer._definitions`` table (because it was opened writable before and one or more semantic views were defined), then ``SHOW SEMANTIC VIEWS``, ``DESCRIBE SEMANTIC VIEW name``, ``FROM semantic_view('name', dimensions := [...], metrics := [...])``, and the rest of the SHOW / DESCRIBE / GET_DDL family all behave identically to writable mode.
 
-2. **A fresh read-only database is treated as having zero views, not as an error.** If the database was never bootstrapped (no ``semantic_layer._definitions`` table exists), ``list_semantic_views()`` returns zero rows. ``describe_semantic_view('anything')`` and ``FROM semantic_view('anything', ...)`` return the standard ``semantic view 'anything' does not exist`` error rather than a raw catalog error about a missing table.
+2. **A fresh read-only database is treated as having zero views, not as an error.** If the database was never bootstrapped (no ``semantic_layer._definitions`` table exists), ``SHOW SEMANTIC VIEWS`` returns zero rows. ``DESCRIBE SEMANTIC VIEW anything`` and ``FROM semantic_view('anything', ...)`` return the standard ``semantic view 'anything' does not exist`` error rather than a raw catalog error about a missing table.
 
 3. **DDL fails with DuckDB's standard read-only error.** ``CREATE``, ``DROP``, and ``ALTER SEMANTIC VIEW`` are rewritten internally into ``INSERT`` / ``DELETE`` / ``UPDATE`` against ``semantic_layer._definitions`` and run on the caller's connection. On a read-only database those statements fail with:
 
