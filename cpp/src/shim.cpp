@@ -607,9 +607,10 @@ static const std::vector<SvFunctionDoc> &sv_function_docs() {
         {"get_ddl", {"object_type", "object_name", "use_fully_qualified_names"},
          "Returns the CREATE OR REPLACE SEMANTIC VIEW statement that recreates "
          "a stored semantic view. object_type must be 'SEMANTIC_VIEW'; pass "
-         "use_fully_qualified_names := true to schema-qualify the view name in "
-         "the output.",
-         {"SELECT GET_DDL('SEMANTIC_VIEW', 'sales');"},
+         "true as the optional third argument (use_fully_qualified_names) to "
+         "schema-qualify the view name in the output.",
+         {"SELECT GET_DDL('SEMANTIC_VIEW', 'sales');",
+          "SELECT GET_DDL('SEMANTIC_VIEW', 'sales', true);"},
          {"semantic_views", "metadata"}},
         {"read_yaml_from_semantic_view", {"view_name"},
          "Returns a stored semantic view's definition as YAML, suitable for "
@@ -623,7 +624,11 @@ static const std::vector<SvFunctionDoc> &sv_function_docs() {
          "to list views; call this directly only to use the listing as a FROM "
          "source.",
          {"SHOW SEMANTIC VIEWS;",
-          "SELECT GET_DDL('SEMANTIC_VIEW', name) FROM list_semantic_views();"},
+          // Qualified and quoted per part: a bare name is a unique-match
+          // lookup, ambiguous once two schemas hold the same view name.
+          "SELECT GET_DDL('SEMANTIC_VIEW', '\"' || replace(schema_name, '\"', "
+          "'\"\"') || '\".\"' || replace(name, '\"', '\"\"') || '\"') FROM "
+          "list_semantic_views();"},
          {"semantic_views", "metadata"}},
         {"list_terse_semantic_views", {},
          "Backs SHOW TERSE SEMANTIC VIEWS: lists every registered semantic "
@@ -641,8 +646,10 @@ static const std::vector<SvFunctionDoc> &sv_function_docs() {
          {"semantic_views", "metadata"}},
         {"show_columns_in_semantic_view", {"view_name"},
          "Backs SHOW COLUMNS IN SEMANTIC VIEW: lists a semantic view's "
-         "queryable dimensions, facts and metrics with their data types and "
-         "expressions. Use that statement rather than calling this directly.",
+         "queryable dimensions, facts and metrics with their kind and "
+         "expression (data_type is the declared type, empty for views created "
+         "since v0.10.0). Use that statement rather than calling this "
+         "directly.",
          {"SHOW COLUMNS IN SEMANTIC VIEW sales;"},
          {"semantic_views", "metadata"}},
         {"show_semantic_dimensions", {"view_name"},
@@ -720,9 +727,11 @@ static const SvFunctionDoc *sv_function_doc(const std::string &name) {
 
 // Sentence appended to every table function that declares the `search_path`
 // named parameter, so a caller reading duckdb_functions() leaves it alone.
+// Worded to hold for the listing functions too: they declare the parameter
+// but the parser never injects it into them (`src/parse/search_path.rs`).
 static const char *const SV_SEARCH_PATH_NOTE =
-    " The search_path parameter is supplied automatically by the extension's "
-    "parser; do not pass it.";
+    " The search_path parameter is reserved for the extension, which fills it "
+    "in where needed; do not pass it.";
 
 static FunctionDescription sv_base_description(const SvFunctionDoc &doc) {
     FunctionDescription desc;

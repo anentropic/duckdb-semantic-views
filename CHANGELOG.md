@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than `col0`), and a runnable example, so tools and agents that discover functions
   over a SQL connection can find and call them correctly. The table functions behind
   `SHOW` / `DESCRIBE SEMANTIC …` say so and point to the statement to use instead, and every
-  read function notes that its `search_path` parameter is supplied automatically.
+  table function notes that its `search_path` parameter is reserved for the extension.
 
 ### Changed
 

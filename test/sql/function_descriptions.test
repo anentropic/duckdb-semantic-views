@@ -152,10 +152,13 @@ SELECT * FROM explain_semantic_view('sales', dimensions := ['region'], metrics :
 query T
 SELECT DISTINCT array_to_string(examples, ' || ') FROM sv_fns WHERE function_name = 'get_ddl';
 ----
-SELECT GET_DDL('SEMANTIC_VIEW', 'sales');
+SELECT GET_DDL('SEMANTIC_VIEW', 'sales'); || SELECT GET_DDL('SEMANTIC_VIEW', 'sales', true);
 
 statement ok
 SELECT GET_DDL('SEMANTIC_VIEW', 'sales');
+
+statement ok
+SELECT GET_DDL('SEMANTIC_VIEW', 'sales', true);
 
 query T
 SELECT array_to_string(examples, ' || ') FROM sv_fns WHERE function_name = 'read_yaml_from_semantic_view';
@@ -168,13 +171,10 @@ SELECT READ_YAML_FROM_SEMANTIC_VIEW('sales');
 query T
 SELECT array_to_string(examples, ' || ') FROM sv_fns WHERE function_name = 'list_semantic_views';
 ----
-SHOW SEMANTIC VIEWS; || SELECT GET_DDL('SEMANTIC_VIEW', name) FROM list_semantic_views();
+SHOW SEMANTIC VIEWS; || SELECT GET_DDL('SEMANTIC_VIEW', '"' || replace(schema_name, '"', '""') || '"."' || replace(name, '"', '""') || '"') FROM list_semantic_views();
 
 statement ok
 SHOW SEMANTIC VIEWS;
-
-statement ok
-SELECT GET_DDL('SEMANTIC_VIEW', name) FROM list_semantic_views();
 
 query T
 SELECT array_to_string(examples, ' || ') FROM sv_fns WHERE function_name = 'show_semantic_dimensions_for_metric';
@@ -242,3 +242,48 @@ SHOW SEMANTIC METRICS IN sales;
 
 statement ok
 SHOW SEMANTIC METRICS;
+
+# --- Case 7: the bulk GET_DDL example survives a duplicated view name ----
+# A bare name is a unique-match lookup, so two schemas holding `sales` make
+# GET_DDL(..., name) ambiguous (get_ddl_qualified_name.test §7). The
+# documented example qualifies and quotes each part. Kept last: the second
+# `sales` would make the bare-name examples above ambiguous too.
+
+statement ok
+CREATE SCHEMA staging;
+
+statement ok
+CREATE SEMANTIC VIEW staging.sales AS
+  TABLES (o AS main.orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.revenue AS SUM(o.amount));
+
+query I
+SELECT count(*) FROM (SELECT GET_DDL('SEMANTIC_VIEW', '"' || replace(schema_name, '"', '""') || '"."' || replace(name, '"', '""') || '"') FROM list_semantic_views())
+----
+2
+
+# --- Case 8: descriptions promise only what the functions do -------------
+
+# GET_DDL's flag is a third positional argument; scalar functions take no
+# `name := value` arguments.
+query T
+SELECT function_name FROM sv_fns
+WHERE function_name = 'get_ddl' AND coalesce(description, '') LIKE '%:=%';
+----
+
+# SHOW COLUMNS reports the stored *declared* type, empty for views created
+# since v0.10.0 (docs/reference/show-columns-semantic-view.rst).
+query T
+SELECT function_name FROM sv_fns
+WHERE function_name = 'show_columns_in_semantic_view'
+  AND coalesce(description, '') NOT LIKE '%declared%';
+----
+
+# The listing functions declare search_path but the parser never injects it
+# into them (src/parse/search_path.rs), so the note must not claim it does.
+query T
+SELECT function_name FROM sv_fns
+WHERE coalesce(description, '') LIKE '%supplied automatically by the extension''s parser%'
+ORDER BY ALL;
+----
