@@ -557,6 +557,202 @@ static ParserExtensionPlanResult sv_plan_unreachable(
 }
 
 // ---------------------------------------------------------------------------
+// duckdb_functions() documentation (GitHub issue #233)
+// ---------------------------------------------------------------------------
+// An agent connected over SQL learns what an extension offers only through
+// `duckdb_functions()`, so every function registered below carries a
+// `FunctionDescription`. The entries live in one table keyed by function name
+// rather than at each call site, so the C entry points keep their signatures
+// and the registration helpers attach the docs uniformly. A registration whose
+// name has no entry fails (see `sv_function_doc`): a new function cannot ship
+// undocumented. `test/sql/function_descriptions.test` pins the rendered result
+// and runs the examples.
+//
+// `positional_names` names only the positional arguments. For a table
+// function DuckDB lists positional arguments and then named parameters under
+// one `parameters` column, and applies `parameter_names` by index across both
+// — so the registration core appends the named-parameter names itself, in the
+// order DuckDB will render them (see `sv_table_function_description`).
+//
+// Most table functions are what the SHOW / DESCRIBE statements lower to
+// (`crate::parse::rewrite::read_function_name`). Their descriptions and
+// examples point at the statement, which is the documented interface.
+struct SvFunctionDoc {
+    const char *name;
+    std::vector<std::string> positional_names;
+    const char *description;
+    std::vector<std::string> examples;
+    std::vector<std::string> categories;
+};
+
+static const std::vector<SvFunctionDoc> &sv_function_docs() {
+    static const std::vector<SvFunctionDoc> docs = {
+        // --- Query functions -------------------------------------------
+        {"semantic_view", {"view_name"},
+         "Queries a semantic view: returns the requested dimensions, metrics "
+         "and/or facts, generating the joins and GROUP BY from the view "
+         "definition. Pass at least one of dimensions, metrics or facts; "
+         "where_clause filters rows before aggregation.",
+         {"SELECT * FROM semantic_view('sales', dimensions := ['region'], "
+          "metrics := ['revenue']);"},
+         {"semantic_views", "query"}},
+        {"explain_semantic_view", {"view_name"},
+         "Shows how semantic_view() would answer the same arguments: the "
+         "generated SQL, the materialization routing decision and the DuckDB "
+         "query plan, as rows of text, without running the data query.",
+         {"SELECT * FROM explain_semantic_view('sales', dimensions := "
+          "['region'], metrics := ['revenue']);"},
+         {"semantic_views", "query"}},
+        // --- Definition export -----------------------------------------
+        {"get_ddl", {"object_type", "object_name", "use_fully_qualified_names"},
+         "Returns the CREATE OR REPLACE SEMANTIC VIEW statement that recreates "
+         "a stored semantic view. object_type must be 'SEMANTIC_VIEW'; pass "
+         "use_fully_qualified_names := true to schema-qualify the view name in "
+         "the output.",
+         {"SELECT GET_DDL('SEMANTIC_VIEW', 'sales');"},
+         {"semantic_views", "metadata"}},
+        {"read_yaml_from_semantic_view", {"view_name"},
+         "Returns a stored semantic view's definition as YAML, suitable for "
+         "re-import with CREATE SEMANTIC VIEW ... FROM YAML.",
+         {"SELECT READ_YAML_FROM_SEMANTIC_VIEW('sales');"},
+         {"semantic_views", "metadata"}},
+        // --- Listing -----------------------------------------------------
+        {"list_semantic_views", {},
+         "Backs SHOW SEMANTIC VIEWS: lists every registered semantic view with "
+         "its creation time, database, schema and comment. Use that statement "
+         "to list views; call this directly only to use the listing as a FROM "
+         "source.",
+         {"SHOW SEMANTIC VIEWS;",
+          "SELECT GET_DDL('SEMANTIC_VIEW', name) FROM list_semantic_views();"},
+         {"semantic_views", "metadata"}},
+        {"list_terse_semantic_views", {},
+         "Backs SHOW TERSE SEMANTIC VIEWS: lists every registered semantic "
+         "view without the comment column. Use that statement rather than "
+         "calling this directly.",
+         {"SHOW TERSE SEMANTIC VIEWS;"},
+         {"semantic_views", "metadata"}},
+        // --- Per-view introspection (DDL-backing) --------------------------
+        {"describe_semantic_view", {"view_name"},
+         "Backs DESCRIBE SEMANTIC VIEW: returns a semantic view's definition "
+         "as one row per property of each table, relationship, fact, "
+         "dimension, metric and materialization. Use that statement rather "
+         "than calling this directly.",
+         {"DESCRIBE SEMANTIC VIEW sales;"},
+         {"semantic_views", "metadata"}},
+        {"show_columns_in_semantic_view", {"view_name"},
+         "Backs SHOW COLUMNS IN SEMANTIC VIEW: lists a semantic view's "
+         "queryable dimensions, facts and metrics with their data types and "
+         "expressions. Use that statement rather than calling this directly.",
+         {"SHOW COLUMNS IN SEMANTIC VIEW sales;"},
+         {"semantic_views", "metadata"}},
+        {"show_semantic_dimensions", {"view_name"},
+         "Backs SHOW SEMANTIC DIMENSIONS IN <view>: lists the dimensions of "
+         "one semantic view. Use that statement rather than calling this "
+         "directly.",
+         {"SHOW SEMANTIC DIMENSIONS IN sales;"},
+         {"semantic_views", "metadata"}},
+        {"show_semantic_metrics", {"view_name"},
+         "Backs SHOW SEMANTIC METRICS IN <view>: lists the metrics of one "
+         "semantic view. Use that statement rather than calling this directly.",
+         {"SHOW SEMANTIC METRICS IN sales;"},
+         {"semantic_views", "metadata"}},
+        {"show_semantic_facts", {"view_name"},
+         "Backs SHOW SEMANTIC FACTS IN <view>: lists the facts of one semantic "
+         "view. Use that statement rather than calling this directly.",
+         {"SHOW SEMANTIC FACTS IN sales;"},
+         {"semantic_views", "metadata"}},
+        {"show_semantic_materializations", {"view_name"},
+         "Backs SHOW SEMANTIC MATERIALIZATIONS IN <view>: lists the "
+         "materializations declared in one semantic view. Use that statement "
+         "rather than calling this directly.",
+         {"SHOW SEMANTIC MATERIALIZATIONS IN sales;"},
+         {"semantic_views", "metadata"}},
+        {"show_semantic_dimensions_for_metric", {"view_name", "metric_name"},
+         "Backs SHOW SEMANTIC DIMENSIONS IN <view> FOR METRIC <metric>: lists "
+         "the dimensions that can be combined with a metric without a fan "
+         "trap, and which ones a window metric requires. Use that statement "
+         "rather than calling this directly.",
+         {"SHOW SEMANTIC DIMENSIONS IN sales FOR METRIC revenue;"},
+         {"semantic_views", "metadata"}},
+        // --- Cross-view introspection (DDL-backing) ------------------------
+        {"show_semantic_dimensions_all", {},
+         "Backs SHOW SEMANTIC DIMENSIONS without IN: lists the dimensions of "
+         "every semantic view. Use that statement rather than calling this "
+         "directly.",
+         {"SHOW SEMANTIC DIMENSIONS;"},
+         {"semantic_views", "metadata"}},
+        {"show_semantic_metrics_all", {},
+         "Backs SHOW SEMANTIC METRICS without IN: lists the metrics of every "
+         "semantic view. Use that statement rather than calling this directly.",
+         {"SHOW SEMANTIC METRICS;"},
+         {"semantic_views", "metadata"}},
+        {"show_semantic_facts_all", {},
+         "Backs SHOW SEMANTIC FACTS without IN: lists the facts of every "
+         "semantic view. Use that statement rather than calling this directly.",
+         {"SHOW SEMANTIC FACTS;"},
+         {"semantic_views", "metadata"}},
+        {"show_semantic_materializations_all", {},
+         "Backs SHOW SEMANTIC MATERIALIZATIONS without IN: lists the "
+         "materializations of every semantic view. Use that statement rather "
+         "than calling this directly.",
+         {"SHOW SEMANTIC MATERIALIZATIONS;"},
+         {"semantic_views", "metadata"}},
+        // --- Internal ----------------------------------------------------
+        {"__sv_compute_create_from_yaml", {"file_path", "view_name", "comment"},
+         "Internal helper behind CREATE SEMANTIC VIEW ... FROM YAML FILE. Use "
+         "that statement instead; this function is not for direct use.",
+         {},
+         {"semantic_views", "internal"}},
+    };
+    return docs;
+}
+
+// Look up the documentation entry for `name`; nullptr when there is none,
+// which the registration helpers turn into a registration failure.
+static const SvFunctionDoc *sv_function_doc(const std::string &name) {
+    for (const auto &doc : sv_function_docs()) {
+        if (name == doc.name) {
+            return &doc;
+        }
+    }
+    return nullptr;
+}
+
+// Sentence appended to every table function that declares the `search_path`
+// named parameter, so a caller reading duckdb_functions() leaves it alone.
+static const char *const SV_SEARCH_PATH_NOTE =
+    " The search_path parameter is supplied automatically by the extension's "
+    "parser; do not pass it.";
+
+static FunctionDescription sv_base_description(const SvFunctionDoc &doc) {
+    FunctionDescription desc;
+    desc.parameter_names = doc.positional_names;
+    desc.description = doc.description;
+    desc.examples = doc.examples;
+    desc.categories = doc.categories;
+    return desc;
+}
+
+// Build the description for a table function. `fn` must be the function
+// object stored in the CreateTableFunctionInfo being registered: DuckDB
+// renders the named parameters by iterating that function's
+// `named_parameters` map, so the names are appended in the same iteration to
+// stay aligned with `parameter_types`.
+static FunctionDescription sv_table_function_description(
+    const SvFunctionDoc &doc, const TableFunction &fn) {
+    auto desc = sv_base_description(doc);
+    bool has_search_path = false;
+    for (const auto &np : fn.named_parameters) {
+        desc.parameter_names.push_back(np.first);
+        has_search_path = has_search_path || np.first == "search_path";
+    }
+    if (has_search_path) {
+        desc.description += SV_SEARCH_PATH_NOTE;
+    }
+    return desc;
+}
+
+// ---------------------------------------------------------------------------
 // Table-function registration: shared spec-based core (C-7, code-review
 // 2026-07-11)
 // ---------------------------------------------------------------------------
@@ -685,10 +881,22 @@ static bool sv_register_table_function_core(
             tf.named_parameters[np.first] = np.second;
         }
 
+        const SvFunctionDoc *doc = sv_function_doc(spec.name);
+        if (doc == nullptr) {
+            write_err(who +
+                ": no duckdb_functions() documentation entry (add one to "
+                "sv_function_docs in cpp/src/shim.cpp)");
+            return false;
+        }
+
         CreateTableFunctionInfo info(tf);
         // ALTER_ON_CONFLICT: extension reload replaces the registration cleanly
         // instead of throwing on duplicate name.
         info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+        // Built from the function object the info actually holds, so the
+        // named-parameter names follow the map iteration DuckDB renders.
+        info.descriptions.push_back(
+            sv_table_function_description(*doc, info.functions.functions[0]));
 
         auto &system_catalog = Catalog::GetSystemCatalog(db);
         auto txn = CatalogTransaction::GetSystemTransaction(db);
@@ -821,8 +1029,23 @@ static bool sv_register_scalar_function_set(
         }
         auto &db = *wrapper->database->instance;
 
+        const SvFunctionDoc *doc = sv_function_doc(name);
+        if (doc == nullptr) {
+            write_err(
+                "sv_register_scalar_function('%s'): no duckdb_functions() "
+                "documentation entry (add one to sv_function_docs in "
+                "cpp/src/shim.cpp)",
+                name);
+            return false;
+        }
+
         CreateScalarFunctionInfo info(std::move(set));
         info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+        // One description, no parameter_types: DuckDB applies a lone
+        // description to every overload and takes as many names as each
+        // overload has arguments, so get_ddl's 2- and 3-argument forms both
+        // render real names.
+        info.descriptions.push_back(sv_base_description(*doc));
 
         auto &system_catalog = Catalog::GetSystemCatalog(db);
         auto txn = CatalogTransaction::GetSystemTransaction(db);

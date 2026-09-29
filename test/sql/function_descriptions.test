@@ -1,0 +1,242 @@
+# duckdb_functions() documentation for every function the extension registers
+# (GitHub issue #233).
+#
+# An agent connected over SQL can only learn what an extension offers by
+# querying duckdb_functions(). Every registration therefore carries a
+# FunctionDescription: a description, real parameter names (never the
+# `col0`/`col1` placeholders DuckDB falls back to), and, for everything but
+# the internal CREATE ... FROM YAML helper, a runnable example.
+#
+# The registration core refuses a function with no documentation entry, so a
+# newly added function cannot silently ship undocumented; this file pins the
+# rendered result for the current set.
+
+require semantic_views
+
+statement ok
+LOAD semantic_views;
+
+statement ok
+CREATE TEMP TABLE sv_fns AS
+SELECT function_name, function_type, description, parameters, parameter_types, examples
+FROM duckdb_functions()
+WHERE function_name IN (
+    'semantic_view', 'explain_semantic_view', 'get_ddl',
+    'read_yaml_from_semantic_view', 'list_semantic_views',
+    'list_terse_semantic_views', 'describe_semantic_view',
+    'show_columns_in_semantic_view', 'show_semantic_dimensions',
+    'show_semantic_metrics', 'show_semantic_facts',
+    'show_semantic_materializations', 'show_semantic_dimensions_all',
+    'show_semantic_metrics_all', 'show_semantic_facts_all',
+    'show_semantic_materializations_all',
+    'show_semantic_dimensions_for_metric', '__sv_compute_create_from_yaml');
+
+# All 18 functions are registered (get_ddl has two overloads, hence 19 rows).
+query I
+SELECT count(*) FROM sv_fns;
+----
+19
+
+# --- Case 1: every overload has a description ----------------------------
+
+query T
+SELECT function_name FROM sv_fns WHERE description IS NULL ORDER BY ALL;
+----
+
+# --- Case 2: no placeholder parameter names ------------------------------
+
+query T
+SELECT function_name FROM sv_fns
+WHERE len(list_filter(parameters, p -> regexp_full_match(p, 'col[0-9]+'))) > 0
+ORDER BY ALL;
+----
+
+# --- Case 3: every non-internal function has an example -------------------
+
+query T
+SELECT function_name FROM sv_fns
+WHERE len(examples) = 0 AND function_name <> '__sv_compute_create_from_yaml'
+ORDER BY ALL;
+----
+
+# --- Case 3b: functions behind a SQL statement redirect to it ------------
+# Every function that a SHOW / DESCRIBE / CREATE ... FROM YAML FILE
+# statement lowers to says so, and tells the caller to use the statement.
+
+query T
+SELECT function_name FROM sv_fns
+WHERE function_name NOT IN ('semantic_view', 'explain_semantic_view',
+                            'get_ddl', 'read_yaml_from_semantic_view')
+  AND NOT (description LIKE 'Backs %' OR description LIKE 'Internal helper behind %')
+ORDER BY ALL;
+----
+
+query T
+SELECT function_name FROM sv_fns
+WHERE function_name NOT IN ('semantic_view', 'explain_semantic_view',
+                            'get_ddl', 'read_yaml_from_semantic_view')
+  AND description NOT LIKE '%Use that statement%'
+ORDER BY ALL;
+----
+
+# --- Case 4: named parameters keep their own names *and* types -----------
+# The names of a table function's named parameters come from an unordered
+# map, so the description's name list is built from that same map at
+# registration time. Pairing each name with its type catches a
+# misalignment, which a bare "no colN" check would not.
+
+query T
+SELECT array_to_string(list_sort(list_transform(list_zip(parameters, parameter_types),
+                                x -> x[1] || ':' || x[2])), ' | ')
+FROM sv_fns WHERE function_name = 'semantic_view';
+----
+dimensions:VARCHAR[] | facts:VARCHAR[] | metrics:VARCHAR[] | search_path:VARCHAR[] | view_name:VARCHAR | where_clause:VARCHAR
+
+query T
+SELECT array_to_string(list_sort(list_transform(list_zip(parameters, parameter_types),
+                                x -> x[1] || ':' || x[2])), ' | ')
+FROM sv_fns WHERE function_name = 'explain_semantic_view';
+----
+dimensions:VARCHAR[] | facts:VARCHAR[] | metrics:VARCHAR[] | search_path:VARCHAR[] | view_name:VARCHAR | where_clause:VARCHAR
+
+query T
+SELECT array_to_string(list_transform(list_zip(parameters, parameter_types),
+                      x -> x[1] || ':' || x[2]), ' | ')
+FROM sv_fns WHERE function_name = 'show_semantic_dimensions_for_metric';
+----
+view_name:VARCHAR | metric_name:VARCHAR | search_path:VARCHAR[]
+
+# --- Case 5: both get_ddl overloads carry real names ---------------------
+
+query T
+SELECT array_to_string(parameters, ' | ') FROM sv_fns WHERE function_name = 'get_ddl'
+ORDER BY len(parameters);
+----
+object_type | object_name
+object_type | object_name | use_fully_qualified_names
+
+# --- Case 6: the examples for the query functions actually run -----------
+# Each example below is copied verbatim from its registration; the fixture
+# view is named to match them.
+
+statement ok
+CREATE TABLE orders (id INTEGER PRIMARY KEY, region VARCHAR, amount DECIMAL(10,2));
+
+statement ok
+INSERT INTO orders VALUES (1, 'US', 100), (2, 'EU', 200), (3, 'US', 50);
+
+statement ok
+CREATE SEMANTIC VIEW sales AS
+  TABLES (o AS orders PRIMARY KEY (id))
+  DIMENSIONS (o.region AS o.region)
+  METRICS (o.revenue AS SUM(o.amount));
+
+query T
+SELECT array_to_string(examples, ' || ') FROM sv_fns WHERE function_name = 'semantic_view';
+----
+SELECT * FROM semantic_view('sales', dimensions := ['region'], metrics := ['revenue']);
+
+statement ok
+SELECT * FROM semantic_view('sales', dimensions := ['region'], metrics := ['revenue']);
+
+query T
+SELECT array_to_string(examples, ' || ') FROM sv_fns WHERE function_name = 'explain_semantic_view';
+----
+SELECT * FROM explain_semantic_view('sales', dimensions := ['region'], metrics := ['revenue']);
+
+statement ok
+SELECT * FROM explain_semantic_view('sales', dimensions := ['region'], metrics := ['revenue']);
+
+query T
+SELECT DISTINCT array_to_string(examples, ' || ') FROM sv_fns WHERE function_name = 'get_ddl';
+----
+SELECT GET_DDL('SEMANTIC_VIEW', 'sales');
+
+statement ok
+SELECT GET_DDL('SEMANTIC_VIEW', 'sales');
+
+query T
+SELECT array_to_string(examples, ' || ') FROM sv_fns WHERE function_name = 'read_yaml_from_semantic_view';
+----
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('sales');
+
+statement ok
+SELECT READ_YAML_FROM_SEMANTIC_VIEW('sales');
+
+query T
+SELECT array_to_string(examples, ' || ') FROM sv_fns WHERE function_name = 'list_semantic_views';
+----
+SHOW SEMANTIC VIEWS; || SELECT GET_DDL('SEMANTIC_VIEW', name) FROM list_semantic_views();
+
+statement ok
+SHOW SEMANTIC VIEWS;
+
+statement ok
+SELECT GET_DDL('SEMANTIC_VIEW', name) FROM list_semantic_views();
+
+query T
+SELECT array_to_string(examples, ' || ') FROM sv_fns WHERE function_name = 'show_semantic_dimensions_for_metric';
+----
+SHOW SEMANTIC DIMENSIONS IN sales FOR METRIC revenue;
+
+statement ok
+SHOW SEMANTIC DIMENSIONS IN sales FOR METRIC revenue;
+
+# The remaining DDL-backing functions each document the statement that
+# lowers to them; run each one against the fixture.
+
+query T
+SELECT function_name || ' => ' || examples[1] FROM sv_fns
+WHERE function_name IN (
+    'list_terse_semantic_views', 'describe_semantic_view',
+    'show_columns_in_semantic_view', 'show_semantic_dimensions',
+    'show_semantic_metrics', 'show_semantic_facts',
+    'show_semantic_materializations', 'show_semantic_dimensions_all',
+    'show_semantic_metrics_all', 'show_semantic_facts_all',
+    'show_semantic_materializations_all')
+ORDER BY ALL;
+----
+describe_semantic_view => DESCRIBE SEMANTIC VIEW sales;
+list_terse_semantic_views => SHOW TERSE SEMANTIC VIEWS;
+show_columns_in_semantic_view => SHOW COLUMNS IN SEMANTIC VIEW sales;
+show_semantic_dimensions => SHOW SEMANTIC DIMENSIONS IN sales;
+show_semantic_dimensions_all => SHOW SEMANTIC DIMENSIONS;
+show_semantic_facts => SHOW SEMANTIC FACTS IN sales;
+show_semantic_facts_all => SHOW SEMANTIC FACTS;
+show_semantic_materializations => SHOW SEMANTIC MATERIALIZATIONS IN sales;
+show_semantic_materializations_all => SHOW SEMANTIC MATERIALIZATIONS;
+show_semantic_metrics => SHOW SEMANTIC METRICS IN sales;
+show_semantic_metrics_all => SHOW SEMANTIC METRICS;
+
+statement ok
+DESCRIBE SEMANTIC VIEW sales;
+
+statement ok
+SHOW TERSE SEMANTIC VIEWS;
+
+statement ok
+SHOW COLUMNS IN SEMANTIC VIEW sales;
+
+statement ok
+SHOW SEMANTIC DIMENSIONS IN sales;
+
+statement ok
+SHOW SEMANTIC DIMENSIONS;
+
+statement ok
+SHOW SEMANTIC FACTS IN sales;
+
+statement ok
+SHOW SEMANTIC FACTS;
+
+statement ok
+SHOW SEMANTIC MATERIALIZATIONS IN sales;
+
+statement ok
+SHOW SEMANTIC MATERIALIZATIONS;
+
+statement ok
+SHOW SEMANTIC METRICS IN sales;
+
+statement ok
+SHOW SEMANTIC METRICS;
