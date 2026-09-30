@@ -709,6 +709,19 @@ Key fields:
 
 ### Submitting a New Release
 
+> **Prefer the `PublishExtension.yml` workflow** (`gh workflow run PublishExtension.yml -f version=X.Y.Z`,
+> ideally with `-f dry_run=true` first). It does everything `just release` does *plus* the
+> version bump, the `[Unreleased]` → `[X.Y.Z]` changelog roll (`scripts/changelog_release.py`),
+> the tag, and the registry-pin gate. `just release` does **none** of those: it publishes
+> whatever version `Cargo.toml` already says, so running it before bumping resubmits the
+> previous release under a new `ref`. The workflow authenticates with `CE_PUBLISH_PAT`,
+> falling back to `VERSION_MONITOR_PAT`. When that token expires, this workflow and the DuckDB
+> Version Monitor both fail at `actions/checkout` with `could not read Username for 'https://github.com'`.
+>
+> The monitor's changelog bullet comes from `scripts/changelog_add_bullet.py`, guarded by
+> `tests/changelog_scripts.rs`. Still read the rolled section in the dry-run diff: it becomes
+> the release notes verbatim.
+
 The `just release` recipe automates steps 3-7 below:
 
 1. Complete the milestone on the milestone branch

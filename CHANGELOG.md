@@ -21,12 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **The "semantic view not found" error now suggests `SHOW SEMANTIC VIEWS`** instead of
-- DuckDB version pin bumped to `v1.5.6`.
   `FROM list_semantic_views()`. The documentation and the read-only example likewise use
   `SHOW SEMANTIC VIEWS` / `DESCRIBE SEMANTIC VIEW` in place of the `list_semantic_views()` /
   `describe_semantic_view()` table functions those statements run on. The functions remain
   available — `list_semantic_views()` is still the way to use the view listing as a `FROM`
   source, e.g. to feed `GET_DDL` for every view.
+- DuckDB version pin bumped to `v1.5.6`.
 
 ## [0.12.1] - 2026-08-28
 
