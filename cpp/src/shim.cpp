@@ -742,16 +742,16 @@ static FunctionDescription sv_base_description(const SvFunctionDoc &doc) {
     return desc;
 }
 
-// Build the description for a table function. `fn` must be the function
-// object stored in the CreateTableFunctionInfo being registered: DuckDB
-// renders the named parameters by iterating that function's
+// Build the description for a table function. `rendered` must be a copy of
+// the registered function made exactly as duckdb_functions() makes one (see
+// the call site): DuckDB lists the named parameters by iterating that copy's
 // `named_parameters` map, so the names are appended in the same iteration to
 // stay aligned with `parameter_types`.
 static FunctionDescription sv_table_function_description(
-    const SvFunctionDoc &doc, const TableFunction &fn) {
+    const SvFunctionDoc &doc, const TableFunction &rendered) {
     auto desc = sv_base_description(doc);
     bool has_search_path = false;
-    for (const auto &np : fn.named_parameters) {
+    for (const auto &np : rendered.named_parameters) {
         desc.parameter_names.push_back(np.first);
         has_search_path = has_search_path || np.first == "search_path";
     }
@@ -902,10 +902,20 @@ static bool sv_register_table_function_core(
         // ALTER_ON_CONFLICT: extension reload replaces the registration cleanly
         // instead of throwing on duplicate name.
         info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
-        // Built from the function object the info actually holds, so the
-        // named-parameter names follow the map iteration DuckDB renders.
+        // The named-parameter names must follow the iteration order DuckDB
+        // renders, and that order is not stable across copies: `named_parameters`
+        // is an unordered_map, and libc++ (macOS) reverses its iteration order
+        // on every copy while libstdc++ (Linux) preserves it. duckdb_functions()
+        // renders both `parameters` and `parameter_types` from
+        // `entry.functions.GetFunctionByOffset(offset)` -- a by-value copy of
+        // the catalog entry's function, which the entry *moves* out of
+        // `info.functions` (TableFunctionCatalogEntry ctor, DuckDB 1.5.5). So a
+        // GetFunctionByOffset copy of the info's function iterates exactly like
+        // DuckDB's rendering copy. Iterating `info.functions.functions[0]`
+        // directly is one copy short, and misaligned names and types on macOS.
+        const TableFunction rendered = info.functions.GetFunctionByOffset(0);
         info.descriptions.push_back(
-            sv_table_function_description(*doc, info.functions.functions[0]));
+            sv_table_function_description(*doc, rendered));
 
         auto &system_catalog = Catalog::GetSystemCatalog(db);
         auto txn = CatalogTransaction::GetSystemTransaction(db);
