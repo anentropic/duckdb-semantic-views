@@ -69,10 +69,14 @@ def main():
     cat_head = f"### {category}"
     head_idx = next((i for i, l in enumerate(block) if l.strip() == cat_head), None)
     if head_idx is not None:
-        # Append after the last contiguous bullet of this subsection.
+        # Append after the last bullet of this subsection, including the indented
+        # continuation lines of a wrapped bullet (inserting after a bullet's
+        # first line would split it in two).
         last = head_idx
         for k in range(head_idx + 1, len(block)):
             if block[k].startswith("- "):
+                last = k
+            elif last != head_idx and block[k][:1] in (" ", "\t") and block[k].strip():
                 last = k
             elif block[k].startswith("### "):
                 break
@@ -89,7 +93,9 @@ def main():
                 if rank.get(other, 999) > mine:
                     insert_at = i
                     break
-        block[insert_at:insert_at] = ["", cat_head, "", bullet_line]
+        # Trailing "" separates the new section from a following ### heading;
+        # normalize() collapses it where a blank line already follows.
+        block[insert_at:insert_at] = ["", cat_head, "", bullet_line, ""]
 
     new_lines = lines[: start + 1] + normalize(block) + lines[end:]
     open(CHANGELOG, "w", encoding="utf-8").write("\n".join(new_lines))
