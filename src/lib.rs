@@ -26,7 +26,7 @@ pub mod util;
 /// tested against. The three sources of truth — this constant, the
 /// `.duckdb-version` file, and the pinned `libduckdb-sys` version in
 /// `Cargo.toml` — are asserted consistent by `tests::duckdb_version_pins_agree`.
-pub const MINIMUM_DUCKDB_VERSION: &str = "v1.5.5";
+pub const MINIMUM_DUCKDB_VERSION: &str = "v1.5.6";
 
 /// Test helpers for integration tests.
 ///
