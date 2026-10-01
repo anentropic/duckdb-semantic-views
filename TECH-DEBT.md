@@ -559,6 +559,29 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **What is given up, explicitly:** the implication "YAML-storable ⇒ renders to parseable DDL" is no longer machine-checked over random definitions. It is still *enforced* — `validate_ddl_representable` is unchanged and still runs at the YAML choke point — and still tested, by the unit tests in `src/model.rs` and `test/sql/cr20260806_yaml_ddl_contract.test`. What is lost is randomized search for the next rule the validator does not yet know.
 - **What would finish it:** a target that fuzzes DDL **text**, not a struct — feed arbitrary bytes to `parse_keyword_body`, skip on parse failure (arbitrary bytes legitimately are not DDL), and assert that anything that DOES parse re-renders and re-parses to a fixpoint. That needs no precondition, since everything it asserts on came from the parser, and it searches the direction this target structurally cannot: what the parser *accepts*. It would subsume this entry and **#59**.
 
+### 77. ❌ `SHOW SEMANTIC …` / `DESCRIBE SEMANTIC VIEW` cannot be used as a subquery — revisit with the DuckDB 2.0 PEG parser — OPEN
+
+- **Origin:** the v0.13.0 docs audit (PR #242, 2026-10-01). Six doc examples had shipped since v0.5.4–v0.7.0 filtering introspection output in the DuckDB idiom, `SELECT … FROM (DESCRIBE SEMANTIC VIEW v) WHERE object_kind = 'DIMENSION'` and `SELECT … FROM (SHOW SEMANTIC VIEWS)`. All six are parser errors (`syntax error at or near "VIEW"`). No test or example script ran them, so they went unnoticed until the audit executed them.
+- **Why it is natural to expect:** DuckDB accepts its own introspection statements in subquery position. On 1.5.6, `SELECT column_name FROM (DESCRIBE t) WHERE …` and `SELECT count(*) FROM (SHOW TABLES)` both work. Users who know DuckDB will reach for the same form with ours.
+- **Why it fails:** DuckDB's grammar doesn't know our statements. We recognise them ourselves, but only at the start of a statement: the `parser_override` entry point (`src/parse/ffi.rs`) asks `detect_ddl_kind` in `src/parse/detect.rs` whether the statement starts with one of our statements (v0.5.x used the same prefix test in `detect_ddl_prefix`). `SELECT * FROM (DESCRIBE SEMANTIC VIEW v)` starts with `SELECT`, so the extension never sees it and DuckDB's parser rejects the inner text. Supporting it today would mean finding and rewriting our statements inside arbitrary SQL with the string scanners. That's a large, fragile surface, not worth building against the current parser-extension API.
+- **What we ship instead (the interim state):** the backing table functions are the documented FROM sources. `FROM describe_semantic_view('v')` and `FROM list_semantic_views()` work now, and `docs/reference/functions.rst` (`ref-functions-describe`, `ref-functions-list`) plus the DESCRIBE / SHOW / materializations pages show them, while the statements stay the primary interface (#235). Only those two have documented FROM-source use. The other statement-backing functions (`show_semantic_dimensions`, `…_metrics`, `…_facts`, `…_materializations`, `show_columns_in_semantic_view`, `show_semantic_dimensions_for_metric`, the `*_all` and terse variants) still say "use the statement rather than calling this directly" in `duckdb_functions()`.
+- **Revisit when:** we move to a custom PEG grammar on **DuckDB 2.0**. With our statements as real grammar productions, they can appear wherever DuckDB allows its own `DESCRIBE` / `SHOW`, so no rewriting scanner is needed.
+- **What would finish it:**
+  - Make every statement the extension provides parse in subquery and CTE position:
+    - `DESCRIBE SEMANTIC VIEW`
+    - `SHOW [TERSE] SEMANTIC VIEWS`
+    - `SHOW SEMANTIC {DIMENSIONS,METRICS,FACTS,MATERIALIZATIONS}` (with and without `IN <view>`)
+    - `SHOW SEMANTIC DIMENSIONS … FOR METRIC`
+    - `SHOW COLUMNS IN SEMANTIC VIEW`
+  - Add sqllogictest cases that filter, join and aggregate each one as a subquery.
+  - Then put the six examples back in statement form, and reduce the FROM-source notes and `functions.rst` entries to "also available as a function".
+  - Re-word the `describe_semantic_view` / `list_semantic_views` descriptions in `cpp/src/shim.cpp` to match.
+- **Docs to flip when it lands:**
+  - `docs/reference/functions.rst` (FROM-source section)
+  - `docs/reference/describe-semantic-view.rst` (`ref-describe-from-source` and the `object_kind` filter tip)
+  - `docs/reference/show-semantic-views.rst`
+  - `docs/how-to/materializations.rst`
+
 ### 76. ❌ Query-time scalar expressions in `dimensions` / `metrics` / `facts` are not supported — OPEN
 
 - **Origin:** parity question 2026-09-30 — Snowflake accepts `SELECT * FROM SEMANTIC_VIEW(tpch_analysis DIMENSIONS DATE_PART('year', orders.order_date) AS year) ORDER BY year`; we have no equivalent.
