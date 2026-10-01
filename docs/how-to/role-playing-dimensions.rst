@@ -146,6 +146,93 @@ Use :ref:`explain_semantic_view() <ref-explain-semantic-view>` to see how the ex
 The expanded SQL shows the airports table joined with a scoped alias (e.g., ``a__dep_airport``) that reflects which relationship path was used.
 
 
+.. _howto-rp-diamond:
+
+Role-Playing vs an Ambiguous Diamond
+====================================
+
+.. versionchanged:: 0.11.0
+
+   A table reached from two *different* source tables -- a join "diamond" -- is
+   rejected at ``CREATE`` time. Earlier versions accepted it and joined the
+   shared table through whichever relationship was declared first, which gave
+   wrong numbers when the two paths lead to different rows.
+
+Role-playing and a diamond both reach one table by two routes, but only one of
+them tells the extension which route a query means:
+
+- **Role-playing (supported):** several named relationships from **one** source
+  table to one target, like ``dep_airport`` and ``arr_airport`` from
+  ``flights`` to ``airports`` above. ``USING`` on a metric picks the route.
+- **Diamond (rejected):** one target reached from two **different** source
+  tables. In the view below, ``regions`` is reached from both ``customers`` and
+  ``stores``, so a ``region`` dimension could mean the customer's region or the
+  store's:
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW sales AS
+   TABLES (
+       o AS orders    PRIMARY KEY (order_id),
+       c AS customers PRIMARY KEY (customer_id),
+       s AS stores    PRIMARY KEY (store_id),
+       r AS regions   PRIMARY KEY (region_id)
+   )
+   RELATIONSHIPS (
+       order_customer  AS o(customer_id) REFERENCES c,
+       order_store     AS o(store_id)    REFERENCES s,
+       customer_region AS c(region_id)   REFERENCES r,
+       store_region    AS s(region_id)   REFERENCES r
+   )
+   DIMENSIONS (
+       r.region AS r.name
+   )
+   METRICS (
+       o.revenue AS SUM(o.amount)
+   );
+
+.. code-block:: text
+
+   diamond: 'r' is reachable from multiple tables ('c', 's'); the join path is
+   ambiguous. Declare the target under a second table alias so it is joined once
+   per path.
+
+Fix it as the message says: declare ``regions`` once per path, under two
+aliases, and give each alias its own dimension. Each route then has its own
+table and there is nothing left to choose between:
+
+.. code-block:: sql
+   :emphasize-lines: 6,7,12,13,16,17
+
+   CREATE SEMANTIC VIEW sales AS
+   TABLES (
+       o  AS orders    PRIMARY KEY (order_id),
+       c  AS customers PRIMARY KEY (customer_id),
+       s  AS stores    PRIMARY KEY (store_id),
+       cr AS regions   PRIMARY KEY (region_id),
+       sr AS regions   PRIMARY KEY (region_id)
+   )
+   RELATIONSHIPS (
+       order_customer  AS o(customer_id) REFERENCES c,
+       order_store     AS o(store_id)    REFERENCES s,
+       customer_region AS c(region_id)   REFERENCES cr,
+       store_region    AS s(region_id)   REFERENCES sr
+   )
+   DIMENSIONS (
+       cr.customer_region AS cr.name,
+       sr.store_region    AS sr.name
+   )
+   METRICS (
+       o.revenue AS SUM(o.amount)
+   );
+
+A query can now group by ``customer_region``, ``store_region`` or both.
+
+Two relationships from one source to two *different* targets, like
+``orders → customers`` and ``orders → products`` in :ref:`tutorial-multi-table`,
+are neither pattern and need nothing extra.
+
+
 .. _howto-rp-errors:
 
 Troubleshooting
@@ -192,3 +279,14 @@ Troubleshooting
    a role-playing dimension but has no ``USING`` to disambiguate the role is
    now rejected as ambiguous at query time -- the same error a directly-queried
    role-playing dimension raises. See :ref:`howto-semi-additive`.
+
+
+.. _howto-rp-related:
+
+Related
+=======
+
+- :ref:`ref-create-relationships` -- ``RELATIONSHIPS`` syntax and validation rules
+- :ref:`ref-create-metrics` -- ``USING`` in the metric grammar
+- :ref:`howto-fan-traps` -- What a role-played dimension does to multi-grain queries
+- :ref:`howto-derived-metrics` -- Composing metrics that carry ``USING`` context

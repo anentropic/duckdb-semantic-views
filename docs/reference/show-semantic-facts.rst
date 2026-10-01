@@ -121,7 +121,7 @@ Returns one row per fact with 8 columns:
      - The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``synonyms``
      - VARCHAR
-     - JSON array of synonym strings (e.g., ``["discounted_price"]``). Empty string if no synonyms are set.
+     - JSON array of synonym strings (e.g., ``["discounted_price"]``). ``[]`` when no synonyms are set.
    * - ``comment``
      - VARCHAR
      - The fact comment text. Empty string if no comment is set.
@@ -145,10 +145,10 @@ Given a semantic view ``orders_sv`` with one fact:
    ┌───────────────┬─────────────┬──────────────────────┬────────────┬────────────┬────────────────┬──────────┬─────────┐
    │ database_name │ schema_name │ semantic_view_name   │ table_name │ name       │ data_type      │ synonyms │ comment │
    ├───────────────┼─────────────┼──────────────────────┼────────────┼────────────┼────────────────┼──────────┼─────────┤
-   │ memory        │ main        │ orders_sv            │ orders     │ raw_amount │                │          │         │
+   │ memory        │ main        │ orders_sv            │ orders     │ raw_amount │                │ []       │         │
    └───────────────┴─────────────┴──────────────────────┴────────────┴────────────┴────────────────┴──────────┴─────────┘
 
-``data_type`` is empty here because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because ``GET_DDL`` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. Reporting the type an expression actually produces would require probing it on the read side, at ``SHOW`` bind time; that is a known limitation and is not implemented today. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+``data_type`` is empty here because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`GET_DDL <ref-get-ddl>` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. Reporting the type an expression actually produces would require probing it on the read side, at ``SHOW`` bind time; that is a known limitation and is not implemented today. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 **List facts across all views:**
 
@@ -202,8 +202,8 @@ Facts can reference other facts. Consider a view with two chained facts:
    ┌───────────────┬─────────────┬──────────────────────┬────────────┬────────────┬────────────────┬──────────┬─────────┐
    │ database_name │ schema_name │ semantic_view_name   │ table_name │ name       │ data_type      │ synonyms │ comment │
    ├───────────────┼─────────────┼──────────────────────┼────────────┼────────────┼────────────────┼──────────┼─────────┤
-   │ memory        │ main        │ tpch_analysis        │ line_items │ net_price  │                │          │         │
-   │ memory        │ main        │ tpch_analysis        │ line_items │ tax_amount │                │          │         │
+   │ memory        │ main        │ tpch_analysis        │ line_items │ net_price  │                │ []       │         │
+   │ memory        │ main        │ tpch_analysis        │ line_items │ tax_amount │                │ []       │         │
    └───────────────┴─────────────┴──────────────────────┴────────────┴────────────┴────────────────┴──────────┴─────────┘
 
 Both facts show an empty ``data_type``, including ``net_price``, whose expression uses only physical columns: no type is inferred for either. Chained references (``tax_amount`` references ``li.net_price``) are resolved at query expansion time regardless.

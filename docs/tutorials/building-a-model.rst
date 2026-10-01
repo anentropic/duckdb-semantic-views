@@ -276,7 +276,7 @@ The expanded SQL shows the full chain:
 2. **Derived metric expansion** -- ``profit`` is replaced with ``revenue - cost``, where ``revenue`` and ``cost`` are the aggregate expressions from step 1.
 3. **Selective joining** -- only the tables needed for the requested dimensions and metrics are joined. If you remove ``customer`` from the query, the ``customers`` table is dropped from the generated SQL.
 
-This is the core value of the modeling workflow: define facts once, compose metrics from them, and let the extension handle the SQL generation.
+The workflow is: define facts once, compose metrics from them, and let the extension generate the SQL.
 
 
 .. _tutorial-bm-cleanup:

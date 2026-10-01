@@ -139,7 +139,7 @@ Examples
 
 ``avg_order`` is a ``DERIVED_METRIC`` because it has no table alias and its expression names two other metrics. A derived metric may not contain an aggregate function of its own -- ``avg_order AS revenue / COUNT(*)`` is rejected at ``CREATE``, which is why the order count is declared as the base metric ``o.order_count`` first. See :ref:`howto-derived-metrics`.
 
-``data_type`` is empty for every row here because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because ``GET_DDL`` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+``data_type`` is empty for every row here because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`GET_DDL <ref-get-ddl>` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 **Error: view does not exist:**
 

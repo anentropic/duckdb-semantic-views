@@ -7,7 +7,7 @@
 How to Use FACTS for Reusable Row-Level Logic
 ==============================================
 
-This guide shows how to use the ``FACTS`` clause to define reusable row-level expressions that metrics can reference. FACTS eliminate duplicated calculations across metrics and support chaining (one fact referencing another). Facts can also be queried directly as row-level columns and annotated with comments, synonyms, and access modifiers.
+This guide shows how to use the ``FACTS`` clause to define reusable row-level expressions that metrics can reference. FACTS eliminate duplicated calculations across metrics and support chaining (one fact referencing another). Facts can also be queried directly as row-level columns and annotated with comments, synonyms, access modifiers, and the named-filter label.
 
 **Prerequisites:**
 
@@ -241,7 +241,7 @@ Annotate Facts with Metadata
 
 .. versionadded:: 0.6.0
 
-Facts accept four annotations: ``COMMENT``, ``WITH SYNONYMS``, the ``PRIVATE`` / ``PUBLIC`` access modifiers, and ``LABELS = (FILTER)``. They may appear in any order after the expression.
+Facts accept four annotations: ``COMMENT``, ``WITH SYNONYMS``, the ``PRIVATE`` / ``PUBLIC`` access modifiers, and ``LABELS = (FILTER)``. ``PRIVATE`` or ``PUBLIC`` goes **before** the fact's name, as in ``PRIVATE li.raw_margin AS ...`` below. The other three follow the expression, in any order.
 
 .. code-block:: sql
    :emphasize-lines: 6,7
@@ -263,7 +263,7 @@ Facts accept four annotations: ``COMMENT``, ``WITH SYNONYMS``, the ``PRIVATE`` /
        profit_margin   AS total_margin / total_net * 100
    );
 
-- ``COMMENT`` adds a human-readable description, visible in ``DESCRIBE SEMANTIC VIEW`` and ``SHOW SEMANTIC FACTS`` output.
+- ``COMMENT`` adds a human-readable description, visible in :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` and :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>` output.
 - ``WITH SYNONYMS`` adds informational alternative names for discoverability.
 - ``PRIVATE`` prevents a fact from being queried directly via ``facts := [...]``, while still allowing it to be referenced in metric expressions -- here the base metric ``total_margin`` aggregates the private fact ``raw_margin``. Private facts are also excluded from wildcard expansion (``alias.*``).
 - ``LABELS = (FILTER)`` marks a boolean fact as a reusable named filter for :ref:`where_clause <howto-filtering>` predicates. See :ref:`howto-annotations-filters`.
@@ -297,7 +297,7 @@ Troubleshooting
 
 **Circular fact references**
    Facts that reference each other in a cycle cause a define-time error. The extension
-   detects cycles during ``CREATE SEMANTIC VIEW`` and reports which facts are involved.
+   detects cycles during :ref:`CREATE SEMANTIC VIEW <ref-create-semantic-view>` and reports which facts are involved.
 
 **Aggregate functions in facts**
    Facts must be row-level expressions. Using an aggregate function like ``SUM()`` or
@@ -313,3 +313,21 @@ Troubleshooting
    Facts marked ``PRIVATE`` cannot be queried via ``facts := [...]``. They return an
    error: ``fact '<name>' is private and cannot be queried directly``. Remove the
    ``PRIVATE`` keyword to make a fact queryable.
+
+**A fact fails with a syntax error at or near "AS" when queried**
+   ``PRIVATE`` or ``PUBLIC`` was written after the expression
+   (``li.net_price AS li.extended_price PRIVATE``). There the keyword is taken as
+   part of the expression, so ``CREATE`` succeeds and the first query that uses the
+   fact fails. Move the modifier before the name:
+   ``PRIVATE li.net_price AS li.extended_price``.
+
+
+.. _howto-facts-related:
+
+Related
+=======
+
+- :ref:`ref-create-facts` -- Full ``FACTS`` clause syntax and validation rules
+- :ref:`howto-query-facts` -- Query facts as row-level columns
+- :ref:`howto-derived-metrics` -- Compose the metrics that aggregate your facts
+- :ref:`howto-metadata-annotations` -- Comments, synonyms, access modifiers and named filters

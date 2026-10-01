@@ -15,7 +15,7 @@ wrote, how the extension assembles a query whose metrics sit at different
 grains, and which shapes it still refuses.
 
 If you are here because a query raised ``fan trap detected``, the diagnostic
-route is :ref:`howto-fan-traps`. This page is the modelling route.
+route is :ref:`howto-fan-traps`. This page is the modeling route.
 
 
 .. _explanation-grain-what:
@@ -39,7 +39,7 @@ SQL looks wrong. Only the grain of the rows being summed changed.
 
 .. tip::
 
-   If you have modelled a star schema before, grain is the discipline you
+   If you have modeled a star schema before, grain is the discipline you
    already apply when you decide what one row of a fact table means. Semantic
    views make that discipline explicit and enforce it at query time.
 
@@ -69,7 +69,7 @@ commit to one join shape and one ``GROUP BY``; a semantic view keeps each metric
 attached to its own grain and works out the join shape per query. See
 :ref:`explanation-sv-vs-views` for that contrast in full.
 
-The practical consequence for modelling: **declare each metric on the table
+The practical consequence for modeling: **declare each metric on the table
 whose rows it aggregates.** A customer-level metric belongs on the customer
 table even if most of your queries start from orders. Declaring it on the orders
 table to keep the definition tidy does not move the numbers to the order grain;
@@ -105,7 +105,7 @@ A Multi-Grain Query Is One Aggregate per Grain
 
    Queries whose metrics sit at different grains are computed per grain and
    joined. Before, the generated SQL was always anchored at the base table, so
-   these queries were rejected with a fan-trap error rather than answered.
+   these queries were rejected with a fan trap error rather than answered.
 
 Consider a view whose base table is ``orders`` but which also carries a
 customer-level metric:
@@ -169,7 +169,7 @@ Anchoring the query at ``orders`` -- the only option before v0.12.0 -- would hav
 produced neither. Customer 1's balance would have been added once per order, so
 East's total would read 1300.00, and West would have vanished entirely, because
 no order row exists to carry it. That is why the base-anchored path rejected this
-query with a fan-trap error instead of answering it.
+query with a fan trap error instead of answering it.
 
 
 .. _explanation-grain-shapes:
@@ -246,8 +246,8 @@ What Is Still Refused, and Why
 ==============================
 
 Per-grain assembly widens what a semantic view can answer; it does not remove the
-guard rails. Five shapes still raise an error, each for a reason worth knowing
-while you model.
+guard rails. Five shapes still raise an error, and the reason behind each one is
+useful to keep in mind while you model.
 
 **A dimension below a metric's grain.**
    Grouping ``c.total_balance`` by an order-grain or line-item-grain dimension is
@@ -268,15 +268,15 @@ while you model.
    because those grains would have to be joined before the window could run. See
    :ref:`howto-window-metrics`.
 
-**A role-played table reached without ``USING``.**
+**A role-played table reached without** ``USING``.
    When one table is reachable through two named relationships -- ``flights``
    referencing ``airports`` once as departure and once as arrival -- a dimension
    on it means nothing until something says which role is intended. A co-queried
-   metric's ``USING`` clause supplies that, and per-grain assembly honours it:
+   metric's ``USING`` clause supplies that, and per-grain assembly honors it:
    each grain joins the named relationship under its own scoped alias. Without
    ``USING`` the query keeps the error rather than picking a relationship by
    declaration order, because picking silently is how a departure number ends up
-   labelled as an arrival one. Declaring role-playing somewhere in a view does not
+   labeled as an arrival one. Declaring role-playing somewhere in a view does not
    cost the rest of that view its multi-grain queries -- the test is what the
    query reaches, not what the definition contains. See :ref:`howto-role-playing`.
 
@@ -309,10 +309,11 @@ Three habits keep a model on the right side of these rules:
 
 - **Declare each metric on the table whose rows it aggregates.** The alias prefix
   is the grain declaration; treat it as load-bearing.
-- **Declare ``PRIMARY KEY`` and ``UNIQUE`` accurately in ``TABLES``.** Cardinality
-  is inferred from them, and cardinality is what tells the extension which
-  direction of a relationship is safe to traverse. A missing key makes a
-  one-to-one relationship look one-to-many and narrows what the view can answer.
+- **Declare** ``PRIMARY KEY`` **and** ``UNIQUE`` **accurately in** ``TABLES``.
+  Cardinality is inferred from them, and cardinality is what tells the extension
+  which direction of a relationship is safe to traverse. A missing key makes a
+  one-to-one relationship look many-to-one, so traversing it in reverse is treated
+  as a fan-out, and that narrows what the view can answer.
 - **Check before you query.**
   :ref:`SHOW SEMANTIC DIMENSIONS … FOR METRIC <ref-show-dims-for-metric>` applies
   the same grain rules at inspection time and lists only the dimensions that can

@@ -157,6 +157,27 @@ Troubleshooting
    example, ``a AS b + 1`` and ``b AS a + 1`` is rejected.
 
 **Derived metric references unknown name**
-   If a derived metric references a name that is not a defined metric, the extension
-   treats it as a column reference. If that column does not exist, the query fails at
-   execution time.
+   Every bare name in a derived metric must be a metric declared in the same view. Any
+   other name, such as a misspelling or an unqualified column, is rejected at define
+   time. The error suggests the closest match and lists the metrics you can use:
+
+   .. code-block:: text
+
+      unknown metric 'costt' referenced in derived metric 'profit'; did you mean 'cost'?.
+      Available metrics: [revenue, cost, profit]
+
+   To use a column, aggregate it in a base metric first (``li.cost AS SUM(li.unit_cost)``)
+   and reference that metric. A table-qualified column such as ``li.unit_cost`` is not
+   caught at define time: the query fails instead, with DuckDB's ``column "unit_cost" must
+   appear in the GROUP BY clause`` binder error. The fix is the same.
+
+
+.. _howto-derived-related:
+
+Related
+=======
+
+- :ref:`ref-create-metrics` -- Full ``METRICS`` clause syntax, including derived metrics
+- :ref:`howto-facts` -- Reusable row-level expressions for base metrics to aggregate
+- :ref:`howto-role-playing` -- How derived metrics inherit ``USING`` context
+- :ref:`tutorial-building-model` -- A guided walk through facts and derived metrics

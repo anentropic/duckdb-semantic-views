@@ -14,7 +14,7 @@ DuckDB Semantic Views is modeled on Snowflake's ``CREATE SEMANTIC VIEW`` SQL DDL
    Snowflake has two distinct interfaces for semantic views: the SQL DDL (``CREATE SEMANTIC VIEW``)
    and the older YAML spec (``CREATE SEMANTIC VIEW FROM YAML``, designed for Cortex Analyst).
    All comparisons on this page target the SQL DDL interface only. The YAML spec includes
-   concepts like ``time_dimensions``, ``custom_instructions``, and ``access_modifier`` that
+   concepts like ``time_dimensions``, ``custom_instructions``, and ``sample_values`` that
    exist to serve the AI SQL generation layer and have no equivalent in the SQL DDL.
 
 
@@ -74,13 +74,13 @@ Concept Mapping
      - ``alias.*`` in ``dimensions``, ``metrics``, ``facts`` parameters (see :ref:`howto-wildcard-selection`)
    * - View inspection
      - ``DESCRIBE`` / ``DESC SEMANTIC VIEW``
-     - ``DESCRIBE SEMANTIC VIEW`` (``DESC`` abbreviation also accepted)
+     - :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` (``DESC`` abbreviation also accepted)
    * - List views
      - ``SHOW SEMANTIC VIEWS``
-     - ``SHOW SEMANTIC VIEWS``
+     - :ref:`SHOW SEMANTIC VIEWS <ref-show-semantic-views>`
    * - Terse view listing
      - ``SHOW TERSE SEMANTIC VIEWS``
-     - ``SHOW TERSE SEMANTIC VIEWS``
+     - :ref:`SHOW TERSE SEMANTIC VIEWS <ref-show-semantic-views>`
    * - Column listing
      - ``SHOW COLUMNS IN SEMANTIC VIEW``
      - :ref:`SHOW COLUMNS IN SEMANTIC VIEW <ref-show-columns>`
@@ -131,7 +131,7 @@ The DDL syntax is intentionally close to Snowflake's. The clause order (``TABLES
          CREATE SEMANTIC VIEW analytics
          TABLES (
              o AS orders,
-             c AS customers
+             c AS customers PRIMARY KEY (id)
          )
          RELATIONSHIPS (
              order_customer AS o(customer_id) REFERENCES c
@@ -177,14 +177,20 @@ Primary Key Declarations
 .. note::
 
    ``PRIMARY KEY`` declarations in the ``TABLES`` clause are optional at the syntax
-   level, but any table used as the target of a ``RELATIONSHIPS`` entry needs a key
-   the join can resolve against -- either a ``PRIMARY KEY`` / ``UNIQUE`` declaration on
-   that table, or an explicit ``REFERENCES target(columns)`` list on the foreign side.
+   level, but any table used as the target of a ``RELATIONSHIPS`` entry must declare
+   a ``PRIMARY KEY`` or ``UNIQUE`` key in its own ``TABLES`` entry. An explicit column
+   list on the referencing side (``REFERENCES c(id)``) does not replace that
+   declaration: it has to name columns the target already declares as its
+   ``PRIMARY KEY`` or as one of its ``UNIQUE`` keys.
 
-Snowflake resolves PK/FK metadata directly from its catalog, so its SQL DDL does not
-require explicit ``PRIMARY KEY`` declarations. DuckDB Semantic Views takes the opposite
-stance: a ``PRIMARY KEY`` in a semantic view is a **logical assertion you make**, not a
-physical constraint imported from the catalog.
+Both systems take the key from the semantic view definition rather than from the
+physical table. Snowflake's ``CREATE SEMANTIC VIEW`` reference describes a
+referenced column as `"a column identified with the PRIMARY KEY or UNIQUE
+constraint in the logical table definition"
+<https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view>`_, and
+DuckDB Semantic Views applies the same rule. In both, a ``PRIMARY KEY`` in a
+semantic view is a **logical assertion you make** about the data, not a physical
+constraint imported from the catalog.
 
 .. versionchanged:: 0.10.0
 
@@ -193,8 +199,7 @@ physical constraint imported from the catalog.
    ``CREATE`` time when the ``TABLES`` entry declared none; this fallback is gone. You
    must now declare the key explicitly, whether the table is a native DuckDB table or an
    external source. Migration: add a ``PRIMARY KEY (...)`` (or ``UNIQUE (...)``) clause to
-   any ``TABLES`` entry that previously relied on the auto-fallback, or use
-   ``REFERENCES target(columns)`` on the referencing side.
+   any ``TABLES`` entry that previously relied on the auto-fallback.
 
 .. tip::
 
@@ -219,9 +224,16 @@ physical constraint imported from the catalog.
    DIMENSIONS (c.name AS c.name)
    METRICS (o.revenue AS SUM(o.amount));
 
-If a table involved in a ``RELATIONSHIPS`` entry has no primary key from an explicit
-declaration, the extension raises an error at ``CREATE`` time:
-``Table 'X' has no PRIMARY KEY. Specify referenced columns explicitly: REFERENCES X(col).``
+If a relationship's target table declares neither key, the extension rejects the
+definition at ``CREATE`` time, whether or not the ``REFERENCES`` side lists columns.
+With ``c AS customers`` declared without a key in the example above, the error is:
+
+.. code-block:: text
+
+   Parser Error: Table 'c' has no PRIMARY KEY declared but is referenced by FK in 'o'.
+   Add PRIMARY KEY (cols) or UNIQUE (cols) to the TABLES clause for c. (v0.10.0:
+   physical-catalog PK auto-inference removed -- see CHANGELOG.)
+
 This prevents the extension from synthesizing an incorrect JOIN ON clause.
 
 
@@ -253,7 +265,7 @@ In Snowflake, you can write standard SQL against a semantic view and the system 
    );
 
    -- Snowflake: direct SQL with AGG view-defined aggregate function
-   -- (NOT currently supported in duckdb-semantic-views)
+   -- (NOT currently supported in DuckDB Semantic Views)
    SELECT region, AGG(revenue)
    FROM analytics
    GROUP BY region;
@@ -290,7 +302,7 @@ over the joined relation. One safety rule is added on top of Snowflake's, for a
 hazard its single-grain model does not face here: if the fact's table *fans* the
 referencing member's -- a fact on a child table, reached across a one-to-many
 edge -- joining it would multiply the member's rows, so the query is rejected
-with a fan-trap error rather than answered with an inflated aggregate. See
+with a fan trap error rather than answered with an inflated aggregate. See
 :ref:`howto-facts-cross-table`.
 
 A **raw column of another table** (``o.margin AS o.amount - c.discount``) is
@@ -305,7 +317,7 @@ parameter, or a typo to be resolved.
 
 Derived metrics are unaffected: a metric that references metrics on other tables
 (``m AS t1.metric_1 + t2.metric_2``) is supported in both systems, and is
-computed per grain -- see `Metric Grain`_ below.
+computed per grain -- see :ref:`explanation-sf-metric-grain` below.
 
 
 .. _explanation-sf-data-types:
@@ -313,8 +325,10 @@ computed per grain -- see `Metric Grain`_ below.
 Reported Data Types
 -------------------
 
-Snowflake populates the ``data_type`` column of ``SHOW SEMANTIC DIMENSIONS`` /
-``METRICS`` / ``FACTS`` (and the ``DATA_TYPE`` rows of ``DESCRIBE``) with the
+Snowflake populates the ``data_type`` column of
+:ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>` /
+:ref:`METRICS <ref-show-semantic-metrics>` / :ref:`FACTS <ref-show-semantic-facts>`
+(and the ``DATA_TYPE`` rows of :ref:`DESCRIBE <ref-describe-semantic-view>`) with the
 member's actual data type.
 
 Here the column reports the **declared** output type and nothing else, and no
@@ -322,12 +336,14 @@ surface declares one. There is no type inference: ``CREATE`` no longer probes th
 underlying tables (v0.10.0 removed the define-time inference pass), and the read
 side does not probe either. A :ref:`YAML <ref-yaml-format>` definition could once
 declare an ``output_type``, but that field was withdrawn because no DDL clause can
-carry it -- ``GET_DDL`` dropped it silently and a restored view lost the cast. The
+carry it -- :ref:`GET_DDL <ref-get-ddl>` dropped it silently and a restored view lost the cast. The
 column is therefore empty for every view created since v0.10.0, and populated only
 for views stored before that release. Reporting the type an expression actually
 produces would need a probe on the read path, at ``SHOW`` / ``DESCRIBE`` bind
 time; that is a known limitation and is not implemented today.
 
+
+.. _explanation-sf-metric-grain:
 
 Metric Grain
 ------------
@@ -343,11 +359,11 @@ a parent table is therefore not multiplied by the number of child rows, and a
 parent row with no children is not dropped.
 
 Before v0.12.0 the generated SQL was always anchored ``FROM <base table>``, so
-these queries were rejected with a fan-trap error rather than silently inflated.
+these queries were rejected with a fan trap error rather than silently inflated.
 Single-grain queries are unchanged: they are still a single base-anchored
 ``SELECT``.
 
-Four boundaries are worth knowing:
+Four boundaries apply:
 
 - A **dimension below a metric's grain** (``SUM(customers.balance)`` grouped by
   an order-grain dimension) is rejected in both systems. Snowflake's rule is
@@ -355,11 +371,11 @@ Four boundaries are worth knowing:
   table for the metric
   <https://docs.snowflake.com/en/user-guide/views-semantic/querying>`_ and must
   have "an equal or lower level of granularity than the logical table for the
-  metric"; our ``fan trap detected`` error enforces the same condition. Per-grain
+  metric"; the extension's ``fan trap detected`` error enforces the same condition. Per-grain
   aggregation does not make these answerable -- the metric's rows genuinely fan
   across the dimension's values, so there is no single correct value per group.
 - A **window metric** whose inner aggregate lives on a non-base table is computed
-  at its own grain -- the ``__sv_agg`` CTE anchors there, so the inner aggregate is
+  at its own grain -- the inner aggregation is anchored at that table, so it is
   not inflated by the base-table join. Window metrics whose inner aggregates sit
   at *different* grains still error, as those grains would need joining before the
   window runs.
@@ -378,9 +394,9 @@ Four boundaries are worth knowing:
   co-queried metric's ``USING`` names the role: each grain CTE joins that
   relationship under its scoped alias and groups by the dimension bound to it,
   as the single-grain path already did. Without ``USING`` the query keeps the
-  fan-trap error, since a grain CTE would otherwise choose among the
-  relationship instances by declaration order. The rescue covers a queried
-  dimension's own table -- a ``where_clause`` member on a role-played table, a
+  fan trap error, since a grain CTE would otherwise choose among the
+  relationship instances by declaration order. This covers only a queried
+  dimension's own table -- a :ref:`where_clause <ref-sv-pre-agg-filtering>` member on a role-played table, a
   metric aggregated at one, or a table reachable only *through* one still error.
   A definition that merely *declares* role-playing does not lose per-grain
   emission: the test is what the query reaches, so unrelated grains in the same
@@ -466,12 +482,14 @@ Transactional DDL
 
 .. versionadded:: 0.8.0
 
-Both systems run ``CREATE`` / ``ALTER`` / ``DROP SEMANTIC VIEW`` inside the caller's transaction, so ``BEGIN ... ROLLBACK`` discards uncommitted DDL in either engine.
+This is a divergence. In Snowflake, `each DDL statement executes as a separate transaction <https://docs.snowflake.com/en/sql-reference/transactions#ddl>`_: a DDL statement issued inside an open transaction implicitly commits that transaction first, then runs and commits on its own. A ``CREATE``, ``ALTER`` or ``DROP SEMANTIC VIEW`` therefore cannot be rolled back there.
 
-The DuckDB-specific behaviour worth noting before you build on it:
+DuckDB Semantic Views runs these statements inside the caller's transaction, the way DuckDB runs its own DDL. ``BEGIN ... ROLLBACK`` discards an uncommitted ``CREATE``, ``ALTER`` or ``DROP SEMANTIC VIEW``, and a ``COMMIT`` publishes the DDL together with any data changes in the same transaction.
+
+Some DuckDB-specific details to know before you build on it:
 
 - ``DESCRIBE SEMANTIC VIEW`` and the ``SHOW SEMANTIC ...`` family read **committed** catalog state. A ``CREATE`` issued earlier in the same uncommitted transaction is not yet visible to introspection in that transaction; commit first, then describe.
-- ``CREATE SEMANTIC VIEW IF NOT EXISTS`` cannot fully absorb a race between two separate processes both running it against the same database at the same moment -- one will succeed and the other will see a constraint error. Within a single process or transaction, ``IF NOT EXISTS`` is reliable.
+- ``CREATE SEMANTIC VIEW IF NOT EXISTS`` cannot fully absorb a race between two connections both running it against the same database at the same moment -- one will succeed and the other will see a constraint or commit-conflict error. On a single connection, ``IF NOT EXISTS`` is reliable.
 - The non-``IF EXISTS`` ``DROP`` and ``ALTER`` forms raise ``semantic view '<name>' does not exist`` when the view is absent at check time, instead of silently no-opping. The existence check and the write are atomic only inside an explicit transaction; under autocommit a drop committed by another writer in the window between them is not detected. Wrap the DDL in ``BEGIN ... COMMIT`` when you need the check to be reliable under concurrency.
 
 See :ref:`explanation-transactional-ddl` for the full mechanism and worked examples.
@@ -508,7 +526,7 @@ Snowflake ``CREATE SEMANTIC VIEW`` features that are commonly asked about, and w
    * - Direct SQL query interface
      - Not planned; :ref:`semantic_view() <ref-semantic-view-function>` table function is the query interface
    * - Pre-aggregation ``WHERE`` -- ``SEMANTIC_VIEW( v METRICS ... DIMENSIONS ... WHERE <predicate> )``, where the predicate `may refer only to dimensions, facts, and expressions over them <https://docs.snowflake.com/en/sql-reference/constructs/semantic_view>`_ and "is applied before the metrics are computed"
-     - **Supported** as the ``where_clause := '...'`` named parameter (``where`` is a reserved word in DuckDB's named-parameter position, so it cannot be spelled ``where :=``). The predicate names declared dimensions and facts, is substituted to their expressions, and is applied before aggregation on every emission path -- before the ``GROUP BY`` on the base-anchored and fact paths, inside *each* grain CTE for multi-grain queries, inside ``__sv_snapshot`` before the ``RANK`` for semi-additive metrics, and inside ``__sv_agg`` before the window function. So "revenue for orders shipped after X" recomputes each group over the matching rows. Referencing a metric is rejected, matching Snowflake, and members the predicate names participate in the same reachability and fan-out checks as queried dimensions.
+     - **Supported** as the :ref:`where_clause <ref-sv-pre-agg-filtering>` named parameter, written ``where_clause := '...'`` (``where`` is a reserved word in DuckDB's named-parameter position, so it cannot be spelled ``where :=``). The predicate names declared dimensions and facts, is substituted to their expressions, and is applied before aggregation on every emission path -- before the ``GROUP BY`` on the base-anchored and fact paths, inside *each* per-grain aggregate for multi-grain queries, inside the snapshot selection before the ``RANK`` for semi-additive metrics, and inside the inner aggregation before the window function. So "revenue for orders shipped after X" recomputes each group over the matching rows. Referencing a metric is rejected, matching Snowflake, and members the predicate names participate in the same reachability and fan-out checks as queried dimensions.
    * - Query-time scalar expressions -- ``SEMANTIC_VIEW( v DIMENSIONS DATE_PART('year', orders.order_date) AS year )``, where a ``DIMENSIONS`` / ``FACTS`` item `may be a scalar expression over dimensions or facts of the same logical table <https://docs.snowflake.com/en/sql-reference/constructs/semantic_view>`_, a ``METRICS`` item may be an expression over metrics, and any item may take ``AS <alias>``
      - **Not yet supported.** Each ``dimensions := [...]`` / ``metrics := [...]`` / ``facts := [...]`` item must be the name of a member the view declares; an expression is rejected as an unknown member, and output columns always carry the member's name. Declare the derived member in the view instead -- ``orders.order_year AS DATE_PART('year', orders.order_date)`` -- and query ``dimensions := ['order_year']``. Re-grouping a finer-grained result outside ``semantic_view()`` is correct only for additive metrics (``SUM``, ``COUNT``), not for ``COUNT(DISTINCT ...)``, ratios, semi-additive or window metrics.
    * - Named filters -- ``LABELS = (FILTER)`` on a fact or dimension resolving to ``BOOLEAN``, referenced bare in a query's ``WHERE`` (`Snowflake GA May 2026 <https://docs.snowflake.com/en/user-guide/views-semantic/filters>`_)
@@ -530,7 +548,6 @@ Snowflake's `YAML-based semantic view definition <https://docs.snowflake.com/en/
 
 - ``time_dimensions`` with granularity controls (the SQL DDL uses regular dimensions with ``date_trunc()``)
 - ``custom_instructions`` for AI prompt tuning
-- ``access_modifier`` for column-level security
 - ``sample_values`` for AI context
 
 DuckDB Semantic Views supports YAML definition import (``FROM YAML``) and export (:ref:`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>`), but these use the extension's own YAML schema -- not Snowflake's Cortex Analyst YAML spec. The DuckDB YAML format is a serialization of the same model used by the SQL DDL (tables, relationships, facts, dimensions, metrics, materializations). It is designed for version control, migration, and sharing -- not for AI prompt tuning. Comparisons against Snowflake YAML-spec-only features remain not applicable.

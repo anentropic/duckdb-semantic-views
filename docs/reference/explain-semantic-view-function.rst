@@ -31,7 +31,7 @@ Syntax
 Parameters
 ==========
 
-``explain_semantic_view()`` accepts the same parameter set as :ref:`semantic_view() <ref-semantic-view-function>` -- the two functions share one registration, so a query you can run you can also explain.
+``explain_semantic_view()`` accepts the same parameters as :ref:`semantic_view() <ref-semantic-view-function>`, so any query you can run you can also explain.
 
 .. list-table::
    :header-rows: 1
@@ -44,20 +44,20 @@ Parameters
      - VARCHAR (positional)
      - The name of the semantic view to explain. Matched case-insensitively (folded to lowercase per DuckDB identifier semantics), quoted or not. May carry a ``<schema>.`` (or ``<database>.<schema>.``) qualifier; an unqualified name resolves through the session's ``search_path``, exactly as in :ref:`semantic_view() <ref-semantic-view-function>`.
    * - ``dimensions``
-     - LIST (named)
+     - VARCHAR[] (named)
      - Optional list of dimension names. Supports ``alias.*`` wildcard patterns.
    * - ``metrics``
-     - LIST (named)
+     - VARCHAR[] (named)
      - Optional list of metric names. Supports ``alias.*`` wildcard patterns.
    * - ``facts``
-     - LIST (named)
+     - VARCHAR[] (named)
      - Optional list of fact names. Supports ``alias.*`` wildcard patterns. The expanded SQL shows each fact expression inlined, which makes this the quickest way to check how a chained fact resolved.
    * - ``where_clause``
      - VARCHAR (named)
-     - Optional predicate applied **before** metrics are aggregated -- the equivalent of Snowflake's ``SEMANTIC_VIEW( … WHERE <predicate> )``. See :ref:`ref-sv-pre-agg-filtering`. An omitted, empty, or whitespace-only value is treated as absent.
+     - Optional predicate applied **before** metrics are aggregated -- the equivalent of Snowflake's ``SEMANTIC_VIEW( ... WHERE <predicate> )``. See :ref:`ref-sv-pre-agg-filtering`. An omitted, empty, or whitespace-only value is treated as absent.
    * - ``search_path``
-     - LIST (named)
-     - The session's schema resolution order, used to resolve an unqualified ``<view_name>``. **Supplied automatically** -- the extension's parser override injects the caller's search path into every ``explain_semantic_view()`` call it rewrites. Not intended to be written by hand.
+     - VARCHAR[] (named)
+     - **Reserved for the extension. Do not pass it.** The extension fills it in with the session's ``search_path`` so that an unqualified ``<view_name>`` resolves the way it does for :ref:`semantic_view() <ref-semantic-view-function>` (see :ref:`ref-functions-search-path`).
 
 At least one of ``dimensions``, ``metrics``, or ``facts`` must be specified. ``where_clause`` alone is not a query.
 
@@ -86,7 +86,7 @@ Returns multiple rows, each containing a single VARCHAR column:
 
 The output has three sections:
 
-1. **Header:** the view name, requested dimensions/metrics, and materialization routing decision.
+1. **Header:** the view name, the requested dimensions and metrics (plus a ``-- Facts:`` line when facts are requested), and the materialization routing decision.
 2. **Expanded SQL:** the SQL query the extension generates, formatted with indentation.
 3. **DuckDB Plan:** the physical query plan from ``EXPLAIN``.
 
@@ -113,7 +113,7 @@ Examples
        metrics := ['revenue']
    );
 
-Sample output:
+Sample output (plan abridged):
 
 .. code-block:: text
 
@@ -125,41 +125,61 @@ Sample output:
    -- Expanded SQL:
    SELECT
        c.name AS "customer_name",
-       sum(o.amount) AS "revenue"
+       SUM(o.amount) AS "revenue"
    FROM "memory"."main"."orders" AS "o"
-   LEFT JOIN "memory"."main"."customers" AS "c"
-       ON "o"."customer_id" = "c"."id"
+   LEFT JOIN "memory"."main"."customers" AS "c" ON "o"."customer_id" = "c"."id"
    GROUP BY
        1
 
    -- DuckDB Plan:
-   ┌─────────────────────────────┐
-   │     HASH_GROUP_BY           │
-   │   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─     │
-   │           ...               │
-   └─────────────────────────────┘
+   physical_plan
+   ┌───────────────────────────┐
+   │         PROJECTION        │
+   │           ...             │
+   └───────────────────────────┘
 
 **Fact query (row-level, no aggregation):**
 
+Using the ``shop`` view from the :ref:`semantic_view() examples <ref-sv-examples>`:
+
 .. code-block:: sql
 
-   SELECT * FROM explain_semantic_view('analytics',
+   SELECT * FROM explain_semantic_view('shop',
        facts := ['net_price', 'tax_amount']
    );
 
-The expanded SQL shows each fact expression inlined in place of its name, with chained facts resolved recursively.
+The expanded SQL shows each fact expression inlined in place of its name, with chained facts resolved recursively (``tax_amount`` is defined over ``net_price``):
+
+.. code-block:: text
+
+   -- Expanded SQL:
+   SELECT
+       o.price * (1 - o.discount) AS "net_price",
+       (o.price * (1 - o.discount)) * o.tax_rate AS "tax_amount"
+   FROM "memory"."main"."orders" AS "o"
 
 **Pre-aggregation filtering:**
 
 .. code-block:: sql
 
-   SELECT * FROM explain_semantic_view('order_metrics',
+   SELECT * FROM explain_semantic_view('shop',
        dimensions := ['region'],
        metrics := ['revenue'],
        where_clause := 'ordered_at >= DATE ''2024-01-01'''
    );
 
-The expanded SQL shows where the predicate lands relative to the ``GROUP BY``, which is the fastest way to confirm that a filtered metric is recomputed rather than filtered after aggregation.
+The expanded SQL shows where the predicate lands relative to the ``GROUP BY``, which is the fastest way to confirm that a filtered metric is recomputed rather than filtered after aggregation:
+
+.. code-block:: text
+
+   -- Expanded SQL:
+   SELECT
+       o.region AS "region",
+       SUM((o.price * (1 - o.discount))) AS "revenue"
+   FROM "memory"."main"."orders" AS "o"
+   WHERE (o.ordered_at) >= DATE '2024-01-01'
+   GROUP BY
+       1
 
 **Materialization routing match:**
 
@@ -170,7 +190,7 @@ The expanded SQL shows where the predicate lands relative to the ``GROUP BY``, w
        metrics := ['revenue', 'order_count']
    );
 
-Sample output when a materialization covers the exact requested dimensions and metrics:
+Sample output when a materialization covers the exact requested dimensions and metrics (plan abridged):
 
 .. code-block:: text
 
@@ -184,14 +204,18 @@ Sample output when a materialization covers the exact requested dimensions and m
        "region",
        "revenue",
        "order_count"
-   FROM "daily_revenue_by_region"
+   FROM "memory"."main"."revenue_by_region"
 
    -- DuckDB Plan:
-   ┌─────────────────────────────┐
-   │         SEQ_SCAN            │
-   │   ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─     │
-   │  daily_revenue_by_region    │
-   └─────────────────────────────┘
+   physical_plan
+   ┌───────────────────────────┐
+   │          SEQ_SCAN         │
+   │    ────────────────────   │
+   │           Table:          │
+   │        memory.main        │
+   │     .revenue_by_region    │
+   │           ...             │
+   └───────────────────────────┘
 
 .. tip::
 

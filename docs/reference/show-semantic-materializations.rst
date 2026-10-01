@@ -43,19 +43,11 @@ Both forms support an optional ``LIKE '<pattern>'`` clause before ``IN`` (or at 
 Parameters
 ==========
 
-.. list-table::
-   :header-rows: 1
-   :widths: 20 15 65
+``<view_name>``
+   The name of the semantic view to list materializations for. Only used with the ``IN`` form. Returns an error if the view does not exist.
 
-   * - Parameter
-     - Type
-     - Description
-   * - ``<view_name>``
-     - Name (unquoted)
-     - The name of the semantic view to list materializations for. Only used with the ``IN`` form.
-   * - ``LIKE '<pattern>'``
-     - VARCHAR (optional)
-     - Filters materializations by name using SQL ``LIKE`` syntax (``%`` matches any sequence, ``_`` matches one character).
+``LIKE '<pattern>'``
+   Optional. Filters materializations by name using SQL ``LIKE`` syntax (``%`` matches any sequence, ``_`` matches one character). Matching is **case-insensitive**. The pattern must be enclosed in single quotes.
 
 
 .. _ref-show-mat-output:
@@ -127,7 +119,7 @@ Examples
    )
    MATERIALIZATIONS (
        region_agg AS (
-           TABLE daily_revenue_by_region,
+           TABLE revenue_by_region,
            DIMENSIONS (region),
            METRICS (revenue, order_count)
        )
@@ -137,11 +129,11 @@ Examples
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬─────────────────────┬────────────┬──────────────────────────────┬────────────┬──────────────────────────────┐
-   │ database_name │ schema_name │ semantic_view_name  │ name       │ table                        │ dimensions │ metrics                      │
-   ├───────────────┼─────────────┼─────────────────────┼────────────┼──────────────────────────────┼────────────┼──────────────────────────────┤
-   │ memory        │ main        │ order_metrics       │ region_agg │ daily_revenue_by_region      │ ["region"] │ ["revenue","order_count"]    │
-   └───────────────┴─────────────┴─────────────────────┴────────────┴──────────────────────────────┴────────────┴──────────────────────────────┘
+   ┌───────────────┬─────────────┬────────────────────┬────────────┬───────────────────┬────────────┬───────────────────────────┐
+   │ database_name │ schema_name │ semantic_view_name │ name       │ table             │ dimensions │ metrics                   │
+   ├───────────────┼─────────────┼────────────────────┼────────────┼───────────────────┼────────────┼───────────────────────────┤
+   │ memory        │ main        │ order_metrics      │ region_agg │ revenue_by_region │ ["region"] │ ["revenue","order_count"] │
+   └───────────────┴─────────────┴────────────────────┴────────────┴───────────────────┴────────────┴───────────────────────────┘
 
 **List materializations across all views:**
 

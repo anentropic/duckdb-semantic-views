@@ -1,0 +1,326 @@
+.. meta::
+   :description: Every SQL function the extension registers, which ones to call directly, and how a tool discovers their parameters and examples through duckdb_functions()
+
+.. _ref-functions:
+
+=========
+Functions
+=========
+
+Loading the extension registers 19 SQL functions (18 names; ``get_ddl`` has two overloads). Most day-to-day work goes through the statements -- ``CREATE``, ``SHOW``, ``DESCRIBE`` -- and two query functions. This page lists every registered function, says which ones to call directly and which ones back a statement, and shows how a tool or agent can read their descriptions, parameters, and examples over SQL.
+
+
+.. _ref-functions-inventory:
+
+Function Inventory
+==================
+
+**Call these directly:**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 10 60
+
+   * - Function
+     - Type
+     - Purpose
+   * - :ref:`semantic_view() <ref-semantic-view-function>`
+     - table
+     - Query a semantic view: returns the requested dimensions, metrics, or facts.
+   * - :ref:`explain_semantic_view() <ref-explain-semantic-view>`
+     - table
+     - Show the SQL and query plan ``semantic_view()`` would use for the same arguments, without running the data query.
+   * - :ref:`get_ddl(object_type, object_name) <ref-get-ddl>`
+     - scalar
+     - Return the ``CREATE OR REPLACE SEMANTIC VIEW`` statement that recreates a stored view.
+   * - :ref:`get_ddl(object_type, object_name, use_fully_qualified_names) <ref-get-ddl>`
+     - scalar
+     - As above, with the view name schema-qualified in the output when the third argument is ``true``.
+   * - :ref:`read_yaml_from_semantic_view() <ref-read-yaml>`
+     - scalar
+     - Return a stored view's definition as YAML, ready to re-import with ``CREATE SEMANTIC VIEW ... FROM YAML``.
+   * - :ref:`list_semantic_views() <ref-functions-list>`
+     - table
+     - The listing ``SHOW SEMANTIC VIEWS`` returns, as a ``FROM`` source. Use the statement to read it; use the function to filter, join, or aggregate it.
+   * - :ref:`describe_semantic_view() <ref-functions-describe>`
+     - table
+     - The rows ``DESCRIBE SEMANTIC VIEW`` returns, as a ``FROM`` source. Use the statement to read them; use the function to filter, join, or aggregate them.
+
+**These back a statement -- use the statement instead:**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 38 10 52
+
+   * - Function
+     - Type
+     - Statement to use
+   * - ``list_terse_semantic_views``
+     - table
+     - :ref:`SHOW TERSE SEMANTIC VIEWS <ref-show-semantic-views>`
+   * - ``show_columns_in_semantic_view``
+     - table
+     - :ref:`SHOW COLUMNS IN SEMANTIC VIEW <ref-show-columns>`
+   * - ``show_semantic_dimensions``
+     - table
+     - :ref:`SHOW SEMANTIC DIMENSIONS IN ... <ref-show-semantic-dimensions>`
+   * - ``show_semantic_dimensions_all``
+     - table
+     - :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>` (without ``IN``)
+   * - ``show_semantic_dimensions_for_metric``
+     - table
+     - :ref:`SHOW SEMANTIC DIMENSIONS IN ... FOR METRIC ... <ref-show-dims-for-metric>`
+   * - ``show_semantic_facts``
+     - table
+     - :ref:`SHOW SEMANTIC FACTS IN ... <ref-show-semantic-facts>`
+   * - ``show_semantic_facts_all``
+     - table
+     - :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>` (without ``IN``)
+   * - ``show_semantic_materializations``
+     - table
+     - :ref:`SHOW SEMANTIC MATERIALIZATIONS IN ... <ref-show-semantic-materializations>`
+   * - ``show_semantic_materializations_all``
+     - table
+     - :ref:`SHOW SEMANTIC MATERIALIZATIONS <ref-show-semantic-materializations>` (without ``IN``)
+   * - ``show_semantic_metrics``
+     - table
+     - :ref:`SHOW SEMANTIC METRICS IN ... <ref-show-semantic-metrics>`
+   * - ``show_semantic_metrics_all``
+     - table
+     - :ref:`SHOW SEMANTIC METRICS <ref-show-semantic-metrics>` (without ``IN``)
+
+**Internal -- do not call:**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 38 10 52
+
+   * - Function
+     - Type
+     - Notes
+   * - ``__sv_compute_create_from_yaml``
+     - table
+     - Used by :ref:`CREATE SEMANTIC VIEW ... FROM YAML FILE <ref-create-semantic-view>`. Not part of the supported interface; its parameters and behavior can change in any release.
+
+The statements are the stable interface. The functions behind them are listed here so that a tool reading ``duckdb_functions()`` can tell what each one is; their descriptions say which statement to use.
+
+
+.. _ref-functions-discovery:
+
+Discovering Functions over SQL
+==============================
+
+.. versionadded:: 0.13.0
+
+Every function the extension registers has an entry in DuckDB's ``duckdb_functions()`` table function, with a description and its real parameter names and types. Every function except the internal helper also carries at least one runnable example. A tool or agent connected over SQL can learn the whole surface from there.
+
+In DuckDB 1.5, ``duckdb_functions()`` has no column that names the extension a function came from. Filter on the ``categories`` column instead: every function this extension registers carries the ``semantic_views`` category, and no built-in DuckDB function does.
+
+.. code-block:: sql
+
+   SELECT DISTINCT function_name, function_type, categories[2] AS kind
+   FROM duckdb_functions()
+   WHERE list_contains(categories, 'semantic_views')
+   ORDER BY kind DESC, function_name;
+
+.. code-block:: text
+
+   ┌─────────────────────────────────────┬───────────────┬──────────┐
+   │ function_name                       │ function_type │ kind     │
+   ├─────────────────────────────────────┼───────────────┼──────────┤
+   │ explain_semantic_view               │ table         │ query    │
+   │ semantic_view                       │ table         │ query    │
+   │ describe_semantic_view              │ table         │ metadata │
+   │ get_ddl                             │ scalar        │ metadata │
+   │ list_semantic_views                 │ table         │ metadata │
+   │ list_terse_semantic_views           │ table         │ metadata │
+   │ read_yaml_from_semantic_view        │ scalar        │ metadata │
+   │ show_columns_in_semantic_view       │ table         │ metadata │
+   │ show_semantic_dimensions            │ table         │ metadata │
+   │ show_semantic_dimensions_all        │ table         │ metadata │
+   │ show_semantic_dimensions_for_metric │ table         │ metadata │
+   │ show_semantic_facts                 │ table         │ metadata │
+   │ show_semantic_facts_all             │ table         │ metadata │
+   │ show_semantic_materializations      │ table         │ metadata │
+   │ show_semantic_materializations_all  │ table         │ metadata │
+   │ show_semantic_metrics               │ table         │ metadata │
+   │ show_semantic_metrics_all           │ table         │ metadata │
+   │ __sv_compute_create_from_yaml       │ table         │ internal │
+   └─────────────────────────────────────┴───────────────┴──────────┘
+
+``DISTINCT`` folds the two ``get_ddl`` overloads into one row; without it the query returns 19 rows, one per overload.
+
+**The columns a tool needs:**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 18 60
+
+   * - Column
+     - Type
+     - What it holds for this extension's functions
+   * - ``function_name``
+     - VARCHAR
+     - The name to call.
+   * - ``function_type``
+     - VARCHAR
+     - ``table`` (use in ``FROM``) or ``scalar`` (use in a ``SELECT`` list).
+   * - ``categories``
+     - VARCHAR[]
+     - ``semantic_views`` plus one of ``query`` (the query functions), ``metadata`` (inspection and export), or ``internal`` (do not call).
+   * - ``description``
+     - VARCHAR
+     - What the function does. For a function that backs a statement, the description names the statement to use instead.
+   * - ``parameters``
+     - VARCHAR[]
+     - Parameter names. For a table function the first entry is the positional argument (when it has one); the rest are named parameters, passed as ``name := value``, in no guaranteed order.
+   * - ``parameter_types``
+     - VARCHAR[]
+     - The DuckDB type of each parameter, in the same order as ``parameters``.
+   * - ``return_type``
+     - VARCHAR
+     - The result type of a scalar function (``VARCHAR`` for both scalars here). ``NULL`` for table functions.
+   * - ``examples``
+     - VARCHAR[]
+     - Runnable SQL. For a function that backs a statement, the example is the statement itself.
+
+The ``internal`` column is ``true`` for every function the extension registers, and for DuckDB's own built-in functions too, so it does not pick out the internal helper. Use the ``internal`` category for that.
+
+**Read one function's signature, description, and example:**
+
+.. code-block:: sql
+
+   SELECT unnest(parameters) AS parameter, unnest(parameter_types) AS type
+   FROM duckdb_functions()
+   WHERE function_name = 'semantic_view';
+
+.. code-block:: text
+
+   ┌──────────────┬───────────┐
+   │ parameter    │ type      │
+   ├──────────────┼───────────┤
+   │ view_name    │ VARCHAR   │
+   │ where_clause │ VARCHAR   │
+   │ facts        │ VARCHAR[] │
+   │ search_path  │ VARCHAR[] │
+   │ metrics      │ VARCHAR[] │
+   │ dimensions   │ VARCHAR[] │
+   └──────────────┴───────────┘
+
+.. code-block:: sql
+
+   SELECT description, examples
+   FROM duckdb_functions()
+   WHERE function_name = 'semantic_view';
+
+.. code-block:: text
+
+   description = Queries a semantic view: returns the requested dimensions,
+                 metrics and/or facts, generating the joins and GROUP BY from
+                 the view definition. Pass at least one of dimensions, metrics
+                 or facts; where_clause filters rows before aggregation. The
+                 search_path parameter is reserved for the extension, which
+                 fills it in where needed; do not pass it.
+      examples = [SELECT * FROM semantic_view('sales', dimensions := ['region'],
+                 metrics := ['revenue']);]
+
+The example assumes a view named ``sales`` with a ``region`` dimension and a ``revenue`` metric. The output above is shown one column per line and wrapped to fit.
+
+**A function that backs a statement points at the statement:**
+
+.. code-block:: sql
+
+   SELECT description, examples
+   FROM duckdb_functions()
+   WHERE function_name = 'show_semantic_metrics';
+
+.. code-block:: text
+
+   description = Backs SHOW SEMANTIC METRICS IN <view>: lists the metrics of one
+                 semantic view. Use that statement rather than calling this
+                 directly. The search_path parameter is reserved for the
+                 extension, which fills it in where needed; do not pass it.
+      examples = [SHOW SEMANTIC METRICS IN sales;]
+
+.. tip::
+
+   A tool that starts knowing only the extension's name can learn the function surface from ``duckdb_functions()`` as above, list the views with :ref:`SHOW SEMANTIC VIEWS <ref-show-semantic-views>`, list a view's queryable members with :ref:`SHOW COLUMNS IN SEMANTIC VIEW <ref-show-columns>`, check which dimensions are safe with a metric with :ref:`SHOW SEMANTIC DIMENSIONS ... FOR METRIC <ref-show-dims-for-metric>`, and then query with :ref:`semantic_view() <ref-semantic-view-function>`.
+
+
+.. _ref-functions-search-path:
+
+The ``search_path`` Parameter
+=============================
+
+Every table function the extension registers has a named parameter called ``search_path`` (type ``VARCHAR[]``). It is **reserved for the extension**: the extension fills it in with the session's ``search_path`` so that an unqualified view name resolves the way an unqualified table name does. Do not pass it yourself. To control which schema an unqualified name resolves to, set DuckDB's ``search_path`` setting, or qualify the view name (``'analytics.sales'``). See :ref:`ref-create-semantic-view` for the resolution rule.
+
+The scalar functions (``get_ddl`` and ``read_yaml_from_semantic_view``) have no ``search_path`` parameter. They resolve an unqualified name to the one view of that name; see :ref:`ref-get-ddl-resolution`.
+
+
+.. _ref-functions-from-source:
+
+Table Functions as FROM Sources
+===============================
+
+``SHOW SEMANTIC VIEWS`` and ``DESCRIBE SEMANTIC VIEW`` are the normal way to list views and read a definition. They are statements, though, and DuckDB cannot use a statement as a subquery: ``FROM (SHOW SEMANTIC VIEWS)`` and ``FROM (DESCRIBE SEMANTIC VIEW sales)`` are parser errors, and so is the same statement in a ``WITH`` clause. When you need to filter, join, or aggregate their output, query the table function behind the statement instead. It returns the same columns and rows.
+
+The other table functions behind ``SHOW`` statements are not intended for direct use; use their statements.
+
+
+.. _ref-functions-list:
+
+list_semantic_views()
+---------------------
+
+.. code-block:: sqlgrammar
+
+   SELECT ... FROM list_semantic_views()
+
+Called with no arguments. Returns one row per semantic view, in every schema, with the same six columns as :ref:`SHOW SEMANTIC VIEWS <ref-show-output>`: ``created_on``, ``name``, ``kind``, ``database_name``, ``schema_name``, and ``comment``, all VARCHAR.
+
+.. code-block:: sql
+
+   SELECT schema_name, count(*) AS views
+   FROM list_semantic_views()
+   GROUP BY schema_name
+   ORDER BY schema_name;
+
+.. code-block:: text
+
+   ┌─────────────┬───────┐
+   │ schema_name │ views │
+   ├─────────────┼───────┤
+   │ main        │     1 │
+   │ staging     │     1 │
+   └─────────────┴───────┘
+
+:ref:`GET_DDL <ref-get-ddl-examples>` uses it to dump the DDL of every view in one query.
+
+
+.. _ref-functions-describe:
+
+describe_semantic_view()
+------------------------
+
+.. code-block:: sqlgrammar
+
+   SELECT ... FROM describe_semantic_view('<view_name>')
+
+Takes the view name as a string, optionally schema-qualified (``'staging.order_metrics'``). An unqualified name resolves through ``search_path``, the same as ``DESCRIBE SEMANTIC VIEW``. Returns the same five columns and rows as :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-output>`: ``object_kind``, ``object_name``, ``parent_entity``, ``property``, and ``property_value``, all VARCHAR.
+
+.. code-block:: sql
+
+   SELECT object_name, property_value AS expression
+   FROM describe_semantic_view('order_metrics')
+   WHERE object_kind = 'METRIC' AND property = 'EXPRESSION';
+
+.. code-block:: text
+
+   ┌─────────────┬───────────────┐
+   │ object_name │ expression    │
+   ├─────────────┼───────────────┤
+   │ revenue     │ SUM(o.amount) │
+   │ order_count │ COUNT(*)      │
+   └─────────────┴───────────────┘
+
+Here ``order_metrics`` is a single-table view over ``orders`` with the metrics ``revenue AS SUM(o.amount)`` and ``order_count AS COUNT(*)``. More filters are shown on the :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-examples>` page.

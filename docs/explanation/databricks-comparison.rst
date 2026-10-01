@@ -11,9 +11,10 @@ Databricks offers `Metric Views <https://docs.databricks.com/aws/en/uc-semantics
 
 .. note::
 
-   This comparison reflects Databricks' documented metric view surface as of August 2026.
-   Creating a metric view requires Databricks Runtime 16.4 or above, and individual YAML
-   features require later runtimes.
+   This comparison covers Databricks' documented metric view surface. It was last
+   checked against the Databricks documentation in August 2026. Creating a metric
+   view requires Databricks Runtime 16.4 or above, and individual YAML features
+   require later runtimes.
 
 
 .. _explanation-db-concepts:
@@ -30,7 +31,7 @@ Concept Mapping
      - DuckDB Semantic Views
    * - Define a semantic layer
      - ``CREATE VIEW ... WITH METRICS LANGUAGE YAML AS $$ ... $$``
-     - ``CREATE SEMANTIC VIEW``
+     - :ref:`CREATE SEMANTIC VIEW <ref-create-semantic-view>`
    * - Table declarations
      - ``source:`` key naming one table, view, or SQL query
      - ``TABLES`` clause with aliases, optional ``PRIMARY KEY``
@@ -57,7 +58,7 @@ Concept Mapping
      - ``OVER`` clause with ``PARTITION BY EXCLUDING`` (see :ref:`howto-window-metrics`)
    * - Metadata annotations
      - ``comment``, ``synonyms``, ``display_name``, and ``format`` on fields and measures
-     - ``COMMENT``, ``WITH SYNONYMS``, and ``LABELS = (FILTER)`` (see :ref:`howto-annotations-filters`)
+     - ``COMMENT``, ``WITH SYNONYMS``, and ``LABELS = (FILTER)`` (see :ref:`howto-metadata-annotations`)
    * - Access modifiers
      - Unity Catalog ``GRANT`` on the view, plus row filters and column masks
      - ``PRIVATE`` / ``PUBLIC`` on metrics and facts (see :ref:`howto-annotations-access`)
@@ -186,7 +187,7 @@ Both systems join only what a query needs. Databricks joins the source and the d
 
 The difference is in how the join graph is expressed. In Databricks the joins form a tree rooted at ``source``, and each edge carries its own ``on`` or ``using`` condition, so reaching another table means adding an entry -- nested under a dimension table for a snowflake schema. In this extension, ``RELATIONSHIPS`` declares FK/PK edges once, and the extension chooses a path through that graph per query, including multi-hop paths and role-played paths disambiguated with ``USING``.
 
-That difference carries through to fan-out. Databricks' ``rely.at_most_one_match: true`` is an assertion the engine trusts without checking: if the join does fan out, measures return inflated numbers and no error is raised. This extension infers cardinality from the declared ``PRIMARY KEY`` and ``UNIQUE`` constraints and, on a traversal that would fan out, either computes each metric at its own grain or raises a fan-trap error -- it does not return an inflated aggregate (see :ref:`howto-fan-traps`).
+That difference carries through to fan-out. Databricks' ``rely.at_most_one_match: true`` is an assertion the engine trusts without checking: if the join does fan out, measures return inflated numbers and no error is raised. This extension infers cardinality from the declared ``PRIMARY KEY`` and ``UNIQUE`` constraints and, on a traversal that would fan out, either computes each metric at its own grain or raises a fan trap error -- it does not return an inflated aggregate (see :ref:`howto-fan-traps`).
 
 
 Query Interface
@@ -216,7 +217,7 @@ DuckDB Semantic Views uses the :ref:`semantic_view() <ref-semantic-view-function
    );
 
 
-Naming: measures vs metrics
+Naming: Measures vs Metrics
 ---------------------------
 
 Databricks names its aggregate columns under a ``measures:`` key. DuckDB Semantic Views uses a ``METRICS`` clause, following Snowflake's naming convention. The concept is the same: named aggregate expressions that the engine evaluates at whatever grain the query asks for.
@@ -246,7 +247,7 @@ Features in DuckDB Semantic Views Not in Databricks
    * - ``RELATIONSHIPS``
      - FK/PK edges declared once between tables, with cardinality inferred from ``PRIMARY KEY`` and ``UNIQUE`` declarations and the join path chosen per query. Databricks joins are a tree rooted at ``source``, with each edge's condition written out and its cardinality asserted by hand.
    * - Fan-trap detection
-     - Automatic detection of one-to-many traversals that would inflate an aggregate. The extension computes each metric at its own grain where it can, and raises a fan-trap error where it cannot, rather than returning an inflated number. Databricks does not validate ``rely.at_most_one_match``, and picks the first matching row when a many-to-one join turns out to be many-to-many.
+     - Automatic detection of one-to-many traversals that would inflate an aggregate. The extension computes each metric at its own grain where it can, and raises a fan trap error where it cannot, rather than returning an inflated number. Databricks does not validate ``rely.at_most_one_match``, and picks the first matching row when a many-to-one join turns out to be many-to-many.
    * - Role-playing dimensions
      - ``USING`` clause on a metric to choose between multiple join paths to the same table at query time. In Databricks each role is a separate named join entry, fixed at definition time.
    * - :ref:`explain_semantic_view() <ref-explain-semantic-view>`

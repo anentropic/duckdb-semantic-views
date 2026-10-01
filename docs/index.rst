@@ -15,7 +15,7 @@ DuckDB Semantic Views
    <script src="https://unpkg.com/typed.js@3.0.0/dist/typed.umd.js"></script>
    <script>
      new Typed('#typed-target', {
-       strings: ['Iceberg tables', 'CSV files', 'Ducklake', 'dataframes'],
+       strings: ['Iceberg tables', 'CSV files', 'DuckLake', 'dataframes'],
        typeSpeed: 50,
        backSpeed: 30,
        backDelay: 2000,
@@ -27,7 +27,7 @@ DuckDB Semantic Views
 
 A `Semantic Layer <https://www.databricks.com/blog/what-is-a-semantic-layer>`_ sits between your raw tables and the people querying them. Instead of everyone writing their own ``SUM(amount)`` and hoping they ``GROUP BY`` the same columns, you define each metric and dimension once, in one place. Analysts pick the ones they want; the system assembles the SQL.
 
-Snowflake and Databricks, along with dbt Cloud, Cube.dev and others, all ship semantic layers in different forms. Snowflake has `Semantic Views <https://docs.snowflake.com/en/user-guide/views-semantic/overview>`_, Databricks calls them `Metric Views <https://docs.databricks.com/aws/en/metric-views/>`_, both as a SQL syntax sugar for a special kind of flexible view-like interface over aggregated metrics and dimensions. This extension brings the same idea to DuckDB, using DDL syntax modeled closely on Snowflake's ``CREATE SEMANTIC VIEW``.
+Snowflake and Databricks, along with dbt Cloud, Cube.dev and others, all ship semantic layers in different forms. Snowflake has `Semantic Views <https://docs.snowflake.com/en/user-guide/views-semantic/overview>`_ and Databricks has `Metric Views <https://docs.databricks.com/aws/en/uc-semantics/metric-views/>`_. Both expose the semantic layer as a SQL object: a view-like interface over metrics and dimensions that you can query in any combination. This extension brings the same idea to DuckDB, using DDL syntax modeled closely on Snowflake's ``CREATE SEMANTIC VIEW``.
 
 .. grid:: 1 2 3 3
    :gutter: 3
@@ -71,6 +71,7 @@ Snowflake and Databricks, along with dbt Cloud, Cube.dev and others, all ship se
 
       Feature-by-feature comparison with Snowflake's ``CREATE SEMANTIC VIEW``.
 
+If you are building a tool or an agent on top of the extension, every function it registers describes itself in DuckDB's ``duckdb_functions()`` listing, with its parameter names and an example call. :ref:`ref-functions` lists them and shows the query to run.
 
 .. toctree::
    :hidden:

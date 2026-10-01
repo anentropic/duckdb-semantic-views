@@ -7,9 +7,9 @@
 How to Use Materializations
 ===========================
 
-This guide shows how to declare materializations in a semantic view so that queries whose dimensions and metrics exactly match a materialization are routed to a pre-aggregated table instead of expanding raw sources with JOINs and GROUP BY. Materializations can improve query performance for common access patterns without changing the query interface.
-
 .. versionadded:: 0.7.0
+
+This guide shows how to declare materializations in a semantic view so that queries whose dimensions and metrics exactly match a materialization are routed to a pre-aggregated table instead of expanding raw sources with JOINs and GROUP BY. Materializations can improve query performance for common access patterns without changing the query interface.
 
 **Prerequisites:**
 
@@ -38,7 +38,7 @@ First, create the pre-aggregated table:
 
 .. code-block:: sql
 
-   CREATE TABLE daily_revenue_by_region AS
+   CREATE TABLE revenue_by_region AS
    SELECT region, SUM(amount) AS revenue, COUNT(*) AS order_count
    FROM orders
    GROUP BY region;
@@ -61,11 +61,11 @@ Then declare a semantic view with a materialization pointing to that table:
    )
    MATERIALIZATIONS (
        region_agg AS (
-           TABLE daily_revenue_by_region,
+           TABLE revenue_by_region,
            DIMENSIONS (region),
            METRICS (revenue, order_count)
        )
-   )
+   );
 
 The ``MATERIALIZATIONS`` clause must appear after all other clauses. The clause order is: ``TABLES``, ``RELATIONSHIPS``, ``FACTS``, ``DIMENSIONS``, ``METRICS``, ``MATERIALIZATIONS``.
 
@@ -91,7 +91,7 @@ When a match is found, the extension generates a simple ``SELECT ... FROM <mater
 .. code-block:: sql
 
    -- This query matches the materialization (exact dims + metrics)
-   -- Routes to daily_revenue_by_region
+   -- Routes to revenue_by_region
    SELECT * FROM semantic_view('order_metrics',
        dimensions := ['region'],
        metrics := ['revenue', 'order_count']
@@ -142,7 +142,7 @@ A semantic view can declare multiple materializations for different access patte
            DIMENSIONS (region, status),
            METRICS (revenue)
        )
-   )
+   );
 
 Queries match whichever materialization covers their exact dimension and metric set. If two materializations cover the same set, the first one declared wins.
 
@@ -154,8 +154,8 @@ Routing Exclusions
 
 Two kinds of metrics are **always excluded** from materialization routing, even when a materialization declaration covers them:
 
-- **Semi-additive metrics** (declared with ``NON ADDITIVE BY``): These require snapshot selection logic (RANK CTE) that cannot be pre-computed in a materialization table.
-- **Window metrics** (declared with ``OVER``): These require CTE-based window expansion that depends on the queried dimensions.
+- **Semi-additive metrics** (declared with ``NON ADDITIVE BY``): These pick the latest snapshot row at query time, which a pre-aggregated table cannot reproduce.
+- **Window metrics** (declared with ``OVER``): Their values depend on the dimensions in each query, so one pre-computed table cannot serve them.
 
 When a query includes any semi-additive or window metric, the extension skips all materializations and falls back to standard expansion, regardless of whether a matching materialization exists.
 
@@ -178,7 +178,7 @@ When a query includes any semi-additive or window metric, the extension skips al
            DIMENSIONS (customer_id),
            METRICS (total_balance)
        )
-   )
+   );
 
    -- This query falls back to standard expansion (semi-additive metric)
    -- even though a matching materialization exists
@@ -216,7 +216,10 @@ Sample output when routing matches:
        "region",
        "revenue",
        "order_count"
-   FROM "daily_revenue_by_region"
+   FROM "memory"."main"."revenue_by_region"
+
+The output continues with a ``-- DuckDB Plan:`` section, which shows a single
+scan of the materialization table.
 
 When no materialization matches, the output shows ``-- Materialization: none`` and the expanded SQL contains the standard JOINs and GROUP BY.
 
@@ -240,45 +243,41 @@ Use :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` to see materializ
 
 .. code-block:: sql
 
+   DESCRIBE SEMANTIC VIEW order_metrics;
+
+To keep only the materialization rows, select from
+:ref:`describe_semantic_view() <ref-functions-describe>` instead:
+
+.. code-block:: sql
+
    SELECT object_kind, object_name, property, property_value
-   FROM (DESCRIBE SEMANTIC VIEW order_metrics)
+   FROM describe_semantic_view('order_metrics')
    WHERE object_kind = 'MATERIALIZATION';
 
+.. code-block:: text
 
-.. _howto-materializations-troubleshooting:
+   ┌─────────────────┬─────────────┬────────────┬───────────────────────────┐
+   │   object_kind   │ object_name │  property  │      property_value       │
+   ├─────────────────┼─────────────┼────────────┼───────────────────────────┤
+   │ MATERIALIZATION │ region_agg  │ TABLE      │ revenue_by_region         │
+   │ MATERIALIZATION │ region_agg  │ DIMENSIONS │ ["region"]                │
+   │ MATERIALIZATION │ region_agg  │ METRICS    │ ["revenue","order_count"] │
+   └─────────────────┴─────────────┴────────────┴───────────────────────────┘
 
-Troubleshooting
-===============
+.. note::
 
-**Query not routing to materialization when expected**
-
-- Use :ref:`explain_semantic_view() <ref-explain-semantic-view>` to check the ``-- Materialization:`` line.
-- Verify the dimension and metric sets in the query **exactly match** the materialization declaration (supersets and subsets do not match).
-- Check whether any metric in the query is semi-additive (``NON ADDITIVE BY``) or a window metric (``OVER``). These are always excluded from routing.
-
-**Materialization table has wrong column names**
-
-The materialization table must have columns named to match the dimension and metric names declared in the semantic view. If the pre-aggregated table uses different column names, the extension cannot select from it correctly.
-
-**DDL error: dimension or metric not found**
-
-Materialization declarations reference dimensions and metrics by name. The names must match dimensions and metrics declared earlier in the same ``CREATE SEMANTIC VIEW`` statement. The error message suggests close matches.
-
-**DDL error: MATERIALIZATIONS clause out of order**
-
-The ``MATERIALIZATIONS`` clause must appear after ``METRICS``. Move it to the end of the DDL body.
-
-**DDL error: must specify at least one of DIMENSIONS or METRICS**
-
-Each materialization entry must declare at least one dimension or one metric. A materialization with only a ``TABLE`` and neither ``DIMENSIONS`` nor ``METRICS`` is rejected.
-
-See :ref:`ref-error-messages` for the full list of materialization validation errors.
+   ``DESCRIBE SEMANTIC VIEW`` is the normal way to read a view's definition.
+   It is a statement, though, and DuckDB cannot use a statement as a subquery,
+   so ``FROM (DESCRIBE SEMANTIC VIEW order_metrics)`` is a parser error. To
+   filter, join, or aggregate the output, query the table function behind the
+   statement, ``describe_semantic_view('<view>')``, which returns the same
+   rows. :ref:`ref-functions` lists every function the extension registers.
 
 
 .. _howto-materializations-staleness:
 
-Staleness and validation caveats
-================================
+Keep Materialization Tables Fresh
+=================================
 
 Materialization tables are user-owned pre-aggregations. The routing engine
 matches a request against a materialization by **name sets only** -- it does
@@ -301,6 +300,31 @@ a given request routes to a materialization or falls back to raw expansion.
 Dimensions-only routed queries apply ``SELECT DISTINCT``, matching the raw
 expansion path's semantics, so duplicate rows in a pre-aggregation table do
 not change dimension listings.
+
+
+.. _howto-materializations-troubleshooting:
+
+Troubleshooting
+===============
+
+**Query not routing to materialization when expected**
+   - Use :ref:`explain_semantic_view() <ref-explain-semantic-view>` to check the ``-- Materialization:`` line.
+   - Verify the dimension and metric sets in the query **exactly match** the materialization declaration (supersets and subsets do not match).
+   - Check whether any metric in the query is semi-additive (``NON ADDITIVE BY``) or a window metric (``OVER``). These are always excluded from routing.
+
+**Materialization table has wrong column names**
+   The materialization table must have columns named to match the dimension and metric names declared in the semantic view. If the pre-aggregated table uses different column names, the extension cannot select from it correctly.
+
+**DDL error: dimension or metric not found**
+   Materialization declarations reference dimensions and metrics by name. The names must match dimensions and metrics declared earlier in the same ``CREATE SEMANTIC VIEW`` statement. The error message suggests close matches.
+
+**DDL error: MATERIALIZATIONS clause out of order**
+   The ``MATERIALIZATIONS`` clause must appear after ``METRICS``. Move it to the end of the DDL body.
+
+**DDL error: must specify at least one of DIMENSIONS or METRICS**
+   Each materialization entry must declare at least one dimension or one metric. A materialization with only a ``TABLE`` and neither ``DIMENSIONS`` nor ``METRICS`` is rejected.
+
+See :ref:`ref-error-messages` for the full list of materialization validation errors.
 
 
 .. _howto-materializations-related:

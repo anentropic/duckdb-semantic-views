@@ -7,7 +7,7 @@
 READ_YAML_FROM_SEMANTIC_VIEW
 ================================
 
-Scalar function that returns the YAML representation of a stored semantic view definition. The output is suitable for round-trip import via ``CREATE SEMANTIC VIEW ... FROM YAML``.
+Scalar function that returns the YAML representation of a stored semantic view definition. The output is suitable for round-trip import via :ref:`CREATE SEMANTIC VIEW ... FROM YAML <ref-create-from-yaml>`.
 
 .. versionadded:: 0.7.0
 
@@ -36,7 +36,7 @@ Parameters
      - Description
    * - ``<view_name>``
      - VARCHAR
-     - The name of the semantic view to export. Supports unqualified (``my_view``), schema-qualified (``main.my_view``), and catalog-qualified (``memory.main.my_view``) names. The function resolves the bare view name from the last component.
+     - The name of the semantic view to export. Supports unqualified (``my_view``), schema-qualified (``main.my_view``), and catalog-qualified (``memory.main.my_view``) names. A schema qualifier pins the schema. An unqualified name resolves to the unique view of that name; if several schemas hold one, the call fails with an error naming them, and ``search_path`` does not break the tie. This is the same rule :ref:`GET_DDL <ref-get-ddl-resolution>` uses.
 
 
 .. _ref-read-yaml-output:
@@ -44,7 +44,9 @@ Parameters
 Output
 ======
 
-Returns a single VARCHAR value containing the YAML representation of the semantic view definition. The YAML includes all user-declared clauses: tables, relationships, facts, dimensions, metrics, and materializations with their full configuration (comments, synonyms, access modifiers, NON ADDITIVE BY, window specs).
+Returns a single VARCHAR value containing the YAML representation of the semantic view definition. The YAML includes all user-declared clauses: tables, relationships, facts, dimensions, metrics, and materializations with their full configuration (comments, synonyms, access modifiers, named-filter labels, NON ADDITIVE BY, window specs).
+
+The output always carries a ``joins`` and a ``facts`` key (``[]`` when the view has none), and an ``output_type: null`` line on every dimension, metric, and fact. ``output_type`` is a withdrawn field: a type name there is rejected on import, but ``null`` is accepted and ignored, so the exported YAML re-imports unchanged. See :ref:`ref-yaml-format`.
 
 
 .. _ref-read-yaml-stripping:
@@ -52,7 +54,7 @@ Returns a single VARCHAR value containing the YAML representation of the semanti
 Field Stripping
 ===============
 
-Internal fields populated at define time are stripped from the YAML output before serialization. These fields are repopulated automatically when the definition is imported into a new environment:
+Fields that record where and when the view was created are left out of the YAML, because they describe the source environment rather than the definition. ``CREATE SEMANTIC VIEW ... FROM YAML`` sets them again from the session that runs the import:
 
 .. list-table::
    :header-rows: 1
@@ -60,16 +62,14 @@ Internal fields populated at define time are stripped from the YAML output befor
 
    * - Stripped Field
      - Reason
-   * - ``column_type_names``
-     - Column name list from DDL-time type inference. Regenerated at import time.
-   * - ``column_types_inferred``
-     - Column type IDs from DDL-time type inference. Regenerated at import time.
    * - ``created_on``
      - Creation timestamp. Set to the import time on re-creation.
    * - ``database_name``
-     - Connection-specific database context. Set from the target connection.
+     - Database the view lives in. Set from the importing session.
    * - ``schema_name``
-     - Connection-specific schema context. Set from the target connection.
+     - Schema the view lives in. Set from the view name in the ``CREATE`` statement, or from the importing session's current schema when the name is unqualified.
+
+Unqualified table names in ``table:`` entries resolve in the importing session's current schema, the same as in a ``CREATE SEMANTIC VIEW ... AS`` body.
 
 
 .. _ref-read-yaml-examples:
@@ -94,23 +94,27 @@ Examples
 
    SELECT READ_YAML_FROM_SEMANTIC_VIEW('order_metrics');
 
-Sample output:
+Output:
 
 .. code-block:: yaml
 
    tables:
-     - alias: o
-       table: orders
-       pk_columns:
-         - id
+   - alias: o
+     table: orders
+     pk_columns:
+     - id
    dimensions:
-     - name: region
-       expr: o.region
-       source_table: o
+   - name: region
+     expr: o.region
+     source_table: o
+     output_type: null
    metrics:
-     - name: revenue
-       expr: SUM(o.amount)
-       source_table: o
+   - name: revenue
+     expr: SUM(o.amount)
+     source_table: o
+     output_type: null
+   joins: []
+   facts: []
 
 **Save YAML to a file:**
 
@@ -134,7 +138,7 @@ Sample output:
    TO '/tmp/analytics.yaml' (FORMAT CSV, HEADER FALSE, QUOTE '');
 
    -- Import into a new view
-   CREATE SEMANTIC VIEW analytics_copy FROM YAML FILE '/tmp/analytics.yaml'
+   CREATE SEMANTIC VIEW analytics_copy FROM YAML FILE '/tmp/analytics.yaml';
 
 
 .. _ref-read-yaml-errors:
@@ -150,4 +154,15 @@ Error Cases
 
 .. code-block:: text
 
-   Error: semantic view 'nonexistent' does not exist
+   Error: read_yaml_from_semantic_view: semantic view 'nonexistent' does not exist
+
+**Name held by several schemas:**
+
+.. code-block:: sql
+
+   -- With both main.order_metrics and staging.order_metrics present
+   SELECT READ_YAML_FROM_SEMANTIC_VIEW('order_metrics');
+
+.. code-block:: text
+
+   Error: read_yaml_from_semantic_view: semantic view 'order_metrics' is ambiguous: it exists in schemas main, staging. Qualify the reference as <schema>.order_metrics

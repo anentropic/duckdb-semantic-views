@@ -23,9 +23,9 @@ Missing view name
 
 .. code-block:: text
 
-   Missing view name after 'CREATE SEMANTIC VIEW'.
+   Missing view name after DDL prefix.
 
-**Cause:** The ``CREATE SEMANTIC VIEW`` statement has no name before ``AS``.
+**Cause:** The :ref:`CREATE SEMANTIC VIEW <ref-create-semantic-view>` statement ends before a view name.
 
 **Fix:** Add a view name: ``CREATE SEMANTIC VIEW my_view AS ...``
 
@@ -35,9 +35,10 @@ Expected AS or FROM YAML
 
 .. code-block:: text
 
-   Expected 'AS' or 'FROM YAML' after view name.
+   Expected 'AS' or 'FROM YAML' after view name. Use: CREATE SEMANTIC VIEW
+   name AS TABLES (...) DIMENSIONS (...) METRICS (...) or: ...
 
-**Cause:** The statement has a view name but is missing the ``AS`` keyword or ``FROM YAML`` keywords before the body.
+**Cause:** The statement has no view name (``CREATE SEMANTIC VIEW AS ...`` reads ``AS`` as the name), or has a view name but is missing the ``AS`` keyword or ``FROM YAML`` keywords before the body.
 
 **Fix:** Use either the keyword body (``CREATE SEMANTIC VIEW my_view AS TABLES (...)``) or the YAML body (``CREATE SEMANTIC VIEW my_view FROM YAML $$ ... $$``).
 
@@ -126,10 +127,10 @@ Parser strictness
    to "work" begins to error after upgrading, it was almost certainly one of
    these:
 
-- **Stray or leading commas** in a clause list are rejected — ``DIMENSIONS (a AS x,, b AS y)`` and ``TABLES (,o AS orders ...)`` no longer silently drop an entry. A single *trailing* comma (``METRICS (a AS ..., )``) is still tolerated.
+- **Stray or leading commas** in a clause list are rejected -- ``DIMENSIONS (a AS x,, b AS y)`` and ``TABLES (,o AS orders ...)`` no longer silently drop an entry. A single *trailing* comma (``METRICS (a AS ..., )``) is still tolerated.
 - **Malformed identifier slots** are rejected instead of being stored as unqueryable names: a whitespace-separated multi-token name (``o.d junk AS ...``, which used to name the dimension ``d junk``) and an empty quoted identifier ``""`` in a name or alias slot now error. An unqualified entry name whose expression happens to contain a dot (``region AS upper(o.region)``) now reports the missing ``alias.name`` qualifier rather than a misleading "Expected 'AS'".
-- **Trailing tokens** after the view name on a name-only statement (``DROP`` / ``DESCRIBE`` / ``SHOW COLUMNS IN SEMANTIC VIEW``) are rejected — ``DROP SEMANTIC VIEW a b c`` no longer executes and silently discards the extra tokens. ``ALTER`` sub-operations do the same.
-- **DDL prefix keywords require a word boundary** — ``DROP SEMANTIC VIEWS`` (plural typo) no longer drops a view named ``s``, and ``CREATE SEMANTIC VIEWfoo`` is no longer recognised as ``CREATE SEMANTIC VIEW``.
+- **Trailing tokens** after the view name on a name-only statement (``DROP`` / ``DESCRIBE`` / :ref:`SHOW COLUMNS IN SEMANTIC VIEW <ref-show-columns>`) are rejected -- ``DROP SEMANTIC VIEW a b c`` no longer executes and silently discards the extra tokens. ``ALTER`` sub-operations do the same.
+- **DDL prefix keywords require a word boundary** -- ``DROP SEMANTIC VIEWS`` (plural typo) no longer drops a view named ``s``, and ``CREATE SEMANTIC VIEWfoo`` is no longer recognized as ``CREATE SEMANTIC VIEW``.
 
 
 .. _ref-err-name-uniqueness:
@@ -193,10 +194,13 @@ Graph validation errors
 
    table '<alias>' cannot reference itself
 
-   Relationship graph contains a cycle: <alias1> -> <alias2> -> ...
+   cycle detected in relationships: <alias1> -> <alias2> -> <alias1>
 
-   Diamond detected: table '<alias>' is reachable via multiple paths.
-   Use named relationships for role-playing dimensions.
+   diamond: '<alias>' is reachable from multiple tables ('<from1>', '<from2>');
+   the join path is ambiguous. Declare the target under a second table alias
+   so it is joined once per path.
+
+   orphan table '<alias>' is not connected by any relationship; did you mean '<suggestion>'?
 
 **Cause:** The relationship graph violates tree structure requirements.
 
@@ -204,7 +208,65 @@ Graph validation errors
 
 - **Self-reference:** A table cannot have a relationship pointing to itself.
 - **Cycle:** Follow the chain in the error message to find the circular dependency and remove it.
-- **Diamond:** If a table is reachable via multiple paths, give each path a unique relationship name (role-playing pattern) or restructure to remove the duplicate path.
+- **Diamond:** One target table is reached from two different source tables. Naming the relationships does not help; declare the shared table a second time under another alias (for example ``s_a AS stores`` and ``s_b AS stores``) so each path has its own copy. Several relationships from the *same* source table to one target are allowed; that is the role-playing pattern (see :ref:`howto-role-playing`).
+- **Orphan:** Add a relationship that connects the table, or remove it from ``TABLES``.
+
+
+Key missing on a relationship target
+------------------------------------
+
+.. code-block:: text
+
+   Table '<target>' has no PRIMARY KEY declared but is referenced by FK in
+   '<from>'. Add PRIMARY KEY (cols) or UNIQUE (cols) to the TABLES clause for
+   <target>. (v0.10.0: physical-catalog PK auto-inference removed -- see
+   CHANGELOG.)
+
+**Cause:** A relationship references a table whose ``TABLES`` entry declares neither ``PRIMARY KEY`` nor ``UNIQUE``. An explicit column list on the relationship (``REFERENCES <target>(<cols>)``) does not satisfy the requirement.
+
+**Fix:** Declare the key on the target table's ``TABLES`` entry: ``c AS customers PRIMARY KEY (id)``, or ``UNIQUE (email)`` when the relationship joins on a unique column.
+
+
+Expression references another table's column
+--------------------------------------------
+
+.. code-block:: text
+
+   semantic view: fact '<name>' references '<alias>.<column>', a column of
+   table '<alias>', but a fact expression may only reference columns of its
+   own table ('<own>'). To use a value from another table, define a FACT on
+   that table and reference the fact by name (e.g. '<alias>.<fact_name>').
+
+The same message is raised for a dimension or metric expression, with ``fact`` replaced by the member kind.
+
+**Cause:** A fact, dimension, or metric expression names a raw column of a different logical table.
+
+**Fix:** Define a fact on the other table and reference that fact by name. See :ref:`howto-facts`.
+
+
+Unknown metric in a derived metric
+----------------------------------
+
+.. code-block:: text
+
+   unknown metric '<name>' referenced in derived metric '<derived>'; did you mean '<suggestion>'?.
+   Available metrics: [<list>]
+
+**Cause:** A derived metric's expression names a metric that the view does not declare, often a typo. The ``did you mean`` clause appears only when a declared metric's name is close enough to suggest.
+
+**Fix:** Correct the name. The error lists every metric in the view.
+
+
+LABELS on a metric
+------------------
+
+.. code-block:: text
+
+   LABELS is not valid on a metric; it applies to facts and dimensions.
+
+**Cause:** A ``METRICS`` entry carries ``LABELS = (FILTER)``. Named filters are row-level members, so only facts and dimensions can be labeled.
+
+**Fix:** Remove ``LABELS`` from the metric. To reuse a filter condition, declare it as a fact or dimension with ``LABELS = (FILTER)``. See :ref:`howto-annotations-filters`.
 
 
 Aggregate in FACTS
@@ -225,9 +287,9 @@ Circular fact or metric references
 
 .. code-block:: text
 
-   Circular dependency detected in facts: <name1>, <name2>, ...
+   cycle detected in facts: <name1> -> <name2> -> <name1>
 
-   Circular dependency detected in derived metrics: <name1>, <name2>, ...
+   cycle detected in derived metrics: <name1> -> <name2> -> <name1>
 
 **Cause:** Facts or derived metrics reference each other in a cycle.
 
@@ -479,11 +541,17 @@ YAML parsing error
 
 .. code-block:: text
 
-   YAML deserialization error: <details>
+   invalid YAML definition for semantic view '<name>': <details>
+
+For example, a definition without a ``metrics`` key fails with:
+
+.. code-block:: text
+
+   invalid YAML definition for semantic view 'sales': missing field `metrics`
 
 **Cause:** The YAML content is not valid YAML or does not match the expected semantic view definition schema.
 
-**Fix:** Check the YAML syntax and structure. The definition must include ``tables``, and at least one of ``dimensions`` or ``metrics``.
+**Fix:** Check the YAML syntax and structure against :ref:`ref-yaml-format`. The definition must include ``tables`` and both the ``dimensions`` and ``metrics`` keys (use ``[]`` for one of them if the view has none), and at least one of the two must be non-empty.
 
 
 .. _ref-err-query:
@@ -575,7 +643,7 @@ COUNT(*) on a joined table requires a PRIMARY KEY
    clause. Add PRIMARY KEY (cols) to '<alias>' or use an explicit column:
    COUNT(<alias>.<column>).
 
-**Cause:** A queried metric (directly, via a derived metric, or as a window metric's inner aggregate) is ``COUNT(*)`` on a table other than the base table. Generated joins are ``LEFT JOIN``\ s, so ``COUNT(*)`` would also count the NULL-extended row produced for each base row with no match — silently inflating the result. The expansion protects against this by rewriting ``COUNT(*)`` to ``COUNT(<first primary key column>)`` for non-base source tables, which requires the table to declare a ``PRIMARY KEY``.
+**Cause:** A queried metric (directly, via a derived metric, or as a window metric's inner aggregate) is ``COUNT(*)`` on a table other than the base table. Generated joins are ``LEFT JOIN``\ s, so ``COUNT(*)`` would also count the NULL-extended row produced for each base row with no match -- silently inflating the result. The expansion protects against this by rewriting ``COUNT(*)`` to ``COUNT(<first primary key column>)`` for non-base source tables, which requires the table to declare a ``PRIMARY KEY``.
 
 **Fix:** Declare ``PRIMARY KEY (<cols>)`` for the metric's source table in the ``TABLES`` clause, or define the metric as ``COUNT(<alias>.<column>)`` over a NOT NULL column.
 
@@ -594,6 +662,22 @@ Fan trap detected
 **Cause:** The query would traverse a one-to-many join boundary, inflating aggregate results.
 
 **Fix:** See :ref:`howto-fan-traps` for detailed solutions: remove the problematic dimension, use a metric from the same table as the dimension, or restructure the view.
+
+
+Fact reached across a fan-out
+-----------------------------
+
+.. code-block:: text
+
+   semantic view '<view>': fan trap detected -- '<metric>' (table '<table>')
+   references the fact '<fact>' on table '<fact_table>', and relationship
+   '<rel>' fans out on the way there, so joining it would multiply '<metric>'s
+   rows. Reference a fact on a table reachable without fanning out, or define
+   the fact on '<table>'.
+
+**Cause:** A metric references a fact on a table that sits on the "many" side of a relationship from the metric's table (for example, a metric on ``orders`` using a fact on ``line_items``). Joining that table would repeat each of the metric's rows once per child row.
+
+**Fix:** Move the fact to the metric's own table, reference a fact on a parent (many-to-one) table instead, or define the metric on the child table. See :ref:`howto-facts`.
 
 
 Ambiguous dimension path
@@ -723,8 +807,8 @@ Incompatible table paths for facts
 .. versionchanged:: 0.12.0
    The rule is now about row multiplication rather than tree position, and the
    message wording changed to match. Pairs that are reachable one way without
-   fanning out — a fact on a table that references the base table, with a
-   dimension on a table the base table references — are now accepted.
+   fanning out -- a fact on a table that references the base table, with a
+   dimension on a table the base table references -- are now accepted.
 
 .. code-block:: text
 
@@ -733,9 +817,9 @@ Incompatible table paths for facts
    from the other without crossing a one-to-many relationship, so joining
    them would duplicate the rows returned
 
-**Cause:** A fact query does not aggregate, so it returns rows as they are. Reaching one of these two tables from the other means traversing a one-to-many relationship *against* its direction — every row on one side matching many on the other — and that holds whichever of the two you start from. The rows returned would silently be duplicates. The usual shape is two tables that both reference a third (``line_items`` and ``shipments`` both referencing ``orders``): joining both multiplies each one's rows by the other's.
+**Cause:** A fact query does not aggregate, so it returns rows as they are. Reaching one of these two tables from the other means traversing a one-to-many relationship *against* its direction -- every row on one side matching many on the other -- and that holds whichever of the two you start from. The rows returned would silently be duplicates. The usual shape is two tables that both reference a third (``line_items`` and ``shipments`` both referencing ``orders``): joining both multiplies each one's rows by the other's.
 
-**Fix:** Query the two tables separately. Facts and dimensions can be combined freely as long as one side is reachable from the other without fanning out — a chain of many-to-one relationships in either direction is fine, however long.
+**Fix:** Query the two tables separately. Facts and dimensions can be combined freely as long as one side is reachable from the other without fanning out -- a chain of many-to-one relationships in either direction is fine, however long.
 
 
 Window and aggregate metric mixing
@@ -773,7 +857,7 @@ Window metric required dimension missing
 Concurrent DDL Errors
 =====================
 
-These errors relate to ``DROP`` or ``ALTER SEMANTIC VIEW`` when another writer modifies the catalog around the same time.
+These errors relate to :ref:`DROP <ref-drop-semantic-view>` or :ref:`ALTER SEMANTIC VIEW <ref-alter-semantic-view>` when another writer modifies the catalog around the same time.
 
 
 Existence guard on DROP / ALTER (and its autocommit window)
@@ -798,6 +882,14 @@ and ``ALTER ... RENAME`` additionally raises, when the target name is taken:
 **Fix:** Decide on the contract you want. Use ``IF EXISTS`` if a missing target should silently no-op (``DROP SEMANTIC VIEW IF EXISTS my_view``, ``ALTER SEMANTIC VIEW IF EXISTS my_view ...``). If you need the check and the write to be atomic under concurrency, wrap the statement in an explicit transaction (``BEGIN; DROP SEMANTIC VIEW my_view; COMMIT;``): all statements then share one snapshot, and a conflicting concurrent commit makes your ``COMMIT`` fail with a retryable transaction-conflict error instead of slipping through the window. See :ref:`explanation-transactional-ddl` for the full mechanism.
 
 
+.. _ref-err-resolution:
+
+Name Resolution and Catalog Errors
+==================================
+
+These errors come from how a view name is resolved to a schema, and from which database holds the semantic view catalog.
+
+
 Unqualified name that is not on the search path
 -----------------------------------------------
 
@@ -807,13 +899,43 @@ Unqualified name that is not on the search path
    schemas <schemas>, none of which are on the current search path (<path>).
    Qualify the reference as <schema>.<name>, or add the schema to search_path.
 
-**Cause:** An unqualified reference resolves through the session's ``search_path``, the same rule DuckDB applies to an unqualified table name. A view of this name exists, but only in schemas that are not on the path — so by that rule it is not visible from here. DuckDB would report a plain "does not exist"; this message says where the view actually is instead, because a bare not-found is confusing for something ``SHOW SEMANTIC VIEWS`` plainly lists.
+**Cause:** An unqualified reference resolves through the session's ``search_path``, the same rule DuckDB applies to an unqualified table name. A view of this name exists, but only in schemas that are not on the path -- so by that rule it is not visible from here. DuckDB would report a plain "does not exist"; this message says where the view actually is instead, because a bare not-found is confusing for something :ref:`SHOW SEMANTIC VIEWS <ref-show-semantic-views>` plainly lists.
 
 This applies to reads and writes alike, and ``IF EXISTS`` does not suppress it: that clause means "do not complain if the view is absent", and a view sitting off the path is not absent. Suppressing it would let a ``DROP`` silently remove one of several same-named views.
 
 **Fix:** Either qualify the reference (``DROP SEMANTIC VIEW analytics.sales``, ``semantic_view('analytics.sales')``) or put the schema on the path (``SET search_path = 'analytics'``). When several schemas hold the name, the first one on the path wins.
 
 **Note:** A view that is the *only* one of its name resolves whether or not its schema is on the path, so this error only appears once a second view shares the name.
+
+
+Ambiguous name in GET_DDL or READ_YAML_FROM_SEMANTIC_VIEW
+---------------------------------------------------------
+
+.. code-block:: text
+
+   get_ddl: semantic view '<name>' is ambiguous: it exists in schemas
+   <schema1>, <schema2>. Qualify the reference as <schema>.<name>
+
+``READ_YAML_FROM_SEMANTIC_VIEW`` raises the same message with a ``read_yaml_from_semantic_view:`` prefix.
+
+**Cause:** :ref:`GET_DDL <ref-get-ddl>` and :ref:`READ_YAML_FROM_SEMANTIC_VIEW <ref-read-yaml>` are scalar functions, so they do not follow ``search_path``. An unqualified name must match exactly one view, and several schemas hold a view of this name.
+
+**Fix:** Qualify the name: ``GET_DDL('SEMANTIC_VIEW', 'analytics.sales')``. See :ref:`ref-get-ddl-resolution`.
+
+
+DDL issued from an attached database
+------------------------------------
+
+.. code-block:: text
+
+   semantic_views: semantic-view DDL was issued against database '<db>', but
+   the semantic view catalog lives in a different database. Semantic views are
+   single-catalog: manage them from the database the extension was loaded
+   into, without USE-ing into an attached database.
+
+**Cause:** The session ran ``USE`` on an attached database, then issued ``CREATE``, ``ALTER``, or ``DROP SEMANTIC VIEW``. Semantic view definitions are stored only in the database the extension was loaded into.
+
+**Fix:** Switch back to that database (``USE memory``, or the name of your file database) before running semantic-view DDL. A view body can still read tables from an attached database by qualifying them (``TABLES (o AS other.main.orders ...)``). See :ref:`explanation-txn-ddl-attach`.
 
 
 .. _ref-err-wildcard:
@@ -857,7 +979,7 @@ Unknown table alias in wildcard
 Near-Miss DDL Detection
 ========================
 
-The extension detects near-miss DDL statements and provides helpful suggestions:
+The extension detects near-miss DDL statements and suggests the statement you meant:
 
 .. code-block:: text
 
@@ -865,4 +987,4 @@ The extension detects near-miss DDL statements and provides helpful suggestions:
 
    Did you mean 'DROP SEMANTIC VIEW'?
 
-This triggers when the input is close to a valid semantic view DDL prefix but contains a typo (e.g., ``CREAT SEMANTIC VIEW`` or ``DROP SEMANTC VIEW``). The detection uses Levenshtein distance with a threshold of 3 edits.
+This triggers when the input is close to a valid semantic-view DDL prefix but contains a typo (e.g., ``CREAT SEMANTIC VIEW`` or ``DROP SEMANTC VIEW``). The detection uses Levenshtein distance with a threshold of 3 edits.

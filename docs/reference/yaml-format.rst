@@ -11,7 +11,7 @@ Specification of the YAML schema accepted by ``CREATE SEMANTIC VIEW ... FROM YAM
 
 .. versionadded:: 0.7.0
 
-The YAML format maps directly to the internal ``SemanticViewDefinition`` structure. Field names follow serde conventions, which differ from SQL clause names in some cases:
+YAML keys differ from the SQL clause names in some cases:
 
 .. list-table::
    :header-rows: 1
@@ -25,7 +25,7 @@ The YAML format maps directly to the internal ``SemanticViewDefinition`` structu
      -
    * - ``RELATIONSHIPS``
      - ``joins``
-     - Different name -- YAML uses the internal ``joins`` key
+     - Different name -- YAML uses ``joins``
    * - ``FACTS``
      - ``facts``
      -
@@ -89,6 +89,9 @@ A YAML definition covering all supported features:
      - name: customer_name
        expr: c.name
        source_table: c
+     - name: report_date
+       expr: o.report_date
+       source_table: o
 
    metrics:
      - name: revenue
@@ -112,7 +115,7 @@ A YAML definition covering all supported features:
 
    materializations:
      - name: region_agg
-       table: daily_revenue_by_region
+       table: revenue_by_region
        dimensions:
          - region
        metrics:
@@ -127,7 +130,7 @@ A YAML definition covering all supported features:
 Minimal Definition
 ==================
 
-A minimal definition requires only ``tables``, and at least one of ``dimensions`` or ``metrics``:
+A minimal definition has ``tables``, ``dimensions``, and ``metrics``. Both the ``dimensions`` and ``metrics`` keys must be present, and at least one of them must be non-empty. Write ``[]`` for the one you do not need:
 
 .. code-block:: yaml
 
@@ -140,6 +143,21 @@ A minimal definition requires only ``tables``, and at least one of ``dimensions`
      - name: region
        expr: o.region
        source_table: o
+   metrics:
+     - name: revenue
+       expr: SUM(o.amount)
+       source_table: o
+
+A definition with metrics only:
+
+.. code-block:: yaml
+
+   tables:
+     - alias: o
+       table: orders
+       pk_columns:
+         - id
+   dimensions: []
    metrics:
      - name: revenue
        expr: SUM(o.amount)
@@ -188,7 +206,7 @@ Top-Level Keys
      - No
      - View-level human-readable description.
 
-:sup:`*` At least one of ``dimensions`` or ``metrics`` must be non-empty.
+:sup:`*` Both keys must be present -- a definition without a ``metrics`` key is rejected with a "missing field" error -- and at least one of the two must be non-empty. Use ``[]`` for the empty one.
 
 
 .. _ref-yaml-format-table:
@@ -289,8 +307,12 @@ Each entry in the ``dimensions`` list declares a named grouping expression.
      - null
      - **No longer accepted.** Write the cast into the expression instead --
        ``expr: CAST(o.ordered_at AS DATE)``. No DDL clause can express a member
-       type, so ``GET_DDL`` dropped this field and a restored view silently lost
-       the cast; a cast written into ``expr`` survives the round trip.
+       type, so :ref:`GET_DDL <ref-get-ddl>` dropped this field and a restored
+       view silently lost the cast; a cast written into ``expr`` survives the
+       round trip. A type name here is rejected at ``CREATE`` time.
+       ``output_type: null`` is accepted and ignored:
+       :ref:`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>` writes it on every
+       dimension, metric, and fact, so exported YAML re-imports unchanged.
    * - ``comment``
      - string
      - No
@@ -301,6 +323,11 @@ Each entry in the ``dimensions`` list declares a named grouping expression.
      - No
      - ``[]``
      - Alternative names for discoverability.
+   * - ``is_filter``
+     - boolean
+     - No
+     - ``false``
+     - ``true`` declares the dimension a :ref:`named filter <howto-annotations-filters>`, the YAML form of ``LABELS = (FILTER)``. The expression should be boolean.
 
 .. code-block:: yaml
 
@@ -312,6 +339,10 @@ Each entry in the ``dimensions`` list declares a named grouping expression.
      - name: order_month
        expr: CAST(date_trunc('month', o.ordered_at) AS DATE)
        source_table: o
+     - name: is_eu
+       expr: o.region = 'EU'
+       source_table: o
+       is_filter: true
 
 
 .. _ref-yaml-format-metric:
@@ -478,8 +509,8 @@ Each entry in the ``facts`` list declares a named row-level expression. Facts ca
      - No
      - null
      - **No longer accepted.** Write the cast into the expression instead
-       (see the dimension table above). ``SHOW SEMANTIC FACTS`` reports an
-       empty ``data_type`` for every newly created view as a result.
+       (see the dimension table above). :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>`
+       reports an empty ``data_type`` for every newly created view as a result.
    * - ``comment``
      - string
      - No
@@ -495,6 +526,11 @@ Each entry in the ``facts`` list declares a named row-level expression. Facts ca
      - No
      - ``Public``
      - Access modifier: ``Public`` (queryable via ``facts := [...]``) or ``Private`` (usable only in metric expressions).
+   * - ``is_filter``
+     - boolean
+     - No
+     - ``false``
+     - ``true`` declares the fact a :ref:`named filter <howto-annotations-filters>`, the YAML form of ``LABELS = (FILTER)``. The expression should be boolean.
 
 .. code-block:: yaml
 
@@ -618,7 +654,7 @@ At least one of ``dimensions`` or ``metrics`` must be specified.
 
    materializations:
      - name: region_agg
-       table: daily_revenue_by_region
+       table: revenue_by_region
        dimensions:
          - region
        metrics:

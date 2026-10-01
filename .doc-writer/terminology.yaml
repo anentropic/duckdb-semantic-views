@@ -27,7 +27,7 @@ source_terms:
     source: "enum Cardinality in src/model.rs (ManyToOne, OneToOne)"
   - canonical: "ExpandError"
     variants: []
-    source: "enum ExpandError in src/expand.rs"
+    source: "enum ExpandError in src/expand/types.rs"
   - canonical: "QueryError"
     variants: []
     source: "enum QueryError in src/query/error.rs"
@@ -40,9 +40,26 @@ source_terms:
   - canonical: "list_semantic_views()"
     variants: []
     source: "table function registered in src/lib.rs (ListSemanticViewsVTab)"
+    note: >-
+      Backing function for SHOW SEMANTIC VIEWS. Prose uses the statement; the
+      function appears only as a FROM source (filter, join, aggregate), linked
+      to ref-functions-list. Explain the idiom as "DuckDB cannot use a
+      statement as a subquery, so FROM (SHOW ...) is a parser error".
   - canonical: "describe_semantic_view()"
     variants: []
     source: "table function registered in src/lib.rs (DescribeSemanticViewVTab)"
+    note: >-
+      Backing function for DESCRIBE SEMANTIC VIEW. Same FROM-source-only rule
+      as list_semantic_views(); link to ref-functions-describe.
+  - canonical: "duckdb_functions()"
+    variants: []
+    source: "DuckDB built-in; every extension function carries the semantic_views category (reference/functions.rst)"
+  - canonical: "object_name"
+    variants: ["<name>"]
+    source: "GET_DDL second parameter as reported by duckdb_functions() (#236)"
+  - canonical: "is_filter"
+    variants: []
+    source: "YAML key for LABELS = (FILTER) on dimensions and facts (src/model.rs:92, :307)"
   - canonical: "READ_YAML_FROM_SEMANTIC_VIEW()"
     variants: []
     source: "scalar function registered in src/ddl/read_yaml.rs"
@@ -60,6 +77,8 @@ proper_nouns:
     variants: []
   - canonical: "Parquet"
     variants: []
+  - canonical: "DuckLake"
+    variants: ["Ducklake"]
   - canonical: "Cortex Analyst"
     variants: []
   - canonical: "Delta Lake"
@@ -79,11 +98,23 @@ project_terms:
   - canonical: "role-playing dimension"
     variants: []
   - canonical: "fan trap"
-    variants: []
+    variants: ["fan-trap error", "fan-trap check", "fan-trap detection"]
+    note: >-
+      Open in attributive use too ("fan trap error", "fan trap check",
+      "fan trap detection"), which is the majority form. The error text
+      itself reads "fan trap detected". Do not call the check a "fence" in
+      user docs.
   - canonical: "define time"
-    variants: ["define-time"]
+    variants: []
+    note: >-
+      Adverbial "at define time" stays open; attributive "define-time error",
+      "define-time inference pass" stays hyphenated (same rule as per grain).
   - canonical: "query time"
-    variants: ["query-time"]
+    variants: []
+    note: Same rule as define time ("at query time", "query-time error").
+  - canonical: "semantic-view DDL"
+    variants: ["semantic view DDL"]
+    note: Attributive compound; the noun phrase "semantic view" stays open.
   - canonical: "expansion time"
     variants: []
   - canonical: "many-to-one"
@@ -121,8 +152,17 @@ project_terms:
       reintroduce the CREATE-time LIMIT 0 probe: that probe now exists only
       on the query bind path (see reference/semantic-view-function.rst).
   - canonical: "semantic view '<name>' does not exist"
-    variants: ["Semantic view '<name>' not found"]
+    variants: []
     source: "catalog::view_not_found_msg in src/catalog/mod.rs:105"
+    note: >-
+      Raised by DDL, SHOW / DESCRIBE and the scalar functions. NOT a variant
+      of the query-path message below; never normalize one into the other.
+  - canonical: "Semantic view '<name>' not found. ... Run SHOW SEMANTIC VIEWS to see all registered views."
+    variants: []
+    source: "QueryError::ViewNotFound in src/query/error.rs (semantic_view() / explain_semantic_view())"
+  - canonical: "revenue_by_region"
+    variants: ["daily_revenue_by_region", "daily_revenue_agg"]
+    note: Example materialization table name, used on every page that shows one.
 
 # Punctuation and markup conventions enforced across docs/
 conventions:
@@ -136,5 +176,19 @@ conventions:
       The data_type column reports a declared type only; no surface declares
       one and nothing infers one. Empty for every view created since v0.10.0.
   - rule: "No internal tracker IDs (TECH-DEBT #NN, RT-N, C-N) in docs/."
+  - rule: >-
+      American spelling (behavior, modeling, labeled, recognized). RST labels
+      that already use British spelling (explanation-grain-modelling) keep it,
+      because renaming a label breaks every reference to it.
+  - rule: >-
+      Headings use title case, except the per-error entries on
+      reference/error-messages.rst, which are consistently sentence case.
+  - rule: >-
+      Parameter layout: statement reference pages use definition lists;
+      function reference pages use a Parameter / Type / Description list-table.
+  - rule: >-
+      How-to layout: Title -> (versionadded, when page-level) -> intro ->
+      **Prerequisites:** -> task sections -> Troubleshooting (definition-list
+      entries: bold symptom, indented body) -> Related.
 
 overrides: {}

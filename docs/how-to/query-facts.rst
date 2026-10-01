@@ -114,7 +114,18 @@ Troubleshooting
    The fact name must match a fact declared in the ``FACTS`` clause. The error message lists available facts and suggests close matches.
 
 **Private fact cannot be queried**
-   Facts marked ``PRIVATE`` cannot be queried directly. They can only be referenced in metric expressions. Remove the ``PRIVATE`` keyword to make a fact queryable.
+   Facts marked ``PRIVATE`` cannot be queried directly. They can only be referenced in metric expressions and other facts. Remove the ``PRIVATE`` keyword to make a fact queryable.
 
 **Incompatible table paths**
-   A fact query returns rows as they are, so the tables it references must be joinable without multiplying them. If neither of two tables can be reached from the other without traversing a one-to-many relationship against its direction — typically two tables that both reference a third — the extension returns ``fact query references objects from incompatible table paths``. A chain of many-to-one relationships is fine however long it is.
+   A fact query returns rows as they are, so the tables it references must be joinable without multiplying them. If neither of two tables can be reached from the other without traversing a one-to-many relationship against its direction -- typically two tables that both reference a third -- the extension returns ``fact query references objects from incompatible table paths``. A chain of many-to-one relationships is fine however long it is.
+
+
+.. _howto-query-facts-related:
+
+Related
+=======
+
+- :ref:`ref-semantic-view-function` -- The ``facts`` parameter and the other query modes
+- :ref:`howto-facts` -- Declare the facts you query here
+- :ref:`howto-wildcard-selection` -- Select every fact on a table alias with ``alias.*``
+- :ref:`howto-fan-traps` -- Why some table combinations cannot be joined without multiplying rows

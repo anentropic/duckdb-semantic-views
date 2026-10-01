@@ -121,7 +121,7 @@ Returns one row per dimension with 8 columns:
      - The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``synonyms``
      - VARCHAR
-     - JSON array of synonym strings (e.g., ``["territory","sales_region"]``). Empty string if no synonyms are set.
+     - JSON array of synonym strings (e.g., ``["territory","sales_region"]``). ``[]`` when no synonyms are set.
    * - ``comment``
      - VARCHAR
      - The dimension comment text. Empty string if no comment is set.
@@ -145,14 +145,14 @@ Given a semantic view ``orders_sv`` with three dimensions:
    ┌───────────────┬─────────────┬────────────────────┬────────────┬───────────────┬───────────┬──────────┬─────────┐
    │ database_name │ schema_name │ semantic_view_name │ table_name │ name          │ data_type │ synonyms │ comment │
    ├───────────────┼─────────────┼────────────────────┼────────────┼───────────────┼───────────┼──────────┼─────────┤
-   │ memory        │ main        │ orders_sv          │ customers  │ customer_name │           │          │         │
-   │ memory        │ main        │ orders_sv          │ orders     │ order_date    │           │          │         │
-   │ memory        │ main        │ orders_sv          │ customers  │ region        │           │          │         │
+   │ memory        │ main        │ orders_sv          │ customers  │ customer_name │           │ []       │         │
+   │ memory        │ main        │ orders_sv          │ orders     │ order_date    │           │ []       │         │
+   │ memory        │ main        │ orders_sv          │ customers  │ region        │           │ []       │         │
    └───────────────┴─────────────┴────────────────────┴────────────┴───────────────┴───────────┴──────────┴─────────┘
 
 The ``table_name`` column shows the actual physical table name, not the alias used in the DDL.
 
-``data_type`` is empty here because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because ``GET_DDL`` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. Reporting the type an expression actually produces would require probing it on the read side, at ``SHOW`` bind time; that is a known limitation and is not implemented today. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+``data_type`` is empty here because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`GET_DDL <ref-get-ddl>` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. Reporting the type an expression actually produces would require probing it on the read side, at ``SHOW`` bind time; that is a known limitation and is not implemented today. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 **List dimensions across all views:**
 

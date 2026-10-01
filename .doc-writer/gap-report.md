@@ -2,100 +2,55 @@
 
 **Source root:** src/
 **Language:** rust
-**Docs root:** docs/ (reStructuredText, Sphinx + Shibuya — not Markdown)
-**Generated:** 2026-08-09, against version 0.12.0 (unreleased)
+**Generated:** 2026-09-30, against `main` @ `67af10f` (v0.13.0)
+**Total exported symbols:** 165 Rust `pub` items (scan-exports.sh) + 19 registered SQL functions
+**Documented symbols:** 18 of 19 SQL functions (all user-facing ones); 0 of 165 Rust items
+**Undocumented symbols:** 1 SQL function (internal); 165 Rust items (internal: see Notes)
 
-## Headline
+## Why the audit counts two surfaces
 
-| Surface | Total | Documented | Undocumented |
-|---------|-------|------------|--------------|
-| **User-facing SQL surface** (DDL statements + registered SQL functions) | 21 | 21 | 0 |
-| Internal Rust `pub` items (`scan-exports.sh` output) | 165 | 0 (by design) | 165 (not applicable) |
+`scan-exports.sh` finds Rust `pub` items (`KeywordBody`, `CiName`, `QueryRequest`,
+`FanTrapError`, `expand()` and so on). This project ships a DuckDB **extension**, not a Rust
+crate. Users never link against these items; they are `pub` only for crate-internal module
+boundaries, tests and fuzz targets. Leaving all 165 out of user docs is correct and none is
+listed as a gap.
 
-The raw `scan-exports.sh` number is **not a meaningful coverage signal for this
-project**. `duckdb-semantic-views` builds a `cdylib` DuckDB extension; its public
-contract is SQL (`CREATE SEMANTIC VIEW`, `semantic_view(...)`, `SHOW SEMANTIC …`),
-not a Rust API. Nothing under `src/` is consumed by users as a crate, so the 165
-`pub` items are internal module boundaries and correctly absent from `docs/`. The
-table below is the coverage check that actually matters.
-
-## User-Facing SQL Surface — Coverage
-
-### DDL statements
-
-| Statement | Reference page | Status |
-|-----------|----------------|--------|
-| `CREATE SEMANTIC VIEW` (+ `OR REPLACE`, `IF NOT EXISTS`, `FROM YAML`) | `reference/create-semantic-view.rst` | documented |
-| `DROP SEMANTIC VIEW [IF EXISTS]` | `reference/drop-semantic-view.rst` | documented |
-| `ALTER SEMANTIC VIEW … RENAME TO` | `reference/alter-semantic-view.rst` | documented |
-| `ALTER SEMANTIC VIEW … SET COMMENT` | `reference/alter-semantic-view.rst` | documented |
-| `ALTER SEMANTIC VIEW … UNSET COMMENT` | `reference/alter-semantic-view.rst` | documented |
-| `DESCRIBE SEMANTIC VIEW` | `reference/describe-semantic-view.rst` | documented |
-| `SHOW SEMANTIC VIEWS` | `reference/show-semantic-views.rst` | documented |
-| `SHOW SEMANTIC DIMENSIONS` | `reference/show-semantic-dimensions.rst` | documented |
-| `SHOW SEMANTIC DIMENSIONS … FOR METRIC` | `reference/show-semantic-dimensions-for-metric.rst` | documented |
-| `SHOW SEMANTIC METRICS` | `reference/show-semantic-metrics.rst` | documented |
-| `SHOW SEMANTIC FACTS` | `reference/show-semantic-facts.rst` | documented |
-| `SHOW SEMANTIC MATERIALIZATIONS` | `reference/show-semantic-materializations.rst` | documented |
-| `SHOW COLUMNS IN SEMANTIC VIEW` | `reference/show-columns-semantic-view.rst` | documented |
-
-The `ALTER` grammar in `src/parse/rewrite.rs:205` ("Supported: RENAME TO, SET
-COMMENT, UNSET COMMENT") matches `reference/alter-semantic-view.rst` exactly — no
-`ADD`/`DROP <member>` forms exist, and their absence from the docs is correct, not
-a gap.
-
-### Registered SQL functions
-
-| Function | Documented in | Status |
-|----------|---------------|--------|
-| `semantic_view(...)` | `reference/semantic-view-function.rst` + 29 other pages | documented |
-| `explain_semantic_view(...)` | `reference/explain-semantic-view-function.rst` + 12 pages | documented |
-| `get_ddl(...)` (both arities) | `reference/get-ddl.rst` + 9 pages | documented |
-| `read_yaml_from_semantic_view(...)` | `reference/read-yaml-from-semantic-view.rst` + 8 pages | documented |
-
-### `semantic_view()` named parameters
-
-Every named parameter accepted in `cpp/src/shim.cpp` — `dimensions`, `metrics`,
-`facts`, `where_clause`, `search_path` — appears in the docs (`where_clause` in 4
-pages, `search_path` in 5). No parameter is undocumented.
-
-### DDL clause features
-
-Spot-checked against the parser; all present in `docs/`: `TABLES`,
-`RELATIONSHIPS`, `FACTS`, `DIMENSIONS`, `METRICS`, `PRIMARY KEY`, `UNIQUE`,
-`REFERENCES`, `USING RELATIONSHIPS`, `COMMENT =`, `WITH SYNONYMS`,
-`NON ADDITIVE BY`, `OVER` (window metrics), `MATERIALIZATION`, `FROM YAML`.
+What users *do* use is the SQL surface. The registered functions were taken from
+`duckdb_functions()` by diffing it before and after `LOAD`ing `build/debug/semantic_views.duckdb_extension`
+on DuckDB 1.5.6. The DDL statements were checked against the `reference/` pages.
 
 ## Undocumented Exports
 
-No undocumented **user-facing** exports. Two lower-confidence items are worth a
-deliberate decision rather than an automatic fix:
+| Symbol | File | Type |
+|--------|------|------|
+| `__sv_compute_create_from_yaml(file_path, view_name, comment, search_path)` | src/ (DDL rewrite target) | table function — **internal**, `__sv_` prefix; the rewrite target for `CREATE SEMANTIC VIEW … FROM YAML FILE`. Correctly undocumented. |
 
-| Symbol | File | Type | Note |
-|--------|------|------|------|
-| `list_semantic_views`, `list_terse_semantic_views` | `cpp/src/shim.cpp` | table function | Backs `SHOW SEMANTIC VIEWS`. Registered, therefore directly callable by a user, but never named in the docs. |
-| `show_semantic_dimensions_all`, `show_semantic_metrics_all`, `show_semantic_facts_all`, `show_semantic_materializations_all` | `cpp/src/shim.cpp` | table function | Arity variants backing the un-scoped `SHOW SEMANTIC …` forms. Same situation. |
-| `describe_semantic_view`, `show_columns_in_semantic_view` | `cpp/src/shim.cpp` | table function | Function-form of the corresponding `DESCRIBE` / `SHOW COLUMNS` statements. Documented only in statement form. |
+## SQL surface coverage
 
-These are implementation plumbing that DuckDB's function registry happens to
-expose. Documenting them would invite users onto an unsupported surface; the
-current omission is defensible. The gap is that nothing in the docs *says* they
-are unsupported. Either is fine — it just shouldn't be accidental.
+| Function | Documented as | Pages | Notes |
+|----------|---------------|------:|-------|
+| `semantic_view(view_name, dimensions, metrics, facts, where_clause)` | itself | 30 | All named parameters documented |
+| `explain_semantic_view(…)` | itself | 15 | All named parameters documented |
+| `get_ddl(object_type, object_name[, use_fully_qualified_names])` | `GET_DDL(...)` | 14 | **Name mismatch:** `reference/get-ddl.rst` calls the 2nd parameter `<name>`; `duckdb_functions()` reports `object_name` (as of #236) |
+| `read_yaml_from_semantic_view(view_name)` | itself | 9 | ok |
+| `list_semantic_views` / `list_terse_semantic_views` | `SHOW [TERSE] SEMANTIC VIEWS` | 9 / 2 | `list_semantic_views()` still named as a `FROM` source (intended) |
+| `describe_semantic_view` | `DESCRIBE SEMANTIC VIEW` | 14 | Statement-first by design (#235) |
+| `show_columns_in_semantic_view` | `SHOW COLUMNS IN SEMANTIC VIEW` | 4 | ok |
+| `show_semantic_{dimensions,metrics,facts,materializations}[_all]` | `SHOW SEMANTIC …` | 2–9 | ok |
+| `show_semantic_dimensions_for_metric` | `SHOW SEMANTIC DIMENSIONS … FOR METRIC` | 6 | ok |
+
+The `search_path` parameter on every table function is reserved for the extension (the
+parser rewrite supplies it), and the function descriptions say so. It is correctly left out of
+user docs; `search_path` appears only as the DuckDB session setting.
 
 ## Notes
 
-- **Docs are RST, not Markdown.** `paths.docs_root: "docs/"` in
-  `.doc-writer/config.yaml` still records `detected.doc_system: "plain-markdown"`
-  and `existing_docs: false`, both stale — the project is Sphinx + Shibuya with 41
-  RST pages plus `changelog.md`. Worth correcting in config so future
-  `/doc-writer` runs glob the right extensions.
-- **Docs track the code closely.** Ten `.. versionadded:: 0.12.0` /
-  `versionchanged:: 0.12.0` directives already exist for the unreleased version,
-  covering per-grain aggregation, fan traps, facts, and the Snowflake comparison.
-  Doc commits are interleaved with feature commits (e.g. `06e95c8`, `ae03567`,
-  `bca6e91`), so drift is being caught at PR time rather than accumulating.
-- **`docs/.venv/` and `docs/_build/` pollute naive globs.** A `docs/**/*.md`
-  scan returns mostly vendored package READMEs. Any tooling pointed at this repo
-  should exclude both.
-- Coverage was checked by matching each registered name and DDL keyword against
-  `docs/**/*.rst`, case-insensitively, excluding `.venv` and `_build`.
+- **v0.13.0's headline feature is barely documented.** "Every function the extension
+  registers is documented in `duckdb_functions()`" is in the CHANGELOG, and
+  `examples/function_discovery.py` demos it. But the only doc page that mentions
+  `duckdb_functions()` is `changelog.md`. No how-to or reference page shows how a tool or agent
+  discovers the functions, their parameter names and their examples over a SQL connection.
+- **The `get_ddl` parameter-name drift** is minor, but it's the kind #236 set out to fix:
+  someone reading `duckdb_functions()` sees `object_name`, while the docs say `<name>`.
+- The DDL reference covers all verbs: `CREATE` (incl. `FROM YAML`), `ALTER`, `DROP`, `DESCRIBE`,
+  `SHOW` × 7 variants, `GET_DDL`, and `READ_YAML_FROM_SEMANTIC_VIEW`.

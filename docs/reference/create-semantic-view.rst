@@ -19,7 +19,9 @@ Syntax
 
 .. code-block:: sqlgrammar
 
-   CREATE [ OR REPLACE ] SEMANTIC VIEW [ IF NOT EXISTS ] <name> AS
+   CREATE [ OR REPLACE ] SEMANTIC VIEW [ IF NOT EXISTS ] <name>
+       [ COMMENT = '<text>' ]
+   AS
    TABLES (
        [ <alias> AS ] <table_name>
            [ PRIMARY KEY ( <column> [, <column> ...] ) ]
@@ -41,7 +43,7 @@ Syntax
        [, ... ]
    ) ]
    [ DIMENSIONS (
-       <alias>.<dim_name> AS <expression>
+       [ PUBLIC ] <alias>.<dim_name> AS <expression>
            [ COMMENT = '<text>' ]
            [ WITH SYNONYMS = ( '<synonym>' [, '<synonym>' ...] ) ]
            [ LABELS = ( FILTER ) ]
@@ -156,7 +158,7 @@ All three variants work with both the ``AS`` keyword body and the ``FROM YAML`` 
 
    A name that exists only in schemas *off* the path is a miss: the error names the schemas it does live in, the path that was searched, and the two ways out (qualify the reference, or add the schema to ``search_path``). ``IF EXISTS`` does not absorb it -- that clause means "do not complain if the view is absent", and a view sitting off the path is not absent.
 
-   Two exceptions: :ref:`ref-get-ddl` and ``READ_YAML_FROM_SEMANTIC_VIEW`` are scalar functions, which cannot be handed the search path, so they resolve a bare name to the unique match and raise an error naming the candidate schemas when several hold it.
+   Two exceptions: :ref:`ref-get-ddl` and :ref:`READ_YAML_FROM_SEMANTIC_VIEW <ref-read-yaml>` are scalar functions, which cannot be handed the search path, so they resolve a bare name to the unique match and raise an error naming the candidate schemas when several hold it.
 
    Unqualified table names in the body resolve in the **creating session's** schema, not in the view's -- so a semantic view in ``analytics`` built over ``main.orders`` can be written as ``CREATE SEMANTIC VIEW analytics.sales AS TABLES (o AS orders ...)`` from a session in ``main``. This follows DuckDB's rule for a view body.
 
@@ -166,11 +168,11 @@ All three variants work with both the ``AS`` keyword body and the ``FROM YAML`` 
 
 .. note::
 
-   ``CREATE SEMANTIC VIEW IF NOT EXISTS`` reliably absorbs duplicates within a single process or transaction (re-running a setup script, repeated statements in the same ``BEGIN`` block). It cannot absorb a race between two separate processes that both run ``CREATE IF NOT EXISTS`` against the same database at the same time -- one will succeed and the other will see a constraint error. Concurrent DDL across processes is unusual for typical DuckDB workloads, so most users will never hit this. See :ref:`explanation-txn-ddl-create-race` for the workaround.
+   ``CREATE SEMANTIC VIEW IF NOT EXISTS`` reliably absorbs duplicates within a single connection or transaction (re-running a setup script, repeated statements in the same ``BEGIN`` block). It cannot absorb a race between two connections that both run ``CREATE IF NOT EXISTS`` against the same database at the same time -- one will succeed and the other will see a constraint error. Concurrent DDL across connections is unusual for typical DuckDB workloads, so most users will never hit this. See :ref:`explanation-txn-ddl-create-race` for the workaround.
 
 .. note::
 
-   Requires a writable database. On a read-only database this statement fails with DuckDB's standard ``Cannot execute statement of type "..." which is attached in read-only mode!`` error. See :ref:`explanation-txn-ddl-readonly`.
+   Requires a writable database. On a read-only database this statement fails with DuckDB's standard ``Cannot execute statement of type "..." on database "<name>" which is attached in read-only mode!`` error. See :ref:`explanation-txn-ddl-readonly`.
 
 
 .. _ref-create-clauses:
@@ -248,11 +250,12 @@ Cardinality is used for :ref:`fan trap detection <howto-fan-traps>`.
 
 **Validation rules:**
 
-- The relationship graph must form a tree rooted at the base table.
-- Cycles are rejected.
-- Diamond patterns (multiple paths to the same table) are rejected unless all paths use named relationships (role-playing pattern).
+- The relationship graph must form a tree rooted at the base table: each table is reached from exactly one other table.
+- Cycles are rejected: ``cycle detected in relationships: a -> b -> a``.
+- Several named relationships from the **same** source table to the same target are allowed. This is the role-playing pattern (``dep_airport`` and ``arr_airport`` from ``flights`` to ``airports``); pick the path per metric with ``USING``.
+- One target reached from two **different** source tables is a diamond, and is rejected whatever the relationships are named: ``diamond: 's' is reachable from multiple tables ('a', 'b'); the join path is ambiguous.`` To model it, declare the shared table twice under two aliases, one per path, so each is joined once.
 - Self-references (``from_alias`` equals ``to_alias``) are rejected.
-- Orphan tables (declared in ``TABLES`` but not reachable via relationships) are rejected in multi-table views.
+- Orphan tables (declared in ``TABLES`` but not connected by any relationship) are rejected once the view declares at least one relationship. A view with several tables and no ``RELATIONSHIPS`` clause is not checked this way; a query that needs one of the unconnected tables then fails when it is bound.
 
 
 .. _ref-create-facts:
@@ -279,7 +282,7 @@ Declares named row-level expressions. Facts are inlined into metric expressions 
 - ``<row_level_expression>``, the SQL expression **after** ``AS``: any expression that operates on individual rows. Must not contain aggregate functions. A fact may be named after its own backing column (``s.unit_price AS s.unit_price``), giving a passthrough fact.
 - ``COMMENT = '<text>'``, optional. A human-readable description.
 - ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability.
-- ``LABELS = (FILTER)``, optional. Declares the fact a :ref:`named filter <howto-annotations-filters>` -- a boolean-valued member meant for reuse in a query's ``where_clause``. Metadata only: it does not restrict querying, and the ``BOOLEAN`` requirement is enforced by DuckDB's binder at query time. ``FILTER`` is the only accepted label.
+- ``LABELS = (FILTER)``, optional. Declares the fact a :ref:`named filter <howto-annotations-filters>` -- a boolean-valued member meant for reuse in a query's :ref:`where_clause <ref-sv-pre-agg-filtering>`. Metadata only: it does not restrict querying, and the ``BOOLEAN`` requirement is enforced by DuckDB's binder at query time. ``FILTER`` is the only accepted label.
 
 **Fact chaining:**
 
@@ -292,7 +295,7 @@ Facts can reference other facts by name. The extension resolves dependencies in 
 
 **Reported data type:**
 
-As with dimensions and metrics, ``CREATE`` records no output type for a fact. The ``data_type`` column reported by :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is empty for every view created since v0.10.0, and populated only for views stored before that change. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+As with dimensions and metrics, ``CREATE`` records no output type for a fact. The ``data_type`` column reported by :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is empty for every view created since v0.10.0, and populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 
 .. _ref-create-dimensions:
@@ -317,7 +320,7 @@ Declares named grouping expressions available for queries.
 - ``<expression>``, any SQL expression. Can be a simple column reference (``o.region``) or a computed expression (``date_trunc('month', o.ordered_at)``).
 - ``COMMENT = '<text>'``, optional. A human-readable description.
 - ``WITH SYNONYMS = ('<synonym>', ...)``, optional. Alternative names for discoverability.
-- ``LABELS = (FILTER)``, optional. Declares the dimension a :ref:`named filter <howto-annotations-filters>` -- a boolean-valued member meant for reuse in a query's ``where_clause``. Metadata only: it does not hide the dimension from output, and the ``BOOLEAN`` requirement is enforced by DuckDB's binder at query time. ``FILTER`` is the only accepted label.
+- ``LABELS = (FILTER)``, optional. Declares the dimension a :ref:`named filter <howto-annotations-filters>` -- a boolean-valued member meant for reuse in a query's :ref:`where_clause <ref-sv-pre-agg-filtering>`. Metadata only: it does not hide the dimension from output, and the ``BOOLEAN`` requirement is enforced by DuckDB's binder at query time. ``FILTER`` is the only accepted label.
 
 .. note::
 
@@ -330,13 +333,13 @@ Declares named grouping expressions available for queries.
 
 **Reported data type:**
 
-``CREATE`` does not record an output type for a dimension, and no surface can declare one: the DDL grammar above has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`ref-get-ddl` could not carry it (a restored view silently lost the cast). The ``data_type`` column reported by :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is therefore empty for every view created since v0.10.0, and populated only for views stored before that change.
+``CREATE`` does not record an output type for a dimension, and no surface can declare one: the DDL grammar above has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`ref-get-ddl` could not carry it (a restored view silently lost the cast). The ``data_type`` column reported by :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is therefore empty for every view created since v0.10.0, and populated only for views stored before that release.
 
 Query results are still fully typed -- :ref:`semantic_view() <ref-semantic-view-function>` infers each output column when the query is bound. Only the catalog metadata is silent about types. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 .. versionchanged:: 0.10.0
 
-   The define-time type inference pass was removed. Views created before this
+   The define-time inference pass was removed. Views created before this
    change keep whatever ``data_type`` they were stored with.
 
 
@@ -463,7 +466,7 @@ See :ref:`howto-window-metrics` for details on both modes.
 
 **Reported data type:**
 
-As with dimensions, ``CREATE`` does not record an output type for a metric. The ``data_type`` column reported by :ref:`SHOW SEMANTIC METRICS <ref-show-semantic-metrics>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is empty for every view created since v0.10.0, and populated only for views stored before that change. The metric's result column is typed when the query is bound, not when the view is defined. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+As with dimensions, ``CREATE`` does not record an output type for a metric. The ``data_type`` column reported by :ref:`SHOW SEMANTIC METRICS <ref-show-semantic-metrics>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is empty for every view created since v0.10.0, and populated only for views stored before that release. The metric's result column is typed when the query is bound, not when the view is defined. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 
 .. _ref-create-materializations:
@@ -479,7 +482,7 @@ Declares named materializations that map pre-aggregated tables to the dimensions
 
    MATERIALIZATIONS (
        region_agg AS (
-           TABLE daily_revenue_by_region,
+           TABLE revenue_by_region,
            DIMENSIONS (region),
            METRICS (revenue, order_count)
        ),
@@ -542,7 +545,7 @@ Creates a semantic view from a YAML definition instead of the keyword-based ``AS
      - name: revenue
        expr: SUM(o.amount)
        source_table: o
-   $$
+   $$;
 
 The YAML content is enclosed in dollar-quote delimiters. Tagged dollar-quoting (``$yaml$...$yaml$``) is also supported.
 
@@ -550,7 +553,7 @@ The YAML content is enclosed in dollar-quote delimiters. Tagged dollar-quoting (
 
 .. code-block:: sql
 
-   CREATE SEMANTIC VIEW order_metrics FROM YAML FILE '/path/to/definition.yaml'
+   CREATE SEMANTIC VIEW order_metrics FROM YAML FILE '/path/to/definition.yaml';
 
 The file path must be single-quoted. DuckDB reads the file contents and parses as YAML.
 
@@ -625,9 +628,10 @@ Examples
        f.carrier AS f.carrier
    )
    METRICS (
-       f.departures    USING (dep_airport) AS COUNT(*),
-       f.arrivals      USING (arr_airport) AS COUNT(*),
-       total_flights   AS departures + arrivals
+       f.departures            USING (dep_airport) AS COUNT(*),
+       f.arrivals              USING (arr_airport) AS COUNT(*),
+       f.international_flights AS SUM(f.is_international),
+       total_flights           AS departures + arrivals
    );
 
 **With metadata annotations:**
@@ -724,7 +728,7 @@ Examples
    )
    MATERIALIZATIONS (
        region_agg AS (
-           TABLE daily_revenue_by_region,
+           TABLE revenue_by_region,
            DIMENSIONS (region),
            METRICS (revenue, order_count)
        ),
@@ -755,7 +759,7 @@ Examples
      - name: revenue
        expr: SUM(o.amount)
        source_table: o
-   $$
+   $$;
 
 **From YAML file:**
 
@@ -763,4 +767,4 @@ Examples
 
 .. code-block:: sql
 
-   CREATE SEMANTIC VIEW order_metrics FROM YAML FILE '/path/to/definition.yaml'
+   CREATE SEMANTIC VIEW order_metrics FROM YAML FILE '/path/to/definition.yaml';

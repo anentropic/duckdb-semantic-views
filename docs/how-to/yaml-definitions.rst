@@ -7,9 +7,9 @@
 How to Import and Export YAML Definitions
 ==============================================
 
-This guide shows how to create a semantic view from a YAML definition (inline or file), export an existing view to YAML, and round-trip definitions between environments. These features enable version-controlled definitions, cross-environment migration, and sharing semantic view configurations outside of SQL.
-
 .. versionadded:: 0.7.0
+
+This guide shows how to create a semantic view from a YAML definition (inline or file), export an existing view to YAML, and round-trip definitions between environments. These features enable version-controlled definitions, cross-environment migration, and sharing semantic view configurations outside of SQL.
 
 **Prerequisites:**
 
@@ -41,7 +41,7 @@ Use ``FROM YAML`` with a dollar-quoted string to create a semantic view from an 
      - name: revenue
        expr: SUM(o.amount)
        source_table: o
-   $$
+   $$;
 
 The YAML body is enclosed in ``$$`` dollar-quote delimiters. Tagged dollar-quoting is also supported for clarity:
 
@@ -61,7 +61,7 @@ The YAML body is enclosed in ``$$`` dollar-quote delimiters. Tagged dollar-quoti
      - name: revenue
        expr: SUM(o.amount)
        source_table: o
-   $yaml$
+   $yaml$;
 
 Both ``CREATE OR REPLACE`` and ``CREATE IF NOT EXISTS`` variants work with ``FROM YAML``:
 
@@ -69,11 +69,11 @@ Both ``CREATE OR REPLACE`` and ``CREATE IF NOT EXISTS`` variants work with ``FRO
 
    CREATE OR REPLACE SEMANTIC VIEW order_metrics FROM YAML $$
    ...
-   $$
+   $$;
 
    CREATE SEMANTIC VIEW IF NOT EXISTS order_metrics FROM YAML $$
    ...
-   $$
+   $$;
 
 
 .. _howto-yaml-import-file:
@@ -85,14 +85,14 @@ Use ``FROM YAML FILE`` with a single-quoted file path to create a semantic view 
 
 .. code-block:: sql
 
-   CREATE SEMANTIC VIEW order_metrics FROM YAML FILE '/path/to/order_metrics.yaml'
+   CREATE SEMANTIC VIEW order_metrics FROM YAML FILE '/path/to/order_metrics.yaml';
 
 The file path must be single-quoted. DuckDB reads the file and parses its contents as a YAML semantic view definition.
 
 .. code-block:: sql
 
    CREATE OR REPLACE SEMANTIC VIEW order_metrics
-   FROM YAML FILE '/path/to/order_metrics.yaml'
+   FROM YAML FILE '/path/to/order_metrics.yaml';
 
 .. note::
 
@@ -147,7 +147,7 @@ Export and import together enable a full round-trip workflow for migrating seman
 
 .. code-block:: sql
 
-   CREATE SEMANTIC VIEW analytics FROM YAML FILE '/shared/analytics.yaml'
+   CREATE SEMANTIC VIEW analytics FROM YAML FILE '/shared/analytics.yaml';
 
 **3. Verify the import:**
 
@@ -169,32 +169,25 @@ Troubleshooting
 ===============
 
 **Error: Expected 'AS' or 'FROM YAML' after view name**
-
-The DDL body must start with either ``AS`` (keyword body) or ``FROM YAML`` (YAML body). Check that the ``FROM YAML`` keywords appear directly after the view name.
+   The DDL body must start with either ``AS`` (keyword body) or ``FROM YAML`` (YAML body). Check that the ``FROM YAML`` keywords appear directly after the view name.
 
 **Error: Expected '$' to begin dollar-quoted string**
-
-The inline YAML body must be enclosed in dollar-quote delimiters (``$$`` or ``$tag$``). Ensure the YAML content starts with ``$$`` immediately after ``FROM YAML``.
+   The inline YAML body must be enclosed in dollar-quote delimiters (``$$`` or ``$tag$``). Ensure the YAML content starts with ``$$`` immediately after ``FROM YAML``.
 
 **Error: Unterminated dollar-quoted string**
-
-The closing delimiter was not found. Ensure the closing ``$$`` (or ``$tag$``) matches the opening delimiter exactly.
+   The closing delimiter was not found. Ensure the closing ``$$`` (or ``$tag$``) matches the opening delimiter exactly.
 
 **Error: Unexpected content after closing dollar-quote**
-
-Extra text appears after the closing ``$$``. Remove any trailing content after the closing delimiter (semicolons are allowed at the statement level but not inside the dollar-quote).
+   Extra text appears after the closing ``$$``. Remove any trailing content after the closing delimiter (semicolons are allowed at the statement level but not inside the dollar-quote).
 
 **Error: File path cannot be empty**
-
-The ``FROM YAML FILE`` variant requires a non-empty single-quoted file path: ``FROM YAML FILE '/path/to/file.yaml'``.
+   The ``FROM YAML FILE`` variant requires a non-empty single-quoted file path: ``FROM YAML FILE '/path/to/file.yaml'``.
 
 **Error: YAML definition exceeds size limit**
-
-YAML definitions are capped at 1 MiB. Large definitions should be split into multiple semantic views.
+   YAML definitions are capped at 1 MiB. Large definitions should be split into multiple semantic views.
 
 **Error: semantic view 'name' does not exist (on export)**
-
-:ref:`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>` requires the view to exist. Check the view name with ``SHOW SEMANTIC VIEWS``.
+   :ref:`READ_YAML_FROM_SEMANTIC_VIEW() <ref-read-yaml>` requires the view to exist. Check the view name with :ref:`SHOW SEMANTIC VIEWS <ref-show-semantic-views>`.
 
 See :ref:`ref-error-messages` for the full list of YAML-related error messages.
 

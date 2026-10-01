@@ -95,20 +95,26 @@ Load the ``iceberg`` extension and scan Iceberg tables:
 S3 Credentials
 --------------
 
-DuckDB needs S3 credentials to read from cloud storage. Configure them before running ``iceberg_scan``:
+DuckDB needs S3 credentials to read from cloud storage. Create a secret before running ``iceberg_scan``, either with explicit keys or from the AWS SDK credential chain:
 
 .. code-block:: sql
 
-   SET s3_region = 'us-east-1';
-   SET s3_access_key_id = 'AKIA...';
-   SET s3_secret_access_key = '...';
+   -- Explicit keys
+   CREATE SECRET (
+       TYPE s3,
+       KEY_ID 'AKIA...',
+       SECRET '...',
+       REGION 'us-east-1'
+   );
 
-   -- Or use the httpfs extension's credential chain
-   INSTALL httpfs;
-   LOAD httpfs;
-   SET s3_url_style = 'path';
+   -- Or: credentials from environment variables, ~/.aws config,
+   -- or an instance profile (uses DuckDB's aws extension)
+   CREATE SECRET (
+       TYPE s3,
+       PROVIDER credential_chain
+   );
 
-See the `DuckDB httpfs documentation <https://duckdb.org/docs/extensions/httpfs/s3api>`_ for credential chain options including environment variables and instance profiles.
+See the DuckDB `S3 API <https://duckdb.org/docs/stable/core_extensions/httpfs/s3api>`_ and `aws extension <https://duckdb.org/docs/stable/core_extensions/aws>`_ documentation for the other secret options, such as named profiles and assumed roles.
 
 Iceberg Catalog Types
 ---------------------
@@ -137,6 +143,8 @@ Creating a ``VIEW`` instead of a ``TABLE`` keeps queries reading the latest Iceb
 
 This is useful when the underlying Iceberg table changes frequently. The trade-off is that each :ref:`semantic_view() <ref-semantic-view-function>` query re-scans the Iceberg metadata.
 
+.. _howto-ds-schema-evolution:
+
 Schema Evolution
 ----------------
 
@@ -147,18 +155,26 @@ If columns are added or removed from the Iceberg table, update the semantic view
 
 .. tip::
 
-   For a DuckDB + Iceberg + analytics application stack, semantic views provide
-   a stable query interface over Iceberg tables. The application queries
-   :ref:`semantic_view() <ref-semantic-view-function>` with dimension and metric names, and the extension handles
-   schema mapping and join logic.
+   For a DuckDB + Iceberg + analytics application stack, semantic views give
+   the application a stable query interface over Iceberg tables. The
+   application queries :ref:`semantic_view() <ref-semantic-view-function>` with
+   dimension and metric names, and the extension writes the joins and
+   aggregation. Three pages cover the rest of that stack:
+
+   - :ref:`explanation-txn-ddl-readonly` -- define the views once in a writable
+     database file, then open it read-only in the application.
+   - :ref:`explanation-txn-ddl-attach` -- run semantic-view DDL from the
+     database you loaded the extension into, not from an ``ATTACH``-ed one.
+   - :ref:`howto-filtering-app` -- pass a user's date range or segment into a
+     query without building SQL from request input.
 
 
 .. _howto-ds-postgres:
 
-Postgres via postgres_scanner
-=============================
+Postgres via the ``postgres`` Extension
+=======================================
 
-Attach a Postgres database and create tables or views from it:
+Attach a Postgres database with DuckDB's ``postgres`` extension, then either copy its tables into DuckDB or reference them where they are. To copy them:
 
 .. code-block:: sql
 
@@ -170,7 +186,28 @@ Attach a Postgres database and create tables or views from it:
    CREATE TABLE orders AS SELECT * FROM pg.public.orders;
    CREATE TABLE customers AS SELECT * FROM pg.public.customers;
 
-Then define a semantic view over the local tables as usual. Alternatively, use the attached tables directly if DuckDB can resolve them.
+Then define a semantic view over the local ``orders`` and ``customers`` tables as usual.
+
+To read from Postgres at query time instead of from a copy, name the attached tables with their catalog-qualified names in the ``TABLES`` clause:
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW pg_analytics AS
+   TABLES (
+       o AS pg.public.orders    PRIMARY KEY (order_id),
+       c AS pg.public.customers PRIMARY KEY (customer_id)
+   )
+   RELATIONSHIPS (
+       order_customer AS o(customer_id) REFERENCES c
+   )
+   DIMENSIONS (
+       c.name AS c.customer_name
+   )
+   METRICS (
+       o.revenue AS SUM(o.amount)
+   );
+
+Each :ref:`semantic_view() <ref-semantic-view-function>` query then scans Postgres through the attachment, so ``pg`` must be attached in every session that queries the view. Run the ``CREATE SEMANTIC VIEW`` itself while your session is on the database you loaded the extension into -- do not ``USE pg`` first. :ref:`explanation-txn-ddl-attach` explains why.
 
 
 .. _howto-ds-mixed:
@@ -238,25 +275,42 @@ If your tables live in a specific catalog or schema, use the fully qualified tab
 The extension quotes each segment of the table name separately (``"my_catalog"."my_schema"."orders"``) in the generated SQL.
 
 
-.. _howto-ds-ambiguous-paths:
+.. _howto-ds-troubleshooting:
 
-Ambiguous Join Paths Are Rejected
-=================================
+Troubleshooting
+===============
 
-.. versionchanged:: 0.11.0
+**Catalog Error: Table with name ... does not exist**
+   ``CREATE SEMANTIC VIEW`` does not check that the tables in ``TABLES``
+   exist; they are looked up when you query the view. This error means a source
+   table is missing from the current session -- a ``CREATE TABLE ... AS`` copy
+   was dropped, or an attached database such as ``pg`` has not been attached
+   again after reconnecting. Recreate the table or re-run the ``ATTACH``.
 
-   A table reachable from two *different* source tables -- a join "diamond",
-   e.g. ``orders → a → shared`` and ``orders → b → shared`` -- makes the join
-   path to ``shared`` ambiguous. Such a definition is now rejected at
-   ``CREATE`` time; previously it was accepted and a query silently joined the
-   shared table through whichever relationship was declared first, producing
-   wrong numbers when the two paths point at different rows.
+**Binder Error: Table "o" does not have a column named ...**
+   A column that a dimension, metric or fact reads was removed from the source,
+   for example by Iceberg schema evolution. Update the view with ``CREATE OR
+   REPLACE SEMANTIC VIEW`` (see :ref:`howto-ds-schema-evolution`).
 
-The safe fan-out shown above (``orders → customers`` and ``orders → products``,
-two *different* targets from one source) is unaffected -- only a shared
-*target* reached from two different sources is ambiguous.
+**semantic-view DDL was issued against database 'pg', but the semantic view catalog lives in a different database**
+   The session had switched to an attached database with ``USE`` when it ran
+   ``CREATE``, ``ALTER`` or ``DROP SEMANTIC VIEW``. Switch back to the database
+   you loaded the extension into and run the DDL again. Qualified table names
+   such as ``pg.public.orders`` inside the view body are fine.
 
-**Role-playing is still supported.** Multiple distinctly-named relationships
-from a *single* source table to one target (e.g. ``flights → airports`` via
-``dep_airport`` / ``arr_airport``) is the role-playing pattern, not a diamond,
-and remains supported. See :ref:`howto-role-playing`.
+**diamond: '...' is reachable from multiple tables**
+   The view reaches one table from two different source tables, which makes
+   the join path ambiguous. This often happens when two sources share a lookup
+   table, such as ``regions``. Declare the shared table under a second alias;
+   see :ref:`howto-rp-diamond`.
+
+
+.. _howto-ds-related:
+
+Related
+=======
+
+- :ref:`ref-create-semantic-view` -- Full ``TABLES`` and ``RELATIONSHIPS`` syntax
+- :ref:`explanation-transactional-ddl` -- Read-only databases, attached databases and other deployment limits
+- :ref:`howto-filtering` -- Scope a query to a date range or segment before aggregation
+- :ref:`howto-materializations` -- Route common queries to a pre-aggregated table instead of re-scanning the source
