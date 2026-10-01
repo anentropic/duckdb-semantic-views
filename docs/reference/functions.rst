@@ -173,7 +173,7 @@ In DuckDB 1.5, ``duckdb_functions()`` has no column that names the extension a f
      - What the function does. For a function that backs a statement, the description names the statement to use instead.
    * - ``parameters``
      - VARCHAR[]
-     - Parameter names. For a table function the first entry is the positional argument (when it has one); the rest are named parameters, passed as ``name := value``, in no guaranteed order.
+     - Parameter names. For a table function, the positional arguments come first, in call order, and everything after them is a named parameter, passed as ``name := value``, in no guaranteed order. The number of positional arguments varies: none for ``list_semantic_views``, ``list_terse_semantic_views`` and the ``*_all`` functions; one (``view_name``) for ``semantic_view``, ``explain_semantic_view`` and the other functions that take a view; two (``view_name``, ``metric_name``) for ``show_semantic_dimensions_for_metric``; three for the internal helper. The metadata doesn't mark where the positional group ends, so take the count from this list. ``search_path`` is always named, and is reserved (see :ref:`ref-functions-search-path`).
    * - ``parameter_types``
      - VARCHAR[]
      - The DuckDB type of each parameter, in the same order as ``parameters``.
