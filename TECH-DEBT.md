@@ -564,7 +564,11 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Origin:** the v0.13.0 docs audit (PR #242, 2026-10-01). Six doc examples had shipped since v0.5.4–v0.7.0 filtering introspection output in the DuckDB idiom, `SELECT … FROM (DESCRIBE SEMANTIC VIEW v) WHERE object_kind = 'DIMENSION'` and `SELECT … FROM (SHOW SEMANTIC VIEWS)`. All six are parser errors (`syntax error at or near "VIEW"`). No test or example script ran them, so they went unnoticed until the audit executed them.
 - **Why it is natural to expect:** DuckDB accepts its own introspection statements in subquery position. On 1.5.6, `SELECT column_name FROM (DESCRIBE t) WHERE …` and `SELECT count(*) FROM (SHOW TABLES)` both work. Users who know DuckDB will reach for the same form with ours.
 - **Why it fails:** DuckDB's grammar doesn't know our statements. We recognise them ourselves, but only at the start of a statement: the `parser_override` entry point (`src/parse/ffi.rs`) asks `detect_ddl_kind` in `src/parse/detect.rs` whether the statement starts with one of our statements (v0.5.x used the same prefix test in `detect_ddl_prefix`). `SELECT * FROM (DESCRIBE SEMANTIC VIEW v)` starts with `SELECT`, so the extension never sees it and DuckDB's parser rejects the inner text. Supporting it today would mean finding and rewriting our statements inside arbitrary SQL with the string scanners. That's a large, fragile surface, not worth building against the current parser-extension API.
-- **What we ship instead (the interim state):** the backing table functions are the documented FROM sources. `FROM describe_semantic_view('v')` and `FROM list_semantic_views()` work now, and `docs/reference/functions.rst` (`ref-functions-describe`, `ref-functions-list`) plus the DESCRIBE / SHOW / materializations pages show them, while the statements stay the primary interface (#235). Only those two have documented FROM-source use. The other statement-backing functions (`show_semantic_dimensions`, `…_metrics`, `…_facts`, `…_materializations`, `show_columns_in_semantic_view`, `show_semantic_dimensions_for_metric`, the `*_all` and terse variants) still say "use the statement rather than calling this directly" in `duckdb_functions()`.
+- **What we ship instead (the interim state):**
+  - The docs say plainly that these statements can't be subqueries (`docs/reference/functions.rst` `ref-functions-subqueries`, with notes on the DESCRIBE and SHOW SEMANTIC VIEWS pages), and the six examples were removed.
+  - We deliberately do **not** recommend calling the backing table functions as a FROM workaround. They're implementation details of the statements, and their `duckdb_functions()` descriptions say "use the statement rather than calling this directly".
+  - The one documented exception is the `GET_DDL` dump-every-view recipe in `docs/reference/get-ddl.rst`, which reads `FROM list_semantic_views()`. It predates this entry: `list_semantic_views`'s registered description carves it out, and `test/sql/function_descriptions.test` runs it.
+  - `FROM describe_semantic_view('v')` does work, but it's undocumented on purpose.
 - **Revisit when:** we move to a custom PEG grammar on **DuckDB 2.0**. With our statements as real grammar productions, they can appear wherever DuckDB allows its own `DESCRIBE` / `SHOW`, so no rewriting scanner is needed.
 - **What would finish it:**
   - Make every statement the extension provides parse in subquery and CTE position:
@@ -574,13 +578,14 @@ Areas where test coverage is reduced compared to ideal, with justification.
     - `SHOW SEMANTIC DIMENSIONS … FOR METRIC`
     - `SHOW COLUMNS IN SEMANTIC VIEW`
   - Add sqllogictest cases that filter, join and aggregate each one as a subquery.
-  - Then put the six examples back in statement form, and reduce the FROM-source notes and `functions.rst` entries to "also available as a function".
-  - Re-word the `describe_semantic_view` / `list_semantic_views` descriptions in `cpp/src/shim.cpp` to match.
+  - Then restore the removed examples in statement form: filtering DESCRIBE output by `object_kind` (dimensions only, relationships only, count by kind, materialization rows only), and selecting or filtering `SHOW SEMANTIC VIEWS` columns.
+  - Move the `GET_DDL` dump-every-view recipe to `FROM (SHOW SEMANTIC VIEWS)`, and drop the FROM-source carve-out from `list_semantic_views`'s description in `cpp/src/shim.cpp` and its check in `test/sql/function_descriptions.test`.
 - **Docs to flip when it lands:**
-  - `docs/reference/functions.rst` (FROM-source section)
-  - `docs/reference/describe-semantic-view.rst` (`ref-describe-from-source` and the `object_kind` filter tip)
-  - `docs/reference/show-semantic-views.rst`
-  - `docs/how-to/materializations.rst`
+  - `docs/reference/functions.rst` (`ref-functions-subqueries`)
+  - `docs/reference/describe-semantic-view.rst` (`ref-describe-subquery` note)
+  - `docs/reference/show-semantic-views.rst` (`ref-show-subquery` note)
+  - `docs/reference/get-ddl.rst` (the dump-every-view recipe)
+  - `docs/how-to/materializations.rst` (the "materialization rows come last" sentence)
 
 ### 76. ❌ Query-time scalar expressions in `dimensions` / `metrics` / `facts` are not supported — OPEN
 

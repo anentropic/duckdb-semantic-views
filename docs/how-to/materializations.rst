@@ -245,33 +245,7 @@ Use :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` to see materializ
 
    DESCRIBE SEMANTIC VIEW order_metrics;
 
-To keep only the materialization rows, select from
-:ref:`describe_semantic_view() <ref-functions-describe>` instead:
-
-.. code-block:: sql
-
-   SELECT object_kind, object_name, property, property_value
-   FROM describe_semantic_view('order_metrics')
-   WHERE object_kind = 'MATERIALIZATION';
-
-.. code-block:: text
-
-   ┌─────────────────┬─────────────┬────────────┬───────────────────────────┐
-   │   object_kind   │ object_name │  property  │      property_value       │
-   ├─────────────────┼─────────────┼────────────┼───────────────────────────┤
-   │ MATERIALIZATION │ region_agg  │ TABLE      │ revenue_by_region         │
-   │ MATERIALIZATION │ region_agg  │ DIMENSIONS │ ["region"]                │
-   │ MATERIALIZATION │ region_agg  │ METRICS    │ ["revenue","order_count"] │
-   └─────────────────┴─────────────┴────────────┴───────────────────────────┘
-
-.. note::
-
-   ``DESCRIBE SEMANTIC VIEW`` is the normal way to read a view's definition.
-   It is a statement, though, and DuckDB cannot use a statement as a subquery,
-   so ``FROM (DESCRIBE SEMANTIC VIEW order_metrics)`` is a parser error. To
-   filter, join, or aggregate the output, query the table function behind the
-   statement, ``describe_semantic_view('<view>')``, which returns the same
-   rows. :ref:`ref-functions` lists every function the extension registers.
+The materialization rows come last, after the tables, dimensions, and metrics. To see only the materializations, use ``SHOW SEMANTIC MATERIALIZATIONS IN order_metrics`` above.
 
 
 .. _howto-materializations-staleness:

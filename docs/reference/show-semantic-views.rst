@@ -154,26 +154,11 @@ Examples
 
 If no semantic views are registered, the result set is empty.
 
-.. _ref-show-from-source:
+.. _ref-show-subquery:
 
-**Select, filter, or join the listing:**
+.. note::
 
-``SHOW SEMANTIC VIEWS`` is a statement, and DuckDB cannot use a statement as a subquery, so ``FROM (SHOW SEMANTIC VIEWS)`` is a parser error. To pick columns, filter, or join the listing, query the table function behind the statement, :ref:`list_semantic_views() <ref-functions-list>`, which returns the same six columns. For example, leave out the ``created_on`` timestamp to get output that does not change from run to run:
-
-.. code-block:: sql
-
-   SELECT name, kind, database_name, schema_name, comment
-   FROM list_semantic_views()
-   ORDER BY name;
-
-.. code-block:: text
-
-   ┌─────────────────┬───────────────┬───────────────┬─────────────┬───────────────────┐
-   │ name            │ kind          │ database_name │ schema_name │ comment           │
-   ├─────────────────┼───────────────┼───────────────┼─────────────┼───────────────────┤
-   │ order_metrics   │ SEMANTIC_VIEW │ memory        │ main        │ Revenue analytics │
-   │ sales_analytics │ SEMANTIC_VIEW │ memory        │ main        │                   │
-   └─────────────────┴───────────────┴───────────────┴─────────────┴───────────────────┘
+   ``SHOW SEMANTIC VIEWS`` can't be used as a subquery or in a ``WITH`` clause. Unlike DuckDB's own ``SHOW``, ``SELECT ... FROM (SHOW SEMANTIC VIEWS)`` is a parser error. Run the statement on its own. See :ref:`ref-functions-subqueries`.
 
 **TERSE variant (no comment column):**
 

@@ -327,10 +327,6 @@ Examples
 
 The first row is the view-level comment, so its ``object_kind`` and ``object_name`` are empty.
 
-.. _ref-describe-from-source:
-
-**Filter, join, or aggregate the output.** ``DESCRIBE SEMANTIC VIEW`` is a statement, and DuckDB cannot use a statement as a subquery, so ``FROM (DESCRIBE SEMANTIC VIEW ...)`` is a parser error. The table function behind the statement, :ref:`describe_semantic_view() <ref-functions-describe>`, returns the same rows and works as a ``FROM`` source. Use the statement to read a definition; use the function when you need to filter, join, or aggregate the result.
-
 **View with materializations:**
 
 .. code-block:: sql
@@ -354,53 +350,40 @@ The first row is the view-level comment, so its ``object_kind`` and ``object_nam
        )
    );
 
-   SELECT * FROM describe_semantic_view('order_metrics')
-   WHERE object_kind = 'MATERIALIZATION';
+   DESCRIBE SEMANTIC VIEW order_metrics;
 
 .. code-block:: text
 
-   ┌─────────────────┬─────────────┬───────────────┬────────────┬──────────────────────────────┐
-   │ object_kind     │ object_name │ parent_entity │ property   │ property_value               │
-   ├─────────────────┼─────────────┼───────────────┼────────────┼──────────────────────────────┤
-   │ MATERIALIZATION │ region_agg  │               │ TABLE      │ revenue_by_region            │
-   │ MATERIALIZATION │ region_agg  │               │ DIMENSIONS │ ["region"]                   │
-   │ MATERIALIZATION │ region_agg  │               │ METRICS    │ ["revenue","order_count"]    │
-   └─────────────────┴─────────────┴───────────────┴────────────┴──────────────────────────────┘
+   ┌─────────────────┬─────────────┬───────────────┬──────────────────────────┬───────────────────────────┐
+   │ object_kind     │ object_name │ parent_entity │ property                 │ property_value            │
+   ├─────────────────┼─────────────┼───────────────┼──────────────────────────┼───────────────────────────┤
+   │ TABLE           │ orders      │               │ BASE_TABLE_DATABASE_NAME │ memory                    │
+   │ TABLE           │ orders      │               │ BASE_TABLE_SCHEMA_NAME   │ main                      │
+   │ TABLE           │ orders      │               │ BASE_TABLE_NAME          │ orders                    │
+   │ TABLE           │ orders      │               │ PRIMARY_KEY              │ ["id"]                    │
+   │ DIMENSION       │ region      │ orders        │ TABLE                    │ orders                    │
+   │ DIMENSION       │ region      │ orders        │ EXPRESSION               │ o.region                  │
+   │ DIMENSION       │ region      │ orders        │ DATA_TYPE                │                           │
+   │ METRIC          │ revenue     │ orders        │ TABLE                    │ orders                    │
+   │ METRIC          │ revenue     │ orders        │ EXPRESSION               │ SUM(o.amount)             │
+   │ METRIC          │ revenue     │ orders        │ DATA_TYPE                │                           │
+   │ METRIC          │ revenue     │ orders        │ ACCESS_MODIFIER          │ PUBLIC                    │
+   │ METRIC          │ order_count │ orders        │ TABLE                    │ orders                    │
+   │ METRIC          │ order_count │ orders        │ EXPRESSION               │ COUNT(*)                  │
+   │ METRIC          │ order_count │ orders        │ DATA_TYPE                │                           │
+   │ METRIC          │ order_count │ orders        │ ACCESS_MODIFIER          │ PUBLIC                    │
+   │ MATERIALIZATION │ region_agg  │               │ TABLE                    │ revenue_by_region         │
+   │ MATERIALIZATION │ region_agg  │               │ DIMENSIONS               │ ["region"]                │
+   │ MATERIALIZATION │ region_agg  │               │ METRICS                  │ ["revenue","order_count"] │
+   └─────────────────┴─────────────┴───────────────┴──────────────────────────┴───────────────────────────┘
 
-.. tip::
+The materialization rows come last, after the tables, dimensions, and metrics.
 
-   Filter by ``object_kind`` to extract specific parts of the view definition:
+.. _ref-describe-subquery:
 
-   .. code-block:: sql
+.. note::
 
-      -- All dimensions in the view:
-      SELECT object_name, property, property_value
-      FROM describe_semantic_view('order_metrics')
-      WHERE object_kind = 'DIMENSION';
-
-      -- All relationships (the multi-table tutorial's 'shop' view declares one):
-      SELECT object_name, property, property_value
-      FROM describe_semantic_view('shop')
-      WHERE object_kind = 'RELATIONSHIP';
-
-      -- Count objects by kind:
-      SELECT object_kind, COUNT(DISTINCT object_name) AS object_count
-      FROM describe_semantic_view('order_metrics')
-      GROUP BY object_kind
-      ORDER BY object_kind;
-
-   For the materialization view above, the last query returns:
-
-   .. code-block:: text
-
-      ┌─────────────────┬──────────────┐
-      │ object_kind     │ object_count │
-      ├─────────────────┼──────────────┤
-      │ DIMENSION       │            1 │
-      │ MATERIALIZATION │            1 │
-      │ METRIC          │            2 │
-      │ TABLE           │            1 │
-      └─────────────────┴──────────────┘
+   ``DESCRIBE SEMANTIC VIEW`` can't be used as a subquery or in a ``WITH`` clause. Unlike DuckDB's own ``DESCRIBE``, ``SELECT ... FROM (DESCRIBE SEMANTIC VIEW order_metrics)`` is a parser error. Run the statement on its own. See :ref:`ref-functions-subqueries`.
 
 **Error: view does not exist:**
 

@@ -39,12 +39,6 @@ Function Inventory
    * - :ref:`read_yaml_from_semantic_view() <ref-read-yaml>`
      - scalar
      - Return a stored view's definition as YAML, ready to re-import with ``CREATE SEMANTIC VIEW ... FROM YAML``.
-   * - :ref:`list_semantic_views() <ref-functions-list>`
-     - table
-     - The listing ``SHOW SEMANTIC VIEWS`` returns, as a ``FROM`` source. Use the statement to read it; use the function to filter, join, or aggregate it.
-   * - :ref:`describe_semantic_view() <ref-functions-describe>`
-     - table
-     - The rows ``DESCRIBE SEMANTIC VIEW`` returns, as a ``FROM`` source. Use the statement to read them; use the function to filter, join, or aggregate them.
 
 **These back a statement -- use the statement instead:**
 
@@ -55,6 +49,12 @@ Function Inventory
    * - Function
      - Type
      - Statement to use
+   * - ``describe_semantic_view``
+     - table
+     - :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>`
+   * - ``list_semantic_views``
+     - table
+     - :ref:`SHOW SEMANTIC VIEWS <ref-show-semantic-views>` (one exception: see :ref:`ref-functions-subqueries`)
    * - ``list_terse_semantic_views``
      - table
      - :ref:`SHOW TERSE SEMANTIC VIEWS <ref-show-semantic-views>`
@@ -257,70 +257,11 @@ Every table function the extension registers has a named parameter called ``sear
 The scalar functions (``get_ddl`` and ``read_yaml_from_semantic_view``) have no ``search_path`` parameter. They resolve an unqualified name to the one view of that name; see :ref:`ref-get-ddl-resolution`.
 
 
-.. _ref-functions-from-source:
+.. _ref-functions-subqueries:
 
-Table Functions as FROM Sources
-===============================
+Statements Are Not Subqueries
+=============================
 
-``SHOW SEMANTIC VIEWS`` and ``DESCRIBE SEMANTIC VIEW`` are the normal way to list views and read a definition. They are statements, though, and DuckDB cannot use a statement as a subquery: ``FROM (SHOW SEMANTIC VIEWS)`` and ``FROM (DESCRIBE SEMANTIC VIEW sales)`` are parser errors, and so is the same statement in a ``WITH`` clause. When you need to filter, join, or aggregate their output, query the table function behind the statement instead. It returns the same columns and rows.
+``SHOW SEMANTIC ...`` and ``DESCRIBE SEMANTIC VIEW`` can't be used as a subquery or in a ``WITH`` clause. Unlike DuckDB's own ``SHOW`` and ``DESCRIBE``, ``SELECT ... FROM (SHOW SEMANTIC VIEWS)`` and ``SELECT ... FROM (DESCRIBE SEMANTIC VIEW sales)`` are parser errors. Run the statement on its own and read the rows it returns.
 
-The other table functions behind ``SHOW`` statements are not intended for direct use; use their statements.
-
-
-.. _ref-functions-list:
-
-list_semantic_views()
----------------------
-
-.. code-block:: sqlgrammar
-
-   SELECT ... FROM list_semantic_views()
-
-Called with no arguments. Returns one row per semantic view, in every schema, with the same six columns as :ref:`SHOW SEMANTIC VIEWS <ref-show-output>`: ``created_on``, ``name``, ``kind``, ``database_name``, ``schema_name``, and ``comment``, all VARCHAR.
-
-.. code-block:: sql
-
-   SELECT schema_name, count(*) AS views
-   FROM list_semantic_views()
-   GROUP BY schema_name
-   ORDER BY schema_name;
-
-.. code-block:: text
-
-   ┌─────────────┬───────┐
-   │ schema_name │ views │
-   ├─────────────┼───────┤
-   │ main        │     1 │
-   │ staging     │     1 │
-   └─────────────┴───────┘
-
-:ref:`GET_DDL <ref-get-ddl-examples>` uses it to dump the DDL of every view in one query.
-
-
-.. _ref-functions-describe:
-
-describe_semantic_view()
-------------------------
-
-.. code-block:: sqlgrammar
-
-   SELECT ... FROM describe_semantic_view('<view_name>')
-
-Takes the view name as a string, optionally schema-qualified (``'staging.order_metrics'``). An unqualified name resolves through ``search_path``, the same as ``DESCRIBE SEMANTIC VIEW``. Returns the same five columns and rows as :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-output>`: ``object_kind``, ``object_name``, ``parent_entity``, ``property``, and ``property_value``, all VARCHAR.
-
-.. code-block:: sql
-
-   SELECT object_name, property_value AS expression
-   FROM describe_semantic_view('order_metrics')
-   WHERE object_kind = 'METRIC' AND property = 'EXPRESSION';
-
-.. code-block:: text
-
-   ┌─────────────┬───────────────┐
-   │ object_name │ expression    │
-   ├─────────────┼───────────────┤
-   │ revenue     │ SUM(o.amount) │
-   │ order_count │ COUNT(*)      │
-   └─────────────┴───────────────┘
-
-Here ``order_metrics`` is a single-table view over ``orders`` with the metrics ``revenue AS SUM(o.amount)`` and ``order_count AS COUNT(*)``. More filters are shown on the :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-examples>` page.
+The one documented exception is the :ref:`GET_DDL <ref-get-ddl-examples>` recipe that dumps the DDL of every view in one query. It reads the view list from ``list_semantic_views()``, the table function behind ``SHOW SEMANTIC VIEWS``, because that recipe needs the listing as a ``FROM`` source.
