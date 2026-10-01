@@ -339,11 +339,111 @@ of a semi-additive metric so that filtering changes which row wins, and inside
 the aggregate step of a window metric so that a filtered window number is
 recomputed rather than trimmed afterwards.
 
-.. tip::
+An omitted, empty, or whitespace-only ``where_clause`` is treated as absent,
+so ``where_clause := ''`` returns the unfiltered numbers.
 
-   An omitted, empty, or whitespace-only ``where_clause`` is treated as absent.
-   Application code that assembles a predicate from optional request parameters
-   can therefore pass an empty string for "no filter" without special-casing it.
+
+.. _howto-filtering-app:
+
+Pass a Request Value from Application Code
+==========================================
+
+When the filter value comes from outside your code -- a date range in an HTTP
+request, a segment picked in a dashboard -- keep that input out of the
+predicate's SQL text. ``where_clause`` does accept a prepared-statement
+parameter, but the parameter supplies the **whole predicate as SQL text**, and
+the extension splices that text into the query it generates. Binding it with
+``?`` therefore escapes nothing inside it. A placeholder *inside* the predicate,
+such as ``where_clause := 'ordered_at >= ?'``, is not supported: DuckDB rejects
+the statement with a parameter count mismatch.
+
+.. danger::
+
+   A ``where_clause`` built by pasting request input into the string, whether
+   with an f-string or with ``'...' || ?`` in SQL, is open to SQL injection. The
+   predicate runs with every right the connection has. Sent as the date in
+   ``ordered_at >= DATE '...'``, the value ``2024-01-01' OR true --`` removes
+   the date scope, and a subquery such as ``region IN (SELECT ... FROM
+   other_table)`` or ``EXISTS (SELECT 1 FROM read_text('...'))`` reads any table
+   or file the connection can reach.
+
+Two patterns keep request input out of the SQL text.
+
+**Parse the value into a typed value, then write the literal from it.** A
+``datetime.date`` can only ever format as ``YYYY-MM-DD``, so the literal you
+build from it cannot carry SQL. Anything that does not parse is rejected before
+a query is issued:
+
+.. code-block:: python
+
+   import datetime
+
+   import duckdb
+
+   con = duckdb.connect("analytics.duckdb")  # the database holding order_metrics
+   con.execute("LOAD semantic_views")
+
+
+   def revenue_by_region(since_text):
+       predicate = ""  # an empty where_clause means "no filter"
+       if since_text:
+           # Raises ValueError for anything that is not a YYYY-MM-DD date
+           since = datetime.date.fromisoformat(since_text)
+           predicate = f"ordered_at >= DATE '{since.isoformat()}'"
+       return con.execute(
+           """
+           SELECT * FROM semantic_view('order_metrics',
+               dimensions := ['region'],
+               metrics := ['revenue', 'order_count'],
+               where_clause := ?
+           ) ORDER BY region
+           """,
+           [predicate],
+       ).fetchall()
+
+
+   revenue_by_region("2024-01-01")
+   # [('East', Decimal('300.00'), 2), ('West', Decimal('150.00'), 1)]
+
+   revenue_by_region(None)
+   # [('East', Decimal('400.00'), 3), ('West', Decimal('550.00'), 2)]
+
+   revenue_by_region("2024-01-01' OR true --")
+   # ValueError: Invalid isoformat string: "2024-01-01' OR true --"
+
+**Map request choices to named filters.** When the choices are a fixed set,
+declare each one as a :ref:`named filter <howto-filtering-named>` and look the
+request value up in an allowlist. The predicate is then always one of your own
+member names:
+
+.. code-block:: python
+
+   # Using con and the order_metrics view with the is_2024 named filter from above
+   NAMED_FILTERS = {"2024": "is_2024"}  # request value -> named filter
+
+
+   def revenue_for_period(period):
+       predicate = NAMED_FILTERS[period]  # KeyError for anything not listed
+       return con.execute(
+           """
+           SELECT * FROM semantic_view('order_metrics',
+               dimensions := ['region'],
+               metrics := ['revenue'],
+               where_clause := ?
+           ) ORDER BY region
+           """,
+           [predicate],
+       ).fetchall()
+
+
+   revenue_for_period("2024")
+   # [('East', Decimal('300.00')), ('West', Decimal('150.00'))]
+
+The ``dimensions`` and ``metrics`` lists are different: you can bind them
+directly, for example ``dimensions := ?`` with ``[["region"]]``. The extension
+matches every name against the members the view declares and rejects anything
+else (``unknown dimension 'amount'. Available: [region, ordered_at]``), so a
+list value never reaches the generated SQL as text.
 
 
 .. _howto-filtering-troubleshooting:
@@ -363,7 +463,7 @@ Troubleshooting
 
 **A fan trap error names a member you only filtered on**
    Tables the predicate reaches are joined in and checked exactly as a queried
-   dimension's are, so a filter can trip the fan-out fence on its own. See
+   dimension's are, so a filter can trip the fan trap check on its own. See
    :ref:`howto-fan-traps` for the fixes, and :ref:`explanation-metric-grain` for
    why the check exists.
 
@@ -378,6 +478,11 @@ Troubleshooting
    the filter is first used, not at ``CREATE``. Check that the member's
    expression really evaluates to a boolean.
 
+**A prepared statement fails with a parameter count mismatch**
+   The ``?`` is inside the predicate string, where DuckDB does not see it as a
+   parameter. Bind the whole ``where_clause`` value instead, built as shown in
+   :ref:`howto-filtering-app`.
+
 **Quoting looks wrong**
    ``where_clause`` is a SQL string literal, so every single quote inside it is
    doubled: ``where_clause := 'region = ''East'''``. Double-quoted identifiers
@@ -386,13 +491,13 @@ Troubleshooting
 
 .. _howto-filtering-related:
 
-Related Guides
-==============
+Related
+=======
 
-- :ref:`explanation-metric-grain` -- why a pre-aggregation filter changes the
-  numbers and a post-aggregation one cannot.
-- :ref:`howto-annotations-filters` -- declaring reusable named filters with
-  ``LABELS = (FILTER)``.
-- :ref:`ref-sv-pre-agg-filtering` -- the full ``where_clause`` reference,
-  including exactly where the predicate is injected on each emission path.
-- :ref:`howto-fan-traps` -- resolving the fan-out errors a predicate can trigger.
+- :ref:`explanation-metric-grain` -- Why a pre-aggregation filter changes the
+  numbers and a post-aggregation one cannot
+- :ref:`howto-annotations-filters` -- Declare reusable named filters with
+  ``LABELS = (FILTER)``
+- :ref:`ref-sv-pre-agg-filtering` -- The full ``where_clause`` reference,
+  including where the predicate is injected on each emission path
+- :ref:`howto-fan-traps` -- Resolve the fan trap errors a predicate can trigger

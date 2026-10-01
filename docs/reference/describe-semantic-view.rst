@@ -51,13 +51,13 @@ The result contains multiple rows with 5 VARCHAR columns:
      - Description
    * - ``object_kind``
      - VARCHAR
-     - The type of object: ``SEMANTIC_VIEW``, ``TABLE``, ``RELATIONSHIP``, ``FACT``, ``DIMENSION``, ``METRIC``, ``DERIVED_METRIC``, or ``MATERIALIZATION``.
+     - The type of object: ``TABLE``, ``RELATIONSHIP``, ``FACT``, ``DIMENSION``, ``METRIC``, ``DERIVED_METRIC``, or ``MATERIALIZATION``. Empty string on the view-level comment row.
    * - ``object_name``
      - VARCHAR
-     - The name of the object (view name, table name, relationship name, fact/dimension/metric name, materialization name).
+     - The name of the object (table name, relationship name, fact/dimension/metric name, materialization name). Empty string on the view-level comment row.
    * - ``parent_entity``
      - VARCHAR
-     - The parent table for this object. Empty string for ``SEMANTIC_VIEW``, ``TABLE``, ``DERIVED_METRIC``, and ``MATERIALIZATION`` objects.
+     - The parent table for this object. Empty string for the view-level comment row and for ``TABLE``, ``DERIVED_METRIC``, and ``MATERIALIZATION`` objects.
    * - ``property``
      - VARCHAR
      - The property name being described.
@@ -71,10 +71,10 @@ The result contains multiple rows with 5 VARCHAR columns:
 Object Kinds and Properties
 ===========================
 
-Rows appear in definition order: ``SEMANTIC_VIEW`` (when comment is set), then ``TABLE`` objects, then ``RELATIONSHIP``, ``FACT``, ``DIMENSION``, ``METRIC``, ``DERIVED_METRIC``, and ``MATERIALIZATION``.
+Rows appear in definition order: the view-level comment (when one is set), then ``TABLE`` objects, then ``RELATIONSHIP``, ``FACT``, ``DIMENSION``, ``METRIC``, ``DERIVED_METRIC``, and ``MATERIALIZATION``.
 
-**SEMANTIC_VIEW**
-   Emitted only when a view-level comment is set (via :ref:`ALTER SEMANTIC VIEW SET COMMENT <ref-alter-semantic-view>`). Produces one property row:
+**View-level comment**
+   Emitted only when a view-level comment is set (in ``CREATE`` or via :ref:`ALTER SEMANTIC VIEW SET COMMENT <ref-alter-semantic-view>`). The row describes the view itself, so ``object_kind``, ``object_name``, and ``parent_entity`` are all empty strings. Produces one property row:
 
    .. list-table::
       :header-rows: 1
@@ -145,7 +145,7 @@ Rows appear in definition order: ``SEMANTIC_VIEW`` (when comment is set), then `
       * - ``SYNONYMS``
         - JSON array of synonym strings. Only emitted when synonyms are set.
       * - ``LABELS``
-        - ``["FILTER"]`` when the fact is declared a :ref:`named filter <howto-annotations-filters>` with ``LABELS = (FILTER)``. Only emitted when labelled.
+        - ``["FILTER"]`` when the fact is declared a :ref:`named filter <howto-annotations-filters>` with ``LABELS = (FILTER)``. Only emitted when labeled.
       * - ``ACCESS_MODIFIER``
         - ``PUBLIC`` or ``PRIVATE``. Always emitted.
 
@@ -169,7 +169,7 @@ Rows appear in definition order: ``SEMANTIC_VIEW`` (when comment is set), then `
       * - ``SYNONYMS``
         - JSON array of synonym strings. Only emitted when synonyms are set.
       * - ``LABELS``
-        - ``["FILTER"]`` when the dimension is declared a :ref:`named filter <howto-annotations-filters>` with ``LABELS = (FILTER)``. Only emitted when labelled.
+        - ``["FILTER"]`` when the dimension is declared a :ref:`named filter <howto-annotations-filters>` with ``LABELS = (FILTER)``. Only emitted when labeled.
 
 **METRIC**
    One block per base metric (those scoped to a table) declared in the ``METRICS`` clause:
@@ -289,7 +289,7 @@ Examples
 
    CREATE SEMANTIC VIEW annotated AS
    TABLES (
-       o AS orders PRIMARY KEY (id)
+       o AS orders PRIMARY KEY (id) COMMENT = 'Order data'
    )
    DIMENSIONS (
        o.region AS o.region COMMENT = 'Sales region' WITH SYNONYMS = ('territory')
@@ -304,26 +304,28 @@ Examples
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬───────────────┬──────────────────────────┬──────────────────────┐
-   │ object_kind   │ object_name │ parent_entity │ property                 │ property_value       │
-   ├───────────────┼─────────────┼───────────────┼──────────────────────────┼──────────────────────┤
-   │ SEMANTIC_VIEW │ annotated   │               │ COMMENT                  │ Revenue analytics    │
-   │ TABLE         │ orders      │               │ BASE_TABLE_DATABASE_NAME │ memory               │
-   │ TABLE         │ orders      │               │ BASE_TABLE_SCHEMA_NAME   │ main                 │
-   │ TABLE         │ orders      │               │ BASE_TABLE_NAME          │ orders               │
-   │ TABLE         │ orders      │               │ PRIMARY_KEY              │ ["id"]               │
-   │ TABLE         │ orders      │               │ COMMENT                  │ Order data           │
-   │ DIMENSION     │ region      │ orders        │ TABLE                    │ orders               │
-   │ DIMENSION     │ region      │ orders        │ EXPRESSION               │ o.region             │
-   │ DIMENSION     │ region      │ orders        │ DATA_TYPE                │                      │
-   │ DIMENSION     │ region      │ orders        │ COMMENT                  │ Sales region         │
-   │ DIMENSION     │ region      │ orders        │ SYNONYMS                 │ ["territory"]        │
-   │ METRIC        │ revenue     │ orders        │ TABLE                    │ orders               │
-   │ METRIC        │ revenue     │ orders        │ EXPRESSION               │ SUM(o.amount)        │
-   │ METRIC        │ revenue     │ orders        │ DATA_TYPE                │                      │
-   │ METRIC        │ revenue     │ orders        │ COMMENT                  │ Total revenue        │
-   │ METRIC        │ revenue     │ orders        │ ACCESS_MODIFIER          │ PUBLIC               │
-   └───────────────┴─────────────┴───────────────┴──────────────────────────┴──────────────────────┘
+   ┌─────────────┬─────────────┬───────────────┬──────────────────────────┬───────────────────┐
+   │ object_kind │ object_name │ parent_entity │ property                 │ property_value    │
+   ├─────────────┼─────────────┼───────────────┼──────────────────────────┼───────────────────┤
+   │             │             │               │ COMMENT                  │ Revenue analytics │
+   │ TABLE       │ orders      │               │ BASE_TABLE_DATABASE_NAME │ memory            │
+   │ TABLE       │ orders      │               │ BASE_TABLE_SCHEMA_NAME   │ main              │
+   │ TABLE       │ orders      │               │ BASE_TABLE_NAME          │ orders            │
+   │ TABLE       │ orders      │               │ PRIMARY_KEY              │ ["id"]            │
+   │ TABLE       │ orders      │               │ COMMENT                  │ Order data        │
+   │ DIMENSION   │ region      │ orders        │ TABLE                    │ orders            │
+   │ DIMENSION   │ region      │ orders        │ EXPRESSION               │ o.region          │
+   │ DIMENSION   │ region      │ orders        │ DATA_TYPE                │                   │
+   │ DIMENSION   │ region      │ orders        │ COMMENT                  │ Sales region      │
+   │ DIMENSION   │ region      │ orders        │ SYNONYMS                 │ ["territory"]     │
+   │ METRIC      │ revenue     │ orders        │ TABLE                    │ orders            │
+   │ METRIC      │ revenue     │ orders        │ EXPRESSION               │ SUM(o.amount)     │
+   │ METRIC      │ revenue     │ orders        │ DATA_TYPE                │                   │
+   │ METRIC      │ revenue     │ orders        │ COMMENT                  │ Total revenue     │
+   │ METRIC      │ revenue     │ orders        │ ACCESS_MODIFIER          │ PUBLIC            │
+   └─────────────┴─────────────┴───────────────┴──────────────────────────┴───────────────────┘
+
+The first row is the view-level comment, so its ``object_kind`` and ``object_name`` are empty.
 
 **View with materializations:**
 
@@ -342,45 +344,46 @@ Examples
    )
    MATERIALIZATIONS (
        region_agg AS (
-           TABLE daily_revenue_agg,
+           TABLE revenue_by_region,
            DIMENSIONS (region),
            METRICS (revenue, order_count)
        )
    );
 
-   SELECT * FROM (DESCRIBE SEMANTIC VIEW order_metrics)
-   WHERE object_kind = 'MATERIALIZATION';
+   DESCRIBE SEMANTIC VIEW order_metrics;
 
 .. code-block:: text
 
-   ┌─────────────────┬─────────────┬───────────────┬────────────┬──────────────────────────────┐
-   │ object_kind     │ object_name │ parent_entity │ property   │ property_value               │
-   ├─────────────────┼─────────────┼───────────────┼────────────┼──────────────────────────────┤
-   │ MATERIALIZATION │ region_agg  │               │ TABLE      │ daily_revenue_agg            │
-   │ MATERIALIZATION │ region_agg  │               │ DIMENSIONS │ ["region"]                   │
-   │ MATERIALIZATION │ region_agg  │               │ METRICS    │ ["revenue","order_count"]    │
-   └─────────────────┴─────────────┴───────────────┴────────────┴──────────────────────────────┘
+   ┌─────────────────┬─────────────┬───────────────┬──────────────────────────┬───────────────────────────┐
+   │ object_kind     │ object_name │ parent_entity │ property                 │ property_value            │
+   ├─────────────────┼─────────────┼───────────────┼──────────────────────────┼───────────────────────────┤
+   │ TABLE           │ orders      │               │ BASE_TABLE_DATABASE_NAME │ memory                    │
+   │ TABLE           │ orders      │               │ BASE_TABLE_SCHEMA_NAME   │ main                      │
+   │ TABLE           │ orders      │               │ BASE_TABLE_NAME          │ orders                    │
+   │ TABLE           │ orders      │               │ PRIMARY_KEY              │ ["id"]                    │
+   │ DIMENSION       │ region      │ orders        │ TABLE                    │ orders                    │
+   │ DIMENSION       │ region      │ orders        │ EXPRESSION               │ o.region                  │
+   │ DIMENSION       │ region      │ orders        │ DATA_TYPE                │                           │
+   │ METRIC          │ revenue     │ orders        │ TABLE                    │ orders                    │
+   │ METRIC          │ revenue     │ orders        │ EXPRESSION               │ SUM(o.amount)             │
+   │ METRIC          │ revenue     │ orders        │ DATA_TYPE                │                           │
+   │ METRIC          │ revenue     │ orders        │ ACCESS_MODIFIER          │ PUBLIC                    │
+   │ METRIC          │ order_count │ orders        │ TABLE                    │ orders                    │
+   │ METRIC          │ order_count │ orders        │ EXPRESSION               │ COUNT(*)                  │
+   │ METRIC          │ order_count │ orders        │ DATA_TYPE                │                           │
+   │ METRIC          │ order_count │ orders        │ ACCESS_MODIFIER          │ PUBLIC                    │
+   │ MATERIALIZATION │ region_agg  │               │ TABLE                    │ revenue_by_region         │
+   │ MATERIALIZATION │ region_agg  │               │ DIMENSIONS               │ ["region"]                │
+   │ MATERIALIZATION │ region_agg  │               │ METRICS                  │ ["revenue","order_count"] │
+   └─────────────────┴─────────────┴───────────────┴──────────────────────────┴───────────────────────────┘
 
-.. tip::
+The materialization rows come last, after the tables, dimensions, and metrics.
 
-   Filter by ``object_kind`` to extract specific parts of the view definition:
+.. _ref-describe-subquery:
 
-   .. code-block:: sql
+.. note::
 
-      -- All dimensions in the view:
-      SELECT object_name, property, property_value
-      FROM (DESCRIBE SEMANTIC VIEW order_metrics)
-      WHERE object_kind = 'DIMENSION';
-
-      -- All relationships:
-      SELECT object_name, property, property_value
-      FROM (DESCRIBE SEMANTIC VIEW multi_view)
-      WHERE object_kind = 'RELATIONSHIP';
-
-      -- Count objects by kind:
-      SELECT object_kind, COUNT(DISTINCT object_name) AS object_count
-      FROM (DESCRIBE SEMANTIC VIEW multi_view)
-      GROUP BY object_kind;
+   ``DESCRIBE SEMANTIC VIEW`` can't be used as a subquery or in a ``WITH`` clause. Unlike DuckDB's own ``DESCRIBE``, ``SELECT ... FROM (DESCRIBE SEMANTIC VIEW order_metrics)`` is a parser error. Run the statement on its own. See :ref:`ref-functions-subqueries`.
 
 **Error: view does not exist:**
 

@@ -31,6 +31,8 @@ Use ``table_alias.*`` in any of the three list parameters (``dimensions``, ``met
 
 This expands ``o.*`` to all dimensions scoped to table alias ``o`` and all metrics scoped to ``o``.
 
+Items declared without a table alias, such as derived metrics, belong to the view's **first** declared table. ``alias.*`` for that table's alias includes them; a wildcard for any other alias does not.
+
 
 .. _howto-wildcard-private:
 
@@ -39,9 +41,17 @@ PRIVATE Item Exclusion
 
 Wildcard expansion excludes ``PRIVATE`` metrics and facts. Only ``PUBLIC`` items (the default) are included in the expanded list.
 
-Given a view with both public and private metrics:
+Given a view with public, private and derived metrics:
 
 .. code-block:: sql
+
+   CREATE TABLE orders (
+       id INTEGER, region VARCHAR, status VARCHAR,
+       amount DECIMAL(10,2), cost DECIMAL(10,2)
+   );
+   INSERT INTO orders VALUES
+       (1, 'East', 'open',   100.00, 40.00),
+       (2, 'West', 'closed',  50.00, 30.00);
 
    CREATE SEMANTIC VIEW sales AS
    TABLES (o AS orders PRIMARY KEY (id))
@@ -54,11 +64,23 @@ Given a view with both public and private metrics:
 
 .. code-block:: sql
 
-   -- o.* expands to ['revenue'] only -- internal_cost is PRIVATE
+   -- o.* expands to ['revenue', 'profit']: internal_cost is PRIVATE,
+   -- and profit, a derived metric, belongs to o, the first declared table
    SELECT * FROM semantic_view('sales',
        dimensions := ['region'],
        metrics := ['o.*']
-   );
+   ) ORDER BY region;
+
+.. code-block:: text
+
+   ┌────────┬─────────┬────────┐
+   │ region │ revenue │ profit │
+   ├────────┼─────────┼────────┤
+   │ East   │  100.00 │  60.00 │
+   │ West   │   50.00 │  20.00 │
+   └────────┴─────────┴────────┘
+
+The private ``internal_cost`` is left out of the result, but ``profit`` can still use it.
 
 
 .. _howto-wildcard-dedup:
@@ -66,9 +88,21 @@ Given a view with both public and private metrics:
 Deduplication
 =============
 
-When an item appears both explicitly and via a wildcard, it appears only once in the expanded list:
+When an item appears both explicitly and via a wildcard, it appears only once in the expanded list. With a ``status`` dimension added to the ``sales`` view:
 
 .. code-block:: sql
+
+   CREATE OR REPLACE SEMANTIC VIEW sales AS
+   TABLES (o AS orders PRIMARY KEY (id))
+   DIMENSIONS (
+       o.region AS o.region,
+       o.status AS o.status
+   )
+   METRICS (
+       o.revenue AS SUM(o.amount),
+       PRIVATE o.internal_cost AS SUM(o.cost),
+       profit AS revenue - internal_cost
+   );
 
    -- 'region' is listed explicitly AND is part of o.*
    -- Result: ['region', 'status'] (region appears once)
@@ -95,8 +129,8 @@ Bare Wildcard Rejection
 
 .. code-block:: text
 
-   unqualified wildcard '*' is not supported. Use table_alias.* to select all items
-   for a specific table.
+   semantic view 'sales': unqualified wildcard '*' is not supported. Use table_alias.*
+   to select all items for a specific table.
 
 
 .. _howto-wildcard-facts:
@@ -124,4 +158,18 @@ Troubleshooting
    The table alias must match an alias declared in the ``TABLES`` clause. The error lists available aliases: ``unknown table alias 'x' in wildcard 'x.*'. Available aliases: [o, c, li]``.
 
 **Empty expansion**
-   If the wildcard expands to an empty list (no items scoped to that alias, or all are private), the query may fail with an empty request error. Verify that the alias has public items defined.
+   A wildcard for an alias with no public items of that kind expands to nothing. If every list in the query ends up empty, the query fails with ``specify at least dimensions := [...], metrics := [...], or facts := [...]``. If another list still has items, the query runs without the empty one: ``dimensions := ['region'], metrics := ['c.*']`` on a view with no metrics on ``c`` returns the distinct ``region`` values only. Check the alias's members with :ref:`SHOW COLUMNS IN SEMANTIC VIEW <ref-show-columns>`.
+
+**A derived metric is missing from, or included in, an alias wildcard**
+   Derived metrics have no table alias, so only the first declared table's ``alias.*`` includes them. List a derived metric by name to query it next to another alias's wildcard.
+
+
+.. _howto-wildcard-related:
+
+Related
+=======
+
+- :ref:`ref-sv-wildcard` -- Wildcard rules in the ``semantic_view()`` reference
+- :ref:`howto-annotations-access` -- Mark metrics and facts ``PRIVATE``
+- :ref:`howto-query-facts` -- Query facts, including with ``alias.*``
+- :ref:`ref-show-columns` -- List every public member of a view

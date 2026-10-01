@@ -121,7 +121,7 @@ Returns one row per metric with 8 columns:
      - The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``synonyms``
      - VARCHAR
-     - JSON array of synonym strings (e.g., ``["total_sales","gmv"]``). Empty string if no synonyms are set.
+     - JSON array of synonym strings (e.g., ``["total_sales","gmv"]``). ``[]`` when no synonyms are set.
    * - ``comment``
      - VARCHAR
      - The metric comment text. Empty string if no comment is set.
@@ -145,11 +145,11 @@ Given a semantic view ``orders_sv`` with two base metrics:
    ┌───────────────┬─────────────┬────────────────────┬────────────┬──────────────┬───────────┬──────────┬─────────┐
    │ database_name │ schema_name │ semantic_view_name │ table_name │ name         │ data_type │ synonyms │ comment │
    ├───────────────┼─────────────┼────────────────────┼────────────┼──────────────┼───────────┼──────────┼─────────┤
-   │ memory        │ main        │ orders_sv          │ orders     │ order_count  │           │          │         │
-   │ memory        │ main        │ orders_sv          │ orders     │ total_amount │           │          │         │
+   │ memory        │ main        │ orders_sv          │ orders     │ order_count  │           │ []       │         │
+   │ memory        │ main        │ orders_sv          │ orders     │ total_amount │           │ []       │         │
    └───────────────┴─────────────┴────────────────────┴────────────┴──────────────┴───────────┴──────────┴─────────┘
 
-``data_type`` is empty here because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because ``GET_DDL`` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. Reporting the type an expression actually produces would require probing it on the read side, at ``SHOW`` bind time; that is a known limitation and is not implemented today. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+``data_type`` is empty here because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`GET_DDL <ref-get-ddl>` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. Reporting the type an expression actually produces would require probing it on the read side, at ``SHOW`` bind time; that is a known limitation and is not implemented today. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 **List metrics across all views:**
 
@@ -188,10 +188,10 @@ Derived metrics reference other metrics rather than a specific physical table. T
    ┌───────────────┬─────────────┬────────────────────┬────────────┬─────────┬───────────┬──────────┬─────────┐
    │ database_name │ schema_name │ semantic_view_name │ table_name │ name    │ data_type │ synonyms │ comment │
    ├───────────────┼─────────────┼────────────────────┼────────────┼─────────┼───────────┼──────────┼─────────┤
-   │ memory        │ main        │ profit_analysis    │ line_items │ cost    │           │          │         │
-   │ memory        │ main        │ profit_analysis    │            │ margin  │           │          │         │
-   │ memory        │ main        │ profit_analysis    │            │ profit  │           │          │         │
-   │ memory        │ main        │ profit_analysis    │ line_items │ revenue │           │          │         │
+   │ memory        │ main        │ profit_analysis    │ line_items │ cost    │           │ []       │         │
+   │ memory        │ main        │ profit_analysis    │            │ margin  │           │ []       │         │
+   │ memory        │ main        │ profit_analysis    │            │ profit  │           │ []       │         │
+   │ memory        │ main        │ profit_analysis    │ line_items │ revenue │           │ []       │         │
    └───────────────┴─────────────┴────────────────────┴────────────┴─────────┴───────────┴──────────┴─────────┘
 
 Base metrics (``revenue``, ``cost``) show their physical table name. Derived metrics (``profit``, ``margin``) show an empty ``table_name`` because they reference other metrics rather than a specific table. ``data_type`` is empty for all four, for the reason given above.

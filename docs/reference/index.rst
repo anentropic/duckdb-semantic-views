@@ -1,5 +1,5 @@
 .. meta::
-   :description: Complete SQL syntax reference for all CREATE, ALTER, DROP, DESCRIBE, SHOW, GET_DDL, READ_YAML, and query function statements
+   :description: Complete SQL syntax reference for all CREATE, ALTER, DROP, DESCRIBE, SHOW, GET_DDL, READ_YAML, and query function statements, plus the full list of registered functions
 
 .. _reference:
 
@@ -31,6 +31,10 @@ SQL syntax reference for all DuckDB Semantic Views statements and functions.
 - :ref:`ref-semantic-view-function` -- Query a semantic view with any combination of dimensions and metrics.
 - :ref:`ref-explain-semantic-view` -- Inspect the SQL generated for a semantic view query.
 
+**Functions and discovery**
+
+- :ref:`ref-functions` -- Every function the extension registers, which ones to call directly, and how a tool reads their parameters and examples from ``duckdb_functions()``.
+
 **Error reference**
 
 - :ref:`ref-error-messages` -- Error messages, causes, and fixes.
@@ -54,4 +58,5 @@ SQL syntax reference for all DuckDB Semantic Views statements and functions.
    yaml-format
    semantic-view-function
    explain-semantic-view-function
+   functions
    error-messages

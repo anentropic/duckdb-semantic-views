@@ -11,7 +11,7 @@ Returns only the dimensions that can be safely combined with a specific metric, 
 
 For window function metrics, the ``required`` column indicates which dimensions must be included in the query because they appear in the metric's ``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY`` clauses.
 
-For background on what fan traps are and how to resolve them, see :ref:`How to Understand and Avoid Fan Traps <howto-fan-traps>`.
+For background on what fan traps are and how to resolve them, see :ref:`howto-fan-traps`.
 
 
 .. _ref-show-dims-for-metric-syntax:
@@ -44,7 +44,7 @@ Parameters
 
 .. tip::
 
-   Both the view name and metric name support fuzzy matching in error messages. If a name is close to an existing name, the error suggests the closest match: ``metric 'totl' not found in semantic view 'orders_sv'. Did you mean 'total'?``
+   Both the view name and metric name support fuzzy matching in error messages. If a name is close to an existing name, the error suggests the closest match: ``metric 'order_totl' not found in semantic view 'star_sv'. Did you mean 'order_total'?``
 
 
 .. _ref-show-dims-for-metric-filtering-clauses:
@@ -108,7 +108,11 @@ The filtering logic determines whether a dimension is reachable from a metric's 
 - **One-to-many (reverse):** Traversing from the referenced table back to the FK table is fan-out. This direction duplicates rows, inflating aggregates. Dimensions reachable only through such an edge are excluded.
 - **One-to-one:** If the FK columns match a ``PRIMARY KEY`` or ``UNIQUE`` constraint on the FK table, the relationship is one-to-one. Both directions are safe.
 - **Derived metrics:** For derived metrics (those without a table alias), the extension resolves all base metrics they depend on and uses the union of their source tables. A dimension is included if it is reachable from at least one of those source tables without fan-out.
-- **Window metrics:** Fan trap checking is skipped for window function metrics. All dimensions reachable in the relationship graph are returned, since window metrics do not aggregate across join boundaries in the same way as standard aggregate metrics. Dimensions referenced in the ``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY`` clauses are marked ``required = TRUE``.
+- **Window metrics:** A window metric is checked like any other metric on its table: dimensions reachable from that table only through a fan-out edge are excluded. Dimensions referenced in the ``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY`` clauses are marked ``required = TRUE``.
+
+.. warning::
+
+   For a derived metric whose components sit on **different** tables, this command is more permissive than the query. The "at least one source table" rule lists a dimension that is safe for one component even when it is below the grain of another, and :ref:`semantic_view() <ref-semantic-view-function>` then refuses that combination. For example, with ``items_per_order AS item_count / order_count`` (``item_count`` on ``line_items``, ``order_count`` on ``orders``), a ``line_items`` dimension is listed for ``items_per_order``, but querying the two together raises a fan trap error. For those metrics, check each component metric separately. See :ref:`explanation-grain-refused` for the shapes the query refuses.
 
 
 .. _ref-show-dims-for-metric-examples:
@@ -145,7 +149,7 @@ Examples
 
 With a single table, there are no joins, so every dimension is safe for every metric.
 
-``data_type`` is empty here, and in every example below, because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because ``GET_DDL`` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+``data_type`` is empty here, and in every example below, because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`GET_DDL <ref-get-ddl>` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 **Multi-table view with fan trap filtering:**
 
@@ -242,11 +246,33 @@ In this example, ``region`` is required because it appears in ``EXCLUDING`` (it 
 
 .. tip::
 
-   Use the ``required`` column to build valid queries for window metrics. Omitting a required dimension produces a query-time error: ``window function metric 'avg_qty' requires dimension 'month' to be included in the query``.
+   Use the ``required`` column to build valid queries for window metrics. Omitting a required dimension produces a query-time error: ``semantic view 'monthly_sv': window function metric 'avg_qty' requires dimension 'month' to be included in the query (used in ORDER BY)``.
 
-**Filter safe dimensions with LIKE (case-insensitive):**
+**Filter safe dimensions with LIKE, STARTS WITH, and LIMIT:**
 
-After fan trap filtering, narrow results further by name pattern:
+The filtering examples below use a two-table view in which every dimension is safe for ``total_amount``:
+
+.. code-block:: sql
+
+   CREATE SEMANTIC VIEW filter_sv AS
+   TABLES (
+       c AS customers PRIMARY KEY (id),
+       o AS orders    PRIMARY KEY (id)
+   )
+   RELATIONSHIPS (
+       order_customer AS o(customer_id) REFERENCES c
+   )
+   DIMENSIONS (
+       c.customer_name AS c.name,
+       c.region        AS c.region,
+       o.order_date    AS o.order_date,
+       o.status        AS o.status
+   )
+   METRICS (
+       o.total_amount AS SUM(o.amount)
+   );
+
+After fan trap filtering, narrow results further by name pattern. ``LIKE`` is case-insensitive:
 
 .. code-block:: sql
 
@@ -260,7 +286,7 @@ After fan trap filtering, narrow results further by name pattern:
    │ customers  │ region │           │ false    │
    └────────────┴────────┴───────────┴──────────┘
 
-**Filter safe dimensions with STARTS WITH (case-sensitive):**
+``STARTS WITH`` is case-sensitive:
 
 .. code-block:: sql
 
@@ -274,7 +300,7 @@ After fan trap filtering, narrow results further by name pattern:
    │ customers  │ customer_name │           │ false    │
    └────────────┴───────────────┴───────────┴──────────┘
 
-**Limit safe dimensions:**
+``LIMIT`` applies after the rows are sorted by dimension name:
 
 .. code-block:: sql
 
@@ -286,8 +312,8 @@ After fan trap filtering, narrow results further by name pattern:
    │ table_name │ name          │ data_type │ required │
    ├────────────┼───────────────┼───────────┼──────────┤
    │ customers  │ customer_name │           │ false    │
-   │ customers  │ region        │           │ false    │
    │ orders     │ order_date    │           │ false    │
+   │ customers  │ region        │           │ false    │
    └────────────┴───────────────┴───────────┴──────────┘
 
 **Derived metrics inherit source tables:**

@@ -129,7 +129,7 @@ Semantic views are not a replacement for regular views in all cases.
 **When regular views are better:**
 
 - Fixed reports where the query shape never changes
-- Complex queries that cannot be expressed as dimension/metric combinations (window functions, CTEs, correlated subqueries)
+- Complex queries that cannot be expressed as dimension/metric combinations: CTEs, correlated subqueries, or window functions over raw rows rather than over an aggregated metric. A window function over a metric -- a rolling average, a lag comparison, a running total -- is available as a :ref:`window metric <howto-window-metrics>`.
 - Queries that need fine-grained control over join types, ordering, or LIMIT within the view
 
 **When semantic views are better:**
@@ -149,7 +149,7 @@ Materialization Support
 
 By default, semantic views do not store data. The extension is a *preprocessor*: it generates SQL and hands it to DuckDB for execution. Each query runs fresh against the underlying tables.
 
-Starting in v0.7.0, the ``MATERIALIZATIONS`` clause lets you optionally route queries to pre-aggregated tables. When a query's requested dimensions and metrics exactly match a declared materialization, the extension reads from the pre-aggregated table instead of expanding raw sources with JOINs and GROUP BY.
+The ``MATERIALIZATIONS`` clause lets you optionally route queries to pre-aggregated tables. When a query's requested dimensions and metrics exactly match a declared materialization, the extension reads from the pre-aggregated table instead of expanding raw sources with JOINs and GROUP BY.
 
 .. code-block:: sql
 
@@ -165,12 +165,12 @@ Starting in v0.7.0, the ``MATERIALIZATIONS`` clause lets you optionally route qu
    )
    MATERIALIZATIONS (
        region_agg AS (
-           TABLE daily_revenue_by_region,
+           TABLE revenue_by_region,
            DIMENSIONS (region),
            METRICS (revenue)
        )
    );
 
-This is not automatic caching or background refresh. You create and maintain the pre-aggregated table yourself (or use external tools like dbt). The extension simply routes matching queries to it. For queries that do not match any materialization, standard on-demand SQL generation continues as before.
+This is not automatic caching or background refresh. You create and maintain the pre-aggregated table yourself (or use external tools like dbt). The extension routes matching queries to it. For queries that do not match any materialization, standard on-demand SQL generation continues as before.
 
 Materialization routing is transparent to the caller -- the :ref:`semantic_view() <ref-semantic-view-function>` interface does not change. See :ref:`howto-materializations` for a detailed guide.

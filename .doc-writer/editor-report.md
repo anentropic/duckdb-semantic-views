@@ -1,185 +1,112 @@
 # Editor Report
 
-**Generated:** 2026-08-09
-**Files reviewed:** 22 revised pages, plus a terminology sweep of all 39 `.rst` files under `docs/`
-**Changes made:** 31
-  - BLOCKING: 8
-  - SUGGESTION: 12
-  - NITPICK: 11
+**Generated:** 2026-10-01, working tree on `docs/v0.13.0-audit-fixes` (uncommitted Author revisions + Editor pass)
+**Mode:** edit. All four passes were run on the 43 revised pages. The terminology pass also scanned `tutorials/index.rst` and `explanation/index.rst`. Example SQL, outputs, error texts and behavioral claims were **not** edited. Where one looks wrong, it is reported below. The one exception: an example table name was renamed consistently in both the DDL and its output (see `describe-semantic-view.rst`).
+**Files reviewed:** 45 (`docs/index.rst`, 43 pages under `tutorials/`, `how-to/`, `explanation/`, `reference/` including the new `reference/functions.rst`, plus `CHANGELOG.md`)
+**Changes made:** 34 fixed findings (45 findings in total; 11 left open for the Author)
+  - BLOCKING: 7 (5 fixed, all added cross-reference links; 2 open)
+  - SUGGESTION: 22 (15 fixed; 7 open)
+  - NITPICK: 16 (14 fixed; 2 open)
+
+**Build:** `sphinx-build -b html -W -E docs` passes after the edits (clean environment, output written to `$TMPDIR`, `docs/_build` untouched). No `:ref:` label was added, removed or renamed by the Editor. The Author-side label changes (for example, `howto-ds-ambiguous-paths` removed) leave no dangling references.
 
 ## Summary
 
-The five parallel authors produced unusually clean prose — the humanizer pass
-found exactly one hit across 22 files — but they drifted on facts, as expected.
-The most serious drift is a shared `data_type` one-liner that six pages inherited
-from a stale CHANGELOG sentence and that directly contradicts `yaml-format.rst`
-and `src/model.rs`. The per-grain story now agrees across `metric-grain.rst`,
-`fan-traps.rst` and `snowflake-comparison.rst`; both new pages' hand-computed
-result tables reconcile against their own `INSERT` rows; and no surviving
-after-`AS` `NON ADDITIVE BY` example exists anywhere in `docs/`.
-
-### Priority checks, resolved
-
-| # | Check | Result |
-|---|-------|--------|
-| 1 | `data_type` wording identical across five pages | **Was not.** One-liner was factually wrong on six pages; prose block existed in three different wordings and was missing entirely from a fourth. All normalized. No `LIMIT 0` CREATE-time inference reintroduced; `TECH-DEBT #51` appears nowhere in `docs/` (nor does any other tracker ID). |
-| 2 | `NON ADDITIVE BY` clause order | **Clean.** Grepped all 39 files. The only after-`AS` occurrences are the two deliberate counter-examples (`semi-additive-metrics.rst:251` troubleshooting, `create-semantic-view.rst:346` rule statement). Both are correctly framed as errors. Verified against `src/body_parser/mod.rs` (`non_additive_by_after_as_is_rejected`, `using_after_as_is_rejected`). |
-| 3 | Per-grain behaviour consistent | **Two gaps, both fixed.** `snowflake-comparison.rst` and `metric-grain.rst` both omitted the role-played-dimension + active-semi-additive exclusion that `fan-traps.rst` documents. Added to both, matching `role_played_dimension_with_a_semi_additive_metric_stays_ineligible` (`tests_per_grain.rs:1545`). |
-| 4 | New pages: Diataxis, terminology, arithmetic | **Types are clean** (see Pass 2). All four result tables in `filtering.rst` and the one in `metric-grain.rst` reconcile against their own `INSERT` rows — arithmetic verified by hand, nothing executed. |
-| 5 | RST internal-notes blocks | **Removed** from both new pages. |
-| 6 | Cross-references and toctrees | **All 317 `:ref:` targets resolve**, no duplicate labels, both new pages present in their toctree and in `conf.py` `nav_links`. Two links added; nothing introduced that would break `-W`. |
+The three Authors resolved almost every row of the 2026-09-30 audit. That includes all 36 correctness findings except the ones covered by the project author's standing decisions. Cross-page consistency is now good. The `FROM describe_semantic_view()` / `FROM list_semantic_views()` idiom is explained the same way on four pages, `revenue_by_region` is the materialization table everywhere, and all 13 how-tos share one layout. The Editor's work was mostly terminology normalization, two Troubleshooting sections brought into line, internal jargon ("the fence") removed, and five missing links added. Two remaining factual problems need an Author: `metadata-annotations.rst` says dimensions take no access modifier, and one error-catalogue template is incomplete.
 
 ---
 
-## docs/reference/show-semantic-dimensions.rst
+## Status of the 2026-09-30 report
+
+**Resolved (by the Authors unless marked):**
+
+| Area | Rows | Status |
+|------|------|--------|
+| Cross-cutting | function-discovery gap; how-to structure (Rule 3); reference parameter layout; spelling; Rule 1 internals; 39 em dashes; "worth knowing" ×4 | **All resolved.** `reference/functions.rst` added, and `index.rst` points to it. All 13 how-tos now have Prerequisites, Troubleshooting and Related. The Editor converted the two Troubleshooting sections that still used plain paragraphs. The parameter layout is now a consistent split: statements use definition lists, functions use a Parameter / Type / Description list-table (recorded in `terminology.yaml`). There are 0 em dashes and 0 British spellings; the Editor fixed the last one, "labelled". The only British spelling left is the label `explanation-grain-modelling`, which was kept to avoid breaking references. `__sv_agg` now appears only in explain output, and the `SemanticViewDefinition` / serde / connection wording is gone. |
+| `index.rst` | grammar; `Ducklake`; Databricks URL | Resolved. |
+| Tutorials | `SHOW SEMANTIC VIEWS` columns / timestamp; missing `ORDER BY`; `month` TIMESTAMP; "core value" phrasing | Resolved. |
+| `data-sources.rst` | S3 credential chain; Postgres attached tables; diamond section drift; heading | Resolved. The diamond rule is now a Troubleshooting entry linking `howto-rp-diamond`. |
+| `derived-metrics.rst` | unknown-name troubleshooting | Resolved. |
+| `facts.rst` | Pass 4 links; intro annotation list | Resolved. The aggregate-in-FACTS text is **kept by project decision (2)**. |
+| `fan-traps.rst` | type blur in Multi-Grain section; wrong background link; truncated error; grammar / `...` fragment | Resolved. |
+| `materializations.rst` | `FROM (DESCRIBE …)` parser error; missing `;`; `daily_revenue_by_region` name; unqualified `FROM` in sample | Resolved. |
+| `metadata-annotations.rst` | private items in SHOW; `GET_DDL` link; private reference scope; filter scope wording; merged sample row | Resolved. A new, related issue is listed below as B-open-1. |
+| `query-facts.rst`, `role-playing-dimensions.rst`, `filtering.rst` | em dash / none / none | Resolved or nothing to do. |
+| `semi-additive-metrics.rst` | `explain_output` column; `GET_DDL` link; blur (moved to a dropdown); `important::`; heading case; bold label case | Resolved. |
+| `window-metrics.rst` | pseudo-notation block; `LAG` naming; abbreviated errors | Resolved. |
+| `wildcard-selection.rst` | derived metric in `o.*`; `status` dimension; hedging | Resolved. |
+| `yaml-definitions.rst` | `SHOW SEMANTIC VIEWS` link; missing `;` | Resolved. |
+| `semantic-views-vs-regular-views.rst`, `metric-grain.rst`, `databricks-comparison.rst` | all rows | Resolved. |
+| `snowflake-comparison.rst` | PK/`REFERENCES` rule; invented error text; Snowflake DDL transactions; Pass 4 links; `access_modifier`; project name; implicit `Metric Grain`_ target | Resolved. |
+| `transactional-ddl-and-limitations.rst` | read-only error text; Pass 4 links; roadmap promise; PEG restore wording | Resolved. The type-blur row is **still open** (S-open-4). |
+| `create-semantic-view.rst` | diamond rule; Pass 4 links; grammar missing `COMMENT` / `PUBLIC`; "before that change"; unused `is_international` | Resolved. The aggregate-in-FACTS text is **kept by decision (2)**. |
+| `alter-` / `drop-semantic-view.rst` | promised ambiguity error; wrong error text | Resolved (`search_path` rule, **decision (3)**). |
+| `describe-semantic-view.rst` | `FROM (DESCRIBE …)` failures; table-comment row | Resolved via option (a): `describe_semantic_view()` is documented as a FROM source (**decision (1)**). |
+| `show-semantic-views.rst` | `FROM (SHOW …)`; `created_on` format | Resolved. |
+| `show-semantic-dimensions` / `-metrics` / `-facts.rst` | `synonyms` shows `[]`; `GET_DDL` links | Resolved. |
+| `show-semantic-dimensions-for-metric.rst` | `GET_DDL` link; undefined `filter_sv`; window-metric scoping; truncated tip error | Resolved. |
+| `show-columns-semantic-view.rst` | `GET_DDL` link | Resolved. |
+| `get-ddl.rst` | `<name>` → `object_name`; Pass 4 links; unexplained `list_semantic_views()` | Resolved (**decision (4)**). |
+| `read-yaml-from-semantic-view.rst` | field stripping; resolution rule; sample output / `output_type: null` | Resolved. |
+| `yaml-format.rst` | complete example does not import; required keys; `is_filter`; Pass 4 links; Rule 1 intro | Resolved. |
+| `semantic-view-function.rst`, `explain-semantic-view-function.rst` | undefined members in examples; raw-column rule; `SUM` casing | Resolved. |
+| `error-messages.rst` | wrong message texts ×5; missing entries; Pass 4 links | Resolved. The aggregate-in-FACTS entry is **kept by decision (2)**. |
+| `CHANGELOG.md` | 0.12.0 "which only a YAML definition can do" | Resolved. |
+
+**Still open from the previous report:** `CHANGELOG.md` tracker IDs, the 0.10.0 `REFERENCES target(cols)` shorthand claim, subsection order, and the `[0.5.3]` link (S-open-6, S-open-7, N-open-2), plus the procedure blur in `transactional-ddl-and-limitations.rst` (S-open-4). The source-side observations (§ "Source-side observations" of the old report) are code issues and are outside this pass.
+
+---
+
+## Cross-page consistency check (requested focus)
+
+| Check | Result |
+|-------|--------|
+| FROM-source idiom | `functions.rst`, `describe-semantic-view.rst` and `show-semantic-views.rst` all say: the statement is primary, "DuckDB cannot use a statement as a subquery, so `FROM (…)` is a parser error", and the backing table function returns the same rows. `materializations.rst` said "can't take a statement … as a subquery" and "syntax error". **Editor rewrote it** to the shared wording and linked `describe_semantic_view()`. `get-ddl.rst` states the reason briefly and links `list_semantic_views()` (fine). |
+| Materialization example table | `revenue_by_region` on 7 pages. `describe-semantic-view.rst` still used `daily_revenue_agg`. **Editor renamed it** in both the DDL and the output row. The name has the same length, so the box table stays aligned. |
+| How-to layout | All 13 have Title → (page-level `versionadded` on `materializations` and `yaml-definitions` only, placed directly under the title) → intro → **Prerequisites:** → tasks → Troubleshooting → Related. **Editor fixed** two Troubleshooting sections (definition-list form) and the `filtering.rst` Related entries (capitalization and punctuation). |
+| Parameter tables | Statement pages (`alter`, `drop`, `describe`, `show-*`) use definition lists. Function pages (`semantic-view-function`, `explain`, `get-ddl`, `read-yaml`) use a Parameter / Type / Description list-table. This split is consistent. The type spellings differ, though (S-open-2). |
+| Terms | "fan trap error" vs "fan-trap error" were mixed (10 vs 7). **Normalized** to the open form. "the fence" (internal jargon) appeared on two pages and is **removed**. "define-time" / "query-time" are consistent (open adverbial, hyphenated attributive). |
+| Link titles | `show-semantic-dimensions-for-metric.rst` linked `howto-fan-traps` with the stale explicit title "How to Understand and Avoid Fan Traps". **Editor fixed it** to use the page's own title. |
+| Project decisions (1)–(4) | All four are respected on every page. No edit touched them. |
+
+---
+
+## docs/how-to/metadata-annotations.rst
 
 ### BLOCKING
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Output Columns → `data_type` | The shared one-liner claimed the type is "Empty string unless the definition declares one, which only a YAML definition can do". A YAML `output_type` is now **rejected at import** — `reject_output_type` in `src/model.rs:839` raises `"declares output_type '<T>', which no DDL clause can express"`. This directly contradicts `yaml-format.rst:476-482` ("**No longer accepted.**") on the same site. | Replaced with: "The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release." |
+| Set Access Modifiers, warning, L144 | **Open (behavioral claim, not edited).** "Dimensions do not support access modifiers." But `PUBLIC` is accepted on a dimension as a no-op (`src/body_parser/entries.rs:68`, test at `src/body_parser/mod.rs:4486`). `create-semantic-view.rst` (grammar L46, parameters L318) and `snowflake-comparison.rst` L65/L117 say the same. | "Dimensions accept only `PUBLIC`, as a no-op; `PRIVATE` on a dimension is rejected." |
 
 ### SUGGESTION
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Examples | The explanatory `data_type` paragraph ended "populated only for views stored before that change" with no antecedent for *that change* — two changes are described in the sentence (the v0.10.0 inference removal and the YAML withdrawal). | Named the release explicitly and folded in the missing inference-removal clause. Now byte-identical to the sibling paragraph on `show-semantic-facts.rst` and `show-semantic-metrics.rst`. |
-
----
-
-## docs/reference/show-semantic-facts.rst
-
-### BLOCKING
-
-| Section | Description | Fix |
-|---------|-------------|-----|
-| Output Columns → `data_type` | Same stale one-liner. | Same replacement. |
-
-### SUGGESTION
-
-| Section | Description | Fix |
-|---------|-------------|-----|
-| Examples | Third distinct wording of the same paragraph, and the only one that named the removed pass as "the CREATE-time `typeof` pass" — vocabulary no other page uses. | Normalized to the canonical paragraph; the removed pass is called "the define-time inference pass" here and on the `snowflake-comparison.rst` anchor. |
-
----
-
-## docs/reference/show-semantic-metrics.rst
-
-### BLOCKING
-
-| Section | Description | Fix |
-|---------|-------------|-----|
-| Output Columns → `data_type` | Same stale one-liner. | Same replacement. |
-
-### SUGGESTION
-
-| Section | Description | Fix |
-|---------|-------------|-----|
-| Examples | Rule 3 (Consistent Structure): this page was the only one of the four `SHOW` siblings with **no** explanatory paragraph after its first example — the explanation was deferred to a caption three examples later. A reader comparing the four pages sees a different layout. | Added the canonical paragraph after the first example; shortened the later caption to "for the reason given above". |
+| Mark a Named Filter, L172 | The `where_clause` link pointed at the top of `ref-semantic-view-function`. The other pages link the parameter's own section. | **Fixed:** retargeted to `ref-sv-pre-agg-filtering`. |
 
 ### NITPICK
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Filtering Clauses | Literal em dash where the rest of the corpus uses `--`. Under Sphinx smartquotes these render differently (— vs –). | Replaced 1 instance. |
+| Headings | 4 sentence-case subheadings ("View-level comment", "Table-level comment", "Comments on dimensions, metrics, and facts", "Via SHOW commands") in a title-case corpus. | **Fixed:** title case (no labels affected). |
 
 ---
 
-## docs/reference/show-semantic-dimensions-for-metric.rst
+## docs/reference/error-messages.rst
 
 ### BLOCKING
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Output Columns → `data_type` | Same stale one-liner. | Same replacement. |
-
-### SUGGESTION
-
-| Section | Description | Fix |
-|---------|-------------|-----|
-| Examples | Fourth wording variant, shorter than the others and missing the inference-removal clause. | Normalized. |
+| Unknown metric in a derived metric, L250-253 | **Open (error text, not edited).** The template omits the optional `; did you mean '<suggestion>'?` that `src/graph/derived_metrics.rs:184-194` inserts before `. Available metrics:`. `derived-metrics.rst` L166 shows the full form, so the two pages disagree. | Template: `unknown metric '<name>' referenced in derived metric '<derived>'[; did you mean '<suggestion>'?]. Available metrics: [<list>]` |
 
 ### NITPICK
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Parameters | Literal em dash. | Replaced 1 instance. |
-
----
-
-## docs/reference/show-columns-semantic-view.rst
-
-### BLOCKING
-
-| Section | Description | Fix |
-|---------|-------------|-----|
-| Output Columns → `data_type` | Same stale one-liner. | Same replacement. |
-| Examples → Error | Documented error text was `Error: Semantic view 'nonexistent' not found`. `src/ddl/show_columns.rs:71` calls `crate::catalog::view_not_found_msg`, which produces `semantic view '<name>' does not exist` (`src/catalog/mod.rs:105`) — the same wording every other reference page shows. Both the capital *S* and the "not found" phrasing were wrong. | Corrected to `Error: semantic view 'nonexistent' does not exist`. |
-
-### SUGGESTION
-
-| Section | Description | Fix |
-|---------|-------------|-----|
-| Examples | The one-line caption gave a different reason ("the view was created through SQL DDL") from the four `SHOW` pages, implying a YAML-defined view might differ. | Replaced with the canonical paragraph. |
-
----
-
-## docs/explanation/snowflake-comparison.rst
-
-### BLOCKING
-
-| Section | Description | Fix |
-|---------|-------------|-----|
-| Metric Grain | The bullet list omitted the one multi-grain pairing that still declines: a role-played dimension queried together with an active semi-additive metric. Read alongside the two bullets that *do* say role-playing-with-`USING` and semi-additive both work, the page implied the combination works. Source: `tests_per_grain.rs:1545` `role_played_dimension_with_a_semi_additive_metric_stays_ineligible`, which asserts the query must decline because the snapshot grain would bind the declaration-order relationship while the sibling grain binds the `USING`-named one. | Added a closing sentence to the role-playing bullet naming the exclusion and its reason. |
-
-### SUGGESTION
-
-| Section | Description | Fix |
-|---------|-------------|-----|
-| Metric Grain | "Two boundaries are worth knowing:" introduced a list of **four** bullets. | Changed to "Four boundaries". |
-| Reported Data Types | Called the removed pass "the `typeof` pass" and said the column is empty "for every newly created view … before that change", while `create-semantic-view.rst` said "since v0.10.0 … before that change". | Aligned to "the define-time inference pass" and "since v0.10.0 … before that release", matching the reference pages that link here. |
-
----
-
-## docs/explanation/metric-grain.rst (NEW)
-
-### BLOCKING
-
-| Section | Description | Fix |
-|---------|-------------|-----|
-| What Is Still Refused, and Why | Same omission as `snowflake-comparison.rst`: the page said semi-additive metrics "are computed at their own grain and can appear alongside metrics at other grains" with no exception, while `fan-traps.rst` (corrected by the maintainer against the source tests) documents the role-played-dimension pairing as still ineligible. As written the two pages contradicted each other. | Added a fifth refused-shape entry, "A role-played dimension queried together with an active semi-additive metric", and qualified the closing semi-additive paragraph with "otherwise". Count updated from "Four shapes" to "Five shapes". |
-
-### SUGGESTION
-
-| Section | Description | Fix |
-|---------|-------------|-----|
-| Author's accuracy note (resolved) | The Author flagged that the two CHANGELOG semi-additive bullets disagree and that this page followed the later one. Confirmed correct against `tests_per_grain.rst:531` `multi_grain_with_active_semi_additive_metric_is_computed`, whose doc comment states it *supersedes* `..._still_errors`. No prose change needed. | None — claim verified. |
-| Result table | The worked "accounts" table was hand-computed. Reconciled against the page's own `INSERT` rows: East = customers 1+2 = 500+300 = 800.00 and 3 orders; West = customer 3 = 900.00 with no order rows, hence `NULL`. Arithmetic is internally consistent; the `NULL`-vs-`0` behaviour matches the NULL-safe `FULL OUTER JOIN` the same page documents. | No change. Still unverified by execution, as instructed. |
-| Cross-references | Missing entry in the refused list for `using_naming_a_non_role_played_relationship_still_declines` (`tests_per_grain.rs:1292`) — a `USING` that names a relationship which is not the role-played one also declines. Minor, and arguably covered by the "reached without `USING`" bullet. | Flagged only; not added, to avoid over-specifying an explanation page. |
-
-### NITPICK
-
-| Section | Description | Fix |
-|---------|-------------|-----|
-| End of file | 31-line `.. Internal notes for the Editor agent` RST comment block. No other page in `docs/` carries one. | Removed. |
-
----
-
-## docs/how-to/filtering.rst (NEW)
-
-### SUGGESTION
-
-| Section | Description | Fix |
-|---------|-------------|-----|
-| Author's accuracy notes (resolved) | Three open questions from the Author, all checked: (a) `explain_semantic_view()` does accept `where_clause` — `explain-semantic-view-function.rst:25,55-57` agrees, and the two functions share one registration; (b) `LABELS = (FILTER)` on a **dimension** is correct — `create-semantic-view.rst:47` grammar and `metadata-annotations.rst:152` both admit it on a fact *or* dimension; (c) `0.12.0` is the right release — `Cargo.toml` reads `version = "0.12.0"` against an open `## [Unreleased]` CHANGELOG section. | No prose change needed on any of the three. |
-| Result tables | All four hand-computed tables reconcile against the five `INSERT` rows: unfiltered East 400.00/3 and West 550.00/2; 2024-filtered East 300.00/2 and West 150.00/1; the per-day breakout (250.00 / 50.00 / 150.00); and the combined filter keeping only East 300.00. Order 4 (2023-12-10) is correctly excluded throughout. | No change. Still unverified by execution, as instructed. |
-| Diataxis | Type integrity is clean. The page stays imperative, every section is a task, and the one conceptual claim ("`where_clause` decides which rows the metrics aggregate over") is one sentence long and links out to `explanation-metric-grain` rather than expanding. No drift toward explanation. | No change. |
-
-### NITPICK
-
-| Section | Description | Fix |
-|---------|-------------|-----|
-| End of file | 27-line `.. Internal notes for the Editor agent` RST comment block. | Removed. |
+| Near-Miss DDL Detection, L982 | "provides helpful suggestions" (filler). | **Fixed:** "suggests the statement you meant". |
+| L990 | "semantic view DDL prefix" vs "semantic-view DDL" (9 other uses). | **Fixed.** |
 
 ---
 
@@ -189,14 +116,155 @@ after-`AS` `NON ADDITIVE BY` example exists anywhere in `docs/`.
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Multi-Grain Queries | Cross-type linking (Diataxis): the page is the *only* one of the three per-grain pages with no outbound link to `explanation-metric-grain`, even though `metric-grain.rst` opens by pointing here as its diagnostic counterpart. The pairing was one-directional. | Added a sentence after the single-grain note linking to `explanation-metric-grain` for the modelling view. |
-| Prose | "computed per-grain" used adverbially (3 instances) where `metric-grain.rst` writes "computed per grain". Attributive uses ("the per-grain path", "per-grain assembly") are correct hyphenated and were left alone. | Normalized the 3 adverbial uses. |
+| Heading L226, versionchanged L232 | "Other Shapes the Fence Rejects" / "slipped past the fence": "fence" is maintainer jargon (Rule 1 / Rule 5). | **Fixed:** heading is now "Other Shapes That Raise the Fan Trap Error" (label `howto-fan-other-shapes` unchanged, unreferenced), and the body says "fan trap check". |
+| L264 | "fan-trap check" | **Fixed:** "fan trap check" (term map). |
 
 ### NITPICK
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Throughout | Literal em dashes where the corpus uses `--`. | Replaced 10 instances. |
+| L219-221 | "why the last three shapes are refused". The list it refers to has only three items. | **Fixed:** "these three shapes". |
+| Note, L273 | "As of v0.11.0" matches the knowledge-cutoff pattern. | **Fixed:** "Since v0.11.0". |
+
+---
+
+## docs/how-to/filtering.rst
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Troubleshooting, L466 | "the fan-out fence" (jargon). | **Fixed:** "the fan trap check". |
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Related | Entries were lowercase with trailing periods. The other 12 how-tos capitalize and use no period. | **Fixed** (4 entries). |
+
+---
+
+## docs/how-to/materializations.rst
+
+### BLOCKING
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Inspect with SHOW and DESCRIBE, L248 | `describe_semantic_view()` named in prose with no link to its reference entry. | **Fixed:** linked `ref-functions-describe`. |
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Note, L267-274 | FROM-source explanation worded differently from the three other pages ("can't take a statement … as a subquery", "syntax error"). | **Fixed:** rewritten to the shared idiom ("cannot use a statement as a subquery … parser error … returns the same rows"). |
+| Troubleshooting | Bold heading followed by an unindented paragraph. The other 11 how-tos use definition lists. | **Fixed:** 5 entries converted (content unchanged). |
+
+---
+
+## docs/how-to/yaml-definitions.rst
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Troubleshooting | Same layout mismatch as `materializations.rst`. | **Fixed:** 7 entries converted (content unchanged). |
+
+---
+
+## docs/how-to/semi-additive-metrics.rst
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Mixed metrics, L221 | Contraction "don't" (the corpus avoids contractions). | **Fixed:** "do not". |
+
+---
+
+## docs/how-to/data-sources.rst
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Heading L174 | "Postgres via the postgres Extension" (the extension name read as a lowercase word). | **Fixed:** "Postgres via the ``postgres`` Extension" (underline extended; label unchanged). |
+
+---
+
+## docs/tutorials/multi-table.rst
+
+### BLOCKING
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Update the View, L205 | `CREATE OR REPLACE` introduced with no link; the page never links the CREATE reference. | **Fixed:** linked `ref-create-variants`. |
+
+---
+
+## docs/explanation/snowflake-comparison.rst
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Metric Grain, L374 | "our `fan trap detected` error" (first person, against the tone rules). | **Fixed:** "the extension's". |
+| Metric Grain, L398 | "The rescue covers a queried dimension's own table" (unclear jargon). | **Fixed:** "This covers only a queried dimension's own table". |
+| L305, L362, L397 | "fan-trap error" ×3 | **Fixed:** "fan trap error". |
+
+---
+
+## docs/explanation/databricks-comparison.rst
+
+### BLOCKING
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Concept table, L34 | DuckDB column shows `CREATE SEMANTIC VIEW` unlinked, while neighboring rows link their references. | **Fixed:** linked `ref-create-semantic-view`. |
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| L190, L250 | "fan-trap error" ×2 | **Fixed.** |
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Heading L220 | "Naming: measures vs metrics" | **Fixed:** title case. |
+
+---
+
+## docs/explanation/metric-grain.rst
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| L108, L172 | "fan-trap error" ×2 | **Fixed.** |
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| L279 | "labelled" (the last British spelling in prose). | **Fixed:** "labeled". |
+
+---
+
+## docs/explanation/transactional-ddl-and-limitations.rst
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Type blur (S-open-4) | **Open, carried over.** The Python catch-and-treat-as-success pattern (L94-101) and the bootstrap-then-reopen workflow (L175-197) are how-to procedures inside an explanation. Not structural enough to block, and each is short. | Move them into a how-to ("Ship a read-only database with semantic views") and link to it from here. |
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| L224, L265 | Filler: "the rule is simply", "genuinely rolls back". | **Fixed.** |
+| Heading L172 | "Bootstrap-then-reopen workflow" | **Fixed:** title case. |
 
 ---
 
@@ -206,89 +274,126 @@ after-`AS` `NON ADDITIVE BY` example exists anywhere in `docs/`.
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| FACTS | Rule 3: `DIMENSIONS` and `METRICS` each carry a **Reported data type** block; `FACTS` does not, although `SHOW SEMANTIC FACTS` reports the same empty column and `show-semantic-facts.rst` explains it at length. A reader working down the clause reference finds the note twice and then loses it. | **Not fixed** — adding a third block is new content, not an edit. Recommend the Author add a one-paragraph **Reported data type** block to the `FACTS` section mirroring the `METRICS` one. |
-| Clause order / Reported data type blocks | Both `data_type` blocks and the `NON ADDITIVE BY` clause-order paragraph were checked against the source and against each other. They agree, and they agree with the `explanation-sf-data-types` anchor after this pass. | No change. |
+| DIMENSIONS versionchanged, L342 | "define-time type inference pass" is a variant in the term map. | **Fixed:** "define-time inference pass". |
+| `IF NOT EXISTS` note, L171 (S-open-1) | **Open (behavioral wording, not edited).** Says `IF NOT EXISTS` absorbs duplicates "within a single process" and fails in a race "between two separate processes". `transactional-ddl-and-limitations.rst` L76-90 and `snowflake-comparison.rst` L492 describe the race between **connections**, and note that only one process can open a file for writing. | Say "on a single connection" / "two connections". Also consider "a constraint or commit-conflict error" to match the explanation page. |
+| Read-only notes, L175 (S-open-3) | **Open (error text).** Quotes `Cannot execute statement of type "..." which is attached in read-only mode!`. The real message (as quoted in `transactional-ddl-and-limitations.rst` L160) has `on database "<name>"` before `which`. The same quote appears in `alter-semantic-view.rst` L60 and `drop-semantic-view.rst` L44. | Quote the full form, or mark the gap with `…`. |
 
 ### NITPICK
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Throughout | Literal em dashes. | Replaced 19 instances. |
+| FROM YAML examples, L548, L556, L762, L770 (N-open-1) | **Open (example SQL).** The four `FROM YAML` / `FROM YAML FILE` statements have no terminating `;`. `yaml-definitions.rst` now has them. | Add `;`. |
 
 ---
 
-## docs/how-to/semi-additive-metrics.rst
+## docs/reference/semantic-view-function.rst and explain-semantic-view-function.rst
 
 ### SUGGESTION
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Troubleshooting | Mid-sentence "Non-additive" / "Non-Additive" (3 instances) against 80+ lowercase uses elsewhere. Reads as a proper noun the project does not have. | Normalized to "non-additive". |
-| Clause order | The `NON ADDITIVE BY`-before-`AS` rule, its grammar block, its error text and its `versionchanged:: 0.12.0` note were checked against `src/body_parser/mod.rs` and against `create-semantic-view.rst:346`. Consistent on both. | No change. |
+| Parameters tables (S-open-2) | **Open (type claim, not edited).** `dimensions`, `metrics`, `facts` and `search_path` are typed `LIST (named)`. `functions.rst` (L199-208, L255), which shows real `duckdb_functions()` output, gives `VARCHAR[]`. | Use `VARCHAR[] (named)` on both pages. |
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| `semantic-view-function.rst` headings L202, L219 | "Post-aggregation -- outer WHERE" / "Pre-aggregation -- where_clause" | **Fixed:** title case (label `ref-sv-pre-agg-filtering` unchanged). |
 
 ---
 
-## docs/how-to/facts.rst
+## docs/reference/describe-semantic-view.rst
 
 ### SUGGESTION
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Annotate Facts with Metadata | Two problems in one sentence. It claimed facts support "the same metadata annotations as dimensions and metrics" — but dimensions reject `PRIVATE` (`create-semantic-view.rst:311`) and metrics reject `LABELS` (`create-semantic-view.rst:109-112`), so the set is not shared with either. And it omitted `LABELS = (FILTER)`, which `create-semantic-view.rst`, `metadata-annotations.rst` and the new `filtering.rst` all document on facts. | Rewrote as a direct enumeration of the four annotations facts accept, and added a bullet for `LABELS = (FILTER)` linking to `howto-annotations-filters` and `howto-filtering`. |
+| View with materializations, L351, L365 | Materialization table `daily_revenue_agg`. Every other page uses `revenue_by_region`. | **Fixed:** renamed in both the DDL and the output row. Same width, so the table stays aligned. No behavior changed. |
+| Tip, L383 (S-open-5) | **Open (example SQL).** The relationships query reads `describe_semantic_view('multi_view')`, a view the page never defines (it has no relationships in `order_metrics`). | Point it at a view with relationships defined on the page, or mark it as illustrative. |
 
 ---
 
-## docs/reference/yaml-format.rst
+## docs/reference/get-ddl.rst
+
+### BLOCKING
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Dump and restore, L204 | "the table function behind `SHOW SEMANTIC VIEWS`": the statement is unlinked on this page. | **Fixed:** linked `ref-show-semantic-views`. |
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Heading L66 | "How an unqualified name resolves" | **Fixed:** title case. Label `ref-get-ddl-resolution` is unchanged; the three `:ref:` uses now render the new title. |
+
+---
+
+## docs/reference/read-yaml-from-semantic-view.rst
+
+### BLOCKING
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Intro, L10 | `CREATE SEMANTIC VIEW ... FROM YAML` unlinked. | **Fixed:** linked `ref-create-from-yaml`. |
+
+---
+
+## docs/reference/show-semantic-dimensions-for-metric.rst
 
 ### SUGGESTION
 
 | Section | Description | Fix |
 |---------|-------------|-----|
-| Complete example | "A **comprehensive** YAML definition covering all supported features" — AI-vocabulary hedge, and redundant beside "all supported features". | "A YAML definition covering all supported features". |
+| Intro, L14 | The explicit link title "How to Understand and Avoid Fan Traps" is stale: the page is now "How to Diagnose and Fix Fan Traps". | **Fixed:** `:ref:\`howto-fan-traps\`` (renders the current title). |
 
 ---
 
-## Pages reviewed with no changes required
+## Pages with no findings this pass
 
-`docs/explanation/databricks-comparison.rst`, `docs/explanation/transactional-ddl-and-limitations.rst`,
-`docs/explanation/index.rst`, `docs/how-to/index.rst`,
-`docs/reference/explain-semantic-view-function.rst`, `docs/tutorials/getting-started.rst`,
-`docs/tutorials/multi-table.rst`, `docs/tutorials/building-a-model.rst`, `docs/conf.py`.
-
-All three tutorials' result tables were reconciled against their `INSERT` rows and are
-arithmetically correct, including the DOUBLE margin values in `building-a-model.rst`
-(141/236, 35/60, 94/176) and the fact-inlining totals (Alice 50.00 + 36.00 + 150.00 = 236.00).
-`conf.py` `nav_links` carries both new pages with summaries in the right sections.
+`index.rst`, `tutorials/getting-started.rst`, `tutorials/building-a-model.rst`, `how-to/index.rst`, `how-to/facts.rst`, `how-to/derived-metrics.rst`, `how-to/role-playing-dimensions.rst`, `how-to/query-facts.rst`, `how-to/wildcard-selection.rst`, `how-to/window-metrics.rst`, `explanation/semantic-views-vs-regular-views.rst`, `reference/index.rst`, `reference/functions.rst` (new: Rule 2 examples present, links to every function page, consistent FROM-source wording), `reference/alter-semantic-view.rst` and `reference/drop-semantic-view.rst` (only the shared S-open-3 quote), `reference/show-semantic-views.rst`, `show-semantic-dimensions.rst`, `show-semantic-metrics.rst`, `show-semantic-facts.rst` (the three sibling pages diff cleanly against each other), `show-semantic-materializations.rst`, `show-columns-semantic-view.rst`, `yaml-format.rst`, `explain-semantic-view-function.rst` (only S-open-2).
 
 ---
 
-## Findings outside the revised set (reported, not edited)
+## CHANGELOG.md (rendered as `docs/changelog.md`)
 
-| File | Severity | Finding |
-|------|----------|---------|
-| `docs/reference/describe-semantic-view.rst` | **BLOCKING** | Carries the same wrong `data_type` one-liner **four times** (lines 141-142, 165-166, 187-188, 211-212). It must get the corrected wording or `DESCRIBE` will contradict every `SHOW` page. This is the single most important follow-up. |
-| `docs/reference/semantic-view-function.rst` | SUGGESTION | Line 142 describes the query-bind-time `LIMIT 0` probe. This is correct and is *not* the removed CREATE-time inference — the sentence already says so ("there is no `CREATE`-time type cache to fall back on"). Left alone deliberately; noting it so a future sweep does not mistake it for the removed pass. |
-| `CHANGELOG.md` line 100 | SUGGESTION | Source of the drift. It says the column reports the type a definition declared "— which only a YAML definition can do", which line 106 of the same file later revokes. Worth reconciling before the changelog is rendered verbatim as the Release Notes page. |
-| `docs/reference/get-ddl.rst` (10), `semantic-view-function.rst` (14), `error-messages.rst` (10), `show-semantic-views.rst` (3), `how-to/query-facts.rst` (2) | NITPICK | 39 literal em dashes outside the revised set. The corpus convention is `--`; under Sphinx smartquotes the two render differently. Worth one sweep. |
-| `docs/reference/show-dims-for-metric` "Window metrics" rule | NITPICK | "Fan trap checking is skipped for window function metrics" is inspection-time behaviour and reads slightly against the query-time rule in `metric-grain.rst` ("two window metrics at different grains still error"). Not a contradiction — different surfaces — but a half-sentence of scoping would remove the friction. |
+Only the 0.12.0 line was revised, and it now reads correctly. The Editor did not rewrite historical release entries, because `CHANGELOG.md` is governed by the CLAUDE.md milestone rules. The items below are still open.
+
+### SUGGESTION
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| 20 bullets (S-open-6) | `TECH-DEBT #NN` / "TECH-DEBT item NN" references on lines 76, 82, 84, 90, 114, 126, 142, 213, 217, 221, 223, 227, 235, 237, 245, 251, 353, 416, 417. They render on the Release Notes page. This goes against the "No internal tracker IDs in docs/" convention and the CLAUDE.md audience note. | Remove the IDs, rewording the "See TECH-DEBT item N" sentences at L416-417. |
+| 0.10.0 → Changed, L345 (S-open-7) | "or use `REFERENCES target(cols)` shorthand on the foreign side" contradicts the now-corrected `snowflake-comparison.rst` and `error-messages.rst` ("An explicit column list … does not satisfy the requirement"). | Drop the clause, or add a correcting note. |
+
+### NITPICK
+
+| Section | Description | Fix |
+|---------|-------------|-----|
+| Structure (N-open-2) | 0.11.0 has `Changed` before `Added`. 0.10.0 has `Removed` after `Security`. The `[0.5.3]` link compares `...tags/v0.5.3`, unlike every other entry. | Reorder; fix the link. |
 
 ---
 
 ## Terminology Changes
 
+`.doc-writer/terminology.yaml` was updated (it validates as YAML). Normalizations applied:
+
 | Term | Before | After | Authority |
 |------|--------|-------|-----------|
-| non-additive | `Non-additive`, `Non-Additive` (3×, `semi-additive-metrics.rst`) | `non-additive` | Most-frequent form (80+ lowercase uses corpus-wide) |
-| computed per grain | `computed per-grain` (3×, `fan-traps.rst`) | `computed per grain` | `metric-grain.rst`; adverbial vs attributive grammar |
-| define-time inference pass | `CREATE-time typeof pass` (`show-semantic-facts.rst`), `typeof pass` (`snowflake-comparison.rst`) | `define-time inference pass` | CHANGELOG v0.10.0 entry; consistency with `create-semantic-view.rst` |
-| `semantic view '<name>' does not exist` | `Semantic view '<name>' not found` (`show-columns-semantic-view.rst`) | canonical form | `catalog::view_not_found_msg`, `src/catalog/mod.rs:105` |
-| `--` (parenthetical dash) | literal em dash | `--` | Corpus convention (30 of 39 files); 31 instances replaced across 4 revised pages |
+| fan trap (attributive) | "fan-trap error" ×7, "fan-trap check" ×1 | "fan trap error", "fan trap check" | Majority form (10 open vs 7 hyphenated); term map canonical "fan trap" |
+| define-time inference pass | "define-time type inference pass" (create L342) | "define-time inference pass" | Term map canonical |
+| semantic-view DDL | "semantic view DDL prefix" (error-messages L990) | "semantic-view DDL prefix" | Majority attributive form (9 vs 1) |
+| labeled | "labelled" (metric-grain L279) | "labeled" | American spelling, majority usage |
+| Materialization example table | `daily_revenue_agg` (describe) | `revenue_by_region` | Cross-page example consistency |
+| "fence" (jargon) | "the Fence", "the fence", "fan-out fence" | "fan trap check" / "Fan Trap Error" | Rule 1 / Rule 5 (maintainer term) |
 
-Terms deliberately **not** normalized: `fan trap` / `fan-trap`, `define time` / `define-time`,
-`query time` / `query-time`, `base table` / `base-table`. Each pair is noun-versus-attributive
-and the hyphenation is grammatically correct in the position it appears. Normalizing them would
-be over-normalization, not consistency.
+Term-map updates with no doc change:
 
-The term map at `.doc-writer/terminology.yaml` has been updated with these entries plus a new
-`conventions` block recording the four cross-file rules this pass enforced (dash form, clause
-order, `data_type` semantics, no internal tracker IDs).
+| Entry | Change |
+|-------|--------|
+| `ExpandError` source | `src/expand.rs` → `src/expand/types.rs` |
+| `list_semantic_views()`, `describe_semantic_view()` | Annotated as FROM-source-only backing functions, with the shared wording and link targets |
+| `duckdb_functions()`, `object_name`, `is_filter`, `DuckLake` | Added |
+| View-not-found wording | Split into two canonical messages (catalog "does not exist" vs query-path "not found … Run SHOW SEMANTIC VIEWS"). They are no longer mapped as variants of each other, so a future pass cannot "normalize" correct text. |
+| define time / query time | Variants removed. Note added: adverbial open, attributive hyphenated (the corpus is already consistent with this). |
+| Conventions | Added: American spelling (British-spelled labels kept), title-case headings (error-catalogue entries excepted), statement vs function parameter layout, how-to section layout. `rules.md` still has no project rules; consider copying the spelling rule there. |

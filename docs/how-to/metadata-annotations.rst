@@ -1,5 +1,5 @@
 .. meta::
-   :description: Add COMMENT, WITH SYNONYMS, and PRIVATE/PUBLIC access modifiers to semantic view definitions and inspect them via DESCRIBE and SHOW
+   :description: Add COMMENT, WITH SYNONYMS, PRIVATE/PUBLIC access modifiers, and LABELS = (FILTER) to semantic view definitions and inspect them via DESCRIBE and SHOW
 
 .. _howto-metadata-annotations:
 
@@ -7,7 +7,7 @@
 How to Use Metadata Annotations
 =====================================
 
-This guide shows how to annotate dimensions, metrics, facts, and tables with comments, synonyms, and access modifiers in a semantic view definition.
+This guide shows how to annotate dimensions, metrics, facts, and tables with comments, synonyms, access modifiers, and named-filter labels in a semantic view definition.
 
 **Prerequisites:**
 
@@ -23,7 +23,7 @@ Add Comments
 Comments are human-readable descriptions attached to any entry in the view definition. They appear in :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` output and in the ``comment`` column of ``SHOW`` commands.
 
 
-View-level comment
+View-Level Comment
 ------------------
 
 Set a comment on the semantic view itself using :ref:`ALTER <ref-alter-semantic-view>`:
@@ -43,7 +43,7 @@ Remove a view-level comment:
    View-level comments appear in the ``comment`` column of :ref:`SHOW SEMANTIC VIEWS <ref-show-semantic-views>` and as a ``SEMANTIC_VIEW`` object kind row in :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>`.
 
 
-Table-level comment
+Table-Level Comment
 -------------------
 
 Add a ``COMMENT`` clause after the table declaration:
@@ -60,7 +60,7 @@ Add a ``COMMENT`` clause after the table declaration:
    METRICS (o.revenue AS SUM(o.amount));
 
 
-Comments on dimensions, metrics, and facts
+Comments on Dimensions, Metrics, and Facts
 -------------------------------------------
 
 Add ``COMMENT`` after the expression on any entry:
@@ -114,7 +114,7 @@ Synonyms appear as a JSON array in :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-se
 Set Access Modifiers (PRIVATE / PUBLIC)
 =======================================
 
-Metrics and facts support ``PRIVATE`` and ``PUBLIC`` access modifiers. ``PUBLIC`` is the default. ``PRIVATE`` items cannot be queried directly -- they can only be referenced by derived metric expressions.
+Metrics and facts support ``PRIVATE`` and ``PUBLIC`` access modifiers. ``PUBLIC`` is the default. ``PRIVATE`` items cannot be queried directly. A private metric can only be referenced by derived metrics. A private fact can only be referenced by metric expressions and by other facts.
 
 .. code-block:: sql
    :emphasize-lines: 6,10,11,12
@@ -135,13 +135,13 @@ Metrics and facts support ``PRIVATE`` and ``PUBLIC`` access modifiers. ``PUBLIC`
 
 In this example:
 
-- ``raw_margin`` is a private fact -- it can be referenced by metrics (like ``total_margin``) but cannot be queried via ``facts := ['raw_margin']``.
+- ``raw_margin`` is a private fact -- it can be referenced by metrics (like ``total_margin``) and by other facts, but cannot be queried via ``facts := ['raw_margin']`` or named in ``where_clause``.
 - ``total_cost`` is a private metric -- it can be referenced by derived metrics (like ``profit``) but cannot be queried via ``metrics := ['total_cost']``.
 - ``total_margin`` and ``profit`` are public (default) and use the private items to compute their values.
 
 .. warning::
 
-   ``PRIVATE`` is placed before the table alias (``PRIVATE li.total_cost``), not after the expression. Dimensions do not support access modifiers.
+   ``PRIVATE`` is placed before the table alias (``PRIVATE li.total_cost``), not after the expression. Dimensions accept ``PUBLIC`` (the default) but not ``PRIVATE``: a private dimension is rejected with ``PRIVATE is not supported on dimensions``.
 
 
 .. _howto-annotations-filters:
@@ -169,7 +169,7 @@ A **named filter** is a boolean-valued fact or dimension meant to be reused in a
        o.revenue AS SUM(o.amount)
    );
 
-Reference the filter by name in :ref:`where_clause <ref-semantic-view-function>`, which applies it *before* the metrics aggregate:
+Reference the filter by name in :ref:`where_clause <ref-sv-pre-agg-filtering>`, which applies it *before* the metrics aggregate:
 
 .. code-block:: sql
 
@@ -177,8 +177,8 @@ Reference the filter by name in :ref:`where_clause <ref-semantic-view-function>`
 
 The label is **declarative metadata**, not an access restriction or a resolution rule:
 
-- ``where_clause`` already substitutes any declared fact or dimension name, labelled or not. The label records that the member *exists to be filtered on*, and surfaces it in :ref:`DESCRIBE <ref-describe-semantic-view>` and ``GET_DDL`` for discoverability.
-- A filter is still a queryable member. ``dimensions := ['is_domestic']`` returns its boolean values like any other dimension. To hide a member from queries, use ``PRIVATE`` (facts only) instead.
+- ``where_clause`` already substitutes any declared fact or dimension name, labeled or not. The label records that the member *exists to be filtered on*, and surfaces it in :ref:`DESCRIBE <ref-describe-semantic-view>` and :ref:`GET_DDL <ref-get-ddl>` for discoverability.
+- A filter is still a queryable member. ``dimensions := ['is_domestic']`` returns its boolean values like any other dimension. There is no way to hide a filter while keeping it usable: ``PRIVATE`` applies only to facts and metrics, and a private fact is refused in ``where_clause`` as well as in ``facts := [...]``.
 
 .. note::
 
@@ -207,12 +207,12 @@ Look for these property rows:
 
 - ``COMMENT`` -- the comment text (conditional, only when set)
 - ``SYNONYMS`` -- JSON array of synonyms (conditional, only when set)
-- ``LABELS`` -- ``["FILTER"]`` for a :ref:`named filter <howto-annotations-filters>` (conditional, only on labelled facts and dimensions)
+- ``LABELS`` -- ``["FILTER"]`` for a :ref:`named filter <howto-annotations-filters>` (conditional, only on labeled facts and dimensions)
 - ``ACCESS_MODIFIER`` -- ``PUBLIC`` or ``PRIVATE`` (always emitted for facts and metrics)
 - ``NON_ADDITIVE_BY`` -- non-additive dimension list (conditional, only for semi-additive metrics)
 - ``WINDOW_SPEC`` -- reconstructed OVER clause (conditional, only for window metrics)
 
-Via SHOW commands
+Via SHOW Commands
 -----------------
 
 The :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>`, :ref:`SHOW SEMANTIC METRICS <ref-show-semantic-metrics>`, and :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>` commands include ``synonyms`` and ``comment`` columns in their output:
@@ -223,15 +223,17 @@ The :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>`, :ref:`SHOW S
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬────────────────────┬────────────┬────────┬───────────┬──────────────────────────────┬──────────────────────────────────────┐
-   │ database_name │ schema_name │ semantic_view_name │ table_name │ name   │ data_type │ synonyms                     │ comment                              │
-   ├───────────────┼─────────────┼────────────────────┼────────────┼────────┼───────────┼──────────────────────────────┼──────────────────────────────────────┤
-   │ memory        │ main        │ sales              │ orders     │ region │           │ ["sales_region","territory"] │ Sales region from shipping address   │
-   └───────────────┴─────────────┴────────────────────┴────────────┴────────┴───────────┴──────────────────────────────┴──────────────────────────────────────┘
+   ┌───────────────┬─────────────┬────────────────────┬────────────┬────────┬───────────┬──────────────────────────────┬─────────┐
+   │ database_name │ schema_name │ semantic_view_name │ table_name │  name  │ data_type │           synonyms           │ comment │
+   ├───────────────┼─────────────┼────────────────────┼────────────┼────────┼───────────┼──────────────────────────────┼─────────┤
+   │ memory        │ main        │ sales              │ orders     │ region │           │ ["sales_region","territory"] │         │
+   └───────────────┴─────────────┴────────────────────┴────────────┴────────┴───────────┴──────────────────────────────┴─────────┘
+
+This output is for the ``sales`` view from :ref:`howto-annotations-synonyms`. Its ``region`` dimension has synonyms but no comment.
 
 .. tip::
 
-   Private items are excluded from :ref:`SHOW COLUMNS IN SEMANTIC VIEW <ref-show-columns>` and from wildcard expansion (``alias.*``). They only appear in :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>`.
+   Private items are excluded from :ref:`SHOW COLUMNS IN SEMANTIC VIEW <ref-show-columns>` and from wildcard expansion (``alias.*``). They still appear in :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` (with ``ACCESS_MODIFIER`` set to ``PRIVATE``), :ref:`SHOW SEMANTIC METRICS <ref-show-semantic-metrics>`, and :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>`.
 
 
 .. _howto-annotations-troubleshoot:
@@ -243,7 +245,7 @@ Troubleshooting
    Only view-level comments appear in :ref:`SHOW SEMANTIC VIEWS <ref-show-semantic-views>`. Table/dimension/metric/fact comments appear in :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` and in the ``comment`` column of :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>`, :ref:`SHOW SEMANTIC METRICS <ref-show-semantic-metrics>`, and :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>`.
 
 **Cannot query a private metric or fact**
-   Private items return an error when queried directly. Use them only in derived metric expressions. To make an item queryable again, recreate the view without the ``PRIVATE`` keyword.
+   Private items return an error when queried directly, for example ``metric 'total_cost' is private and cannot be queried directly``. Reference a private metric from a derived metric, and a private fact from a metric or another fact. To make an item queryable again, recreate the view without the ``PRIVATE`` keyword.
 
 **Synonyms not affecting query resolution**
    Synonyms are informational metadata only. They do not expand the set of names recognized by :ref:`semantic_view() <ref-semantic-view-function>` or :ref:`explain_semantic_view() <ref-explain-semantic-view>`. Use the declared name to query an item.
@@ -258,4 +260,15 @@ Troubleshooting
    ``LABELS`` applies only to facts and dimensions -- they are the entries that carry the filter flag. On a ``TABLES`` or ``METRICS`` entry, or in the trailing view-level annotation position, it raises *LABELS is not valid on a ...*. Move the annotation to the fact or dimension you meant to mark.
 
 **A named filter still shows up in query output**
-   Expected. ``LABELS = (FILTER)`` declares intent and drives introspection; it does not hide the member. Use ``PRIVATE`` (facts and metrics only) to make an item unqueryable.
+   Expected. ``LABELS = (FILTER)`` declares intent and drives introspection; it does not hide the member. ``PRIVATE`` is not a way round this: it applies only to facts and metrics, and a private fact cannot be used in ``where_clause`` either.
+
+
+.. _howto-annotations-related:
+
+Related
+=======
+
+- :ref:`ref-create-semantic-view` -- Where each annotation fits in the ``CREATE SEMANTIC VIEW`` grammar
+- :ref:`ref-describe-semantic-view` -- The property rows annotations produce
+- :ref:`howto-filtering` -- Use named filters in ``where_clause``
+- :ref:`howto-wildcard-selection` -- How private items are left out of ``alias.*``

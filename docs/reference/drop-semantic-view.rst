@@ -33,15 +33,15 @@ Statement Variants
 
 .. note::
 
-   **Which view a bare name means.** Semantic views are scoped to a schema, so ``<name>`` may carry a ``<schema>.`` qualifier, and it decides which view is dropped: ``DROP SEMANTIC VIEW staging.sales`` leaves ``analytics.sales`` alone. An unqualified name resolves to the one view of that name when exactly one exists; when several schemas hold one, the statement is an error naming them rather than dropping an arbitrary one. See :ref:`ref-create-semantic-view` for the full rule.
+   **Which view a bare name means.** Semantic views are scoped to a schema, so ``<name>`` may carry a ``<schema>.`` qualifier, and it decides which view is dropped: ``DROP SEMANTIC VIEW staging.sales`` leaves ``analytics.sales`` alone. An unqualified name resolves through the session's ``search_path``, as an unqualified table reference does: the first schema on the path holding a view of that name wins. With ``main.sales`` and ``staging.sales`` both present and the default path, ``DROP SEMANTIC VIEW sales`` drops ``main.sales`` without warning. When several schemas hold a view of the same name, qualify the name so the statement drops the view you mean. See :ref:`ref-create-semantic-view` for the full rule.
 
 .. note::
 
-   ``DROP`` participates in your surrounding transaction (``BEGIN ... ROLLBACK`` restores the view). ``DROP SEMANTIC VIEW`` (without ``IF EXISTS``) raises ``semantic view '<name>' does not exist`` when the view is absent at check time; ``IF EXISTS`` keeps its silent-no-op behaviour. The existence check and the delete are atomic only inside an explicit transaction -- under autocommit a drop that another process commits in the window between them is not detected. See :ref:`explanation-transactional-ddl` for the guard window and how to close it.
+   ``DROP`` participates in your surrounding transaction (``BEGIN ... ROLLBACK`` restores the view). ``DROP SEMANTIC VIEW`` (without ``IF EXISTS``) raises ``semantic view '<name>' does not exist`` when the view is absent at check time; ``IF EXISTS`` keeps its silent no-op behavior. The existence check and the delete are atomic only inside an explicit transaction -- under autocommit a drop that another process commits in the window between them is not detected. See :ref:`explanation-transactional-ddl` for the guard window and how to close it.
 
 .. note::
 
-   Requires a writable database. On a read-only database this statement fails with DuckDB's standard ``Cannot execute statement of type "..." which is attached in read-only mode!`` error. See :ref:`explanation-txn-ddl-readonly`.
+   Requires a writable database. On a read-only database this statement fails with DuckDB's standard ``Cannot execute statement of type "..." on database "<name>" which is attached in read-only mode!`` error. See :ref:`explanation-txn-ddl-readonly`.
 
 
 .. _ref-drop-params:

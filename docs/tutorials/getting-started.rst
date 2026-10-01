@@ -107,11 +107,14 @@ You should see the view listed with its metadata:
 
 .. code-block:: text
 
-   ┌─────────────────────┬───────────────┬───────────────┬───────────────┬─────────────┐
-   │     created_on      │     name      │     kind      │ database_name │ schema_name │
-   ├─────────────────────┼───────────────┼───────────────┼───────────────┼─────────────┤
-   │ 2026-04-01T12:00:00 │ order_metrics │ SEMANTIC_VIEW │ memory        │ main        │
-   └─────────────────────┴───────────────┴───────────────┴───────────────┴─────────────┘
+   ┌──────────────────────┬───────────────┬───────────────┬───────────────┬─────────────┬─────────┐
+   │      created_on      │     name      │     kind      │ database_name │ schema_name │ comment │
+   ├──────────────────────┼───────────────┼───────────────┼───────────────┼─────────────┼─────────┤
+   │ 2026-04-01T12:00:00Z │ order_metrics │ SEMANTIC_VIEW │ memory        │ main        │         │
+   └──────────────────────┴───────────────┴───────────────┴───────────────┴─────────────┴─────────┘
+
+``created_on`` shows when you ran the ``CREATE`` statement. ``comment`` is empty
+because this view has no ``COMMENT``.
 
 
 .. _tutorial-gs-query:
@@ -119,7 +122,7 @@ You should see the view listed with its metadata:
 Query the Semantic View
 =======================
 
-Query the semantic view using the :ref:`semantic_view() <ref-semantic-view-function>` table function. Pick any combination of the dimensions and metrics you defined.
+Query the semantic view using the :ref:`semantic_view() <ref-semantic-view-function>` table function. Pick any combination of the dimensions and metrics you defined. The result is an ordinary table, so you can add ``ORDER BY``, ``LIMIT`` or a join to the outer query, as the examples below do with ``ORDER BY`` to fix the row order.
 
 **Dimensions and metrics together** (grouped aggregation):
 
@@ -128,7 +131,8 @@ Query the semantic view using the :ref:`semantic_view() <ref-semantic-view-funct
    SELECT * FROM semantic_view('order_metrics',
        dimensions := ['region', 'category'],
        metrics := ['revenue', 'order_count']
-   );
+   )
+   ORDER BY region, category;
 
 .. code-block:: text
 
@@ -147,7 +151,8 @@ Query the semantic view using the :ref:`semantic_view() <ref-semantic-view-funct
 
    SELECT * FROM semantic_view('order_metrics',
        dimensions := ['region']
-   );
+   )
+   ORDER BY region;
 
 .. code-block:: text
 
@@ -243,4 +248,4 @@ You now know how to:
 - Inspect generated SQL with :ref:`explain_semantic_view() <ref-explain-semantic-view>`
 - Drop a semantic view with :ref:`DROP SEMANTIC VIEW <ref-drop-semantic-view>`
 
-Next, learn how to model multiple tables with relationships in the :ref:`tutorial-multi-table` tutorial.
+Next, learn how to model multiple tables with relationships in the :ref:`tutorial-multi-table` tutorial. To see how a semantic view differs from a regular ``CREATE VIEW``, read :ref:`explanation-sv-vs-views`.

@@ -1,13 +1,13 @@
 .. meta::
-   :description: Understand how the extension detects fan traps and restructure queries or views to avoid inflated aggregation results
+   :description: Diagnose the fan trap error, fix the query or the view, and know which multi-grain queries the extension answers
 
 .. _howto-fan-traps:
 
-==========================================
-How to Understand and Avoid Fan Traps
-==========================================
+=====================================
+How to Diagnose and Fix Fan Traps
+=====================================
 
-This guide explains what fan traps are, how the extension detects them, and how to restructure queries or views to avoid inflated aggregation results.
+This guide shows how to recognize the fan trap error, fix the query or the view that triggers it, and tell which queries across several tables the extension answers rather than rejects.
 
 **Prerequisites:**
 
@@ -29,7 +29,7 @@ For example, consider orders and line items:
 - If you join orders to line items to get a line-item dimension, each order row is duplicated per line item.
 - ``COUNT(*)`` on orders now returns the number of line items, not the number of orders.
 
-The extension detects this pattern and raises an error instead of returning incorrect results. For background on the concept, see :ref:`explanation-sv-vs-views`.
+The extension detects this pattern and raises an error instead of returning incorrect results. For why a metric's grain belongs to its table, see :ref:`explanation-metric-grain`.
 
 
 .. _howto-fan-detect:
@@ -92,7 +92,16 @@ The relationship ``li_to_order`` is many-to-one from ``li`` to ``o``. Traversing
    SELECT * FROM semantic_view('sales',
        dimensions := ['region'],
        metrics := ['revenue']
-   );
+   ) ORDER BY region;
+
+.. code-block:: text
+
+   ┌────────┬─────────┐
+   │ region │ revenue │
+   ├────────┼─────────┤
+   │ East   │   300.0 │
+   │ West   │   150.0 │
+   └────────┴─────────┘
 
 **Blocked query,** ``o.order_count`` grouped by ``li.status``:
 
@@ -113,7 +122,8 @@ The error message identifies the metric, dimension, and relationship involved:
    semantic view 'sales': fan trap detected -- metric 'order_count' (table 'o')
    would be duplicated when joined to dimension 'status' (table 'li') via
    relationship 'li_to_order' (many-to-one cardinality, inferred: FK is not
-   PK/UNIQUE). This would inflate aggregation results.
+   PK/UNIQUE). This would inflate aggregation results. Remove the dimension,
+   use a metric from the same table, or restructure the relationship.
 
 
 .. _howto-fan-fix:
@@ -147,110 +157,80 @@ Instead of ``o.order_count`` with ``li.status``, use ``li.revenue`` with ``li.st
 
 **3. Restructure the view**
 
-If you need both ``order_count`` by ``status``, consider creating a separate semantic view scoped to the appropriate table, or pre-aggregating at the line-item level.
+If you need the order count broken down by ``status``, decide what an order with lines in several statuses should count as, then model that answer. For example, add an order-level status column to ``orders`` and declare the dimension there, or pre-aggregate the line items to one row per order and declare that table instead of ``line_items``.
 
 
 .. _howto-fan-per-grain:
 
-Multi-Grain Queries: Each Metric at Its Own Grain
-=================================================
+Query Metrics at Different Grains
+=================================
 
 .. versionchanged:: 0.12.0
 
-   Queries whose metrics sit at **different grains** are computed per grain
-   instead of being rejected. Each metric is aggregated over its own table in a
-   separate CTE and the results are joined on the queried dimensions, which is
-   how Snowflake computes them.
+   Queries whose metrics sit at different grains are answered instead of
+   rejected with ``fan trap detected``.
 
-Three shapes are answered this way. All three used to raise ``fan trap
-detected``, because the generated query was always anchored ``FROM <base
-table>``:
+Metrics from different tables in one query are not a fan trap on their own.
+Each metric is aggregated over its own table, and the results are joined on
+the queried dimensions. In the ``sales`` view above, ``order_count`` (on
+``orders``) and ``revenue`` (on ``line_items``) can be queried together:
 
-**A metric on a parent ("one" side) table the base table references.**
-   ``SUM(customers.balance)`` in a view whose base table is ``orders``. Anchored
-   at ``orders``, each customer row is counted once per order and customers with
-   no orders vanish entirely. It is now aggregated over ``customers`` itself, so
-   the total is the plain customer-grain total -- queried alone, or alongside
-   dimensions at or above the customer grain.
+.. code-block:: sql
 
-**Metrics at two different grains, queried together.**
-   ``order_count`` (on ``orders``) with ``item_qty`` (on ``line_items``), or two
-   metrics on different child tables of one parent (a *chasm trap*). Each is
-   aggregated separately and the results joined on the shared dimensions.
+   SELECT * FROM semantic_view('sales',
+       dimensions := ['region'],
+       metrics := ['order_count', 'revenue']
+   ) ORDER BY region;
 
-**A single derived metric that internally fuses two grains.**
-   ``avg AS order_total / item_count``. Each component is aggregated at its own
-   grain and the expression is evaluated over the two pre-aggregates, so the
-   denominator is the true order count rather than the fanned one.
+.. code-block:: text
 
-Dimension groups are combined with a NULL-safe ``FULL OUTER JOIN``, so a group
-present at one grain but not another is preserved with a ``NULL`` metric -- a
-customer region with no orders keeps its balance and reports a ``NULL`` order
-count -- rather than being dropped. Queries with no dimensions produce one row
-per grain, combined with ``CROSS JOIN``.
+   ┌────────┬─────────────┬─────────┐
+   │ region │ order_count │ revenue │
+   ├────────┼─────────────┼─────────┤
+   │ East   │           1 │   300.0 │
+   │ West   │           1 │   150.0 │
+   └────────┴─────────────┴─────────┘
 
-A ``COUNT(*)`` metric on a table with no declared ``PRIMARY KEY`` is answerable
-on this path too: the table anchors its own CTE, so there are no NULL-extended
-rows to over-count and the ``PRIMARY KEY`` requirement that applies to the
-base-anchored join does not.
+The same applies to these shapes:
 
-.. note::
+- A metric on a parent table, such as ``SUM(customers.balance)`` in a view
+  built around ``orders``, queried alone or with dimensions at or above the
+  customer grain.
+- Metrics on two child tables of one parent (a *chasm trap*).
+- A derived metric that combines two grains, such as
+  ``order_total / item_count``.
+- A window metric whose inner aggregate is on a non-base table.
+- An active semi-additive metric (``NON ADDITIVE BY`` with its snapshot
+  dimension left out of the query).
+- A role-played table, when a metric's ``USING`` names the relationship.
 
-   Single-grain queries are unaffected -- they keep the same base-anchored SQL.
-   The per-grain path is entered only where the query would otherwise have been
-   rejected.
+A dimension group that exists at one grain but not another is kept, with
+``NULL`` for the metrics that have no rows there. For example, a region with
+customers but no orders reports its balance and a ``NULL`` order count.
 
-For why a metric's grain belongs to its table rather than to the query, and what
-that means when you are designing a model rather than debugging one, see
-:ref:`explanation-metric-grain`.
+These multi-grain queries still raise the fan trap error. Query each part at a
+single grain instead:
 
-A **window metric** whose inner aggregate lives on a non-base table *is*
-computed at its own grain: the ``__sv_agg`` CTE is anchored at that table, so the
-inner aggregate sees one row per record there instead of one per base-table row.
-The window function itself is unaffected -- it runs over the already-grouped CTE.
-Two window metrics whose inner aggregates sit at **different** grains still raise
-the fan-trap error, because those grains would have to be joined before the
-window runs.
+- Two window metrics whose inner aggregates sit at different grains.
+- A role-played dimension together with an active semi-additive metric.
+- A role-played table reached with no ``USING`` to say which relationship is
+  meant.
 
-An **active semi-additive metric** (``NON ADDITIVE BY`` with a snapshot dimension
-outside the query) is also computed at its own grain: the snapshot CTE is
-anchored at the metric's own table, so the ``RANK()`` runs over one row per
-record there rather than over a join that has already duplicated them. A
-``NON ADDITIVE BY`` dimension declared on a different table is joined into that
-CTE so its ordering still resolves.
-
-**Role-playing** is decided per query rather than per view. A query that reaches
-a role-played table -- one table reached from the same source through two named
-relationships -- is computed per grain when a metric's ``USING`` names which
-relationship is meant, and raises the fan-trap error when nothing does. Picking a
-role silently would depend on declaration order, which is the mis-binding this
-fence exists to prevent.
-
-Two shapes still raise the error. A role-played dimension queried **together
-with** an active semi-additive metric declines, because a snapshot group cannot
-carry a role: it would join whichever relationship is declared first while a
-sibling grain CTE joins the one ``USING`` named, and the outer join would then
-compare two different instances of the same dimension -- a wrong answer rather
-than an error. And a query that reaches a role-played table with no ``USING`` to
-disambiguate it declines for the reason above. Query those at a single grain.
-
-.. versionchanged:: 0.12.0
-
-   Active semi-additive metrics and ``USING``-disambiguated role-playing were
-   both previously excluded from the per-grain path and raised the fan-trap
-   error in any multi-grain query.
+:ref:`explanation-grain-multi` explains how the per-grain results are joined,
+and :ref:`explanation-grain-refused` explains why these three shapes are
+refused.
 
 
 .. _howto-fan-other-shapes:
 
-Other Shapes the Fence Rejects
-==============================
+Other Shapes That Raise the Fan Trap Error
+==========================================
 
 .. versionchanged:: 0.11.0
 
    Query shapes that inflate the same way as the classic fan trap previously
-   slipped past the fence and returned silently wrong numbers. They now raise
-   the same ``fan trap detected`` error.
+   slipped past the fan trap check and returned silently wrong numbers. They
+   now raise the same ``fan trap detected`` error.
 
 **A dimension below a metric's own grain.**
    The classic case above (``order_count`` by ``li.status``), and its
@@ -281,8 +261,8 @@ Other Shapes the Fence Rejects
    child table ran its snapshot (``RANK``) query over the already-multiplied
    join, where ties across the fanned duplicates of one source row are
    indistinguishable from ties across distinct rows -- so it could
-   double-count. Such metrics previously skipped the fan-trap check on the
-   assumption that the snapshot neutralised the fan; they now get the same
+   double-count. Such metrics previously skipped the fan trap check on the
+   assumption that the snapshot neutralized the fan; they now get the same
    check. Fix: snapshot only on safe, root-ward dimensions, or query the
    semi-additive metric without the fanning child dimension.
 
@@ -290,9 +270,8 @@ Other Shapes the Fence Rejects
 
    A semantic view whose ``RELATIONSHIPS`` form a **cycle** (``a`` references
    ``b`` and ``b`` references ``a``) parses successfully but such a definition
-   is degenerate. As of v0.11.0 a query against it terminates with an error
-   instead of hanging with unbounded memory growth (the fan-trap ancestor walk
-   used to loop forever on a cyclic parent map).
+   is degenerate. Since v0.11.0 a query against it terminates with an error
+   instead of hanging.
 
 
 .. _howto-fan-onetoone:
@@ -304,17 +283,43 @@ If the FK columns match a PK or UNIQUE constraint on the "from" side, the extens
 
 .. code-block:: sql
 
-   CREATE SEMANTIC VIEW order_details AS
+   CREATE TABLE order_details (order_id INTEGER, gift_wrap BOOLEAN, shipping_cost DOUBLE);
+   INSERT INTO order_details VALUES (1, true, 5.0), (2, false, 7.5);
+
+   CREATE SEMANTIC VIEW order_details_sv AS
    TABLES (
-       o  AS orders     PRIMARY KEY (id),
+       o  AS orders        PRIMARY KEY (id),
        od AS order_details PRIMARY KEY (order_id) -- order_id is both PK and FK
    )
    RELATIONSHIPS (
        detail_to_order AS od(order_id) REFERENCES o
    )
-   ...
+   DIMENSIONS (
+       o.region     AS o.region,
+       od.gift_wrap AS od.gift_wrap
+   )
+   METRICS (
+       o.order_count AS COUNT(*),
+       od.shipping   AS SUM(od.shipping_cost)
+   );
 
-Because ``order_id`` is the PK of ``order_details``, the relationship is one-to-one. Metrics from either table can be grouped by dimensions from the other without triggering a fan trap.
+Because ``order_id`` is the PK of ``order_details``, the relationship is one-to-one. Metrics from either table can be grouped by dimensions from the other without triggering a fan trap. Here ``order_count`` (on ``orders``) is grouped by ``gift_wrap`` (on ``order_details``):
+
+.. code-block:: sql
+
+   SELECT * FROM semantic_view('order_details_sv',
+       dimensions := ['gift_wrap'],
+       metrics := ['order_count']
+   ) ORDER BY gift_wrap;
+
+.. code-block:: text
+
+   ┌───────────┬─────────────┐
+   │ gift_wrap │ order_count │
+   ├───────────┼─────────────┤
+   │ false     │           1 │
+   │ true      │           1 │
+   └───────────┴─────────────┘
 
 .. tip::
 
@@ -323,3 +328,41 @@ Because ``order_id`` is the PK of ``order_details``, the relationship is one-to-
    .. code-block:: sql
 
       SHOW SEMANTIC DIMENSIONS IN sales FOR METRIC order_count;
+
+
+.. _howto-fan-troubleshooting:
+
+Troubleshooting
+===============
+
+**fan trap detected -- metric '...' would be duplicated when joined to dimension '...'**
+   The dimension sits below the metric's grain. Apply one of the fixes in
+   :ref:`howto-fan-fix`, or run ``SHOW SEMANTIC DIMENSIONS IN <view> FOR METRIC
+   <metric>`` to list the dimensions that combine with it safely.
+
+**The error says "inferred: FK is not PK/UNIQUE", but each row really has one match**
+   The extension infers a relationship as one-to-one only when the foreign-key
+   columns are declared ``PRIMARY KEY`` or ``UNIQUE`` on their own table in
+   ``TABLES``. Declare the key, as in :ref:`howto-fan-onetoone`, and the
+   relationship can be traversed in both directions.
+
+**The fan trap error names a member you only filtered on**
+   Tables that a ``where_clause`` predicate reaches are checked like a queried
+   dimension's. See the troubleshooting section of :ref:`howto-filtering`.
+
+**Some groups show NULL for one metric**
+   In a multi-grain query, ``NULL`` means that group has no rows at that
+   metric's grain -- for example, a region with customers but no orders. It is
+   not zero. Wrap the column in ``COALESCE`` in the outer query if you want
+   zeros.
+
+
+.. _howto-fan-related:
+
+Related
+=======
+
+- :ref:`explanation-metric-grain` -- What grain is and why the extension refuses some shapes
+- :ref:`ref-show-dims-for-metric` -- List the dimensions a metric can be grouped by
+- :ref:`ref-create-relationships` -- How relationship cardinality is inferred
+- :ref:`howto-role-playing` -- Relationships that reach one table by more than one route

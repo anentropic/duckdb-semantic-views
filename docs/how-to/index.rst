@@ -13,8 +13,8 @@ Goal-oriented guides for specific tasks with DuckDB Semantic Views.
 
 - :ref:`howto-facts` -- Define reusable row-level expressions that can be referenced inside metric aggregations.
 - :ref:`howto-derived-metrics` -- Compose metrics from other metrics using arithmetic without repeating aggregate logic.
-- :ref:`howto-role-playing` -- Join the same physical table multiple times under different aliases for distinct relationships.
-- :ref:`howto-fan-traps` -- Understand, detect, and resolve fan traps that inflate aggregation results in multi-table views, and see how queries spanning several grains are computed.
+- :ref:`howto-role-playing` -- Join the same table through several named relationships, pick the route with ``USING``, and fix an ambiguous diamond.
+- :ref:`howto-fan-traps` -- Diagnose and fix the fan trap error in multi-table views, and see which queries across several grains are answered.
 
 **Advanced Metrics**
 
@@ -24,13 +24,13 @@ Goal-oriented guides for specific tasks with DuckDB Semantic Views.
 **Data & Queries**
 
 - :ref:`howto-data-sources` -- Connect semantic views to CSV, Parquet, Iceberg, and database tables.
-- :ref:`howto-filtering` -- Filter a query before aggregation with ``where_clause`` or after it with an outer ``WHERE``, and tell which one a filter needs.
+- :ref:`howto-filtering` -- Filter a query before aggregation with ``where_clause`` or after it with an outer ``WHERE``, tell which one a filter needs, and pass request values from application code safely.
 - :ref:`howto-query-facts` -- Query facts directly as row-level columns without aggregation.
 - :ref:`howto-wildcard-selection` -- Select all dimensions, metrics, or facts for a table alias using wildcard patterns in queries.
 
 **Operations**
 
-- :ref:`howto-metadata-annotations` -- Add comments, synonyms, and access modifiers to dimensions, metrics, facts, and tables.
+- :ref:`howto-metadata-annotations` -- Add comments, synonyms, access modifiers, and named filters to dimensions, metrics, facts, and tables.
 - :ref:`howto-materializations` -- Declare materializations that route matching queries to pre-aggregated tables.
 - :ref:`howto-yaml-definitions` -- Import and export semantic view definitions as YAML for version control and migration.
 

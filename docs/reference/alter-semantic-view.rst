@@ -49,15 +49,15 @@ Statement Variants
 
 .. note::
 
-   **Schema qualifiers.** ``<name>`` may carry a ``<schema>.`` qualifier and it decides which view is altered; an unqualified name resolves to the one view of that name, and is an error when several schemas hold one (see :ref:`ref-create-semantic-view`). A qualifier on ``<new_name>`` **moves** the view: ``ALTER SEMANTIC VIEW analytics.sales RENAME TO staging.sales`` relocates it to ``staging``. An unqualified ``<new_name>`` leaves the view in its current schema, so the ordinary rename never moves anything. The "already exists" check applies to the destination schema.
+   **Schema qualifiers.** ``<name>`` may carry a ``<schema>.`` qualifier and it decides which view is altered; an unqualified name resolves through the session's ``search_path``, and the first schema on the path holding a view of that name wins (see :ref:`ref-create-semantic-view`). When several schemas hold a view of the same name, qualify ``<name>`` so the statement alters the view you mean. A qualifier on ``<new_name>`` **moves** the view: ``ALTER SEMANTIC VIEW analytics.sales RENAME TO staging.sales`` relocates it to ``staging``. An unqualified ``<new_name>`` leaves the view in its current schema, so the ordinary rename never moves anything. The "already exists" check applies to the destination schema.
 
 .. note::
 
-   ``ALTER`` participates in your surrounding transaction (``BEGIN ... ROLLBACK`` restores the previous name and comment). The non-``IF EXISTS`` forms raise ``semantic view '<name>' does not exist`` when the view is absent at check time (and ``RENAME`` raises ``semantic view '<new_name>' already exists`` if the target name is taken); ``IF EXISTS`` keeps its silent-no-op behaviour. The existence/collision check and the update are atomic only inside an explicit transaction -- under autocommit a concurrent commit in the window between them is not detected (a concurrent drop leaves the update affecting 0 rows; a concurrently taken rename target surfaces a raw key-constraint error). See :ref:`explanation-transactional-ddl` for the guard window and how to close it.
+   ``ALTER`` participates in your surrounding transaction (``BEGIN ... ROLLBACK`` restores the previous name and comment). The non-``IF EXISTS`` forms raise ``semantic view '<name>' does not exist`` when the view is absent at check time (and ``RENAME`` raises ``semantic view '<new_name>' already exists`` if the target name is taken); ``IF EXISTS`` keeps its silent no-op behavior. The existence/collision check and the update are atomic only inside an explicit transaction -- under autocommit a concurrent commit in the window between them is not detected (a concurrent drop leaves the update affecting 0 rows; a concurrently taken rename target surfaces a raw key-constraint error). See :ref:`explanation-transactional-ddl` for the guard window and how to close it.
 
 .. note::
 
-   Requires a writable database. On a read-only database this statement fails with DuckDB's standard ``Cannot execute statement of type "..." which is attached in read-only mode!`` error. See :ref:`explanation-txn-ddl-readonly`.
+   Requires a writable database. On a read-only database this statement fails with DuckDB's standard ``Cannot execute statement of type "..." on database "<name>" which is attached in read-only mode!`` error. See :ref:`explanation-txn-ddl-readonly`.
 
 
 .. _ref-alter-params:
@@ -134,7 +134,8 @@ After the rename, queries must use the new name:
        metrics := ['total_amount']
    );
 
-   -- This fails: "semantic view 'sales_view' does not exist"
+   -- This fails: "Semantic view 'sales_view' not found.
+   -- Run SHOW SEMANTIC VIEWS to see all registered views."
    SELECT * FROM semantic_view('sales_view',
        dimensions := ['region'],
        metrics := ['total_amount']

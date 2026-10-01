@@ -3,6 +3,8 @@ user_personas:
   - name: "Data engineers exploring semantic views"
     skill_level: "intermediate"
     generated_at: "2026-08-09"
+    updated_at: "2026-10-01"
+    update_note: "S1-S5 reused unchanged (page set grew by two pages, explanation/metric-grain.rst and how-to/filtering.rst, well under the regeneration threshold). S6 appended for the v0.13.0 duckdb_functions() metadata feature. 2026-10-01: docs/reference/functions.rst added to doc_pages (created by the audit-fix PR to satisfy S6)."
     doc_pages:
       - "docs/index.rst"
       - "docs/changelog.md"
@@ -16,6 +18,7 @@ user_personas:
       - "docs/how-to/role-playing-dimensions.rst"
       - "docs/how-to/fan-traps.rst"
       - "docs/how-to/data-sources.rst"
+      - "docs/how-to/filtering.rst"
       - "docs/how-to/metadata-annotations.rst"
       - "docs/how-to/semi-additive-metrics.rst"
       - "docs/how-to/window-metrics.rst"
@@ -25,6 +28,7 @@ user_personas:
       - "docs/how-to/yaml-definitions.rst"
       - "docs/explanation/index.rst"
       - "docs/explanation/semantic-views-vs-regular-views.rst"
+      - "docs/explanation/metric-grain.rst"
       - "docs/explanation/snowflake-comparison.rst"
       - "docs/explanation/databricks-comparison.rst"
       - "docs/explanation/transactional-ddl-and-limitations.rst"
@@ -46,6 +50,7 @@ user_personas:
       - "docs/reference/semantic-view-function.rst"
       - "docs/reference/explain-semantic-view-function.rst"
       - "docs/reference/error-messages.rst"
+      - "docs/reference/functions.rst"
     scenarios:
       - id: S1
         goal: "I want to install the extension, define my first semantic view over a single table, and query it three different ways"
@@ -72,3 +77,8 @@ user_personas:
         starting_point: "docs/index.rst"
         persona_relevance: "Financial and inventory reporting is why a semantic layer earns its keep -- last balance per account, rolling averages, rankings. These are the definitions that get computed inconsistently when every analyst writes them by hand."
         done_when: "I can write NON ADDITIVE BY and OVER metric definitions with confidence about the exact clause syntax and position, know when snapshot selection activates, know the mixing restrictions, and can inspect the generated CTEs."
+      - id: S6
+        goal: "I'm building a tool or agent that talks to DuckDB over SQL. I want to discover, over that SQL connection, what functions this extension provides, what parameters they take, and how to call them"
+        starting_point: "docs/index.rst"
+        persona_relevance: "The DuckDB + analytics-app stack increasingly includes an LLM agent or a BI/SQL tool that introspects the engine rather than reading a website. v0.13.0 advertises that every function the extension registers now carries a description, real parameter names and a runnable example in duckdb_functions(); I need to know how to use that."
+        done_when: "I know the SQL query that returns the extension's function metadata and how to scope it to this extension's functions; I know which metadata columns carry the description, parameter names/types and example; I have an inventory of every function the extension registers, with which are meant to be called directly and which are internal (the table functions behind SHOW/DESCRIBE, the reserved search_path parameter); and each directly-callable function has a documented signature with an example."

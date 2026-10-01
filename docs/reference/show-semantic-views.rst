@@ -51,14 +51,14 @@ Optional Filtering Clauses
    Filters views to those whose name matches the pattern. Uses SQL ``LIKE`` pattern syntax: ``%`` matches any sequence of characters, ``_`` matches a single character. Matching is **case-insensitive** (the extension maps ``LIKE`` to DuckDB's ``ILIKE``). The pattern must be enclosed in single quotes.
 
 ``IN SCHEMA [<database_name>.]<schema_name>``
-   Filters views to those in the specified schema. The schema may be qualified with a database — ``IN SCHEMA mydb.analytics`` — in which case both halves must match, so a same-named schema in another database is not included. Unqualified, the schema is matched in any database.
+   Filters views to those in the specified schema. The schema may be qualified with a database -- ``IN SCHEMA mydb.analytics`` -- in which case both halves must match, so a same-named schema in another database is not included. Unqualified, the schema is matched in any database.
 
 ``IN DATABASE <database_name>``
    Filters views to those in the specified database. Unlike the schema, a database name takes no qualifier; ``IN DATABASE a.b`` is an error rather than a name.
 
    Both names may be written double-quoted, which is what lets a name containing whitespace be given at all: ``IN SCHEMA "my schema"``. Matching follows DuckDB's identifier rule, the same rule view, dimension and metric names use: quotes are stripped and case is ignored, so ``"main"``, ``main`` and ``MAIN`` all select the same schema.
 
-   Case-insensitivity here is not a convenience — it is required for the filter to be answerable at all. The schema and database recorded against a semantic view come from ``current_schema()`` / ``current_database()`` at ``CREATE`` time, and DuckDB returns those as the spelling the caller last wrote in ``USE``, not the catalog's own. Two views created in one schema under ``USE MySchema`` and ``USE myschema`` are therefore recorded differently, and an exact-match filter could return at most one of them.
+   Case-insensitivity here is not a convenience -- it is required for the filter to be answerable at all. The schema and database recorded against a semantic view come from ``current_schema()`` / ``current_database()`` at ``CREATE`` time, and DuckDB returns those as the spelling the caller last wrote in ``USE``, not the catalog's own. Two views created in one schema under ``USE MySchema`` and ``USE myschema`` are therefore recorded differently, and an exact-match filter could return at most one of them.
 
 ``STARTS WITH '<prefix>'``
    Filters views to those whose name begins with the prefix. Matching is **case-sensitive**. The prefix must be enclosed in single quotes.
@@ -89,7 +89,7 @@ Output Columns
      - Description
    * - ``created_on``
      - VARCHAR
-     - Timestamp when the semantic view was created.
+     - Time the semantic view was created, as an ISO 8601 UTC string (e.g., ``2026-09-30T22:39:55Z``).
    * - ``name``
      - VARCHAR
      - The semantic view name.
@@ -117,7 +117,7 @@ Output Columns
      - Description
    * - ``created_on``
      - VARCHAR
-     - Timestamp when the semantic view was created.
+     - Time the semantic view was created, as an ISO 8601 UTC string.
    * - ``name``
      - VARCHAR
      - The semantic view name.
@@ -139,23 +139,26 @@ Examples
 
 **List all semantic views:**
 
-The ``created_on`` column contains a non-deterministic timestamp. To get deterministic output, select specific columns from the underlying table function:
-
 .. code-block:: sql
 
-   SELECT name, kind, database_name, schema_name, comment
-   FROM (SHOW SEMANTIC VIEWS);
+   SHOW SEMANTIC VIEWS;
 
 .. code-block:: text
 
-   ┌─────────────────┬───────────────┬───────────────┬─────────────┬──────────────────────┐
-   │ name            │ kind          │ database_name │ schema_name │ comment              │
-   ├─────────────────┼───────────────┼───────────────┼─────────────┼──────────────────────┤
-   │ order_metrics   │ SEMANTIC_VIEW │ memory        │ main        │ Revenue analytics    │
-   │ sales_analytics │ SEMANTIC_VIEW │ memory        │ main        │                      │
-   └─────────────────┴───────────────┴───────────────┴─────────────┴──────────────────────┘
+   ┌──────────────────────┬─────────────────┬───────────────┬───────────────┬─────────────┬───────────────────┐
+   │ created_on           │ name            │ kind          │ database_name │ schema_name │ comment           │
+   ├──────────────────────┼─────────────────┼───────────────┼───────────────┼─────────────┼───────────────────┤
+   │ 2026-09-30T23:02:27Z │ order_metrics   │ SEMANTIC_VIEW │ memory        │ main        │ Revenue analytics │
+   │ 2026-09-30T23:02:27Z │ sales_analytics │ SEMANTIC_VIEW │ memory        │ main        │                   │
+   └──────────────────────┴─────────────────┴───────────────┴───────────────┴─────────────┴───────────────────┘
 
 If no semantic views are registered, the result set is empty.
+
+.. _ref-show-subquery:
+
+.. note::
+
+   ``SHOW SEMANTIC VIEWS`` can't be used as a subquery or in a ``WITH`` clause. Unlike DuckDB's own ``SHOW``, ``SELECT ... FROM (SHOW SEMANTIC VIEWS)`` is a parser error. Run the statement on its own. See :ref:`ref-functions-subqueries`.
 
 **TERSE variant (no comment column):**
 
@@ -165,12 +168,12 @@ If no semantic views are registered, the result set is empty.
 
 .. code-block:: text
 
-   ┌─────────────────────┬─────────────────┬───────────────┬───────────────┬─────────────┐
-   │ created_on          │ name            │ kind          │ database_name │ schema_name │
-   ├─────────────────────┼─────────────────┼───────────────┼───────────────┼─────────────┤
-   │ 2026-04-02 10:30:00 │ order_metrics   │ SEMANTIC_VIEW │ memory        │ main        │
-   │ 2026-04-02 10:35:00 │ sales_analytics │ SEMANTIC_VIEW │ memory        │ main        │
-   └─────────────────────┴─────────────────┴───────────────┴───────────────┴─────────────┘
+   ┌──────────────────────┬─────────────────┬───────────────┬───────────────┬─────────────┐
+   │ created_on           │ name            │ kind          │ database_name │ schema_name │
+   ├──────────────────────┼─────────────────┼───────────────┼───────────────┼─────────────┤
+   │ 2026-09-30T23:02:27Z │ order_metrics   │ SEMANTIC_VIEW │ memory        │ main        │
+   │ 2026-09-30T23:02:27Z │ sales_analytics │ SEMANTIC_VIEW │ memory        │ main        │
+   └──────────────────────┴─────────────────┴───────────────┴───────────────┴─────────────┘
 
 **Filter by schema:**
 

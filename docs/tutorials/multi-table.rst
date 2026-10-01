@@ -172,13 +172,15 @@ The ``month`` dimension uses ``date_trunc('month', o.ordered_at)`` as its expres
 
 .. code-block:: text
 
-   ┌────────────┬─────────┬─────────────┐
-   │   month    │ revenue │ order_count │
-   ├────────────┼─────────┼─────────────┤
-   │ 2024-01-01 │   75.00 │           2 │
-   │ 2024-02-01 │  125.00 │           2 │
-   │ 2024-03-01 │   50.00 │           1 │
-   └────────────┴─────────┴─────────────┘
+   ┌─────────────────────┬─────────┬─────────────┐
+   │        month        │ revenue │ order_count │
+   ├─────────────────────┼─────────┼─────────────┤
+   │ 2024-01-01 00:00:00 │   75.00 │           2 │
+   │ 2024-02-01 00:00:00 │  125.00 │           2 │
+   │ 2024-03-01 00:00:00 │   50.00 │           1 │
+   └─────────────────────┴─────────┴─────────────┘
+
+The ``month`` column is a ``TIMESTAMP``: DuckDB's ``date_trunc('month', ...)`` returns a timestamp even when its input is a ``DATE``. The column type always follows the dimension's expression, so to get plain dates, write the dimension as ``CAST(date_trunc('month', o.ordered_at) AS DATE)``.
 
 
 .. _tutorial-mt-describe:
@@ -200,7 +202,7 @@ The output uses a property-per-row format. Each row describes one property of on
 Update the View
 ===============
 
-To change a semantic view, use ``CREATE OR REPLACE``:
+To change a semantic view, use :ref:`CREATE OR REPLACE <ref-create-variants>`:
 
 .. code-block:: sql
 

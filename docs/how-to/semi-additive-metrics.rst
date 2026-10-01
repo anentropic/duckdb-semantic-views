@@ -23,14 +23,14 @@ Semi-additive metrics solve a specific problem with snapshot data -- tables wher
 
 .. code-block:: text
 
-   ┌────────────┬─────────────┬─────────┐
-   │ report_date│ customer_id │ balance │
-   ├────────────┼─────────────┼─────────┤
-   │ 2026-04-10 │ ACME        │ 500     │
-   │ 2026-04-10 │ Globex      │ 300     │
-   │ 2026-04-11 │ ACME        │ 550     │
-   │ 2026-04-11 │ Globex      │ 280     │
-   └────────────┴─────────────┴─────────┘
+   ┌─────────────┬─────────────┬─────────┐
+   │ report_date │ customer_id │ balance │
+   ├─────────────┼─────────────┼─────────┤
+   │ 2026-04-10  │ ACME        │     500 │
+   │ 2026-04-10  │ Globex      │     300 │
+   │ 2026-04-11  │ ACME        │     550 │
+   │ 2026-04-11  │ Globex      │     280 │
+   └─────────────┴─────────────┴─────────┘
 
 If you query ``SUM(balance)`` grouped by ``customer_id`` across both dates, you get 1050 for ACME (500 + 550) -- but that is double-counting. The real current balance is 550. Summing across customers makes sense (ACME + Globex = 830 on April 11), but summing the same customer across dates does not.
 
@@ -67,7 +67,7 @@ This declares that ``total_balance`` is non-additive by ``report_date``. When a 
 Clause Order: NON ADDITIVE BY Comes Before AS
 =============================================
 
-.. important::
+.. warning::
 
    ``NON ADDITIVE BY (...)`` is part of the metric's *declaration*, not part of
    its expression, so it goes **before** the ``AS``. The full metric form is:
@@ -96,7 +96,7 @@ Clause Order: NON ADDITIVE BY Comes Before AS
    The after-``AS`` form used to be *accepted*. The clause was absorbed into
    the metric expression, so the metric was stored as an ordinary additive
    metric with its snapshot semantics silently dropped: ``DESCRIBE SEMANTIC
-   VIEW`` reported no non-additive dimensions, ``GET_DDL`` round-tripped the
+   VIEW`` reported no non-additive dimensions, :ref:`GET_DDL <ref-get-ddl>` round-tripped the
    malformed text, and the only complaint arrived at query time as a parser
    error pointing inside generated SQL. If you have definitions written that
    way, move the clause ahead of the ``AS`` -- they will no longer create.
@@ -107,7 +107,7 @@ Clause Order: NON ADDITIVE BY Comes Before AS
 Sort Order and NULLS Placement
 ==============================
 
-Each dimension in ``NON ADDITIVE BY`` accepts an optional sort order and NULLS placement. The rows are sorted by the non-additive dimensions and the rows sharing the **last ordering value** of that sort are aggregated (because the engine uses ``RANK()``, ties at that value all win), so:
+Each dimension in ``NON ADDITIVE BY`` accepts an optional sort order and NULLS placement. The rows are sorted by the non-additive dimensions, and the rows sharing the **last value** in that order are aggregated. Rows tied at that value all count. So:
 
 - ``ASC`` (default) -- selects the **latest** snapshot row (matches Snowflake)
 - ``DESC`` -- selects the **earliest** snapshot row
@@ -148,8 +148,8 @@ The default NULLS placement follows the sort direction, matching DuckDB and Snow
 
 .. _howto-semi-additive-multiple:
 
-Multiple non-additive Dimensions
-=================================
+Multiple Non-Additive Dimensions
+================================
 
 A metric can be non-additive by more than one dimension. Each gets its own sort specification, and the whole list still precedes the ``AS``:
 
@@ -164,10 +164,13 @@ A metric can be non-additive by more than one dimension. Each gets its own sort 
 Snapshot Behavior
 =================
 
-The semi-additive expansion depends on whether the non-additive dimensions are present in the query:
+Snapshot selection depends on whether the non-additive dimensions are in the query. The examples below use the ``accounts`` rows from :ref:`howto-semi-additive-snapshot`.
 
-**non-additive dimension NOT in query (active):**
-   The extension generates a CTE with ``RANK() OVER (PARTITION BY <queried dims> ORDER BY <NA dims>)`` to select the snapshot rows per group, then aggregates over the filtered rows. ``RANK()`` means every row tied at the snapshot ordering value (e.g. several accounts sharing the same latest date within a group) shares rank 1 and is included in the aggregation. This is the snapshot selection behavior.
+**Non-additive dimension not in the query (active):**
+   The extension picks the snapshot rows for each group of the queried
+   dimensions -- the latest ``report_date`` per ``customer_id`` here -- and
+   aggregates only those. Every row tied at that date counts, so several
+   accounts sharing the latest date within a group are all included.
 
 .. code-block:: sql
 
@@ -175,23 +178,52 @@ The semi-additive expansion depends on whether the non-additive dimensions are p
    SELECT * FROM semantic_view('account_metrics',
        dimensions := ['customer_id'],
        metrics := ['total_balance']
-   );
+   ) ORDER BY customer_id;
 
-**non-additive dimension in query (effectively regular):**
-   When all non-additive dimensions are included in the query, the metric behaves as a standard additive metric -- no CTE, no snapshot selection. This matches Snowflake's behavior: "When the non-additive dimension is included in the query, the metric is calculated as a standard additive metric."
+.. code-block:: text
+
+   ┌─────────────┬───────────────┐
+   │ customer_id │ total_balance │
+   ├─────────────┼───────────────┤
+   │ ACME        │           550 │
+   │ Globex      │           280 │
+   └─────────────┴───────────────┘
+
+**Non-additive dimension in the query (effectively regular):**
+   When all non-additive dimensions are included in the query, the metric behaves as a standard additive metric, with no snapshot selection. This matches Snowflake's behavior: "When the non-additive dimension is included in the query, the metric is calculated as a standard additive metric."
 
 .. code-block:: sql
 
-   -- report_date in query -> standard aggregation, no CTE
+   -- report_date in query -> standard aggregation
    SELECT * FROM semantic_view('account_metrics',
        dimensions := ['customer_id', 'report_date'],
        metrics := ['total_balance']
-   );
+   ) ORDER BY customer_id, report_date;
+
+.. code-block:: text
+
+   ┌─────────────┬─────────────┬───────────────┐
+   │ customer_id │ report_date │ total_balance │
+   ├─────────────┼─────────────┼───────────────┤
+   │ ACME        │ 2026-04-10  │           500 │
+   │ ACME        │ 2026-04-11  │           550 │
+   │ Globex      │ 2026-04-10  │           300 │
+   │ Globex      │ 2026-04-11  │           280 │
+   └─────────────┴─────────────┴───────────────┘
 
 **Mixed regular and semi-additive metrics:**
-   Regular metrics and semi-additive metrics can coexist in the same query. The CTE includes both, but only the semi-additive metrics get the ``CASE WHEN __sv_rn = 1`` conditional aggregation. Regular metrics aggregate over all rows.
+   Regular metrics and semi-additive metrics can be queried together. Only the
+   semi-additive metrics are limited to the snapshot rows; regular metrics
+   aggregate over all rows.
 
-   Every metric in such a query (including the semi-additive metric itself) must be a single aggregate call ``SUM/COUNT/AVG/MIN/MAX(<expression>)`` -- the CTE decomposes each metric into a per-row column plus an outer re-aggregation. Shapes that cannot be decomposed (``COUNT(*)``, ``DISTINCT`` aggregates, arithmetic around the aggregate like ``SUM(x) * 0.1``, ``COALESCE``-wrapped aggregates, derived metrics) produce a clear error telling you to query them separately from the semi-additive metric.
+   A regular metric declared on the **same table** as the semi-additive metric
+   must be a single aggregate call ``SUM/COUNT/AVG/MIN/MAX(<expression>)``.
+   Shapes that do not fit (``COUNT(*)``, ``DISTINCT`` aggregates, arithmetic
+   around the aggregate like ``SUM(x) * 0.1``, ``COALESCE``-wrapped aggregates,
+   derived metrics) produce an error that tells you to query them separately
+   from the semi-additive metric. A metric on a **different table**, such as a
+   ``COUNT(*)`` of customers next to a balance on ``accounts``, has no such limit:
+   it is computed at its own grain (see :ref:`explanation-grain-multi`).
 
 
 .. _howto-semi-additive-verify:
@@ -199,7 +231,7 @@ The semi-additive expansion depends on whether the non-additive dimensions are p
 Verify the Generated SQL
 =========================
 
-Use :ref:`explain_semantic_view() <ref-explain-semantic-view>` to inspect the CTE expansion:
+Use :ref:`explain_semantic_view() <ref-explain-semantic-view>` to check that snapshot selection is active:
 
 .. code-block:: sql
 
@@ -208,27 +240,36 @@ Use :ref:`explain_semantic_view() <ref-explain-semantic-view>` to inspect the CT
        metrics := ['total_balance']
    );
 
-The ``sql`` column shows the generated query:
+The function returns one ``explain_output`` column, one line per row. Its ``-- Expanded SQL:`` section shows the generated query:
 
 .. code-block:: sql
 
    WITH __sv_snapshot AS (
        SELECT
-           "accounts"."customer_id",
-           "accounts"."balance",
-           RANK() OVER (
-               PARTITION BY "accounts"."customer_id"
-               ORDER BY "accounts"."report_date" DESC NULLS LAST
-           ) AS __sv_rn
-       FROM "accounts"
+           a.customer_id AS "customer_id",
+           a.balance AS "__sv_semi_0",
+           RANK() OVER (PARTITION BY a.customer_id ORDER BY a.report_date DESC NULLS LAST) AS "__sv_rn"
+       FROM "memory"."main"."accounts" AS "a"
    )
    SELECT
-       "customer_id",
-       SUM(CASE WHEN __sv_rn = 1 THEN "balance" END) AS "total_balance"
+       "customer_id" AS "customer_id",
+       SUM(CASE WHEN "__sv_rn" = 1 THEN "__sv_semi_0" END) AS "total_balance"
    FROM __sv_snapshot
-   GROUP BY "customer_id"
+   GROUP BY
+       1
 
-The CTE assigns a rank per ``customer_id``. Because ``RANK() = 1`` is the *first* row of the window's ``ORDER BY``, the extension emits the **reverse** of the declared direction: the declared default (ascending) becomes ``ORDER BY report_date DESC`` here, so rank 1 is the latest snapshot -- including every row tied at that latest value. The outer query then aggregates only those latest rows via ``CASE WHEN __sv_rn = 1``.
+A ``WITH __sv_snapshot`` step means snapshot selection is active. If the query includes every non-additive dimension, the step is absent and the metric is a plain ``SUM``. The output continues with a ``-- DuckDB Plan:`` section.
+
+.. dropdown:: Why the generated ORDER BY is DESC
+
+   The snapshot step ranks rows within each group and keeps rank 1, which is
+   the *first* row in the window's ``ORDER BY``. To make rank 1 the **last**
+   value in the declared order, the extension emits the reverse of the declared
+   direction: the default (ascending) ``NON ADDITIVE BY (report_date)`` becomes
+   ``ORDER BY a.report_date DESC`` above, so rank 1 is the latest snapshot,
+   along with every row tied at that date. The declared ``NULLS`` placement is
+   kept as written. When metrics in one query declare different ``NON ADDITIVE
+   BY`` lists, each list gets its own ranking column.
 
 
 .. _howto-semi-additive-restrictions:
@@ -249,14 +290,28 @@ Troubleshooting
 **NON ADDITIVE BY must come BEFORE AS**
    The clause belongs between the metric name and the ``AS``, not after the aggregate
    expression. Rewrite ``a.balance AS SUM(a.v) NON ADDITIVE BY (d)`` as
-   ``a.balance NON ADDITIVE BY (d) AS SUM(a.v)``. Parenthesising the expression does
+   ``a.balance NON ADDITIVE BY (d) AS SUM(a.v)``. Parenthesizing the expression does
    not change this -- the clause is still rejected.
 
 **NON ADDITIVE BY dimension not found**
    The dimension name in ``NON ADDITIVE BY`` must match a declared dimension in the view. The error message identifies which dimension name is unrecognized: ``NON ADDITIVE BY dimension 'X' on metric 'Y' does not match any declared dimension``.
 
 **Unexpected aggregation results**
-   Use :ref:`explain_semantic_view() <ref-explain-semantic-view>` to verify whether the CTE is generated. If all non-additive dimensions are in the query, the metric behaves as a regular additive metric and no CTE is produced. Remove the non-additive dimension from the query to activate snapshot selection.
+   Use :ref:`explain_semantic_view() <ref-explain-semantic-view>` to check for the ``WITH __sv_snapshot`` step (see :ref:`howto-semi-additive-verify`). If all non-additive dimensions are in the query, the metric behaves as a regular additive metric and the step is absent. Remove the non-additive dimension from the query to activate snapshot selection.
 
-**Performance with multiple non-additive dimension sets**
-   When multiple semi-additive metrics have different ``NON ADDITIVE BY`` dimensions, each gets its own ``RANK`` column in the CTE (``__sv_rn_1``, ``__sv_rn_2``, etc.). This is functionally correct but adds window function overhead.
+**Slower queries with several non-additive dimension sets**
+   When semi-additive metrics in one query declare different ``NON ADDITIVE BY`` dimensions, the extension ranks the rows once per distinct list. The results are correct, but each extra list adds a window function to the query. Query those metrics separately if that matters.
+
+**A co-queried metric is rejected: cannot be co-queried with semi-additive metric**
+   A regular metric on the same table as the semi-additive metric is not a single ``SUM/COUNT/AVG/MIN/MAX(<expression>)`` call -- ``COUNT(*)``, for example. Query the two metrics separately, or rewrite the regular metric as a single aggregate call over a column, such as ``COUNT(a.id)``.
+
+
+.. _howto-semi-additive-related:
+
+Related
+=======
+
+- :ref:`ref-create-metrics` -- Full metric grammar, including ``NON ADDITIVE BY``
+- :ref:`explanation-metric-grain` -- How semi-additive metrics combine with metrics at other grains
+- :ref:`howto-window-metrics` -- The other kind of metric that depends on the queried dimensions
+- :ref:`howto-materializations` -- Why semi-additive metrics are never routed to a materialization
