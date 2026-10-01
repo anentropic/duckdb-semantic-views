@@ -163,6 +163,10 @@ A definition with metrics only:
        expr: SUM(o.amount)
        source_table: o
 
+.. note::
+
+   ``tables`` must list at least one table, but the import does not check this yet. A definition that omits ``tables``, or sets it to ``[]``, is accepted by ``CREATE SEMANTIC VIEW ... FROM YAML``, and the mistake only shows up as an error when the view is first queried.
+
 
 .. _ref-yaml-format-toplevel:
 
@@ -180,7 +184,7 @@ Top-Level Keys
    * - ``tables``
      - list of `Table`_
      - Yes
-     - Physical tables available to the view.
+     - Physical tables available to the view. Must list at least one table. This is not yet checked at import: a definition without ``tables`` (or with ``tables: []``) is accepted, and the view fails at its first query. See :ref:`ref-yaml-format-minimal`.
    * - ``dimensions``
      - list of `Dimension`_
      - Yes :sup:`*`

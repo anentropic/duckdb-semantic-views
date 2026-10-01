@@ -3,8 +3,8 @@ user_personas:
   - name: "Data engineers exploring semantic views"
     skill_level: "intermediate"
     generated_at: "2026-08-09"
-    updated_at: "2026-09-30"
-    update_note: "S1-S5 reused unchanged (page set grew by two pages, explanation/metric-grain.rst and how-to/filtering.rst, well under the regeneration threshold). S6 appended for the v0.13.0 duckdb_functions() metadata feature."
+    updated_at: "2026-10-01"
+    update_note: "S1-S5 reused unchanged (page set grew by two pages, explanation/metric-grain.rst and how-to/filtering.rst, well under the regeneration threshold). S6 appended for the v0.13.0 duckdb_functions() metadata feature. 2026-10-01: docs/reference/functions.rst added to doc_pages (created by the audit-fix PR to satisfy S6)."
     doc_pages:
       - "docs/index.rst"
       - "docs/changelog.md"
@@ -50,6 +50,7 @@ user_personas:
       - "docs/reference/semantic-view-function.rst"
       - "docs/reference/explain-semantic-view-function.rst"
       - "docs/reference/error-messages.rst"
+      - "docs/reference/functions.rst"
     scenarios:
       - id: S1
         goal: "I want to install the extension, define my first semantic view over a single table, and query it three different ways"
