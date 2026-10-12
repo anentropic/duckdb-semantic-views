@@ -222,7 +222,19 @@ code overlap with the spike branch, so the two run side by side.
   read-side type never goes stale when a source column changes. The Phase 5 BI
   placeholders consume it.
 
-### Phase 1: spike on `v2.0-cyanoptera` (go / no-go, start now)
+### Phase 1: spike on `v2.0-cyanoptera` (go / no-go) — ✅ GO, 2026-10-12
+
+**Result:** see `_notes/spikes/peg-grammar-2026-10-12/README.md`. Every item below
+worked against a real 2.0 build, including transactional DDL through a grammar
+transform. Three findings feed later phases:
+
+- `C_STRUCT_UNSTABLE` can't load on 2.0, but a `C_STRUCT` extension pinned to the
+  v1.5.6 V1 C API can (→ Phase 2).
+- That loses DuckDB's exact-version check, so we need our own load-time version
+  guard (→ Phase 2).
+- Comments inside member expressions are lost in text capture (→ D4).
+
+Original spike brief, kept for reference:
 
 2.0.0 is days away and every later phase hinges on this answer. Throwaway branch;
 the output is a `_notes/` write-up.
@@ -272,7 +284,15 @@ which still takes the raw query string on 2.0, and its scanners. Replace only th
 ### Phase 2: engine bump to DuckDB 2.0, behaviour unchanged
 
 Bump `.duckdb-version`, the crate pins, the pin-encoding test and
-`DuckDBVersionMonitor.yml`. `parser_override` keeps its string signature on 2.0, so
+`DuckDBVersionMonitor.yml`. Per the spike:
+
+- Switch the ABI type from `C_STRUCT_UNSTABLE` (which 2.0 only loads through the
+  new `_init_c_api_v2` handle API) to `C_STRUCT` pinned to the v1.5.6 V1 C API, and
+  verify that duckdb-rs `=1.10506.0` keeps working against a 2.0 host. If it does,
+  the duckdb-rs 2.0 release stops being a hard gate.
+- Add a load-time guard that refuses to load when the host's DuckDB version or
+  source id differs from the one our amalgamation was built from. `C_STRUCT` no
+  longer enforces that, and our C++ reads host objects by layout. `parser_override` keeps its string signature on 2.0, so
 only the `sv_parse_stub` caret path has to move to the token-based `parse_function`.
 All tests stay green with **no** user-visible change. This separates "new engine" from "new parser"
 so a regression can be bisected to one or the other. Decision D2 decides whether
@@ -409,7 +429,7 @@ the same fixture answers both.
 | D1 | #71 semantics: count orphan child rows (FK NULL)? Childless parent's child-COUNT = `NULL` or `0`? | Home-table anchoring, with orphans counted. For childless parents, the two reviews disagree. The first draft said `NULL`. Fable's review says `COALESCE` the COUNT family to `0`, since BI users expect that and a left-joined star gives `0`. Leaning to `0` for COUNT and `NULL` for other aggregates. A Snowflake fixture run would settle it. |
 | D2 | Drop DuckDB 1.x when Phase 2 lands? | Yes, once spike item 6 shows that duckdb-rs and community CI are ready for 2.0. 1.5 is end of life on 2026-11-01. Tag v0.13.x as the last 1.5 line (fixes only). |
 | D3 | Keep `semantic_view('v', dimensions := …)` after `SEMANTIC_VIEW(...)` ships? | Keep it one release as a documented, deprecated alias that maps onto the same IR, then remove it. `explain_semantic_view` becomes a `semantic_view_sql`-style function over any statement. |
-| D4 | Store member expressions as verbatim source text (today) or as DuckDB-normalised text? | Verbatim text, validated by parsing, if spike item 5 shows a transform can slice the original query string. If it can't, switch to normalised text now and change the `roundtrip_proptest` expectations. That preserves `GET_DDL` fidelity. Moving to AST storage would also retire #73 and IDENT-2/3/4, but it is a separate decision. |
+| D4 | Store member expressions as verbatim source text (today) or as DuckDB-normalised text? | The spike shows a transform can rebuild the expression's exact code text, spacing included, from its tokens. Only comments inside an expression are lost, and they become spaces. Recommendation: keep storing that text, and document comment loss as a known divergence with a TECH-DEBT entry and a round-trip test pinning it. That preserves `GET_DDL` fidelity. Moving to AST storage would also retire #73 and IDENT-2/3/4, but it is a separate decision. |
 | D5 | Snowflake metadata clauses (`AI_*`, `TAG`, `COPY GRANTS`, `SAMPLE_VALUES`, `IS_ENUM`, Cortex search, `MAX_STALENESS`): reject (today), or accept and store? | Accept, store, show in DESCRIBE, and round-trip through GET_DDL/YAML, so Snowflake DDL pastes as is. `COPY GRANTS` and `MAX_STALENESS` are accepted as no-ops. Budget it: about 9 clauses, each touching model + JSON + YAML + `render_ddl` + DESCRIBE. |
 | D6 | BI placeholder views share the table/view namespace (a semantic view can't share a name with a table). OK? | Yes, behind the Phase 5 spike. It is what lets BI tools see them at all. |
 | D7 | Version line for the 2.0 cut? | Ship Phase 2 as v0.14.0. Consider v1.0.0 once Phase 4 lands **and** D4's expression storage format has settled. |
