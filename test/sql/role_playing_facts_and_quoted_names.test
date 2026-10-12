@@ -1,0 +1,145 @@
+# TECH-DEBT #69 (MM-1) and #70 (MM-2): two role-playing shapes that were
+# accepted at CREATE and emitted SQL that could not run. Both were found by
+# tests/metamorphic_proptest.rs.
+#
+# #69: a `USING` metric over a FACT on the role-played table. The fact inlined
+#      as its raw expression (`a.elevation`) while the table was joined only
+#      under its scoped alias (`"p0a_airports" AS "a__dep_airport"`):
+#      `Binder Error: Referenced table "a" not found`.
+# #70: a QUOTED relationship name on a role-played edge. The scoped alias was
+#      concatenated from the stored text, quotes and all, and the JOIN and the
+#      member reference quoted it differently: `Parser Error: syntax error`.
+#
+# Every number below differs between the two roles, so a fix that bound the
+# wrong instance would fail here rather than pass by accident.
+
+require semantic_views
+
+statement ok
+CREATE TABLE p0a_airports (airport_code VARCHAR, city VARCHAR, elevation INTEGER);
+
+statement ok
+INSERT INTO p0a_airports VALUES ('SFO', 'San Francisco', 13), ('DEN', 'Denver', 5434);
+
+statement ok
+CREATE TABLE p0a_flights (flight_id INTEGER, departure_code VARCHAR, arrival_code VARCHAR);
+
+# Two flights SFO -> DEN, one DEN -> SFO.
+statement ok
+INSERT INTO p0a_flights VALUES (1, 'SFO', 'DEN'), (2, 'SFO', 'DEN'), (3, 'DEN', 'SFO');
+
+# ------------------------------------------------------------------
+# #69: USING metrics over a fact on the role-played table
+# ------------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW p0a_elev AS
+  TABLES (
+    f AS p0a_flights PRIMARY KEY (flight_id),
+    a AS p0a_airports PRIMARY KEY (airport_code)
+  )
+  RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a,
+    arr_airport AS f(arrival_code) REFERENCES a
+  )
+  FACTS (
+    a.elev AS a.elevation
+  )
+  DIMENSIONS (
+    a.city AS a.city
+  )
+  METRICS (
+    f.dep_elev USING (dep_airport) AS SUM(a.elev),
+    f.arr_elev USING (arr_airport) AS SUM(a.elev),
+    elev_climb AS arr_elev - dep_elev
+  );
+
+# Departures: 13 + 13 + 5434.
+query I
+SELECT * FROM semantic_view('p0a_elev', metrics := ['dep_elev']);
+----
+5460
+
+# Arrivals: 5434 + 5434 + 13 — the other instance of the same table.
+query I
+SELECT * FROM semantic_view('p0a_elev', metrics := ['arr_elev']);
+----
+10881
+
+# A derived metric composing both roles keeps them distinct.
+query I
+SELECT * FROM semantic_view('p0a_elev', metrics := ['elev_climb']);
+----
+5421
+
+# Grouped by the role-played dimension: the dimension and the inlined fact
+# share the scoped alias, so each departure city sums its own elevation.
+query TI rowsort
+SELECT * FROM semantic_view('p0a_elev', dimensions := ['city'], metrics := ['dep_elev']);
+----
+Denver	5434
+San Francisco	26
+
+# ------------------------------------------------------------------
+# #70: quoted relationship names on the role-playing pair
+# ------------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW p0a_quoted AS
+  TABLES (
+    f AS p0a_flights PRIMARY KEY (flight_id),
+    a AS p0a_airports PRIMARY KEY (airport_code)
+  )
+  RELATIONSHIPS (
+    "Dep Airport" AS f(departure_code) REFERENCES a,
+    "arr""port" AS f(arrival_code) REFERENCES a
+  )
+  DIMENSIONS (
+    a.city AS a.city
+  )
+  METRICS (
+    f.departures USING ("Dep Airport") AS COUNT(*),
+    f.arrivals USING ("arr""port") AS COUNT(*)
+  );
+
+# A space in the relationship name.
+query TI rowsort
+SELECT * FROM semantic_view('p0a_quoted', dimensions := ['city'], metrics := ['departures']);
+----
+Denver	1
+San Francisco	2
+
+# An embedded doubled quote in the relationship name.
+query TI rowsort
+SELECT * FROM semantic_view('p0a_quoted', dimensions := ['city'], metrics := ['arrivals']);
+----
+Denver	2
+San Francisco	1
+
+# ------------------------------------------------------------------
+# The fence #69 walks past: a member reaching the role-played fact with no
+# single role to name. Before, `any_elev` returned 5460 — the departure role,
+# only because `dep_airport` is declared first.
+# ------------------------------------------------------------------
+
+statement ok
+CREATE SEMANTIC VIEW p0a_unscoped AS
+  TABLES (
+    f AS p0a_flights PRIMARY KEY (flight_id),
+    a AS p0a_airports PRIMARY KEY (airport_code)
+  )
+  RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a,
+    arr_airport AS f(arrival_code) REFERENCES a
+  )
+  FACTS (
+    a.elev AS a.elevation
+  )
+  METRICS (
+    f.any_elev AS SUM(a.elev)
+  );
+
+statement error
+SELECT * FROM semantic_view('p0a_unscoped', metrics := ['any_elev']);
+----
+'any_elev' is ambiguous -- it references fact

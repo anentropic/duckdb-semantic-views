@@ -7,17 +7,42 @@ use super::facts::{
     collect_derived_metric_source_tables, collect_derived_metric_using,
     collect_referenced_fact_tables, collect_transitive_metric_names,
 };
-use super::resolution::{qualify_and_quote_table_ref, quote_ident};
+use super::resolution::{qualify_and_quote_table_ref, quote_ident, quote_ident_if_needed};
 
 /// Build a role-playing scoped alias in the documented `{table}__{rel}` format.
 ///
-/// Both parts must already be lowercased by the caller (aliases and relationship
-/// names are matched case-insensitively via lowercasing at the call sites). This
-/// is the single source of the format so the two producers — this module's
-/// USING-relationship join synthesis and `role_playing::scoped_alias_for` — can
-/// never drift (E-10, code-review 2026-07-11).
-pub(super) fn scoped_join_alias(table_lower: &str, rel_lower: &str) -> String {
-    format!("{table_lower}__{rel_lower}")
+/// The result is the alias's *logical* value — never SQL text. Both parts go
+/// through [`crate::ident::normalize_ident_part`], so a stored, quoted
+/// relationship name (`"de p"`, embedded `""` and all) contributes its
+/// unquoted, case-folded value (`de p`) rather than its delimiters (TECH-DEBT
+/// #70, MM-2). Every emission site then quotes the alias exactly once: the
+/// JOIN clause via `quote_ident`, a rewritten member reference via
+/// [`rewrite_to_scoped_alias`]. Concatenating the raw stored text instead put
+/// quote characters *inside* the alias, which the two sites then quoted
+/// differently (`"ap__""de p"""` vs `ap__"de p".city`) — unparseable SQL.
+///
+/// This is the single source of the format so every producer — this module's
+/// USING-relationship join synthesis, `role_playing::find_using_context` and
+/// the per-grain emitter — can never drift (E-10, code-review 2026-07-11).
+pub(super) fn scoped_join_alias(table: &str, rel: &str) -> String {
+    format!(
+        "{}__{}",
+        crate::ident::normalize_ident_part(table),
+        crate::ident::normalize_ident_part(rel)
+    )
+}
+
+/// Rewrite every reference qualified by `table` in `expr` to the role-playing
+/// `scoped` alias (as built by [`scoped_join_alias`]), emitting the alias as
+/// one SQL identifier.
+///
+/// A bare-safe alias (`ap__r_dep`) is emitted unquoted, byte-identical to the
+/// pre-#70 output; anything else (`ap__de p`, non-ASCII, upper case) is
+/// double-quoted, matching the `quote_ident` the JOIN clause applies to the
+/// same logical alias. This is the one reference-site spelling, shared by the
+/// dimension emitters and the role-played fact rewrite (TECH-DEBT #69).
+pub(super) fn rewrite_to_scoped_alias(expr: &str, table: &str, scoped: &str) -> String {
+    crate::expr_tokens::rewrite_qualifier(expr, table, &quote_ident_if_needed(scoped))
 }
 
 /// Synthesize an ON clause from PK/FK column declarations (Phase 26).

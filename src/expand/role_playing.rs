@@ -2,9 +2,11 @@ use std::collections::HashSet;
 
 use crate::model::SemanticViewDefinition;
 
-use super::facts::collect_derived_metric_using;
+use super::facts::{
+    collect_derived_metric_using, collect_referenced_facts, collect_transitive_metric_names,
+};
 use super::join_resolver::scoped_join_alias;
-use super::types::ExpandError;
+use super::types::{AmbiguousMemberFactPathError, ExpandError};
 
 /// Determine which relationships point to a given table alias in the definition.
 ///
@@ -204,6 +206,117 @@ pub(super) fn check_where_clause_role_playing_path(
                     available_relationships,
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// Reject a dimension or metric whose expression reaches a FACT on a table that
+/// is (or is reached only through) a role-playing table, unless the member can
+/// name the role (TECH-DEBT #69 — the fence that change walks past).
+///
+/// #69 made a `USING` metric over a fact on the role-played table work: the
+/// inlined fact is requalified to the scoped alias of the one relationship the
+/// metric names (`facts::rewrite_using_scoped_refs`). That is the ONLY shape in
+/// which a member-reached fact on a role-playing path has a role. Everything
+/// else joined the fact's table through `tree_parent` — the first-declared
+/// relationship — and returned that role's number silently:
+///
+/// - a metric with no `USING` (or several naming the same table);
+/// - a dimension, which never carries `USING` (#54 made its expression
+///   fact-inlined, so it reaches facts on other tables);
+/// - a fact on a DESCENDANT of the role-playing table, which the scoped-alias
+///   rewrite does not rename, so the descendant hangs off the bare instance.
+///
+/// A derived metric is checked through the base metrics it inlines, where the
+/// fact references (and the `USING`) live. A member's reference to a fact on
+/// its OWN table is left to the checks that already govern that table
+/// (`find_using_context` for a dimension on the role-playing table).
+pub(super) fn check_member_fact_role_playing_path(
+    view_name: &str,
+    def: &SemanticViewDefinition,
+    resolved_dims: &[&crate::model::Dimension],
+    resolved_mets: &[&crate::model::Metric],
+) -> Result<(), ExpandError> {
+    if def.facts.is_empty() || def.joins.is_empty() {
+        return Ok(());
+    }
+    let ambiguous = |member_name: &str, fact_name: String, fact_table: String, rp: String| {
+        let available_relationships = relationships_to_table(def, &rp);
+        ExpandError::AmbiguousMemberFactPath {
+            detail: Box::new(AmbiguousMemberFactPathError {
+                view_name: view_name.to_string(),
+                member_name: member_name.to_string(),
+                fact_name,
+                fact_table,
+                role_playing_table: rp,
+                available_relationships,
+            }),
+        }
+    };
+
+    for dim in resolved_dims {
+        let own = dim.source_table.as_ref().map(|t| t.to_ascii_lowercase());
+        for (fact_name, fact_table) in collect_referenced_facts(&dim.expr, &def.facts) {
+            if own.as_deref() == Some(fact_table.as_str()) {
+                continue;
+            }
+            if let Some(rp) = role_playing_on_path(view_name, def, &fact_table)? {
+                return Err(ambiguous(&dim.name, fact_name, fact_table, rp));
+            }
+        }
+    }
+
+    // Base metrics only: a derived metric contributes the base metrics it
+    // inlines, deduplicated by canonical name.
+    let mut bases: Vec<&crate::model::Metric> = Vec::new();
+    for met in resolved_mets {
+        if met.source_table.is_some() {
+            bases.push(met);
+            continue;
+        }
+        for name in collect_transitive_metric_names(met, &def.metrics) {
+            if let Some(base) = def.metrics.iter().find(|m| {
+                m.source_table.is_some() && crate::ident::normalize_ident_part(&m.name) == name
+            }) {
+                if !bases.iter().any(|b| std::ptr::eq(*b, base)) {
+                    bases.push(base);
+                }
+            }
+        }
+    }
+
+    for base in bases {
+        let own = base.source_table.as_ref().map(|t| t.to_ascii_lowercase());
+        for (fact_name, fact_table) in collect_referenced_facts(&base.expr, &def.facts) {
+            if own.as_deref() == Some(fact_table.as_str()) {
+                continue;
+            }
+            let Some(rp) = role_playing_on_path(view_name, def, &fact_table)? else {
+                continue;
+            };
+            // The one legal shape: the fact sits ON the role-playing table and
+            // the metric's USING names exactly one relationship to it — the
+            // same name match the join resolver uses to emit the scoped join.
+            if fact_table == rp {
+                let mut roles: Vec<String> = Vec::new();
+                for rel in &base.using_relationships {
+                    let rel_lower = rel.to_ascii_lowercase();
+                    let targets_rp = def.joins.iter().any(|j| {
+                        j.name
+                            .as_ref()
+                            .is_some_and(|n| n.to_ascii_lowercase() == rel_lower)
+                            && j.table.to_ascii_lowercase() == rp
+                    });
+                    if targets_rp && !roles.contains(&rel_lower) {
+                        roles.push(rel_lower);
+                    }
+                }
+                if roles.len() == 1 {
+                    continue;
+                }
+            }
+            return Err(ambiguous(&base.name, fact_name, fact_table, rp));
         }
     }
     Ok(())

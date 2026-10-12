@@ -834,3 +834,319 @@ fn exp31_control_fact_chain_to_a_non_role_playing_table_still_expands() {
         "the table reached through the fact chain must still be joined: {sql}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// TECH-DEBT #69 (MM-1) / #70 (MM-2): role-played facts and quoted role names,
+// asserted on the NUMBERS the emitted SQL returns, not on its text.
+// ---------------------------------------------------------------------------
+
+// The executing tests below need the bundled DuckDB, so they are compiled out
+// of the `extension`-feature unit run (as `tests_phantom_row_guard` is); the
+// default-features run, which can execute SQL, covers them.
+
+/// Flights over two airports. Every flight departs `A` (elevation 100, `Dep
+/// City`) and arrives at `B` (elevation 7, `Arr City`), so each role-scoped
+/// number differs from its sibling: binding the wrong role changes the answer.
+#[cfg(not(feature = "extension"))]
+fn role_numbers_db() -> duckdb::Connection {
+    let con = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+    con.execute_batch(
+        "CREATE TABLE flights (flight_id INTEGER, departure_code VARCHAR,
+                               arrival_code VARCHAR, carrier VARCHAR);
+         CREATE TABLE airports (airport_code VARCHAR, city VARCHAR,
+                                country VARCHAR, elevation INTEGER);
+         INSERT INTO airports VALUES ('A', 'Dep City', 'X', 100), ('B', 'Arr City', 'X', 7);
+         INSERT INTO flights VALUES (1, 'A', 'B', 'c1'), (2, 'A', 'B', 'c1'), (3, 'A', 'B', 'c2');",
+    )
+    .expect("fixture data");
+    con
+}
+
+/// Run `sql` and return `(first column if there are two, last column as f64)`,
+/// sorted. Panics with the SQL when it does not bind.
+#[cfg(not(feature = "extension"))]
+fn run_rows(con: &duckdb::Connection, sql: &str) -> Vec<(Option<String>, f64)> {
+    let mut stmt = con
+        .prepare(sql)
+        .unwrap_or_else(|e| panic!("emitted SQL must bind, got: {e}\nSQL:\n{sql}"));
+    let mut rows: Vec<(Option<String>, f64)> = stmt
+        .query_map([], |r| {
+            let n = r.as_ref().column_count();
+            if n == 1 {
+                Ok((None, r.get::<_, f64>(0)?))
+            } else {
+                Ok((Some(r.get::<_, String>(0)?), r.get::<_, f64>(1)?))
+            }
+        })
+        .expect("query runs")
+        .map(Result::unwrap)
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+/// `flights_airports_def` plus a fact on the ROLE-PLAYED table and one metric
+/// per role aggregating it — the MM-1 shape.
+fn role_played_fact_def() -> SemanticViewDefinition {
+    let mut def = flights_airports_def();
+    def.facts.push(crate::model::Fact {
+        name: "elev".to_string(),
+        expr: "a.elevation".to_string(),
+        source_table: Some("a".to_string()),
+        ..Default::default()
+    });
+    for (name, rel) in [("dep_elev", "dep_airport"), ("arr_elev", "arr_airport")] {
+        def.metrics.push(Metric {
+            name: name.to_string(),
+            expr: "SUM(elev)".to_string(),
+            source_table: Some("f".to_string()),
+            using_relationships: vec![rel.to_string()],
+            ..Default::default()
+        });
+    }
+    def.metrics.push(Metric {
+        name: "elev_climb".to_string(),
+        expr: "dep_elev - arr_elev".to_string(),
+        ..Default::default()
+    });
+    def
+}
+
+fn metrics_req(dims: &[&str], mets: &[&str]) -> QueryRequest {
+    QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: dims.iter().map(|d| DimensionName::new(*d)).collect(),
+        metrics: mets.iter().map(|m| MetricName::new(*m)).collect(),
+    }
+}
+
+/// TECH-DEBT #69 (MM-1): a `USING (dep_airport)` metric over a fact on the
+/// role-played table. The fact inlined as raw `a.elevation` while the table was
+/// joined only as `"airports" AS "a__dep_airport"`, so the query failed to bind
+/// (`Referenced table "a" not found`). Three flights departing elevation 100.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn td69_using_metric_over_a_role_played_fact_binds_to_its_role() {
+    let sql = expand(
+        "v",
+        &role_played_fact_def(),
+        &metrics_req(&[], &["dep_elev"]),
+    )
+    .unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(None, 300.0)],
+        "{sql}"
+    );
+}
+
+/// The other role over the SAME fact must read the other instance: three
+/// flights arriving at elevation 7. Discriminates a rewrite that picks the
+/// first-declared relationship instead of the metric's own `USING`.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn td69_using_metric_over_a_role_played_fact_reads_the_other_role() {
+    let sql = expand(
+        "v",
+        &role_played_fact_def(),
+        &metrics_req(&[], &["arr_elev"]),
+    )
+    .unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(None, 21.0)],
+        "{sql}"
+    );
+}
+
+/// Grouped by a dimension on the role-played table: the dimension and the
+/// inlined fact are rewritten to the SAME scoped alias, so all 300 lands on the
+/// departure city.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn td69_role_played_fact_and_dimension_share_the_scoped_alias() {
+    let sql = expand(
+        "v",
+        &role_played_fact_def(),
+        &metrics_req(&["city"], &["dep_elev"]),
+    )
+    .unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(Some("Dep City".to_string()), 300.0)],
+        "{sql}"
+    );
+}
+
+/// A derived metric over BOTH roles: each base metric's inlined fact is scoped
+/// to its own relationship before the derived expression composes them, so the
+/// two instances stay distinct: 300 - 21.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn td69_derived_metric_over_both_roles_keeps_them_distinct() {
+    let sql = expand(
+        "v",
+        &role_played_fact_def(),
+        &metrics_req(&[], &["elev_climb"]),
+    )
+    .unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(None, 279.0)],
+        "{sql}"
+    );
+}
+
+/// `flights_airports_def` with the departure relationship renamed to a stored,
+/// QUOTED identifier (quotes retained, as the body parser stores it).
+#[cfg(not(feature = "extension"))]
+fn quoted_role_def(stored_rel: &str) -> SemanticViewDefinition {
+    let mut def = flights_airports_def();
+    def.joins[0].name = Some(stored_rel.to_string());
+    def.metrics[0].using_relationships = vec![stored_rel.to_string()];
+    def
+}
+
+/// TECH-DEBT #70 (MM-2): a quoted relationship name with a space. The scoped
+/// alias was concatenated from the raw stored text, so the JOIN emitted
+/// `"a__""Dep Airport"""` and the dimension `a__"Dep Airport".city`, which does
+/// not parse. All three flights depart `Dep City`.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn td70_quoted_relationship_name_with_a_space_emits_one_alias() {
+    let def = quoted_role_def("\"Dep Airport\"");
+    let sql = expand("v", &def, &metrics_req(&["city"], &["departure_count"])).unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(Some("Dep City".to_string()), 3.0)],
+        "{sql}"
+    );
+}
+
+/// TECH-DEBT #70: an embedded (doubled) quote in the relationship name — the
+/// case where raw concatenation and `quote_ident` disagree the most.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn td70_quoted_relationship_name_with_an_embedded_quote_emits_one_alias() {
+    let def = quoted_role_def("\"de\"\"p\"");
+    let sql = expand("v", &def, &metrics_req(&["city"], &["departure_count"])).unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(Some("Dep City".to_string()), 3.0)],
+        "{sql}"
+    );
+}
+
+/// CONTROL for #70: a bare-safe relationship name keeps its pre-fix spelling —
+/// the reference site stays unquoted `a__dep_airport.city`, byte-identical to
+/// every existing golden.
+#[test]
+fn td70_bare_relationship_name_keeps_the_unquoted_reference() {
+    let sql = expand(
+        "v",
+        &flights_airports_def(),
+        &metrics_req(&["city"], &["departure_count"]),
+    )
+    .unwrap();
+    assert!(sql.contains("a__dep_airport.city"), "{sql}");
+    assert!(sql.contains("AS \"a__dep_airport\""), "{sql}");
+}
+
+// The role-playing fence for facts a MEMBER reaches (the pairing #69 walks
+// past). Making a role-played fact reachable through `USING` is only half of
+// it: a member that reaches the same fact WITHOUT a single role to name was
+// joined on the first-declared relationship, a silent wrong-role number.
+
+fn expect_member_fact_ambiguity(def: &SemanticViewDefinition, req: &QueryRequest, member: &str) {
+    match expand("v", def, req) {
+        Err(ExpandError::AmbiguousMemberFactPath { detail }) => {
+            assert_eq!(detail.member_name, member);
+            assert_eq!(detail.role_playing_table, "a");
+        }
+        Err(other) => panic!("expected AmbiguousMemberFactPath, got: {other}"),
+        Ok(sql) => panic!("accepted, binding to an arbitrary role:\n{sql}"),
+    }
+}
+
+/// A metric with NO `USING` over the role-played fact: before the fence it
+/// returned 300 — the departure role, purely because `dep_airport` is
+/// declared first.
+#[test]
+fn td69_fence_metric_without_using_over_a_role_played_fact_is_rejected() {
+    let mut def = role_played_fact_def();
+    def.metrics.push(Metric {
+        name: "any_elev".to_string(),
+        expr: "SUM(elev)".to_string(),
+        source_table: Some("f".to_string()),
+        ..Default::default()
+    });
+    expect_member_fact_ambiguity(&def, &metrics_req(&[], &["any_elev"]), "any_elev");
+}
+
+/// The derived-metric spelling of the same thing: the fence must walk into the
+/// base metrics a derived metric inlines, where the fact reference lives.
+#[test]
+fn td69_fence_derived_metric_over_an_unscoped_role_played_fact_is_rejected() {
+    let mut def = role_played_fact_def();
+    def.metrics.push(Metric {
+        name: "any_elev".to_string(),
+        expr: "SUM(elev)".to_string(),
+        source_table: Some("f".to_string()),
+        ..Default::default()
+    });
+    def.metrics.push(Metric {
+        name: "twice_any".to_string(),
+        expr: "any_elev * 2".to_string(),
+        ..Default::default()
+    });
+    expect_member_fact_ambiguity(&def, &metrics_req(&[], &["twice_any"]), "any_elev");
+}
+
+/// A DIMENSION on the base table whose expression reaches the role-played fact
+/// (#54 made dimension expressions fact-inlined): a dimension carries no
+/// `USING`, so it has no role to pick.
+#[test]
+fn td69_fence_dimension_reaching_a_role_played_fact_is_rejected() {
+    let mut def = role_played_fact_def();
+    def.dimensions.push(Dimension {
+        name: "elev_band".to_string(),
+        expr: "elev > 50".to_string(),
+        source_table: Some("f".to_string()),
+        ..Default::default()
+    });
+    expect_member_fact_ambiguity(
+        &def,
+        &metrics_req(&["elev_band"], &["departure_count"]),
+        "elev_band",
+    );
+}
+
+/// A `USING` metric over a fact on a DESCENDANT of the role-played table: the
+/// scoped-alias rewrite renames only the role-played table itself, so the
+/// descendant would hang off the bare, first-declared instance.
+#[test]
+fn td69_fence_using_metric_over_a_fact_below_the_role_played_table_is_rejected() {
+    let mut def = flights_airports_regions_def();
+    def.facts.push(crate::model::Fact {
+        name: "region_code".to_string(),
+        expr: "r.region_id".to_string(),
+        source_table: Some("r".to_string()),
+        ..Default::default()
+    });
+    def.metrics.push(Metric {
+        name: "dep_regions".to_string(),
+        expr: "COUNT(DISTINCT region_code)".to_string(),
+        source_table: Some("f".to_string()),
+        using_relationships: vec!["dep_airport".to_string()],
+        ..Default::default()
+    });
+    match expand("v", &def, &metrics_req(&[], &["dep_regions"])) {
+        Err(ExpandError::AmbiguousMemberFactPath { detail }) => {
+            assert_eq!(detail.member_name, "dep_regions");
+            assert_eq!(detail.fact_table, "r");
+            assert_eq!(detail.role_playing_table, "a");
+        }
+        other => panic!("expected AmbiguousMemberFactPath, got: {other:?}"),
+    }
+}

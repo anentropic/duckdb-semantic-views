@@ -50,18 +50,23 @@
 //! # Findings this harness produced, and the properties that are `#[ignore]`d
 //!
 //! Four real defects fell out of the cells above. Per the project rule that a
-//! finding is recorded rather than quietly fixed inside a test change, each has
-//! a property that states the CORRECT invariant, is `#[ignore]`d, and carries
-//! the reproduction inline:
+//! finding is recorded rather than quietly fixed inside a test change, each got
+//! a test that states the CORRECT invariant, `#[ignore]`d until fixed, with the
+//! reproduction inline:
 //!
 //! - **MM-1** — [`mm1_role_playing_metric_over_a_fact_on_the_role_played_table`]
+//!   (TECH-DEBT #69, fixed — now live, and the generated model carries
+//!   `dep_alt` / `arr_alt`, `USING` metrics over a fact on the role-played
+//!   table, so every property reaches the shape)
 //! - **MM-2** — [`mm2_role_playing_with_a_quoted_relationship_name`]
+//!   (TECH-DEBT #70, fixed — now live, and the role-playing pair's relationship
+//!   names are drawn from all five identifier styles like every other name)
 //! - **MM-3** — [`mm3_metric_value_changes_when_co_queried_across_grains`]
 //! - **MM-4** — [`mm4_childless_parent_manufactures_a_null_group_under_a_child_dimension`]
 //!
-//! The three live properties are scoped away from those cells (single-grain
-//! metric sets for (a)/(b); bare role-relationship names; parent-side grouping
-//! for (d)) so the harness lands green and the findings stay visible.
+//! The three live properties are scoped away from the still-open cells
+//! (single-grain metric sets for (a)/(b); parent-side grouping for (d)) so the
+//! harness lands green and the findings stay visible.
 
 use std::collections::BTreeSet;
 
@@ -121,17 +126,6 @@ impl Style {
 
 fn arb_style() -> impl Strategy<Value = Style> {
     prop::sample::select(Style::ALL.to_vec())
-}
-
-/// The role-playing relationship names are drawn from the BARE styles only.
-///
-/// A quoted relationship name is spliced raw into the scoped join alias
-/// (`ap__"de p"`) at the reference site while the join clause quotes the whole
-/// alias (`"ap__""de p"""`), so the emitted SQL does not parse — see
-/// [`mm2_role_playing_with_a_quoted_relationship_name`]. Case still varies, so
-/// the `USING` ↔ relationship-name match stays quote-free but not case-fixed.
-fn arb_bare_style() -> impl Strategy<Value = Style> {
-    prop::sample::select(vec![Style::Bare, Style::Upper])
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +209,7 @@ struct BaseMetric {
 /// `dep_*` / `arr_*` are the role-playing half: same expression, different
 /// `USING`, so their *numbers* differ only once a dimension on the role-played
 /// table is grouped by — which is exactly the cell PBT-10 names.
-const BASE_METRICS: [BaseMetric; 14] = [
+const BASE_METRICS: [BaseMetric; 16] = [
     BaseMetric {
         stem: "n_li",
         expr: "COUNT(*)",
@@ -318,6 +312,27 @@ const BASE_METRICS: [BaseMetric; 14] = [
         role: None,
         comb: Comb::Sum,
     },
+    // MM-1 (TECH-DEBT #69): a `USING` metric over a FACT on the role-played
+    // table. Unlike `dep_rate` / `arr_rate`, whose numbers differ only once the
+    // role-played dimension is grouped by, these aggregate the role-played
+    // table ITSELF — so the two roles differ on every request, grouped or not,
+    // and a fact inlined against the wrong instance (or the bare, unjoined
+    // alias) shows up in every property. Appended last so the fixed indices
+    // the `mm*` tests use stay put.
+    BaseMetric {
+        stem: "dep_alt",
+        expr: "SUM({alt})",
+        grain: Grain::Base,
+        role: Some(Role::Dep),
+        comb: Comb::Sum,
+    },
+    BaseMetric {
+        stem: "arr_alt",
+        expr: "SUM({alt})",
+        grain: Grain::Base,
+        role: Some(Role::Arr),
+        comb: Comb::Sum,
+    },
 ];
 
 /// Dimension slots, by index into [`Names::dims`].
@@ -339,8 +354,16 @@ const DIM_SPECS: [(&str, &str, bool); 6] = [
     ("li.amount > 0", "li", true),
 ];
 
-const FACT_STEMS: [&str; 2] = ["fact_amt", "fact_rate"];
-const FACT_SPECS: [(&str, &str); 2] = [("li.amount", "li"), ("o.rate", "o")];
+const FACT_STEMS: [&str; 3] = ["fact_amt", "fact_rate", "fact_alt"];
+/// The third fact lives on the ROLE-PLAYED table; `dep_alt` / `arr_alt` reach
+/// it through `USING` (MM-1, TECH-DEBT #69). It is never queried as a FACT —
+/// a facts request carries no `USING` and is rejected on that table by design.
+const FACT_SPECS: [(&str, &str); 3] = [("li.amount", "li"), ("o.rate", "o"), ("ap.alt", "ap")];
+/// Index of the role-played fact in [`Names::facts`].
+const F_ALT: usize = 2;
+/// Placeholder a [`BaseMetric::expr`] uses for the role-played fact's
+/// (styled) name; [`build_def`] substitutes it.
+const ALT_FACT: &str = "{alt}";
 
 const REL_STEMS: [&str; 4] = ["r_li", "r_dep", "r_arr", "r_car"];
 const TABLE_STEMS: [&str; 4] = ["o", "li", "ap", "cr"];
@@ -371,9 +394,10 @@ fn arb_names() -> impl Strategy<Value = Names> {
         prop::collection::vec(arb_style(), BASE_METRICS.len()),
         prop::collection::vec(arb_style(), MAX_DERIVED),
         prop::collection::vec(arb_style(), FACT_STEMS.len()),
-        // r_li and r_car may be spelled any way; r_dep / r_arr are the
-        // role-playing pair and stay bare (MM-2).
-        (arb_style(), arb_bare_style(), arb_bare_style(), arb_style()),
+        // Every relationship name, the role-playing pair included, is drawn
+        // from all five styles. r_dep / r_arr were held to bare/upper while
+        // MM-2 (TECH-DEBT #70) made a quoted role name emit unparseable SQL.
+        (arb_style(), arb_style(), arb_style(), arb_style()),
     )
         .prop_map(|(t, d, m, dv, f, (rl, rd, ra, rc))| {
             let rel_styles = vec![rl, rd, ra, rc];
@@ -807,7 +831,7 @@ fn build_def(names: &Names, chain: Option<&Chain>) -> SemanticViewDefinition {
         .enumerate()
         .map(|(i, bm)| Metric {
             name: names.mets[i].clone(),
-            expr: bm.expr.to_string(),
+            expr: bm.expr.replace(ALT_FACT, &names.facts[F_ALT]),
             source_table: Some(
                 match bm.grain {
                     Grain::Child => "li",
@@ -1754,6 +1778,58 @@ fn generator_produces_hostile_identifiers() {
         quoted_table >= 128,
         "only {quoted_table}/256 cases used a quoted physical table name"
     );
+
+    // MM-2 (TECH-DEBT #70): a quoted name on the ROLE-PLAYING pair, in a case
+    // that actually names a role — the only place a relationship name reaches
+    // an emitted scoped alias. Held to bare/upper while the defect was open.
+    let quoted_role = cases
+        .iter()
+        .filter(|c| match c.role {
+            Some(Role::Dep) => c.names.rels[1].contains('"'),
+            Some(Role::Arr) => c.names.rels[2].contains('"'),
+            None => false,
+        })
+        .count();
+    assert!(
+        quoted_role >= 16,
+        "only {quoted_role}/256 role-naming cases used a quoted relationship name"
+    );
+}
+
+/// MM-1 (TECH-DEBT #69): the `USING` metrics over the role-played FACT must be
+/// picked by the generators, or the fix has no randomized coverage — they sit
+/// at the end of [`BASE_METRICS`], behind the `take(3)` cut-off of the
+/// metric masks.
+#[test]
+fn generator_reaches_the_role_played_fact() {
+    let alt = |i: usize| BASE_METRICS[i].expr.contains(ALT_FACT);
+    let cases = sample(&arb_algebra_case(), 256);
+    let in_chain = cases
+        .iter()
+        .filter(|c| c.chain.leaves(c.chain.target).into_iter().any(alt))
+        .count();
+    assert!(
+        in_chain >= 16,
+        "only {in_chain}/256 algebra chains reached a role-played-fact metric"
+    );
+    let grouped = cases
+        .iter()
+        .filter(|c| c.groups_by_role_played && c.chain.leaves(c.chain.target).into_iter().any(alt))
+        .count();
+    assert!(
+        grouped >= 4,
+        "only {grouped}/256 algebra cases grouped a role-played-fact metric by its role's dimension"
+    );
+
+    let rollups = sample(&arb_rollup_case(), 256);
+    let r_alt = rollups
+        .iter()
+        .filter(|c| c.metrics.iter().any(|&i| alt(i)))
+        .count();
+    assert!(
+        r_alt >= 16,
+        "only {r_alt}/256 roll-up cases queried a role-played-fact metric"
+    );
 }
 
 /// PBT-13: `where_clause` is never pinned at `None` here, and both sides of the
@@ -1918,7 +1994,6 @@ fn fixed_names() -> Names {
 /// sibling that is *not* broken is a DIMENSION on the role-played table, whose
 /// expression IS rewritten; only the inlined fact text is missed.
 #[test]
-#[ignore = "MM-1: fact inlining does not apply the role-playing scoped-alias rewrite"]
 fn mm1_role_playing_metric_over_a_fact_on_the_role_played_table() {
     let names = fixed_names();
     let mut def = build_def(&names, None);
@@ -1958,7 +2033,6 @@ fn mm1_role_playing_metric_over_a_fact_on_the_role_played_table() {
 /// relationship names from `arb_stored_ident()` (RT-5) — but only for the
 /// render/parse round-trip, never on a path that emits a scoped alias.
 #[test]
-#[ignore = "MM-2: a quoted relationship name produces an unparseable scoped join alias"]
 fn mm2_role_playing_with_a_quoted_relationship_name() {
     let mut names = fixed_names();
     names.rels[1] = "\"de p\"".to_string();

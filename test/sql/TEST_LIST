@@ -111,3 +111,4 @@ test/sql/cr20260808_small_fixes.test
 test/sql/cr20260808_yaml_ingress.test
 test/sql/function_descriptions.test
 test/sql/graph_connectivity.test
+test/sql/role_playing_facts_and_quoted_names.test
