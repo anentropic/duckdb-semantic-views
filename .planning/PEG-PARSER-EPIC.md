@@ -165,11 +165,11 @@ Checked against docs.snowflake.com on 2026-10-12. "P#" is the phase in §5.
 | `ASOF` relationships | GA | not planned | P7 |
 | Range relationships (`CONSTRAINT DISTINCT RANGE` + `BETWEEN … EXCLUSIVE`) | preview | none | P7 |
 | Many-to-many via bridge tables | GA | none | P7 |
-| Materializations (`ADD/DROP/REFRESH MATERIALIZATION`) | limited access | our own `MATERIALIZATIONS` clause | **out of scope for this epic** (per Paul, 2026-10-12) |
+| Materializations (`ADD/DROP/REFRESH MATERIALIZATION`) | limited access | our own `MATERIALIZATIONS` clause | **out of scope for this epic** (per Anentropic, 2026-10-12) |
 | Composable views (`IMPORTS`) | private preview | none | watch only |
 | Privileges, PRIVATE visibility by role, Cortex Search | — | n/a in DuckDB | out of scope |
 
-**Altertable features that go beyond Snowflake.** Paul asked for these to get a look
+**Altertable features that go beyond Snowflake.** Anentropic asked for these to get a look
 too (2026-10-12): metric `FILTER (WHERE …)`, `OFFSET (dim BY interval)`,
 `CUMULATIVE`, and a built-in time spine (`TIME (col)` / `metric_time`). They are not
 Snowflake syntax, and CLAUDE.md makes Snowflake the model for semantics, so they get
@@ -181,11 +181,11 @@ pass could not find their source repo publicly, so "they vendored the PEG parser
 
 ## 5. Phases
 
-One PR open at a time. Each waits for Paul's Copilot review and merges on his word.
+One PR open at a time. Each waits for Anentropic's Copilot review and merges only on Anentropic's word.
 Every PR passes `just test-all`. Any query-semantics change extends at least one
 numeric oracle (CLAUDE.md).
 
-**Standing rules for every phase** (from Paul, 2026-10-12):
+**Standing rules for every phase** (from Anentropic, 2026-10-12):
 
 - **Every phase strengthens the tests.** Each phase adds or reinforces
   high-quality, *discriminating* tests, meaning tests that would fail on the
@@ -402,7 +402,7 @@ Snowflake's docs don't settle either case. The parity plan's maintainer-run
 Snowflake check (`SNOWFLAKE-PARITY-PLAN.md` §3) is the cheapest way to be sure, and
 the same fixture answers both.
 
-## 7. Decisions only Paul can make
+## 7. Decisions only Anentropic can make
 
 | # | Question | Recommendation |
 |---|---|---|
