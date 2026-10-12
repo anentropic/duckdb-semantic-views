@@ -1,0 +1,110 @@
+# TECH-DEBT #72: a relationship graph with a table unreachable from the base
+# table (the first one in TABLES) was accepted at CREATE. `check_no_orphans`
+# exempts the root, so a FIRST table joined to nothing passed, and two
+# components where every table has some edge passed too. Every query then
+# emitted `FROM "<root>" LEFT JOIN … ON … = "<other>"."<col>"` — a reference to
+# an alias that is never in scope — and failed at bind time
+# (`Binder Error: Referenced table "o" not found`). CREATE now rejects both,
+# naming the table.
+#
+# End-to-end coverage for the extension-load -> DDL -> graph-validation path;
+# `graph::relationship::tests::disconnected_*` cover the checker directly.
+
+require semantic_views
+
+statement ok
+CREATE TABLE gc_lonely (id INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE gc_orders (id INTEGER, customer_id INTEGER, amount INTEGER);
+
+statement ok
+CREATE TABLE gc_customers (id INTEGER, region VARCHAR);
+
+statement ok
+CREATE TABLE gc_products (id INTEGER, supplier_id INTEGER);
+
+statement ok
+CREATE TABLE gc_suppliers (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO gc_customers VALUES (1, 'east'), (2, 'west');
+
+statement ok
+INSERT INTO gc_orders VALUES (10, 1, 5), (11, 1, 7), (12, 2, 100);
+
+# Case 1: the FIRST table has no relationship. It becomes the graph root and was
+# exempt from the orphan check.
+statement error
+CREATE SEMANTIC VIEW gc_root_disconnected AS
+  TABLES (
+    x AS gc_lonely PRIMARY KEY (id),
+    o AS gc_orders PRIMARY KEY (id),
+    c AS gc_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    o_to_c AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.region AS c.region
+  )
+  METRICS (
+    o.total AS SUM(o.amount)
+  );
+----
+base table 'x' (the first table in TABLES) is not connected by any relationship
+
+# Case 2: two components, {o, c} and {p, s}. No table is an orphan — each has an
+# edge — but `p` and `s` cannot be reached from the base table `o`.
+statement error
+CREATE SEMANTIC VIEW gc_two_components AS
+  TABLES (
+    o AS gc_orders PRIMARY KEY (id),
+    c AS gc_customers PRIMARY KEY (id),
+    p AS gc_products PRIMARY KEY (id),
+    s AS gc_suppliers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    o_to_c AS o(customer_id) REFERENCES c,
+    p_to_s AS p(supplier_id) REFERENCES s
+  )
+  DIMENSIONS (
+    c.region AS c.region,
+    s.name AS s.name
+  )
+  METRICS (
+    o.total AS SUM(o.amount)
+  );
+----
+table 'p' is not reachable from the base table 'o'
+
+# Neither rejected view was stored.
+query I
+SELECT count(*) FROM list_semantic_views() WHERE name LIKE 'gc_%';
+----
+0
+
+# Control: the same tables, listed with a CONNECTED table first, are accepted
+# and the query binds and returns the right numbers. Reachability ignores edge
+# direction — `o -> c` points away from the root.
+statement ok
+CREATE SEMANTIC VIEW gc_connected AS
+  TABLES (
+    o AS gc_orders PRIMARY KEY (id),
+    c AS gc_customers PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    o_to_c AS o(customer_id) REFERENCES c
+  )
+  DIMENSIONS (
+    c.region AS c.region
+  )
+  METRICS (
+    o.total AS SUM(o.amount)
+  );
+
+query TI rowsort
+SELECT * FROM semantic_view('gc_connected', dimensions := ['region'], metrics := ['total']);
+----
+east	12
+west	100

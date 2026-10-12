@@ -3,7 +3,8 @@
 //! Built from `TABLES` + `RELATIONSHIPS` declarations at CREATE time.
 //! Validates that the relationship graph forms a tree rooted at the base table
 //! (first table in TABLES clause). Rejects cycles, diamonds, self-references,
-//! orphan tables, unreachable `source_table` aliases, and FK/PK count mismatches.
+//! orphan tables, tables unreachable from the root, unreachable `source_table`
+//! aliases, and FK/PK count mismatches.
 //!
 //! Used by `define.rs` at CREATE time and by `expand.rs` at query time.
 
@@ -180,6 +181,70 @@ impl RelationshipGraph {
         }
         Ok(())
     }
+
+    /// Check that every declared table is reachable from the root (the first
+    /// table in TABLES) by an undirected chain of relationships (TECH-DEBT #72).
+    ///
+    /// [`Self::check_no_orphans`] exempts the root, which is right for a
+    /// connected tree — the base table usually has only *incoming* edges — but
+    /// it cannot tell "root of a connected tree" from "isolated table that
+    /// happens to be listed first", nor catch two components where every table
+    /// has *some* edge. Either way expansion emits a `FROM` anchored at the root
+    /// whose `LEFT JOIN … ON` clauses name an alias that is never in scope, and
+    /// the query fails at bind time. Direction is ignored because the emitters
+    /// join each hop with an ON clause naming both sides explicitly.
+    ///
+    /// Run after the orphan check, so every table reaching here has at least
+    /// one edge unless it is the root itself.
+    pub fn check_connected(&self) -> Result<(), String> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut stack: Vec<&str> = vec![self.root.as_str()];
+        seen.insert(self.root.as_str());
+        while let Some(node) = stack.pop() {
+            let out = self.edges.get(node).into_iter().flatten();
+            let inc = self.reverse.get(node).into_iter().flatten();
+            for next in out.chain(inc) {
+                if seen.insert(next.as_str()) {
+                    stack.push(next.as_str());
+                }
+            }
+        }
+        let mut unreachable: Vec<&str> = self
+            .all_nodes
+            .iter()
+            .map(String::as_str)
+            .filter(|n| !seen.contains(n))
+            .collect();
+        if unreachable.is_empty() {
+            return Ok(());
+        }
+        unreachable.sort_unstable();
+        let root = &self.root;
+        if seen.len() == 1 {
+            // The root itself has no edge: the defect is the base table, not the
+            // tables listed after it, so name it.
+            return Err(format!(
+                "base table '{root}' (the first table in TABLES) is not connected by any \
+                 relationship to the other tables ({}); declare a relationship that reaches \
+                 it, or list a connected table first",
+                quote_list(&unreachable)
+            ));
+        }
+        Err(format!(
+            "table '{}' is not reachable from the base table '{root}' (the first table in \
+             TABLES) through any chain of relationships; unreachable: {}",
+            unreachable[0],
+            quote_list(&unreachable)
+        ))
+    }
+}
+
+fn quote_list(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Phase 33: Validate that FK referenced columns match a declared PK or UNIQUE
@@ -292,8 +357,9 @@ fn check_source_tables_reachable(
 /// 2. Cycle detection (Kahn's algorithm)
 /// 3. Diamond detection (multiple parents)
 /// 4. Orphan table detection (declared but not connected)
-/// 5. FK/PK column count matching
-/// 6. Source table reachability
+/// 5. Connectivity: every table reachable from the root (TECH-DEBT #72)
+/// 6. FK/PK column count matching
+/// 7. Source table reachability
 ///
 /// Returns `Ok(graph)` if valid, or `Err` with a descriptive message.
 ///
@@ -324,6 +390,9 @@ pub fn validate_graph(def: &SemanticViewDefinition) -> Result<RelationshipGraph,
 
     // 3. Orphan table detection.
     graph.check_no_orphans().map_err(ParseError::positionless)?;
+
+    // 3b. Connectivity (TECH-DEBT #72): every table reachable from the root.
+    graph.check_connected().map_err(ParseError::positionless)?;
 
     // 4. FK reference validation (Phase 33: replaces FK/PK count check).
     validate_fk_references(def).map_err(ParseError::positionless)?;
@@ -437,6 +506,247 @@ mod tests {
         );
         let err = validate_graph(&def).unwrap_err().message;
         assert!(err.contains("orphan"), "expected orphan error, got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Connectivity (TECH-DEBT #72)
+    // -----------------------------------------------------------------------
+
+    /// TECH-DEBT #72: the FIRST table has no relationship edge. `check_no_orphans`
+    /// exempts the root, so this used to be accepted and every query emitted a
+    /// `FROM "x" LEFT JOIN … ON … = "o"."…"` forward reference that fails to bind.
+    #[test]
+    fn disconnected_root_table_rejected() {
+        let def = make_def(
+            vec![
+                ("x", "lonely", vec!["id"]),
+                ("o", "orders", vec!["id"]),
+                ("c", "customers", vec!["id"]),
+            ],
+            vec![("o", "c", vec!["customer_id"])],
+            vec![],
+            vec![],
+        );
+        let err = validate_graph(&def)
+            .expect_err("a root with no relationship must be rejected")
+            .message;
+        assert!(
+            err.contains("'x'") && err.contains("not connected"),
+            "expected the error to name the disconnected base table 'x', got: {err}"
+        );
+    }
+
+    /// TECH-DEBT #72, the second shape: every table has an edge (so none is an
+    /// orphan) but two components exist — `{o, c}` and `{p, s}`. `s` and `p`
+    /// cannot be reached from the root `o` by any chain of relationships.
+    #[test]
+    fn disconnected_component_rejected_naming_the_unreachable_alias() {
+        let def = make_def(
+            vec![
+                ("o", "orders", vec!["id"]),
+                ("c", "customers", vec!["id"]),
+                ("p", "products", vec!["id"]),
+                ("s", "suppliers", vec!["id"]),
+            ],
+            vec![
+                ("o", "c", vec!["customer_id"]),
+                ("p", "s", vec!["supplier_id"]),
+            ],
+            vec![],
+            vec![],
+        );
+        let err = validate_graph(&def)
+            .expect_err("a second component must be rejected")
+            .message;
+        assert!(
+            err.contains("'p'") && err.contains("not reachable from the base table 'o'"),
+            "expected the error to name the first unreachable alias 'p', got: {err}"
+        );
+    }
+
+    /// Control for the connectivity check: reachability is UNDIRECTED. `li`
+    /// points at the root (`li -> o`, an incoming edge) and `o -> c` points
+    /// away; both are reachable, so the definition stays valid.
+    #[test]
+    fn connectivity_is_undirected() {
+        let def = make_def(
+            vec![
+                ("o", "orders", vec!["id"]),
+                ("li", "line_items", vec!["id"]),
+                ("c", "customers", vec!["id"]),
+                ("p", "products", vec!["id"]),
+            ],
+            vec![
+                ("li", "o", vec!["order_id"]),
+                ("o", "c", vec!["customer_id"]),
+                ("li", "p", vec!["product_id"]),
+            ],
+            vec![],
+            vec![],
+        );
+        assert!(
+            validate_graph(&def).is_ok(),
+            "a connected graph mixing edge directions must be accepted: {:?}",
+            validate_graph(&def).err().map(|e| e.message)
+        );
+    }
+
+    /// One randomly generated relationship graph for the #72 property.
+    ///
+    /// `main` tables `t0..` form a random tree rooted at `t0`: each `t{i}`
+    /// hangs off a random earlier table, the edge pointing AWAY from the root
+    /// (`parent -> child`) unless `towards_root[i]`, the parent is `t0` and `t0`
+    /// is the root, in which case it points INTO the root (`child -> t0`, the fan-in the
+    /// diamond check exempts). Either way the graph stays a valid tree, so
+    /// connectivity is the only thing that can fail. `detached` extra tables
+    /// `d0..` form a second tree joined to nothing in `main`; `detached_first`
+    /// lists them BEFORE the main tables, which makes the root itself the
+    /// isolated node when the detached component is a single table.
+    #[derive(Debug, Clone)]
+    struct GraphCase {
+        main_parents: Vec<usize>,
+        towards_root: Vec<bool>,
+        detached_parents: Vec<usize>,
+        detached_first: bool,
+    }
+
+    fn arb_graph_case() -> impl proptest::strategy::Strategy<Value = GraphCase> {
+        use proptest::prelude::*;
+        (1usize..6, 0usize..4, any::<bool>()).prop_flat_map(|(n_main, n_det, detached_first)| {
+            let parents = |n: usize| {
+                (0..n)
+                    .map(|i| {
+                        if i == 0 {
+                            Just(0).boxed()
+                        } else {
+                            (0..i).boxed()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            (
+                parents(n_main),
+                prop::collection::vec(any::<bool>(), n_main),
+                parents(n_det),
+                Just(detached_first),
+            )
+                .prop_map(
+                    |(main_parents, towards_root, detached_parents, detached_first)| GraphCase {
+                        main_parents,
+                        towards_root,
+                        detached_parents,
+                        detached_first,
+                    },
+                )
+        })
+    }
+
+    fn build_graph_case(case: &GraphCase) -> SemanticViewDefinition {
+        let mut tables: Vec<(String, String)> = Vec::new();
+        let mut joins: Vec<(String, String)> = Vec::new();
+        let mut add_tree = |prefix: &str, parents: &[usize], towards_root: Option<&[bool]>| {
+            let mut t = Vec::new();
+            for (i, &p) in parents.iter().enumerate() {
+                t.push((format!("{prefix}{i}"), format!("tbl_{prefix}{i}")));
+                if i == 0 {
+                    continue;
+                }
+                let (child, parent) = (format!("{prefix}{i}"), format!("{prefix}{p}"));
+                if p == 0 && towards_root.is_some_and(|tr| tr[i]) {
+                    joins.push((child, parent));
+                } else {
+                    joins.push((parent, child));
+                }
+            }
+            t
+        };
+        // Fan-in is only exempt from the diamond check at the ROOT, so edges
+        // may point into `t0` only while `t0` is listed first.
+        let towards_root = (!case.detached_first).then_some(case.towards_root.as_slice());
+        let main = add_tree("t", &case.main_parents, towards_root);
+        let detached = add_tree("d", &case.detached_parents, None);
+        if case.detached_first {
+            tables.extend(detached);
+            tables.extend(main);
+        } else {
+            tables.extend(main);
+            tables.extend(detached);
+        }
+        SemanticViewDefinition {
+            tables: tables
+                .into_iter()
+                .map(|(alias, table)| TableRef {
+                    alias,
+                    table,
+                    pk_columns: vec!["id".to_string()],
+                    ..Default::default()
+                })
+                .collect(),
+            joins: joins
+                .into_iter()
+                .enumerate()
+                .map(|(k, (from, to))| Join {
+                    table: to,
+                    from_alias: from,
+                    fk_columns: vec![format!("fk{k}")],
+                    name: Some(format!("r{k}")),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    proptest::proptest! {
+        /// TECH-DEBT #72, randomized: a definition is accepted iff every table
+        /// is reachable from the first one, whatever the shape of each
+        /// component, the direction of its edges, or the TABLES order. When a
+        /// detached component exists the error names a table that really is
+        /// unreachable — the base table itself when it is the isolated node.
+        #[test]
+        fn graph_accepted_iff_connected(case in arb_graph_case()) {
+            let def = build_graph_case(&case);
+            // Legacy skip: a definition with no relationship at all is not
+            // graph-validated, so only cases with an edge are meaningful.
+            proptest::prop_assume!(!def.joins.is_empty());
+            let n_main = case.main_parents.len();
+            let n_det = case.detached_parents.len();
+            let result = validate_graph(&def);
+            if n_det == 0 {
+                proptest::prop_assert!(
+                    result.is_ok(),
+                    "connected graph rejected: {:?}",
+                    result.err().map(|e| e.message)
+                );
+            } else {
+                let msg = result.expect_err("a detached component must be rejected").message;
+                let (root_side, other_side, other_n) = if case.detached_first {
+                    ("d", "t", n_main)
+                } else {
+                    ("t", "d", n_det)
+                };
+                let root_isolated = if case.detached_first { n_det == 1 } else { n_main == 1 };
+                if root_isolated {
+                    // A one-table root component with any edge elsewhere is
+                    // NOT an orphan-check failure (the root is exempt), so
+                    // connectivity is what must report it.
+                    proptest::prop_assert!(
+                        msg.contains(&format!("base table '{root_side}0'")),
+                        "expected the isolated base table to be named: {msg}"
+                    );
+                } else if other_n == 1 {
+                    // A single detached non-root table has no edge at all —
+                    // the pre-existing orphan check owns that case.
+                    proptest::prop_assert!(msg.contains("orphan"), "{msg}");
+                } else {
+                    proptest::prop_assert!(
+                        msg.contains(&format!("table '{other_side}"))
+                            && msg.contains("not reachable from the base table"),
+                        "expected an unreachable '{other_side}*' table to be named: {msg}"
+                    );
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
