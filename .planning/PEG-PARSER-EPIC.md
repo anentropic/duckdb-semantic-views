@@ -185,6 +185,24 @@ One PR open at a time. Each waits for Paul's Copilot review and merges on his wo
 Every PR passes `just test-all`. Any query-semantics change extends at least one
 numeric oracle (CLAUDE.md).
 
+**Standing rules for every phase** (from Paul, 2026-10-12):
+
+- **Every phase strengthens the tests.** Each phase adds or reinforces
+  high-quality, *discriminating* tests, meaning tests that would fail on the
+  plausible wrong implementation, not just pass on the right one. Each red is
+  confirmed per case, as CLAUDE.md requires. Each phase's PR says which new tests
+  discriminate what. Porting the parser tests (§3) counts as preservation, not
+  strengthening. Phases that delete code still have to add something, such as the
+  DDL-text fuzz target, grammar accept/reject corpora, or `BEGIN … ROLLBACK`
+  coverage on the new ingress.
+- **Docs before release.** No version is published until its user-facing changes
+  are documented through the doc-writer workflow
+  (https://github.com/anentropic/for-agents/tree/main/doc-writer; repo config in
+  `.doc-writer/`). This applies especially to Phases 2, 3, 4 and 5, which change
+  syntax users write. `.doc-writer/context.md` still describes v0.5.3 and the
+  `semantic_view()` interface, so refresh it as part of the first release in this
+  epic.
+
 ### Phase 0: fixes on v1.5.6 (now, in parallel with the Phase 1 spike)
 
 Expansion-layer work that does not touch the parser. It lands while the parser is
