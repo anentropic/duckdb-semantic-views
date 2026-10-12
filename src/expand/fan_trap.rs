@@ -337,10 +337,10 @@ fn build_relationship_graph(
         view_name: view_name.to_string(),
         reason,
     };
-    let graph = crate::graph::RelationshipGraph::from_definition(def).map_err(&uncheckable)?;
+    let graph = crate::graph::RelationshipGraph::from_definition(def).map_err(uncheckable)?;
     // EXP-15: re-run the CREATE-time cycle check. `toposort`'s error names the
     // cycle path, which is what makes the message actionable.
-    graph.toposort().map_err(&uncheckable)?;
+    graph.toposort().map_err(uncheckable)?;
     Ok(graph)
 }
 
