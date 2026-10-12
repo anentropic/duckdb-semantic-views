@@ -53,6 +53,7 @@ GrammarExtension::Register(db, make_shared_ptr<MyGrammar>(...));  // SetTransfor
 - **Activation.** Activation is `SET active_grammar_extensions = ['name']`.
   - The setting has **local (per-connection) scope**: `src/common/settings.json` and `ClientConfig::active_grammar_extensions`.
   - duckdb-psql activates it on load and offers `CALL psql_enable()` for other connections: https://github.com/ywelsch/duckdb-psql/pull/12 (merged 2026-10-06, against v2.0-cyanoptera).
+  - That is the pattern to follow, not proof it works: it can't cover connections opened before `LOAD` either.
 - **Rules we would hook,** from `inlined_grammar.gram`:
   - `Statement`
   - `CreateStatementVariation`

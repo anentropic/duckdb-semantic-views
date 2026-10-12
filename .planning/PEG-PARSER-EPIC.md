@@ -1,6 +1,7 @@
 # Epic: DuckDB 2.0 PEG grammar and full Snowflake parity
 
 **Drafted:** 2026-10-12, against `main` at v0.13.0 (DuckDB v1.5.6).
+**Revised:** 2026-10-12, after a second-opinion review (Fable). Changes: §2 adds the transactional-DDL, signature, layout and error-message findings; Phase 0 is split and runs in parallel with the spike; #51 moves to read-side Phase 0c; the spike gains a transactional go/no-go, an activation/coexistence item and a hard toolchain gate; D1, D2, D4, D5 and D7 are refined.
 **Evidence:** `_notes/peg-parser-research-2026-10-12.md` (DuckDB 2.0 grammar API,
 the current Snowflake surface, and the inventory behind §3 of this plan).
 
@@ -62,6 +63,27 @@ and round-trip contracts that make the extension trustworthy all come through in
   standard-SQL query form (Phase 5).
 - **The API is still moving.** The August blog snippet no longer matches `main`.
   Phase 1 is a spike for this reason.
+- **A transform returns a parsed AST node, never side effects.** This shapes DDL
+  (§5 Phase 1 item 3a). Transactional DDL works today because the lowered
+  `INSERT`/`DELETE`/`UPDATE` runs as the caller's own statement. A transform must
+  therefore return those statements as AST, built by hand or by re-parsing the
+  lowered SQL with a nested `Parser`. Handing the IR to a table function that
+  writes the catalog would run the write on a fresh `Connection` and lose
+  `BEGIN … ROLLBACK` (#19). That is the one thing we must not trade away.
+- **`parser_override` still exists on 2.0 with the same `const string &query`
+  signature** (`parser_extension.hpp`). Only the fallback `parse_function` moved to
+  tokens. So the engine bump (Phase 2) is small, and the no-go fallback is simply
+  to keep today's hook.
+- **Transforms read host objects by layout.** `ParseResult::Cast<>` is a
+  `reinterpret_cast`, so any header drift between our amalgamation and the host is
+  undefined behaviour, not a load error. Exact version pinning is what makes this
+  safe, and that pin stays non-negotiable.
+- **No rule-local syntax errors.** A failed match inside our rule yields DuckDB's
+  generic syntax error. Positioned `ParserException`s are only available from a
+  transform, which means after a successful match. Expect the ported caret tests to
+  become accept/reject cases, with positioned messages only for semantic failures.
+  Negative lookahead `!` is parsed but ignored by the matcher, so clause-boundary
+  rules must be designed without it.
 
 ## 3. Keep, rewire, delete
 
@@ -131,7 +153,7 @@ Checked against docs.snowflake.com on 2026-10-12. "P#" is the phase in §5.
 | Query items as expressions with `[AS] alias`, `tbl.*`, ad-hoc aggregates of dims/facts in METRICS | GA | names only (#76) | P4 |
 | Standard SQL: `SELECT d, AGG(m) FROM sv WHERE … GROUP BY … HAVING …` | GA 2026-03 | none | P5 |
 | SHOW/DESCRIBE usable as subqueries | (DuckDB idiom) | no (#77) | P3 |
-| `data_type` in SHOW/DESCRIBE | populated | empty (#51) | P5 |
+| `data_type` in SHOW/DESCRIBE | populated | empty (#51) | P0c |
 | BI discovery (view appears with typed columns) | n/a (Snowflake catalog) | none | P5 |
 | `VARIABLES (...)` + query-time `VARIABLES v => val` | GA 2026-06 | none | P6 |
 | Logical table as `alias AS (<query>)` | GA 2026-06 | none | P6 |
@@ -139,6 +161,7 @@ Checked against docs.snowflake.com on 2026-10-12. "P#" is the phase in §5.
 | `SHOW … IN ACCOUNT`, `LIMIT n FROM '…'`, `GET_DDL('SEMANTIC VIEW', …)` spelling, `DERIVED_METRIC` kind in DESCRIBE, `required` column in `… FOR METRIC` | GA | partial | P6 |
 | Metadata clauses: `AI_SQL_GENERATION`, `AI_QUESTION_CATEGORIZATION`, `AI_VERIFIED_QUERIES`, `TAG` / `SET TAG`, `COPY GRANTS`, `SAMPLE_VALUES`, `IS_ENUM`, `WITH CORTEX SEARCH SERVICE`, `MAX_STALENESS` | GA | rejected | P6 (accept + store + round-trip; decision D5) |
 | Multi-path `USING` (several relationships) | preview 2026-03 | single | P6 |
+| `ALTER … SET/UNSET TAG`; YAML import flags (`verify_only`, `create_or_alter`) | GA | none | P6 |
 | `ASOF` relationships | GA | not planned | P7 |
 | Range relationships (`CONSTRAINT DISTINCT RANGE` + `BETWEEN … EXCLUSIVE`) | preview | none | P7 |
 | Many-to-many via bridge tables | GA | none | P7 |
@@ -162,55 +185,93 @@ One PR open at a time. Each waits for Paul's Copilot review and merges on his wo
 Every PR passes `just test-all`. Any query-semantics change extends at least one
 numeric oracle (CLAUDE.md).
 
-### Phase 0: semantic foundations on v1.5.6 (now, before the engine moves)
+### Phase 0: fixes on v1.5.6 (now, in parallel with the Phase 1 spike)
 
-Expansion-layer work that does not touch the parser. It should land while the parser
-is still stable, so the differential harnesses judge it without migration noise.
+Expansion-layer work that does not touch the parser. It lands while the parser is
+stable, so the differential harnesses judge it without migration noise. It has no
+code overlap with the spike branch, so the two run side by side.
 
-- **TECH-DEBT #71 (HIGH)**, a metric's value changing with its co-queried metrics.
-  See §6. It needs decision D1.
-- #72 (disconnected base table accepted), #69/#70 (role-play × fact inlining /
-  quoted relationship name). Small, and in the same emitters #71 touches.
-- Optional: `feat/dim-metric-type-inference` (April) is checked for anything
-  reusable for #51.
+- **0a:** #72 (disconnected base table accepted), #69 and #70 (role-play × fact
+  inlining, quoted relationship name). These are small, loud bugs, so do them first.
+- **0b, gated on D1:** TECH-DEBT #71 (HIGH), a metric's value changing with its
+  co-queried metrics. See §6. It is a deliberate numbers change, so it does not
+  block Phases 1 to 3. It must land before Phases 4 and 7 add emission shapes.
+- **0c:** #51 member `data_type`, **read-side**: probe at `SHOW`/`DESCRIBE` bind
+  time, as `query::table_function::try_infer_schema` already does for queries. It
+  has no parser dependency. It also cannot be done at CREATE under the grammar,
+  because the transform has no context and a function called from the lowered DML
+  binds on a fresh connection that can't see same-transaction tables (#19). A
+  read-side type never goes stale when a source column changes. The Phase 5 BI
+  placeholders consume it.
 
-### Phase 1: spike on `v2.0-cyanoptera` (go / no-go)
+### Phase 1: spike on `v2.0-cyanoptera` (go / no-go, start now)
 
-Throwaway branch; the output is a `_notes/` write-up.
+2.0.0 is days away and every later phase hinges on this answer. Throwaway branch;
+the output is a `_notes/` write-up.
 
 1. Register a `GrammarExtension` from our shim, where the amalgamation copy registers
    into the host's `DatabaseInstance`, and confirm it loads under the CLI and the
    Python client (the Phase 15 visibility trap).
-2. Activate it per connection, including connections our own Rust code opens with
-   `duckdb_connect`, and connections opened before `LOAD`.
+2. **Activation and coexistence.**
+   - Activate the grammar per connection via `ExtensionCallback::OnConnectionOpened`
+     and on the loading connection.
+   - Measure what happens on connections opened **before** `LOAD`: the CLI's own,
+     Python's default connection, `.cursor()` clones, ADBC/JDBC pools.
+   - Measure what happens when a user, or another grammar extension such as psql,
+     runs `SET active_grammar_extensions = [...]`, which replaces the list.
+   - Design the "our syntax on a connection where the grammar is off" error so it is
+     actionable.
+   - Confirm that none of the shim's ~12 internal `Connection` sites ever runs text
+     containing our syntax.
 3. One production each:
-   - `CREATE SEMANTIC VIEW x AS TABLES (...) DIMENSIONS (...)` → transform → Rust IR
-     → existing `native_sql` lowering;
-   - `FROM SEMANTIC_VIEW(x DIMENSIONS a METRICS m)` → transform → our existing table
-     function;
-   - `SELECT * FROM (SHOW SEMANTIC VIEWS)`.
+   - **3a, the real go/no-go:**
+     `CREATE SEMANTIC VIEW x AS TABLES (...) DIMENSIONS (...)` → transform → Rust IR
+     → existing `native_sql` lowering → returned as **statement AST executed on the
+     caller's connection**. Proved by a green `BEGIN … CREATE … ROLLBACK` test.
+   - `FROM SEMANTIC_VIEW(x DIMENSIONS a METRICS m)` → transform → a stock
+     `TableFunctionRef` to our table function. It must be stock, so that
+     `CREATE VIEW v AS SELECT * FROM SEMANTIC_VIEW(...)` serializes into the catalog
+     and re-binds on connections without the grammar. Use `PrependChoice` on
+     `InnerTableRef` and fail cleanly on a `'v'` string argument, so the deprecated
+     `semantic_view('v', …)` alias (D3) still parses as an ordinary table function.
+   - `SELECT * FROM (SHOW SEMANTIC VIEWS)`. Choices on `DescribeStatement` /
+     `ShowByName` should get subquery position for free, since `TableSubquery`
+     already admits `DescribeStatement`.
 4. Measure what users see on a syntax error inside our rule, and on DuckDB's
    autocomplete.
-5. Expression capture: can the transform get the **source text span** of an
-   `Expression` child as well as its AST? That decides D4.
-6. Check duckdb-rs / `libduckdb-sys` and `extension-ci-tools` status for 2.0, and how
-   the community-extension CI builds against it.
+5. Expression capture, precisely: can a transform slice the **original query
+   string** at a child's `[offset, offset+length)`? `ParseResult` carries the
+   extent, but the transformer holds a `TokenIterator`, not the SQL text, and
+   rebuilding from tokens loses whitespace and comments. The answer decides D4.
+6. **Hard gate on D2 and D7:** duckdb-rs / `libduckdb-sys` releases for 2.0, how
+   the version-pin encoding (`vX.Y.Z → 1.1XY0Z.0`) extends, `extension-ci-tools`,
+   and community-extension CI against 2.0.
 
-Exit: a written go / no-go. On no-go, the fallback is the 2.0 token-based
-`parse_function` hook. It is less capable, but it still removes the hand lexer.
+Exit: a written go / no-go. On no-go, the fallback is to keep `parser_override`,
+which still takes the raw query string on 2.0, and its scanners. Replace only the
+`parse_function` caret path with the token API.
 
 ### Phase 2: engine bump to DuckDB 2.0, behaviour unchanged
 
-Bump `.duckdb-version` and the crate pins. Port the existing hook to 2.0's changed
-`parse_function` signature (token vector in, `consumed_tokens` out). All tests stay
-green with **no** user-visible change. This separates "new engine" from "new parser"
+Bump `.duckdb-version`, the crate pins, the pin-encoding test and
+`DuckDBVersionMonitor.yml`. `parser_override` keeps its string signature on 2.0, so
+only the `sv_parse_stub` caret path has to move to the token-based `parse_function`.
+All tests stay green with **no** user-visible change. This separates "new engine" from "new parser"
 so a regression can be bisected to one or the other. Decision D2 decides whether
 1.5.x keeps a maintenance branch.
 
 ### Phase 3: DDL and introspection as grammar productions
 
 - CREATE (including `FROM YAML`), ALTER, DROP, DESCRIBE, every SHOW form, and
-  `GET_DDL` become productions that transform into the Rust IR.
+  `GET_DDL` become productions that transform into the Rust IR. This includes our
+  own non-Snowflake `MATERIALIZATIONS` clause. The feature is out of scope for new
+  work, but existing DDL must keep parsing.
+- The scalar functions (`GET_DDL`, `read_yaml_from_semantic_view`) need a named,
+  structural replacement for today's search-path handling (#25).
+- The grammar is a new ingress path, so the PR enumerates the validation choke
+  points it preserves (CLAUDE.md "fences"), as Phase 4 does.
+- Delete `test/sql/peg_compat.test`.
+- Retire `_notes/entry-point-decision.md` into the rewritten architecture note.
 - Delete the §3 "delete" list in the same phase, across as many PRs as review needs.
   The grammar test corpus lands **before** the deletion PR, green against both
   implementations, so coverage provably carries over.
@@ -239,23 +300,26 @@ so a regression can be bisected to one or the other. Decision D2 decides whether
 - Decision D3 settles the fate of `semantic_view()` and `where_clause :=`.
 - The scripted `.test` conversion PR lands here.
 
-### Phase 5: standard-SQL querying, member types, BI discovery
+### Phase 5: standard-SQL querying and BI discovery
 
-- **#51 first.** Record each member's `data_type` at CREATE by binding a LIMIT 0
-  probe in the caller's transaction. Then SHOW, DESCRIBE and placeholders have real
-  types.
+Member types (#51) move to Phase 0c.
+
 - **`SELECT … AGG(m) … FROM sv … GROUP BY …`.** The parse is context-free (§2), so
   it cannot know `sv` is semantic. A spike picks one of:
   - (a) a grammar rule that recognises a SELECT containing `AGG(` and defers it to a
     bind-time table function holding the statement, which resolves `sv` and either
     expands or re-plans the statement as plain SQL;
-  - (b) a catalog placeholder view per semantic view, plus an optimizer or binder
-    extension that rewrites the plan;
-  - (c) a replacement-scan approach.
+  - (b) a catalog placeholder view per semantic view, plus
+    `OperatorExtension::Bind(ClientContext&, Binder&, …)` to take over binding;
+  - (c) a replacement scan.
+  Option (c) is incompatible with (b) and D6, because replacement scans only fire
+  when the name does **not** resolve.
   Snowflake's restrictions (no joins, window calls, QUALIFY or correlated subqueries
   in this form) bound the work.
 - **BI discovery.** Placeholder views in `information_schema` / `duckdb_views()` with
-  one typed column per public member. Decision D6 settles the namespace sharing.
+  one typed column per public member. Decision D6 settles the namespace sharing. The
+  placeholders must be created and dropped inside the same DDL transaction. Lowered
+  DML can't `CREATE VIEW`, so this needs a real catalog write path. Budget for it.
 
 ### Phase 6: remaining DDL and metadata parity
 
@@ -290,7 +354,7 @@ is anchored at the base table (`expand::sql_gen` / `per_grain::is_eligible`). No
 in the grammar work changes it, and nothing in it needs the grammar. It has a
 plausible implementation on v1.5.6 today.
 
-**Recommendation: do it first, as Phase 0.** Three reasons:
+**Recommendation: do it early, as Phase 0b.** It is gated on D1 and must not block the spike or Phases 1 to 3, but it must land before Phases 4 and 7. Three reasons:
 
 - Phases 4, 5 and 7 (expression items, ad-hoc aggregates, standard-SQL queries,
   bridges, ASOF) all add emission shapes. Each would otherwise be built twice, once
@@ -324,13 +388,13 @@ the same fixture answers both.
 
 | # | Question | Recommendation |
 |---|---|---|
-| D1 | #71 semantics: count orphan child rows (FK NULL)? Childless parent's child-COUNT = `NULL` or `0`? | Home-table anchoring: orphans counted, `NULL` for childless, unless a Snowflake run says otherwise. Run the fixture on a Snowflake account if you can. |
-| D2 | Drop DuckDB 1.x when Phase 2 lands? | Yes. 1.5 is end of life on 2026-11-01. Tag v0.13.x as the last 1.5 line (fixes only), and make 2.0 the only target from then on. |
+| D1 | #71 semantics: count orphan child rows (FK NULL)? Childless parent's child-COUNT = `NULL` or `0`? | Home-table anchoring, with orphans counted. For childless parents, the two reviews disagree. The first draft said `NULL`. Fable's review says `COALESCE` the COUNT family to `0`, since BI users expect that and a left-joined star gives `0`. Leaning to `0` for COUNT and `NULL` for other aggregates. A Snowflake fixture run would settle it. |
+| D2 | Drop DuckDB 1.x when Phase 2 lands? | Yes, once spike item 6 shows that duckdb-rs and community CI are ready for 2.0. 1.5 is end of life on 2026-11-01. Tag v0.13.x as the last 1.5 line (fixes only). |
 | D3 | Keep `semantic_view('v', dimensions := …)` after `SEMANTIC_VIEW(...)` ships? | Keep it one release as a documented, deprecated alias that maps onto the same IR, then remove it. `explain_semantic_view` becomes a `semantic_view_sql`-style function over any statement. |
-| D4 | Store member expressions as verbatim source text (today) or as DuckDB-normalised text? | Verbatim text, validated by parsing, if the Phase 1 spike can capture spans. That preserves `GET_DDL` fidelity. Moving to AST storage would also retire #73 and IDENT-2/3/4, but it is a separate decision. |
-| D5 | Snowflake metadata clauses (`AI_*`, `TAG`, `COPY GRANTS`, `SAMPLE_VALUES`, `IS_ENUM`, Cortex search, `MAX_STALENESS`): reject (today), or accept and store? | Accept, store, show in DESCRIBE, and round-trip through GET_DDL/YAML, so Snowflake DDL pastes as is. `COPY GRANTS` and `MAX_STALENESS` are accepted as no-ops. |
+| D4 | Store member expressions as verbatim source text (today) or as DuckDB-normalised text? | Verbatim text, validated by parsing, if spike item 5 shows a transform can slice the original query string. If it can't, switch to normalised text now and change the `roundtrip_proptest` expectations. That preserves `GET_DDL` fidelity. Moving to AST storage would also retire #73 and IDENT-2/3/4, but it is a separate decision. |
+| D5 | Snowflake metadata clauses (`AI_*`, `TAG`, `COPY GRANTS`, `SAMPLE_VALUES`, `IS_ENUM`, Cortex search, `MAX_STALENESS`): reject (today), or accept and store? | Accept, store, show in DESCRIBE, and round-trip through GET_DDL/YAML, so Snowflake DDL pastes as is. `COPY GRANTS` and `MAX_STALENESS` are accepted as no-ops. Budget it: about 9 clauses, each touching model + JSON + YAML + `render_ddl` + DESCRIBE. |
 | D6 | BI placeholder views share the table/view namespace (a semantic view can't share a name with a table). OK? | Yes, behind the Phase 5 spike. It is what lets BI tools see them at all. |
-| D7 | Version line for the 2.0 cut? | Ship Phase 2 as v0.14.0. Consider v1.0.0 when Phase 4 lands with the Snowflake query construct. |
+| D7 | Version line for the 2.0 cut? | Ship Phase 2 as v0.14.0. Consider v1.0.0 once Phase 4 lands **and** D4's expression storage format has settled. |
 
 ## 8. Done when
 
