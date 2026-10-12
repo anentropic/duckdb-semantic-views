@@ -9,7 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_No unreleased changes yet._
+### Fixed
+
+- **A `USING` metric can aggregate a fact on the role-playing table.** A metric such as
+  `f.dep_elev USING (dep_airport) AS SUM(a.elev)`, where `elev` is a fact on the
+  role-played `airports` table, used to fail with `Referenced table "a" not found`. It now
+  reads the fact from the instance of the table its `USING` names, so each role returns its
+  own number.
+- **A member that reaches a fact on a role-playing table without naming a role is rejected
+  instead of silently using the first-declared relationship.** A metric without `USING`, a
+  dimension, or a fact on a table reached only through the role-playing table previously
+  returned the first-declared relationship's numbers; such a query now raises an ambiguity
+  error naming the member, the fact and the relationships to choose from.
+- **Quoted relationship names work on role-playing relationships.** A relationship named
+  with a quoted identifier (`"Dep Airport"`, or a name with an embedded `""`) used to make
+  every query that went through it fail with a parser error.
+- **A table not connected to the base table is rejected at `CREATE`.** If the first table in
+  `TABLES` had no relationship, or the relationships formed two separate groups, the view
+  was accepted and every query failed with a binder error. `CREATE SEMANTIC VIEW` now
+  rejects the definition and names the unreachable table.
 
 ## [0.13.0] - 2026-09-30
 

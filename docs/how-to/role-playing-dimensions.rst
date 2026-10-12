@@ -129,6 +129,40 @@ Derived metrics that reference USING-annotated metrics inherit the USING context
 However, querying ``total_flights`` with the ambiguous ``city`` dimension fails. The extension cannot determine which single USING path should resolve ``city``.
 
 
+.. _howto-rp-facts:
+
+Aggregating a Fact on the Role-Playing Table
+============================================
+
+A metric can aggregate a fact declared on the role-playing table itself. Its
+``USING`` picks which instance of the table the fact is read from, so the same
+fact gives a different number per role:
+
+.. code-block:: sql
+
+   FACTS (
+       a.elev AS a.elevation
+   )
+   METRICS (
+       f.dep_elev USING (dep_airport) AS SUM(a.elev),
+       f.arr_elev USING (arr_airport) AS SUM(a.elev),
+       elev_climb AS arr_elev - dep_elev
+   );
+
+``dep_elev`` sums the departure airports' elevations and ``arr_elev`` the
+arrival airports'; ``elev_climb`` composes both roles and keeps them apart.
+
+The metric's ``USING`` must name exactly one relationship to the table the fact
+lives on. A member that reaches such a fact with no single role to pick -- a
+metric without ``USING``, a dimension, or a fact on a table reached only
+*through* the role-playing table -- is rejected as ambiguous at query time (see
+:ref:`howto-rp-errors`).
+
+Relationship names may be quoted identifiers (``"Dep Airport" AS f(...)
+REFERENCES a`` with ``USING ("Dep Airport")``), including names with spaces or
+embedded quotes.
+
+
 .. _howto-rp-inspect:
 
 Inspect the Scoped Aliases
@@ -269,6 +303,14 @@ Troubleshooting
    rejected. Facts carry no ``USING`` context, so the role was always
    unresolvable -- previously such a fact silently read the first-declared
    relationship's rows.
+
+**A member references a fact on a role-playing table**
+   A metric or dimension whose expression reaches a fact on a role-playing table
+   (or on a table reached only through one) is rejected as ambiguous unless it
+   is a metric whose ``USING`` names exactly one relationship to the fact's own
+   table. Previously such a member silently read the first-declared
+   relationship's rows. Add ``USING`` to the metric, or declare the fact on a
+   non-role-playing table. See :ref:`howto-rp-facts`.
 
 **Semi-additive metric snapshotting on a role-playing dimension**
    .. versionchanged:: 0.11.0
