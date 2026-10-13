@@ -1,0 +1,10 @@
+LOAD './svspike.duckdb_extension';
+SELECT current_setting('active_grammar_extensions') AS active;
+CREATE SEMANTIC VIEW v1 AS DIMENSIONS (o.region AS upper( o.region_code ) || '-x', o.yr AS date_part('year',   o.d));
+SELECT * FROM sv_defs;
+BEGIN;
+CREATE SEMANTIC VIEW v2 AS DIMENSIONS (o.a AS a);
+SELECT count(*) AS in_txn FROM sv_defs;
+ROLLBACK;
+SELECT count(*) AS after_rollback FROM sv_defs;
+CREATE SEMANTIC VIEW v1 AS DIMENSIONS (o.a AS a);
