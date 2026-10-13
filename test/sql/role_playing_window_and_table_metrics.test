@@ -1,0 +1,201 @@
+# PR #247 review follow-ups to TECH-DEBT #69 (role-played facts): the paths
+# the first cut did not walk.
+#
+# 1. A WINDOW metric over a USING metric over the role-played fact. The window
+#    metric is qualified, so the join resolver never followed its inner
+#    metric's USING: the inlined fact named `a__dep_airport` and no scoped join
+#    was emitted (`Binder Error: Referenced table "a__dep_airport" not found`).
+#    The fence had the same blind spot for an inner metric with NO USING.
+# 2. `USING (dep_airport, DEP_AIRPORT)` names one relationship, but the fact
+#    rewrite counted spellings and left the fact on the unjoined bare alias.
+# 3. A metric declared ON the role-played table (it cannot carry a USING of its
+#    own) joined that table through the first-declared relationship and
+#    returned that role's number. Pre-dates #69: the raw-column spelling did
+#    the same on main.
+#
+# Every number below differs between the two roles.
+
+require semantic_views
+
+statement ok
+CREATE TABLE p0c_airports (airport_code VARCHAR, city VARCHAR, elevation INTEGER);
+
+statement ok
+INSERT INTO p0c_airports VALUES ('SFO', 'San Francisco', 13), ('DEN', 'Denver', 5434);
+
+statement ok
+CREATE TABLE p0c_flights (flight_id INTEGER, departure_code VARCHAR, arrival_code VARCHAR);
+
+# Two flights SFO -> DEN, one DEN -> SFO.
+statement ok
+INSERT INTO p0c_flights VALUES (1, 'SFO', 'DEN'), (2, 'SFO', 'DEN'), (3, 'DEN', 'SFO');
+
+statement ok
+CREATE SEMANTIC VIEW p0c_elev AS
+  TABLES (
+    f AS p0c_flights PRIMARY KEY (flight_id),
+    a AS p0c_airports PRIMARY KEY (airport_code)
+  )
+  RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a,
+    arr_airport AS f(arrival_code) REFERENCES a
+  )
+  FACTS (
+    a.elev AS a.elevation
+  )
+  DIMENSIONS (
+    f.flight_id AS f.flight_id
+  )
+  METRICS (
+    f.dep_elev USING (dep_airport) AS SUM(a.elev),
+    f.arr_elev USING (arr_airport) AS SUM(a.elev),
+    f.any_elev AS SUM(a.elev),
+    f.dep_elev_by_flight AS SUM(dep_elev) OVER (PARTITION BY flight_id),
+    f.arr_elev_by_flight AS SUM(arr_elev) OVER (PARTITION BY flight_id),
+    f.any_elev_by_flight AS SUM(any_elev) OVER (PARTITION BY flight_id),
+    f.dep_elev_twice_named USING (dep_airport, DEP_AIRPORT) AS SUM(a.elev),
+    f.latest_arr_elev USING (arr_airport) NON ADDITIVE BY (flight_id) AS SUM(a.elev)
+  );
+
+# 1. Window over the departure role: each flight's departure elevation.
+query II rowsort
+SELECT * FROM semantic_view('p0c_elev', dimensions := ['flight_id'], metrics := ['dep_elev_by_flight']);
+----
+1	13
+2	13
+3	5434
+
+# 1. Window over the arrival role reads the other instance.
+query II rowsort
+SELECT * FROM semantic_view('p0c_elev', dimensions := ['flight_id'], metrics := ['arr_elev_by_flight']);
+----
+1	5434
+2	5434
+3	13
+
+# 1. A window over an inner metric with no USING has no role to name.
+statement error
+SELECT * FROM semantic_view('p0c_elev', dimensions := ['flight_id'], metrics := ['any_elev_by_flight']);
+----
+'any_elev' is ambiguous -- it references fact
+
+# 2. Both spellings name dep_airport: 13 + 13 + 5434.
+query I
+SELECT * FROM semantic_view('p0c_elev', metrics := ['dep_elev_twice_named']);
+----
+5460
+
+# Semi-additive USING metric over the role-played fact: the latest flight (3)
+# arrives at SFO.
+query I
+SELECT * FROM semantic_view('p0c_elev', metrics := ['latest_arr_elev']);
+----
+13
+
+# 3. A metric ON the role-played table. The legs table declares both foreign
+# keys UNIQUE, so both relationships are one-to-one and no fan trap stands in
+# front of the role-playing fence. Before, `any_leg_elev` and `raw_leg_elev`
+# both returned 113 (SFO + LAX, the departure role) only because `leg_dep` is
+# declared first; the arrival role is 5447.
+
+statement ok
+CREATE TABLE p0c_ports (code VARCHAR, elevation INTEGER);
+
+statement ok
+INSERT INTO p0c_ports VALUES ('SFO', 13), ('DEN', 5434), ('LAX', 100);
+
+statement ok
+CREATE TABLE p0c_legs (leg_id INTEGER, dep VARCHAR, arr VARCHAR);
+
+statement ok
+INSERT INTO p0c_legs VALUES (1, 'SFO', 'DEN'), (2, 'LAX', 'SFO');
+
+statement ok
+CREATE SEMANTIC VIEW p0c_legs_view AS
+  TABLES (
+    l AS p0c_legs PRIMARY KEY (leg_id) UNIQUE (dep) UNIQUE (arr),
+    p AS p0c_ports PRIMARY KEY (code)
+  )
+  RELATIONSHIPS (
+    leg_dep AS l(dep) REFERENCES p,
+    leg_arr AS l(arr) REFERENCES p
+  )
+  FACTS (
+    p.elev AS p.elevation
+  )
+  METRICS (
+    p.any_leg_elev AS SUM(p.elev),
+    p.raw_leg_elev AS SUM(p.elevation),
+    l.dep_leg_elev USING (leg_dep) AS SUM(p.elev),
+    l.arr_leg_elev USING (leg_arr) AS SUM(p.elev)
+  );
+
+statement error
+SELECT * FROM semantic_view('p0c_legs_view', metrics := ['any_leg_elev']);
+----
+metric 'any_leg_elev' is ambiguous -- it aggregates table 'p'
+
+statement error
+SELECT * FROM semantic_view('p0c_legs_view', metrics := ['raw_leg_elev']);
+----
+metric 'raw_leg_elev' is ambiguous -- it aggregates table 'p'
+
+# Control: naming the role from the legs table still works, for each role.
+query II
+SELECT * FROM semantic_view('p0c_legs_view', metrics := ['dep_leg_elev', 'arr_leg_elev']);
+----
+113	5447
+
+# The fence the window join walk passes: following a window's inner metric
+# also joins the tables ITS fact references reach, so the referenced-fact fan
+# fence follows it too. A base-table metric over a CHILD-table fact is fenced
+# when queried directly; through a window (or a derived metric) the child table
+# was joined with no fence.
+
+statement ok
+CREATE TABLE p0c_orders (id INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO p0c_orders VALUES (1, 'east'), (2, 'west');
+
+statement ok
+CREATE TABLE p0c_lines (id INTEGER, order_id INTEGER, qty INTEGER);
+
+statement ok
+INSERT INTO p0c_lines VALUES (1, 1, 5), (2, 1, 7), (3, 2, 1);
+
+statement ok
+CREATE SEMANTIC VIEW p0c_orders_view AS
+  TABLES (
+    o AS p0c_orders PRIMARY KEY (id),
+    li AS p0c_lines PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_o AS li(order_id) REFERENCES o
+  )
+  FACTS (
+    li.liq AS li.qty
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.li_qty AS SUM(li.liq),
+    o.li_qty_w AS SUM(li_qty) OVER (PARTITION BY region),
+    li_qty_twice AS li_qty * 2
+  );
+
+statement error
+SELECT * FROM semantic_view('p0c_orders_view', dimensions := ['region'], metrics := ['li_qty']);
+----
+fan trap detected -- 'li_qty' (table 'o')
+
+statement error
+SELECT * FROM semantic_view('p0c_orders_view', dimensions := ['region'], metrics := ['li_qty_w']);
+----
+fan trap detected -- 'li_qty' (table 'o')
+
+statement error
+SELECT * FROM semantic_view('p0c_orders_view', dimensions := ['region'], metrics := ['li_qty_twice']);
+----
+fan trap detected -- 'li_qty' (table 'o')

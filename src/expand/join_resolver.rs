@@ -7,17 +7,42 @@ use super::facts::{
     collect_derived_metric_source_tables, collect_derived_metric_using,
     collect_referenced_fact_tables, collect_transitive_metric_names,
 };
-use super::resolution::{qualify_and_quote_table_ref, quote_ident};
+use super::resolution::{qualify_and_quote_table_ref, quote_ident, quote_ident_if_needed};
 
 /// Build a role-playing scoped alias in the documented `{table}__{rel}` format.
 ///
-/// Both parts must already be lowercased by the caller (aliases and relationship
-/// names are matched case-insensitively via lowercasing at the call sites). This
-/// is the single source of the format so the two producers — this module's
-/// USING-relationship join synthesis and `role_playing::scoped_alias_for` — can
-/// never drift (E-10, code-review 2026-07-11).
-pub(super) fn scoped_join_alias(table_lower: &str, rel_lower: &str) -> String {
-    format!("{table_lower}__{rel_lower}")
+/// The result is the alias's *logical* value — never SQL text. Both parts go
+/// through [`crate::ident::normalize_ident_part`], so a stored, quoted
+/// relationship name (`"de p"`, embedded `""` and all) contributes its
+/// unquoted, case-folded value (`de p`) rather than its delimiters (TECH-DEBT
+/// #70, MM-2). Every emission site then quotes the alias exactly once: the
+/// JOIN clause via `quote_ident`, a rewritten member reference via
+/// [`rewrite_to_scoped_alias`]. Concatenating the raw stored text instead put
+/// quote characters *inside* the alias, which the two sites then quoted
+/// differently (`"ap__""de p"""` vs `ap__"de p".city`) — unparseable SQL.
+///
+/// This is the single source of the format so every producer — this module's
+/// USING-relationship join synthesis, `role_playing::find_using_context` and
+/// the per-grain emitter — can never drift (E-10, code-review 2026-07-11).
+pub(super) fn scoped_join_alias(table: &str, rel: &str) -> String {
+    format!(
+        "{}__{}",
+        crate::ident::normalize_ident_part(table),
+        crate::ident::normalize_ident_part(rel)
+    )
+}
+
+/// Rewrite every reference qualified by `table` in `expr` to the role-playing
+/// `scoped` alias (as built by [`scoped_join_alias`]), emitting the alias as
+/// one SQL identifier.
+///
+/// A bare-safe alias (`ap__r_dep`) is emitted unquoted, byte-identical to the
+/// pre-#70 output; anything else (`ap__de p`, non-ASCII, upper case) is
+/// double-quoted, matching the `quote_ident` the JOIN clause applies to the
+/// same logical alias. This is the one reference-site spelling, shared by the
+/// dimension emitters and the role-played fact rewrite (TECH-DEBT #69).
+pub(super) fn rewrite_to_scoped_alias(expr: &str, table: &str, scoped: &str) -> String {
+    crate::expr_tokens::rewrite_qualifier(expr, table, &quote_ident_if_needed(scoped))
 }
 
 /// Synthesize an ON clause from PK/FK column declarations (Phase 26).
@@ -195,6 +220,30 @@ fn push_bare_join<'a>(
     });
 }
 
+/// `resolved_mets` plus, transitively, every metric a window metric among them
+/// names as its inner aggregate, each once, in first-reached order.
+fn with_window_inner_metrics<'m>(
+    resolved_mets: &[&'m crate::model::Metric],
+    all_metrics: &'m [crate::model::Metric],
+) -> Vec<&'m crate::model::Metric> {
+    let mut out: Vec<&crate::model::Metric> = resolved_mets.to_vec();
+    let mut i = 0;
+    while i < out.len() {
+        if let Some(ref ws) = out[i].window_spec {
+            if let Some(inner) = all_metrics
+                .iter()
+                .find(|m| crate::ident::ident_matches(&m.name, &ws.inner_metric))
+            {
+                if !out.iter().any(|m| std::ptr::eq(*m, inner)) {
+                    out.push(inner);
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Resolve which joins are needed using graph-based PK/FK resolution (Phase 26+32).
 ///
 /// Builds a `RelationshipGraph` from the definition, collects needed table
@@ -221,6 +270,15 @@ pub(super) fn resolve_joins_pkfk<'a>(
     let Ok(graph) = RelationshipGraph::from_definition(def) else {
         return Vec::new(); // Graph was validated at define time
     };
+
+    // A window metric's inner aggregate is computed in `__sv_agg` against these
+    // joins, so the inner metric needs them as much as a queried one does: its
+    // `USING` scoped joins and the tables its inlined facts reach. A window
+    // metric is qualified (it carries the source table of its declaration), so
+    // none of the derived-metric walks below reach it (PR #247 review — the
+    // inlined fact named `a__dep_airport` while no scoped join was emitted).
+    let with_inner = with_window_inner_metrics(resolved_mets, &def.metrics);
+    let resolved_mets: &[&crate::model::Metric] = &with_inner;
 
     let root = &graph.root;
 

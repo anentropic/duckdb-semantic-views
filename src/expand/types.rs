@@ -332,6 +332,30 @@ pub struct ReferencedFactFanTrapError {
     pub relationship_name: String,
 }
 
+/// Detail payload for [`ExpandError::AmbiguousMemberFactPath`], boxed for the
+/// same reason as [`ReferencedFactFanTrapError`] (R-9): five `String`s and a
+/// `Vec` would put `ExpandError` over clippy's `result_large_err` threshold.
+#[derive(Debug)]
+pub struct AmbiguousMemberFactPathError {
+    pub view_name: String,
+    pub member_name: String,
+    pub fact_name: String,
+    pub fact_table: String,
+    pub role_playing_table: String,
+    pub available_relationships: Vec<String>,
+}
+
+/// Detail payload for [`ExpandError::AmbiguousMetricPath`], boxed for the same
+/// reason as [`AmbiguousMemberFactPathError`].
+#[derive(Debug)]
+pub struct AmbiguousMetricPathError {
+    pub view_name: String,
+    pub metric_name: String,
+    pub metric_table: String,
+    pub role_playing_table: String,
+    pub available_relationships: Vec<String>,
+}
+
 /// Detail payload for [`ExpandError::MetricFanTrap`], boxed so the enum stays
 /// small (R-9, code-review 2026-07-11 — the other fat variant).
 #[derive(Debug)]
@@ -436,6 +460,28 @@ pub enum ExpandError {
         member_table: String,
         role_playing_table: String,
         available_relationships: Vec<String>,
+    },
+    /// A dimension or metric whose expression reaches a FACT on a table that is
+    /// (or is reached only through) a role-playing table, with no single role
+    /// to bind it to (TECH-DEBT #69). A base metric over a fact on the
+    /// role-playing table itself is accepted when its `USING` names exactly one
+    /// relationship to that table — the fact is then inlined against that
+    /// role's scoped alias. Anything else (no `USING`, a dimension, or a fact on
+    /// a descendant the scoped alias does not rename) previously joined the
+    /// first-declared relationship silently.
+    AmbiguousMemberFactPath {
+        detail: Box<AmbiguousMemberFactPathError>,
+    },
+    /// A metric declared ON a table that is (or is reached only through) a
+    /// role-playing table (PR #247 review). Such a metric cannot carry a
+    /// `USING` that names a role — a `USING` relationship must originate from
+    /// the metric's own table — so its table can only be joined through
+    /// `tree_parent`, the first-declared relationship: a silent,
+    /// declaration-order-dependent number. The metric analogue of
+    /// [`Self::AmbiguousDescendantPath`] (EXP-4) and [`Self::AmbiguousFactPath`]
+    /// (EXP-5).
+    AmbiguousMetricPath {
+        detail: Box<AmbiguousMetricPathError>,
     },
     /// A requested metric is marked PRIVATE and cannot be queried directly.
     PrivateMetric { view_name: String, name: String },
@@ -779,6 +825,45 @@ impl fmt::Display for ExpandError {
                      a where_clause carries no USING context to pick a role. Filter on a member \
                      from a non-role-playing table, or give the target table a distinct alias \
                      per role.",
+                    available_relationships.join(", ")
+                )
+            }
+            Self::AmbiguousMemberFactPath { detail } => {
+                let AmbiguousMemberFactPathError {
+                    view_name,
+                    member_name,
+                    fact_name,
+                    fact_table,
+                    role_playing_table,
+                    available_relationships,
+                } = detail.as_ref();
+                write!(
+                    f,
+                    "semantic view '{view_name}': '{member_name}' is ambiguous -- it references \
+                     fact '{fact_name}' on table '{fact_table}', which requires the role-playing \
+                     table '{role_playing_table}', joined via multiple relationships: [{}]. A \
+                     metric over a fact on '{role_playing_table}' itself must name exactly one \
+                     of them with USING; a dimension, or a fact on a table reached only through \
+                     '{role_playing_table}', has no way to pick a role.",
+                    available_relationships.join(", ")
+                )
+            }
+            Self::AmbiguousMetricPath { detail } => {
+                let AmbiguousMetricPathError {
+                    view_name,
+                    metric_name,
+                    metric_table,
+                    role_playing_table,
+                    available_relationships,
+                } = detail.as_ref();
+                write!(
+                    f,
+                    "semantic view '{view_name}': metric '{metric_name}' is ambiguous -- it \
+                     aggregates table '{metric_table}', which requires the role-playing table \
+                     '{role_playing_table}', joined via multiple relationships: [{}]. A metric \
+                     on that table cannot name a role (USING relationships must originate from \
+                     the metric's own table); declare it on the referencing table with USING \
+                     instead, e.g. <table>.<metric> USING (<relationship>) AS SUM(<fact>).",
                     available_relationships.join(", ")
                 )
             }

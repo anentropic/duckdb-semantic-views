@@ -1391,7 +1391,7 @@ fn dim_expr(
         return expr;
     };
     match roles.get(&table) {
-        Some(rel) => crate::expr_tokens::rewrite_qualifier(
+        Some(rel) => super::join_resolver::rewrite_to_scoped_alias(
             &expr,
             &table,
             &super::join_resolver::scoped_join_alias(&table, rel),

@@ -198,6 +198,10 @@ unsupported form in the warning above.
       rows. Reference a fact on a table reachable without fanning out, or
       define the fact on 'o'.
 
+   The same check applies when the metric is reached indirectly -- as the
+   inner metric of a window metric or a component of a derived metric. The
+   error then names the metric that references the fact.
+
    Facts on the *parent* side (many-to-one, one row per member row) join safely
    and are the usual case -- a customer's discount, a product's list price, a
    region's tax rate.

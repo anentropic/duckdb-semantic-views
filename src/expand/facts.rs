@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::expr_tokens::{inline_references, references_ref};
 use crate::ident::normalize_ident_part;
-use crate::model::{Fact, TableRef};
+use crate::model::{Fact, Join, TableRef};
 use crate::util::is_word_boundary_char;
 
 use super::resolution::quote_ident;
@@ -883,6 +883,18 @@ fn toposort_derived(
     Ok(order)
 }
 
+/// [`inline_derived_metrics_with_joins`] with no relationships — the test
+/// fixtures that exercise inlining alone declare none.
+#[cfg(test)]
+pub(super) fn inline_derived_metrics(
+    metrics: &[crate::model::Metric],
+    facts: &[Fact],
+    fact_topo_order: &[usize],
+    tables: &[TableRef],
+) -> Result<ResolvedMetricExprs, String> {
+    inline_derived_metrics_with_joins(metrics, facts, fact_topo_order, tables, &[])
+}
+
 /// Resolve all metric expressions: inline facts into base metrics, then inline
 /// base/derived metric references into derived metrics in topological order.
 ///
@@ -914,11 +926,26 @@ fn toposort_derived(
 /// no PRIMARY KEY declared the rewrite is impossible; the metric is recorded
 /// in `count_star_no_pk` and the caller errors when (and only when) a query
 /// actually uses it.
-pub(super) fn inline_derived_metrics(
+///
+/// # TECH-DEBT #69: `USING`-scoped facts
+///
+/// `joins` lets a base metric's `USING` scope the facts it inlines. A metric
+/// with `USING (r_dep)` is aggregated against the role-played table
+/// joined under its scoped alias (`"ap" AS "ap__r_dep"`) — the bare alias is
+/// never joined. A fact on that table inlines as its RAW expression (`ap.alt`),
+/// so the inlined text must be requalified to the scoped alias, exactly as a
+/// dimension expression on the same table is. Done here, at the shared
+/// base-metric resolution step, and *after* fact inlining (the #54 order:
+/// inline first, then rewrite) so it reaches every consumer of the resolved
+/// expressions — the base-anchored SELECT, derived-metric inlining, the grain
+/// CTEs, the semi-additive and window paths. Test callers that build no
+/// relationships use the test-only `inline_derived_metrics`.
+pub(super) fn inline_derived_metrics_with_joins(
     metrics: &[crate::model::Metric],
     facts: &[Fact],
     fact_topo_order: &[usize],
     tables: &[TableRef],
+    joins: &[Join],
 ) -> Result<ResolvedMetricExprs, String> {
     let mut resolved: HashMap<String, String> = HashMap::new();
     let mut count_star_no_pk: HashMap<String, String> = HashMap::new();
@@ -931,6 +958,8 @@ pub(super) fn inline_derived_metrics(
         } else {
             inline_facts(&met.expr, facts, fact_topo_order)
         };
+        // TECH-DEBT #69: requalify facts inlined from a USING-scoped table.
+        expr = rewrite_using_scoped_refs(&expr, met, joins);
         // SG-8: COUNT(*) on a non-base source table (see doc comment above).
         if let Some(ref st) = met.source_table {
             let st_lower = st.to_ascii_lowercase();
@@ -1032,6 +1061,63 @@ pub(super) fn inline_derived_metrics(
         exprs: resolved,
         count_star_no_pk,
     })
+}
+
+/// Requalify references to each table a base metric's `USING` scopes, from the
+/// bare alias to the role-playing scoped alias the join resolver emits for it
+/// (TECH-DEBT #69, MM-1).
+///
+/// `USING` names relationships; each resolves (by the same case-insensitive name
+/// match `join_resolver::resolve_joins_pkfk` uses to emit the scoped join) to
+/// its target table. A target named by exactly ONE of the metric's
+/// relationships (however many spellings of it the `USING` lists) is
+/// rewritten; a target named by several distinct ones has no single role to
+/// pick and is left alone, as is the metric's own table, which is never joined
+/// under a scoped alias. Member expressions cannot reference another table's
+/// raw columns (#52), so on a DDL-created view any reference to a scoped table
+/// reached this point through an inlined fact.
+fn rewrite_using_scoped_refs(expr: &str, met: &crate::model::Metric, joins: &[Join]) -> String {
+    if met.using_relationships.is_empty() || joins.is_empty() {
+        return expr.to_string();
+    }
+    let own = met.source_table.as_deref().map(normalize_ident_part);
+    // target table -> the distinct relationships (join edges) of this metric
+    // that reach it. Distinct by the EDGE a spelling resolves to, not by the
+    // spelling: `USING (dep_airport, DEP_AIRPORT)` names one relationship —
+    // validation, the role-playing fence and the join resolver all fold case
+    // to find it — so it is one role, and must be rewritten as one (PR #247
+    // review). Counting spellings left the fact on the never-joined bare alias.
+    let mut by_target: Vec<(String, Vec<(&str, &Join)>)> = Vec::new();
+    for rel in &met.using_relationships {
+        let rel_lower = rel.to_ascii_lowercase();
+        let Some(join) = joins.iter().find(|j| {
+            j.name
+                .as_ref()
+                .is_some_and(|n| n.to_ascii_lowercase() == rel_lower)
+        }) else {
+            continue;
+        };
+        let target = normalize_ident_part(&join.table);
+        if own.as_deref() == Some(target.as_str()) {
+            continue;
+        }
+        match by_target.iter_mut().find(|(t, _)| *t == target) {
+            Some((_, rels)) => {
+                if !rels.iter().any(|(_, j)| std::ptr::eq(*j, join)) {
+                    rels.push((rel.as_str(), join));
+                }
+            }
+            None => by_target.push((target, vec![(rel.as_str(), join)])),
+        }
+    }
+    let mut out = expr.to_string();
+    for (target, rels) in &by_target {
+        if let [(rel, _)] = rels.as_slice() {
+            let scoped = super::join_resolver::scoped_join_alias(target, rel);
+            out = super::join_resolver::rewrite_to_scoped_alias(&out, target, &scoped);
+        }
+    }
+    out
 }
 
 /// Collect the lowercased names of `met` and every metric it transitively

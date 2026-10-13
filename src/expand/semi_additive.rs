@@ -476,7 +476,7 @@ fn push_cte_dimension_columns(
         let mut base_expr = super::facts::inline_dimension_facts(&dim.expr, &def.facts);
         if let Some(ref scoped) = rd.scoped_alias {
             if let Some(ref st) = dim.source_table {
-                base_expr = crate::expr_tokens::rewrite_qualifier(&base_expr, st, scoped);
+                base_expr = super::join_resolver::rewrite_to_scoped_alias(&base_expr, st, scoped);
             }
         }
         let item = SelectItem::new(base_expr, dim.output_type.clone(), dim_aliases[idx].clone());
@@ -616,7 +616,7 @@ fn na_order_item(
                         // un-inlined fact name.
                         let mut e = super::facts::inline_dimension_facts(&d.expr, &def.facts);
                         if let (Some(sc), Some(st)) = (scoped, d.source_table.as_ref()) {
-                            e = crate::expr_tokens::rewrite_qualifier(&e, st, sc);
+                            e = super::join_resolver::rewrite_to_scoped_alias(&e, st, sc);
                         }
                         e
                     },

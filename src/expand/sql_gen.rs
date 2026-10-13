@@ -2,7 +2,8 @@ use crate::model::{AccessModifier, Dimension, Fact, Metric, SemanticViewDefiniti
 use crate::util::suggest_closest;
 
 use super::facts::{
-    collect_transitive_metric_names, inline_derived_metrics, inline_facts, toposort_facts,
+    collect_transitive_metric_names, inline_derived_metrics_with_joins, inline_facts,
+    toposort_facts,
 };
 use super::fan_trap::{check_fan_traps, validate_fact_table_path};
 use super::join_resolver::resolve_joins_pkfk;
@@ -359,6 +360,9 @@ fn expand_facts(
     for fact in &resolved_facts {
         check_fact_role_playing_path(view_name, def, fact)?;
     }
+    // TECH-DEBT #69: a queried dimension's expression may reach a fact on a
+    // role-playing path too (#54 inlines it), and a fact query has no USING.
+    super::role_playing::check_member_fact_role_playing_path(view_name, def, &resolved_dims, &[])?;
 
     // 3d. EXP-10: a `where_clause` member on (or reached only through) a
     // role-playing table has no way to name its role either — the predicate is
@@ -525,11 +529,17 @@ pub fn expand(
         view_name: view_name.to_string(),
         cycle_description: e,
     })?;
-    let resolved = inline_derived_metrics(&def.metrics, &def.facts, &topo_order, &def.tables)
-        .map_err(|e| ExpandError::CycleDetected {
-            view_name: view_name.to_string(),
-            cycle_description: e,
-        })?;
+    let resolved = inline_derived_metrics_with_joins(
+        &def.metrics,
+        &def.facts,
+        &topo_order,
+        &def.tables,
+        &def.joins,
+    )
+    .map_err(|e| ExpandError::CycleDetected {
+        view_name: view_name.to_string(),
+        cycle_description: e,
+    })?;
 
     // TECH-DEBT #35 / v0.12.0: decide whether this query must be computed at
     // each metric's OWN grain. `plan` returns None for everything the
@@ -714,6 +724,15 @@ pub fn expand(
         &resolved_dims,
         &resolved_mets,
     )?;
+    // TECH-DEBT #69: and the role-playing seam beside it — a referenced fact on
+    // a role-playing path binds to a role only through a base metric's single
+    // `USING`; anything else would join the first-declared relationship.
+    super::role_playing::check_member_fact_role_playing_path(
+        view_name,
+        def,
+        &resolved_dims,
+        &resolved_mets,
+    )?;
     if let Some(rw) = &resolved_where {
         super::fan_trap::check_where_clause_fan_traps(view_name, def, &rw.members, &resolved_mets)?;
         // EXP-10: and the role-playing seam the fan-trap check does not cover —
@@ -812,7 +831,7 @@ pub fn expand(
             if let Some(ref st) = dim.source_table {
                 // Rewrite the source-table qualifier to the scoped alias
                 // e.g., "a.city" -> "a__dep_airport.city"
-                base_expr = crate::expr_tokens::rewrite_qualifier(&base_expr, st, scoped);
+                base_expr = super::join_resolver::rewrite_to_scoped_alias(&base_expr, st, scoped);
             }
         }
         items.push(SelectItem::new(

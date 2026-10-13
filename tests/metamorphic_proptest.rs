@@ -28,6 +28,10 @@
 //! - **(d) data metamorphism** — inserting a PARENT row with no children must
 //!   leave every child-grain metric and every child-fact row untouched. That is
 //!   precisely the EXP-21/25/26/28/29 invariant.
+//! - **(e) declaration-order invariance** — swapping the declaration order of
+//!   the two relationships to the role-played table must change no acceptance
+//!   and no accepted answer. A member that binds to "whichever relationship was
+//!   declared first" fails this without anyone knowing which role was right.
 //!
 //! Because there is no oracle to satisfy, the generator is free to range over
 //! the cells the oracled harnesses cannot reach:
@@ -50,18 +54,23 @@
 //! # Findings this harness produced, and the properties that are `#[ignore]`d
 //!
 //! Four real defects fell out of the cells above. Per the project rule that a
-//! finding is recorded rather than quietly fixed inside a test change, each has
-//! a property that states the CORRECT invariant, is `#[ignore]`d, and carries
-//! the reproduction inline:
+//! finding is recorded rather than quietly fixed inside a test change, each got
+//! a test that states the CORRECT invariant, `#[ignore]`d until fixed, with the
+//! reproduction inline:
 //!
 //! - **MM-1** — [`mm1_role_playing_metric_over_a_fact_on_the_role_played_table`]
+//!   (TECH-DEBT #69, fixed — now live, and the generated model carries
+//!   `dep_alt` / `arr_alt`, `USING` metrics over a fact on the role-played
+//!   table, so every property reaches the shape)
 //! - **MM-2** — [`mm2_role_playing_with_a_quoted_relationship_name`]
+//!   (TECH-DEBT #70, fixed — now live, and the role-playing pair's relationship
+//!   names are drawn from all five identifier styles like every other name)
 //! - **MM-3** — [`mm3_metric_value_changes_when_co_queried_across_grains`]
 //! - **MM-4** — [`mm4_childless_parent_manufactures_a_null_group_under_a_child_dimension`]
 //!
-//! The three live properties are scoped away from those cells (single-grain
-//! metric sets for (a)/(b); bare role-relationship names; parent-side grouping
-//! for (d)) so the harness lands green and the findings stay visible.
+//! The three live properties are scoped away from the still-open cells
+//! (single-grain metric sets for (a)/(b); parent-side grouping for (d)) so the
+//! harness lands green and the findings stay visible.
 
 use std::collections::BTreeSet;
 
@@ -121,17 +130,6 @@ impl Style {
 
 fn arb_style() -> impl Strategy<Value = Style> {
     prop::sample::select(Style::ALL.to_vec())
-}
-
-/// The role-playing relationship names are drawn from the BARE styles only.
-///
-/// A quoted relationship name is spliced raw into the scoped join alias
-/// (`ap__"de p"`) at the reference site while the join clause quotes the whole
-/// alias (`"ap__""de p"""`), so the emitted SQL does not parse — see
-/// [`mm2_role_playing_with_a_quoted_relationship_name`]. Case still varies, so
-/// the `USING` ↔ relationship-name match stays quote-free but not case-fixed.
-fn arb_bare_style() -> impl Strategy<Value = Style> {
-    prop::sample::select(vec![Style::Bare, Style::Upper])
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +213,7 @@ struct BaseMetric {
 /// `dep_*` / `arr_*` are the role-playing half: same expression, different
 /// `USING`, so their *numbers* differ only once a dimension on the role-played
 /// table is grouped by — which is exactly the cell PBT-10 names.
-const BASE_METRICS: [BaseMetric; 14] = [
+const BASE_METRICS: [BaseMetric; 16] = [
     BaseMetric {
         stem: "n_li",
         expr: "COUNT(*)",
@@ -318,6 +316,27 @@ const BASE_METRICS: [BaseMetric; 14] = [
         role: None,
         comb: Comb::Sum,
     },
+    // MM-1 (TECH-DEBT #69): a `USING` metric over a FACT on the role-played
+    // table. Unlike `dep_rate` / `arr_rate`, whose numbers differ only once the
+    // role-played dimension is grouped by, these aggregate the role-played
+    // table ITSELF — so the two roles differ on every request, grouped or not,
+    // and a fact inlined against the wrong instance (or the bare, unjoined
+    // alias) shows up in every property. Appended last so the fixed indices
+    // the `mm*` tests use stay put.
+    BaseMetric {
+        stem: "dep_alt",
+        expr: "SUM({alt})",
+        grain: Grain::Base,
+        role: Some(Role::Dep),
+        comb: Comb::Sum,
+    },
+    BaseMetric {
+        stem: "arr_alt",
+        expr: "SUM({alt})",
+        grain: Grain::Base,
+        role: Some(Role::Arr),
+        comb: Comb::Sum,
+    },
 ];
 
 /// Dimension slots, by index into [`Names::dims`].
@@ -339,8 +358,16 @@ const DIM_SPECS: [(&str, &str, bool); 6] = [
     ("li.amount > 0", "li", true),
 ];
 
-const FACT_STEMS: [&str; 2] = ["fact_amt", "fact_rate"];
-const FACT_SPECS: [(&str, &str); 2] = [("li.amount", "li"), ("o.rate", "o")];
+const FACT_STEMS: [&str; 3] = ["fact_amt", "fact_rate", "fact_alt"];
+/// The third fact lives on the ROLE-PLAYED table; `dep_alt` / `arr_alt` reach
+/// it through `USING` (MM-1, TECH-DEBT #69). It is never queried as a FACT —
+/// a facts request carries no `USING` and is rejected on that table by design.
+const FACT_SPECS: [(&str, &str); 3] = [("li.amount", "li"), ("o.rate", "o"), ("ap.alt", "ap")];
+/// Index of the role-played fact in [`Names::facts`].
+const F_ALT: usize = 2;
+/// Placeholder a [`BaseMetric::expr`] uses for the role-played fact's
+/// (styled) name; [`build_def`] substitutes it.
+const ALT_FACT: &str = "{alt}";
 
 const REL_STEMS: [&str; 4] = ["r_li", "r_dep", "r_arr", "r_car"];
 const TABLE_STEMS: [&str; 4] = ["o", "li", "ap", "cr"];
@@ -356,6 +383,12 @@ struct Names {
     rels: Vec<String>,
     /// The style each name was drawn with — the anti-vacuity guards read this.
     styles: Vec<Style>,
+    /// When set, every role-naming metric spells its relationship TWICE in
+    /// `USING`, the second time case-flipped (`USING (r_dep, R_DEP)`). Both
+    /// spellings name one relationship — validation folds case — so the
+    /// numbers must not move (PR #247 review: the fact rewrite counted
+    /// spellings, not relationships, and left the fact on the unjoined alias).
+    dup_using: bool,
 }
 
 impl Names {
@@ -371,11 +404,13 @@ fn arb_names() -> impl Strategy<Value = Names> {
         prop::collection::vec(arb_style(), BASE_METRICS.len()),
         prop::collection::vec(arb_style(), MAX_DERIVED),
         prop::collection::vec(arb_style(), FACT_STEMS.len()),
-        // r_li and r_car may be spelled any way; r_dep / r_arr are the
-        // role-playing pair and stay bare (MM-2).
-        (arb_style(), arb_bare_style(), arb_bare_style(), arb_style()),
+        // Every relationship name, the role-playing pair included, is drawn
+        // from all five styles. r_dep / r_arr were held to bare/upper while
+        // MM-2 (TECH-DEBT #70) made a quoted role name emit unparseable SQL.
+        (arb_style(), arb_style(), arb_style(), arb_style()),
+        any::<bool>(),
     )
-        .prop_map(|(t, d, m, dv, f, (rl, rd, ra, rc))| {
+        .prop_map(|(t, d, m, dv, f, (rl, rd, ra, rc), dup_using)| {
             let rel_styles = vec![rl, rd, ra, rc];
             let mut styles = Vec::new();
             styles.extend(&t);
@@ -416,8 +451,29 @@ fn arb_names() -> impl Strategy<Value = Names> {
                     .map(|(s, stem)| s.apply(stem))
                     .collect(),
                 styles,
+                dup_using,
             }
         })
+}
+
+/// A second spelling of relationship name `rel` that names the SAME
+/// relationship: its ASCII case flipped, delimiters and non-ASCII untouched.
+fn case_flipped(rel: &str) -> String {
+    let up = rel.to_ascii_uppercase();
+    if up == rel {
+        rel.to_ascii_lowercase()
+    } else {
+        up
+    }
+}
+
+/// The `USING` list a role-naming metric declares for relationship `rel`.
+fn using_list(rel: &str, dup_using: bool) -> Vec<String> {
+    if dup_using {
+        vec![rel.to_string(), case_flipped(rel)]
+    } else {
+        vec![rel.to_string()]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -807,7 +863,7 @@ fn build_def(names: &Names, chain: Option<&Chain>) -> SemanticViewDefinition {
         .enumerate()
         .map(|(i, bm)| Metric {
             name: names.mets[i].clone(),
-            expr: bm.expr.to_string(),
+            expr: bm.expr.replace(ALT_FACT, &names.facts[F_ALT]),
             source_table: Some(
                 match bm.grain {
                     Grain::Child => "li",
@@ -816,8 +872,8 @@ fn build_def(names: &Names, chain: Option<&Chain>) -> SemanticViewDefinition {
                 .to_string(),
             ),
             using_relationships: match bm.role {
-                Some(Role::Dep) => vec![names.rels[1].clone()],
-                Some(Role::Arr) => vec![names.rels[2].clone()],
+                Some(Role::Dep) => using_list(&names.rels[1], names.dup_using),
+                Some(Role::Arr) => using_list(&names.rels[2], names.dup_using),
                 None => vec![],
             },
             ..Default::default()
@@ -1536,6 +1592,233 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
+// (e) Relationship declaration order
+// ---------------------------------------------------------------------------
+//
+// The role-playing pair `r_dep` / `r_arr` is two relationships to ONE table,
+// and nothing in a semantic view's meaning depends on which was declared
+// first. So swapping their declaration order must leave every accepted answer
+// unchanged, and must not turn an accepted query into a rejected one or back.
+// A member that binds to "whichever relationship comes first" — the silent
+// wrong-role class the role-playing fences exist for — fails this without
+// anyone knowing which role was right.
+//
+// The case draws from the base metrics plus three extra shapes, a window
+// metric over any of them, and either cardinality for the pair:
+//
+// - `ap_alt_raw` / `ap_alt_fact`: a metric declared ON the role-played table
+//   with no `USING` (it cannot have one — a `USING` relationship must start at
+//   the metric's own table). Under `ManyToOne` the fan-trap fence rejects it;
+//   under `OneToOne` only the role-playing fence stands between it and the
+//   first-declared role (PR #247 review);
+// - `o_any_alt`: a base-table metric over the role-played FACT with no `USING`
+//   (the TECH-DEBT #69 fence);
+// - `win`: `SUM(inner) OVER ()` partitioned by every queried dimension, over
+//   any of the above — a qualified metric whose inner aggregate carries the
+//   `USING` (PR #247 review: no scoped join was emitted for it). Partitioned by
+//   every queried dimension, each partition is one group, so the window must
+//   also equal its inner metric queried directly.
+
+/// Extra metric shapes property (e) adds to [`build_def`]'s, after the base
+/// metrics: `(name, expr, source table)`.
+const ORDER_EXTRAS: [(&str, &str, &str); 3] = [
+    ("ap_alt_raw", "SUM(ap.alt)", "ap"),
+    ("ap_alt_fact", "SUM({alt})", "ap"),
+    ("o_any_alt", "SUM({alt})", "o"),
+];
+/// The window metric's name in property (e).
+const WIN: &str = "win";
+
+#[derive(Debug, Clone)]
+struct OrderCase {
+    names: Names,
+    data: Data,
+    /// Declare the role-playing pair `OneToOne` (else `ManyToOne`).
+    one_to_one: bool,
+    /// Indices into the metric pool: `0..BASE_METRICS.len()` are the base
+    /// metrics, then [`ORDER_EXTRAS`]. Ignored when `window` is set.
+    metrics: Vec<usize>,
+    /// Query only `win`, over this pool index.
+    window: Option<usize>,
+    dims: Vec<usize>,
+    pred: Option<Pred>,
+}
+
+const ORDER_POOL: usize = BASE_METRICS.len() + ORDER_EXTRAS.len();
+
+fn pool_name(names: &Names, i: usize) -> String {
+    if i < BASE_METRICS.len() {
+        names.mets[i].clone()
+    } else {
+        ORDER_EXTRAS[i - BASE_METRICS.len()].0.to_string()
+    }
+}
+
+/// Whether pool metric `i` reaches the role-played table at all.
+fn pool_reaches_role_played(i: usize) -> bool {
+    i >= BASE_METRICS.len() || BASE_METRICS[i].role.is_some()
+}
+
+fn arb_order_case() -> impl Strategy<Value = OrderCase> {
+    // Biased toward the pool members that reach the role-played table: the
+    // rest cannot depend on declaration order and are there as controls.
+    let role_side: Vec<usize> = (0..ORDER_POOL)
+        .filter(|&i| pool_reaches_role_played(i))
+        .collect();
+    let pick = prop_oneof![
+        3 => prop::sample::select(role_side),
+        1 => 0..ORDER_POOL,
+    ];
+    (
+        arb_names(),
+        arb_data(),
+        any::<bool>(),
+        prop::collection::vec(pick.clone(), 1..=3),
+        prop::option::weighted(0.35, pick),
+        prop::collection::vec(any::<bool>(), 3),
+        prop::option::weighted(0.5, arb_pred(false)),
+    )
+        .prop_map(
+            |(names, data, one_to_one, metrics, window, dim_mask, pred)| {
+                let mut dims = Vec::new();
+                if dim_mask[0] {
+                    dims.push(D_REGION);
+                }
+                if dim_mask[1] {
+                    dims.push(D_CNAME);
+                }
+                if dim_mask[2] {
+                    dims.push(D_CITY);
+                }
+                OrderCase {
+                    names,
+                    data,
+                    one_to_one,
+                    metrics,
+                    window,
+                    dims,
+                    pred,
+                }
+            },
+        )
+}
+
+/// [`build_def`] plus property (e)'s extras, with the role-playing pair at the
+/// given cardinality and, when `swapped`, declared in the other order.
+fn build_order_def(case: &OrderCase, swapped: bool) -> SemanticViewDefinition {
+    let names = &case.names;
+    let mut def = build_def(names, None);
+    for (name, expr, table) in ORDER_EXTRAS {
+        def.metrics.push(Metric {
+            name: name.to_string(),
+            expr: expr.replace(ALT_FACT, &names.facts[F_ALT]),
+            source_table: Some(table.to_string()),
+            ..Default::default()
+        });
+    }
+    if let Some(inner) = case.window {
+        let inner = pool_name(names, inner);
+        def.metrics.push(Metric {
+            name: WIN.to_string(),
+            expr: format!("SUM({inner}) OVER ()"),
+            source_table: Some("o".to_string()),
+            window_spec: Some(semantic_views::model::WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: inner,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+    if case.one_to_one {
+        def.joins[1].cardinality = Cardinality::OneToOne;
+        def.joins[2].cardinality = Cardinality::OneToOne;
+    }
+    if swapped {
+        def.joins.swap(1, 2);
+    }
+    def
+}
+
+/// One query's rows as an order-independent canonical string. Its `ncols`
+/// output columns are renamed positionally (`c0…`), so two queries whose last
+/// column is a different member render alike when their values agree.
+fn render_rows(sql: &str, ncols: usize, conn: &duckdb::Connection) -> Result<String, String> {
+    let cols = (0..ncols)
+        .map(|i| format!("c{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let wrapped = format!(
+        "SELECT COALESCE(string_agg(s, ' | ' ORDER BY s), '<empty>') \
+         FROM (SELECT CAST(t AS VARCHAR) AS s FROM ({sql}) t({cols}))"
+    );
+    conn.query_row(&wrapped, [], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("query failed: {e}\nSQL:\n{sql}"))
+}
+
+fn check_order(case: &OrderCase) -> Result<(), String> {
+    let names = &case.names;
+    let metrics: Vec<String> = match case.window {
+        Some(_) => vec![WIN.to_string()],
+        None => case.metrics.iter().map(|&i| pool_name(names, i)).collect(),
+    };
+    let req = request(names, &case.dims, &metrics, &[], case.pred.as_ref());
+    let first = expand("mm", &build_order_def(case, false), &req);
+    let second = expand("mm", &build_order_def(case, true), &req);
+    let (sql_a, sql_b) = match (first, second) {
+        (Err(_), Err(_)) => return Ok(()),
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            return Err(format!(
+                "declaration order decided acceptance:\nAS DECLARED: {a:?}\nSWAPPED: {b:?}"
+            ))
+        }
+    };
+    let conn = make_db(names, &case.data, "");
+    let ncols = case.dims.len() + metrics.len();
+    let a = render_rows(&sql_a, ncols, &conn)?;
+    let b = render_rows(&sql_b, ncols, &conn)?;
+    if a != b {
+        return Err(format!(
+            "swapping the role-playing relationships' declaration order changed the \
+             answer\nAS DECLARED: {a}\nSWAPPED:     {b}\nSQL (as declared):\n{sql_a}\n\
+             SQL (swapped):\n{sql_b}"
+        ));
+    }
+    // The window partitions by every queried dimension, so each partition is
+    // one group: it must equal its inner metric queried directly.
+    if let Some(inner) = case.window {
+        let inner_name = pool_name(names, inner);
+        let req_inner = request(names, &case.dims, &[inner_name], &[], case.pred.as_ref());
+        let sql_i = expand("mm", &build_order_def(case, false), &req_inner)
+            .map_err(|e| format!("the window was accepted but its inner metric was not: {e}"))?;
+        let i = render_rows(&sql_i, ncols, &conn)?;
+        if a != i {
+            return Err(format!(
+                "SUM(inner) OVER (every queried dimension) differs from inner\n\
+                 WINDOW: {a}\nINNER:  {i}\nWINDOW SQL:\n{sql_a}\nINNER SQL:\n{sql_i}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(192))]
+
+    /// (e) Declaration-order invariance. Swapping the declaration order of the
+    /// two relationships to the role-played table must not change which
+    /// requests are accepted, nor any accepted answer; and a window metric
+    /// partitioned by every queried dimension must equal its inner metric.
+    #[test]
+    fn relationship_declaration_order_is_invisible(case in arb_order_case()) {
+        if let Err(msg) = check_order(&case) {
+            prop_assert!(false, "{}", msg);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Anti-vacuity guards
 // ---------------------------------------------------------------------------
 
@@ -1754,6 +2037,147 @@ fn generator_produces_hostile_identifiers() {
         quoted_table >= 128,
         "only {quoted_table}/256 cases used a quoted physical table name"
     );
+
+    // MM-2 (TECH-DEBT #70): a quoted name on the ROLE-PLAYING pair, in a case
+    // that actually names a role — the only place a relationship name reaches
+    // an emitted scoped alias. Held to bare/upper while the defect was open.
+    let quoted_role = cases
+        .iter()
+        .filter(|c| match c.role {
+            Some(Role::Dep) => c.names.rels[1].contains('"'),
+            Some(Role::Arr) => c.names.rels[2].contains('"'),
+            None => false,
+        })
+        .count();
+    assert!(
+        quoted_role >= 16,
+        "only {quoted_role}/256 role-naming cases used a quoted relationship name"
+    );
+}
+
+/// MM-1 (TECH-DEBT #69): the `USING` metrics over the role-played FACT must be
+/// picked by the generators, or the fix has no randomized coverage — they sit
+/// at the end of [`BASE_METRICS`], behind the `take(3)` cut-off of the
+/// metric masks.
+#[test]
+fn generator_reaches_the_role_played_fact() {
+    let alt = |i: usize| BASE_METRICS[i].expr.contains(ALT_FACT);
+    let cases = sample(&arb_algebra_case(), 256);
+    let in_chain = cases
+        .iter()
+        .filter(|c| c.chain.leaves(c.chain.target).into_iter().any(alt))
+        .count();
+    assert!(
+        in_chain >= 16,
+        "only {in_chain}/256 algebra chains reached a role-played-fact metric"
+    );
+    let grouped = cases
+        .iter()
+        .filter(|c| c.groups_by_role_played && c.chain.leaves(c.chain.target).into_iter().any(alt))
+        .count();
+    assert!(
+        grouped >= 4,
+        "only {grouped}/256 algebra cases grouped a role-played-fact metric by its role's dimension"
+    );
+
+    let rollups = sample(&arb_rollup_case(), 256);
+    let r_alt = rollups
+        .iter()
+        .filter(|c| c.metrics.iter().any(|&i| alt(i)))
+        .count();
+    assert!(
+        r_alt >= 16,
+        "only {r_alt}/256 roll-up cases queried a role-played-fact metric"
+    );
+}
+
+/// PR #247 review: the duplicate-spelling `USING` axis must be drawn on the
+/// cases that name a role, or the dedup fix has no randomized coverage.
+#[test]
+fn generator_varies_the_using_spellings() {
+    let cases = sample(&arb_algebra_case(), 256);
+    let dup = cases
+        .iter()
+        .filter(|c| c.role.is_some() && c.names.dup_using)
+        .count();
+    assert!(
+        dup >= 16,
+        "only {dup}/256 role-naming algebra cases spelled USING twice"
+    );
+    let rollups = sample(&arb_rollup_case(), 256);
+    let r_dup = rollups
+        .iter()
+        .filter(|c| c.names.dup_using && c.metrics.iter().any(|&i| BASE_METRICS[i].role.is_some()))
+        .count();
+    assert!(
+        r_dup >= 16,
+        "only {r_dup}/256 roll-up cases queried a role metric with USING spelled twice"
+    );
+}
+
+/// Property (e) must actually reach the cells it exists for — and get them
+/// ACCEPTED, since an answer only depends on declaration order once it is
+/// computed: a window over a role-scoped inner metric, a metric on the
+/// role-played table under `OneToOne` (where no fan trap stands in front of the
+/// role-playing fence), and a plain role-scoped metric.
+#[test]
+fn generator_reaches_the_declaration_order_cells() {
+    let cases = sample(&arb_order_case(), 256);
+    let accepted = |c: &OrderCase| {
+        let metrics: Vec<String> = match c.window {
+            Some(_) => vec![WIN.to_string()],
+            None => c.metrics.iter().map(|&i| pool_name(&c.names, i)).collect(),
+        };
+        let req = request(&c.names, &c.dims, &metrics, &[], c.pred.as_ref());
+        expand("mm", &build_order_def(c, false), &req).is_ok()
+    };
+    let is_role_metric = |i: usize| i < BASE_METRICS.len() && BASE_METRICS[i].role.is_some();
+    let win_role = cases
+        .iter()
+        .filter(|c| c.window.is_some_and(is_role_metric) && accepted(c))
+        .count();
+    assert!(
+        win_role >= 16,
+        "only {win_role}/256 accepted cases put a window over a USING metric"
+    );
+    let win_role_fact = cases
+        .iter()
+        .filter(|c| {
+            c.window
+                .is_some_and(|i| is_role_metric(i) && BASE_METRICS[i].expr.contains(ALT_FACT))
+                && accepted(c)
+        })
+        .count();
+    assert!(
+        win_role_fact >= 4,
+        "only {win_role_fact}/256 accepted cases put a window over a USING metric \
+         over the role-played fact"
+    );
+    let on_ap =
+        |i: usize| i >= BASE_METRICS.len() && ORDER_EXTRAS[i - BASE_METRICS.len()].2 == "ap";
+    let ap_one_to_one = cases
+        .iter()
+        .filter(|c| {
+            c.one_to_one
+                && (c.window.is_some_and(on_ap)
+                    || (c.window.is_none() && c.metrics.iter().copied().any(on_ap)))
+        })
+        .count();
+    assert!(
+        ap_one_to_one >= 16,
+        "only {ap_one_to_one}/256 cases queried a metric on the role-played table \
+         under OneToOne"
+    );
+    let plain_role = cases
+        .iter()
+        .filter(|c| {
+            c.window.is_none() && c.metrics.iter().copied().any(is_role_metric) && accepted(c)
+        })
+        .count();
+    assert!(
+        plain_role >= 16,
+        "only {plain_role}/256 accepted cases queried a role-scoped metric directly"
+    );
 }
 
 /// PBT-13: `where_clause` is never pinned at `None` here, and both sides of the
@@ -1896,6 +2320,7 @@ fn fixed_names() -> Names {
         facts: FACT_STEMS.iter().map(ToString::to_string).collect(),
         rels: REL_STEMS.iter().map(ToString::to_string).collect(),
         styles,
+        dup_using: false,
     }
 }
 
@@ -1918,7 +2343,6 @@ fn fixed_names() -> Names {
 /// sibling that is *not* broken is a DIMENSION on the role-played table, whose
 /// expression IS rewritten; only the inlined fact text is missed.
 #[test]
-#[ignore = "MM-1: fact inlining does not apply the role-playing scoped-alias rewrite"]
 fn mm1_role_playing_metric_over_a_fact_on_the_role_played_table() {
     let names = fixed_names();
     let mut def = build_def(&names, None);
@@ -1958,7 +2382,6 @@ fn mm1_role_playing_metric_over_a_fact_on_the_role_played_table() {
 /// relationship names from `arb_stored_ident()` (RT-5) — but only for the
 /// render/parse round-trip, never on a path that emits a scoped alias.
 #[test]
-#[ignore = "MM-2: a quoted relationship name produces an unparseable scoped join alias"]
 fn mm2_role_playing_with_a_quoted_relationship_name() {
     let mut names = fixed_names();
     names.rels[1] = "\"de p\"".to_string();
