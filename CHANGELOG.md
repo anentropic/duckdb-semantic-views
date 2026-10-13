@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose type changes after `CREATE`. A member whose source table or column no longer exists
   reports an empty `data_type` instead of making the whole command fail. The cross-view forms
   (`SHOW SEMANTIC METRICS` without `IN`) take about a millisecond or two longer per view.
+  Cancelling one of these commands (Ctrl-C, `interrupt()`, an ADBC cancel) stops the type
+  lookup promptly with an `INTERRUPT` error, rather than once every view has been typed.
 - **`SHOW SEMANTIC DIMENSIONS FOR METRIC` marks a window metric's dimensions `required` however
   they are spelled.** A dimension named in the window's `ORDER BY` or `PARTITION BY [EXCLUDING]`
   as `alias.name` (`ORDER BY s.placed`) or quoted in a different case (`ORDER BY "PLACED"`) was

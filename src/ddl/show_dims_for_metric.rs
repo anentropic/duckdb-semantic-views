@@ -148,14 +148,12 @@ unsafe fn show_dims_for_metric(
 
     let alias_map = def.alias_to_table_map();
     // TECH-DEBT #51: probe the dimensions' types on this bind's connection.
-    let types = unsafe {
-        crate::query::member_types::infer_member_types_on(
-            borrowed.as_raw(),
-            &view_name,
-            &def,
-            crate::query::member_types::Wanted::DIMENSIONS,
-        )
-    };
+    let types = crate::ddl::read_ffi::member_types_for_bind(
+        borrowed,
+        &view_name,
+        &def,
+        crate::query::member_types::Wanted::DIMENSIONS,
+    )?;
     let mut rows: Vec<(Vec<String>, bool)> = if def.joins.is_empty() {
         def.dimensions
             .iter()

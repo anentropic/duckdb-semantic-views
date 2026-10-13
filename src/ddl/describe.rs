@@ -71,14 +71,12 @@ unsafe fn describe_view_rows(
     let base_table = def.base_table().to_string();
     // TECH-DEBT #51: DATA_TYPE rows report each member's type as probed now,
     // on this bind's connection (see `query::member_types`).
-    let types = unsafe {
-        crate::query::member_types::infer_member_types_on(
-            borrowed.as_raw(),
-            &name,
-            &def,
-            crate::query::member_types::Wanted::ALL,
-        )
-    };
+    let types = crate::ddl::read_ffi::member_types_for_bind(
+        borrowed,
+        &name,
+        &def,
+        crate::query::member_types::Wanted::ALL,
+    )?;
 
     let mut internal: Vec<DescribeRow> = Vec::new();
     if let Some(ref comment) = def.comment {

@@ -451,9 +451,10 @@ fn check(case: &Case) -> Result<usize, TestCaseError> {
     }
     let broken = broken_by_drop(case);
 
-    let types = infer_member_types("v", &def, Wanted::ALL, &mut |sql| unsafe {
+    let types = infer_member_types("v", &def, Wanted::ALL, &|| false, &mut |sql| unsafe {
         probe_output_types(db.conn, sql)
-    });
+    })
+    .expect("nothing cancels this call");
 
     // Property 1: every member reports its independently computed type, or
     // nothing when its source column was dropped.

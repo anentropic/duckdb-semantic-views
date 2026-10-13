@@ -71,14 +71,12 @@ unsafe fn show_columns_rows(
         .ok_or_else(|| crate::catalog::view_not_found_msg(&view.to_string()))?;
     let def = SemanticViewDefinition::from_json(&view_name, &json)?;
     // TECH-DEBT #51: probe each column's type on this bind's connection.
-    let types = unsafe {
-        crate::query::member_types::infer_member_types_on(
-            borrowed.as_raw(),
-            &view_name,
-            &def,
-            crate::query::member_types::Wanted::ALL,
-        )
-    };
+    let types = crate::ddl::read_ffi::member_types_for_bind(
+        borrowed,
+        &view_name,
+        &def,
+        crate::query::member_types::Wanted::ALL,
+    )?;
     let rows: Vec<Vec<String>> = collect_column_rows(&def, &view_name, &types)
         .into_iter()
         .map(|r| {

@@ -29,11 +29,11 @@
 use crate::catalog::CatalogReader;
 use crate::ddl::describe::format_json_array;
 use crate::ddl::read_ffi::{
-    probe_catalog_table_present, read_str_arg, run_dispatcher, serialize_varchar_rows,
-    BorrowedConnection,
+    member_types_for_bind, probe_catalog_table_present, read_str_arg, run_dispatcher,
+    serialize_varchar_rows, BorrowedConnection,
 };
 use crate::model::SemanticViewDefinition;
-use crate::query::member_types::{infer_member_types_on, MemberTypes, Wanted};
+use crate::query::member_types::{MemberTypes, Wanted};
 
 /// Which entity slice of a definition a SHOW command reports on.
 #[derive(Clone, Copy)]
@@ -55,14 +55,15 @@ impl EntityKind {
 }
 
 /// Probe the reported types of `kind`'s members of `def` on this bind's
-/// connection (TECH-DEBT #51).
+/// connection (TECH-DEBT #51). Errs only when the caller was cancelled, which
+/// ends the whole listing rather than moving on to the next view.
 fn probe_types(
     kind: EntityKind,
     borrowed: &BorrowedConnection,
     view_name: &str,
     def: &SemanticViewDefinition,
-) -> MemberTypes {
-    unsafe { infer_member_types_on(borrowed.as_raw(), view_name, def, kind.wanted()) }
+) -> Result<MemberTypes, String> {
+    member_types_for_bind(borrowed, view_name, def, kind.wanted())
 }
 
 /// A single 8-column row of `SHOW SEMANTIC {DIMENSIONS,METRICS,FACTS}` output.
@@ -186,7 +187,7 @@ fn show_entities_all(kind: EntityKind, borrowed: &BorrowedConnection) -> Result<
         let Ok(def) = SemanticViewDefinition::from_json(name, json) else {
             continue;
         };
-        let types = probe_types(kind, borrowed, name, &def);
+        let types = probe_types(kind, borrowed, name, &def)?;
         for r in collect_entities(kind, name, &def, &types) {
             rows.push(r.into_cells());
         }
@@ -218,7 +219,7 @@ fn show_entities_one(
     // for this specific view, so a corrupt definition must surface loudly
     // instead of silently returning zero rows.
     let def = SemanticViewDefinition::from_json(&view_name, &json)?;
-    let types = probe_types(kind, borrowed, &view_name, &def);
+    let types = probe_types(kind, borrowed, &view_name, &def)?;
     let mut internal = collect_entities(kind, &view_name, &def, &types);
     internal.sort_by(|a, b| a.name.cmp(&b.name));
     let rows: Vec<Vec<String>> = internal.into_iter().map(EntityRow::into_cells).collect();

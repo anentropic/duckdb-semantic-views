@@ -46,6 +46,18 @@
 //! if it carries one). SHOW / DESCRIBE never fail because a member cannot be
 //! typed; querying that member still reports the binder error.
 //!
+//! # Cancellation
+//!
+//! The one failure that is not swallowed. The probes run on the bind's own
+//! connection, whose interrupt flag a cancel of the caller does not set, so
+//! the caller's state is passed in (`cancelled`) and consulted before every
+//! probe, and a probe the engine reports as interrupted
+//! ([`ProbeError::Interrupted`]) is a cancellation, not an untypable member.
+//! Either way typing stops at once with [`Interrupted`] — no fallback probes,
+//! no further views — and the C++ bind helpers raise the caller's INTERRUPT.
+//! They also forward the caller's flag into the probe connection while the
+//! dispatcher runs, which is what stops a probe that is already binding.
+//!
 //! # PRIVATE members
 //!
 //! A PRIVATE fact or metric cannot be requested, but it still has a type, and
@@ -112,6 +124,29 @@ pub struct ProbedColumn {
     pub data_type: String,
 }
 
+/// Why a probe yielded no columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeError {
+    /// The caller cancelled the command. Typing stops and the cancellation is
+    /// reported, never mistaken for an untypable member.
+    Interrupted,
+    /// Anything else: the members it was probing stay untyped.
+    Failed(String),
+}
+
+/// Typing stopped because the caller cancelled the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Interrupted;
+
+impl From<Interrupted> for String {
+    /// `DuckDB`'s own interrupt text. The C++ bind helpers raise a bare
+    /// `InterruptException` for a cancelled caller ahead of this message; it
+    /// only reaches the user if the probe connection alone was interrupted.
+    fn from(_: Interrupted) -> Self {
+        "Interrupted!".to_string()
+    }
+}
+
 /// The probed type of each member of one view, keyed by the member's stored
 /// name. A member that could not be typed is absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -150,14 +185,23 @@ fn pick(probed: Option<&String>, declared: Option<&String>) -> String {
 /// them and handing the expanded SQL to `probe`, which returns the declared
 /// output columns of a statement (see [`probe_output_types`]).
 ///
-/// Never fails: a member whose type cannot be established is left out of the
-/// result. See the module docs for the batching strategy and its cost.
+/// A member whose type cannot be established is left out of the result; that
+/// is never an error. The one error is cancellation: `cancelled` is consulted
+/// before every probe, and a probe that reports [`ProbeError::Interrupted`]
+/// stops typing too, so a cancelled caller gets `Err(Interrupted)` promptly
+/// instead of every remaining probe running. See the module docs for the
+/// batching strategy and its cost.
+///
+/// # Errors
+///
+/// [`Interrupted`] when the caller cancelled while typing was in progress.
 pub fn infer_member_types(
     view_name: &str,
     def: &SemanticViewDefinition,
     wanted: Wanted,
-    probe: &mut dyn FnMut(&str) -> Result<Vec<ProbedColumn>, String>,
-) -> MemberTypes {
+    cancelled: &dyn Fn() -> bool,
+    probe: &mut dyn FnMut(&str) -> Result<Vec<ProbedColumn>, ProbeError>,
+) -> Result<MemberTypes, Interrupted> {
     // PRIVATE members are typed too: probe a copy in which nothing is private.
     let mut def = def.clone();
     for m in &mut def.metrics {
@@ -171,7 +215,11 @@ pub fn infer_member_types(
     // depend on the role, so such members are retried on a copy that keeps
     // one relationship per role-played pair.
     let one_role = single_role_copy(&def);
-    let mut prober = Prober { view_name, probe };
+    let mut prober = Prober {
+        view_name,
+        cancelled,
+        probe,
+    };
     let mut out = MemberTypes::default();
 
     if wanted.dimensions {
@@ -180,8 +228,8 @@ pub fn infer_member_types(
             dimensions: n.to_vec(),
             ..Request::default()
         };
-        out.dimensions = prober.batch_then_each(&def, &names, build);
-        prober.retry_missing(one_role.as_ref(), &names, &mut out.dimensions, build);
+        out.dimensions = prober.batch_then_each(&def, &names, build)?;
+        prober.retry_missing(one_role.as_ref(), &names, &mut out.dimensions, build)?;
     }
     if wanted.facts {
         let names: Vec<String> = def.facts.iter().map(|f| f.name.clone()).collect();
@@ -189,8 +237,8 @@ pub fn infer_member_types(
             facts: n.to_vec(),
             ..Request::default()
         };
-        out.facts = prober.batch_then_each(&def, &names, build);
-        prober.retry_missing(one_role.as_ref(), &names, &mut out.facts, build);
+        out.facts = prober.batch_then_each(&def, &names, build)?;
+        prober.retry_missing(one_role.as_ref(), &names, &mut out.facts, build)?;
     }
     if wanted.metrics {
         let (window, plain): (Vec<_>, Vec<_>) =
@@ -200,8 +248,8 @@ pub fn infer_member_types(
             metrics: n.to_vec(),
             ..Request::default()
         };
-        out.metrics = prober.batch_then_each(&def, &names, build);
-        prober.retry_missing(one_role.as_ref(), &names, &mut out.metrics, build);
+        out.metrics = prober.batch_then_each(&def, &names, build)?;
+        prober.retry_missing(one_role.as_ref(), &names, &mut out.metrics, build)?;
         // A window metric needs the dimensions its spec names; it has no
         // shape it can be queried in alone, so it is always probed singly.
         for m in window {
@@ -211,14 +259,14 @@ pub fn infer_member_types(
                     metrics: vec![m.name.clone()],
                     facts: Vec::new(),
                 };
-                if let Some(t) = prober.run(d, &req).and_then(|mut t| t.pop()) {
+                if let Some(t) = prober.run(d, &req)?.and_then(|mut t| t.pop()) {
                     out.metrics.insert(m.name.clone(), t);
                     break;
                 }
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// A copy of `def` keeping only the first-declared relationship between each
@@ -257,7 +305,8 @@ struct Request {
 
 struct Prober<'a, 'p> {
     view_name: &'a str,
-    probe: &'p mut dyn FnMut(&str) -> Result<Vec<ProbedColumn>, String>,
+    cancelled: &'p dyn Fn() -> bool,
+    probe: &'p mut dyn FnMut(&str) -> Result<Vec<ProbedColumn>, ProbeError>,
 }
 
 impl Prober<'_, '_> {
@@ -268,27 +317,27 @@ impl Prober<'_, '_> {
         def: &SemanticViewDefinition,
         names: &[String],
         build: impl Fn(&[String]) -> Request,
-    ) -> HashMap<String, String> {
+    ) -> Result<HashMap<String, String>, Interrupted> {
         let mut out = HashMap::new();
         if names.is_empty() {
-            return out;
+            return Ok(out);
         }
-        if let Some(types) = self.run(def, &build(names)) {
+        if let Some(types) = self.run(def, &build(names))? {
             out.extend(names.iter().cloned().zip(types));
-            return out;
+            return Ok(out);
         }
         if names.len() == 1 {
-            return out;
+            return Ok(out);
         }
         for n in names {
             if let Some(t) = self
-                .run(def, &build(std::slice::from_ref(n)))
+                .run(def, &build(std::slice::from_ref(n)))?
                 .and_then(|mut t| t.pop())
             {
                 out.insert(n.clone(), t);
             }
         }
-        out
+        Ok(out)
     }
 
     /// Probe each of `names` still missing from `out` on its own against
@@ -299,28 +348,37 @@ impl Prober<'_, '_> {
         names: &[String],
         out: &mut HashMap<String, String>,
         build: impl Fn(&[String]) -> Request,
-    ) {
+    ) -> Result<(), Interrupted> {
         let Some(def) = def else {
-            return;
+            return Ok(());
         };
         for n in names {
             if out.contains_key(n) {
                 continue;
             }
             if let Some(t) = self
-                .run(def, &build(std::slice::from_ref(n)))
+                .run(def, &build(std::slice::from_ref(n)))?
                 .and_then(|mut t| t.pop())
             {
                 out.insert(n.clone(), t);
             }
         }
+        Ok(())
     }
 
     /// Expand and probe `req`; return the types of its wanted members (the
     /// trailing metrics / facts, or all dimensions when there are neither), in
-    /// request order. `None` when the request does not expand, does not bind,
-    /// or returns columns that do not line up with the request.
-    fn run(&mut self, def: &SemanticViewDefinition, req: &Request) -> Option<Vec<String>> {
+    /// request order. `Ok(None)` when the request does not expand, does not
+    /// bind, or returns columns that do not line up with the request;
+    /// `Err(Interrupted)` when the caller has cancelled.
+    fn run(
+        &mut self,
+        def: &SemanticViewDefinition,
+        req: &Request,
+    ) -> Result<Option<Vec<String>>, Interrupted> {
+        if (self.cancelled)() {
+            return Err(Interrupted);
+        }
         let query = QueryRequest {
             dimensions: req
                 .dimensions
@@ -335,8 +393,14 @@ impl Prober<'_, '_> {
             facts: req.facts.iter().map(|n| FactName::new(n.clone())).collect(),
             where_clause: None,
         };
-        let sql = expand(self.view_name, def, &query).ok()?;
-        let cols = (self.probe)(&format!("{sql} LIMIT 0")).ok()?;
+        let Ok(sql) = expand(self.view_name, def, &query) else {
+            return Ok(None);
+        };
+        let cols = match (self.probe)(&format!("{sql} LIMIT 0")) {
+            Ok(cols) => cols,
+            Err(ProbeError::Interrupted) => return Err(Interrupted),
+            Err(ProbeError::Failed(_)) => return Ok(None),
+        };
         // Output order is the request order: dimensions, then metrics or facts.
         let expected: Vec<&String> = req
             .dimensions
@@ -350,14 +414,16 @@ impl Prober<'_, '_> {
                 .zip(&expected)
                 .all(|(c, n)| crate::ident::ident_matches(n, &c.name))
         {
-            return None;
+            return Ok(None);
         }
         let wanted = if req.metrics.is_empty() && req.facts.is_empty() {
             0
         } else {
             req.dimensions.len()
         };
-        Some(cols.into_iter().skip(wanted).map(|c| c.data_type).collect())
+        Ok(Some(
+            cols.into_iter().skip(wanted).map(|c| c.data_type).collect(),
+        ))
     }
 }
 
@@ -373,8 +439,16 @@ impl Prober<'_, '_> {
 pub unsafe fn probe_output_types(
     conn: ffi::duckdb_connection,
     expanded_sql: &str,
-) -> Result<Vec<ProbedColumn>, String> {
-    let (names, ids) = crate::query::raw_sql::infer_schema_raw(conn, expanded_sql)?;
+) -> Result<Vec<ProbedColumn>, ProbeError> {
+    let classify = |e: crate::query::raw_sql::RawSqlError| {
+        if e.interrupted {
+            ProbeError::Interrupted
+        } else {
+            ProbeError::Failed(e.message)
+        }
+    };
+    let (names, ids) =
+        crate::query::raw_sql::infer_schema_raw(conn, expanded_sql).map_err(classify)?;
     let mut types: Vec<Option<String>> = ids
         .iter()
         .map(|&id| crate::query::wire::declared_type_name(id).map(str::to_string))
@@ -382,13 +456,14 @@ pub unsafe fn probe_output_types(
     if types.iter().any(Option::is_none) {
         // DECIMAL / LIST: `semantic_view()` declares the probed logical type
         // itself, so read its full spelling.
-        let described = crate::query::raw_sql::describe_column_types(conn, expanded_sql)?;
+        let described =
+            crate::query::raw_sql::describe_column_types(conn, expanded_sql).map_err(classify)?;
         if described.len() != types.len() {
-            return Err(format!(
+            return Err(ProbeError::Failed(format!(
                 "DESCRIBE returned {} columns, the probe {}",
                 described.len(),
                 types.len()
-            ));
+            )));
         }
         for (t, d) in types.iter_mut().zip(described) {
             if t.is_none() {
@@ -407,18 +482,25 @@ pub unsafe fn probe_output_types(
 }
 
 /// [`infer_member_types`] probing on `conn` via [`probe_output_types`].
+/// `cancelled` reports whether the command's caller has been cancelled (the
+/// extension passes the bind caller's interrupt flag).
 ///
 /// # Safety
 ///
 /// `conn` must be a valid, non-null `duckdb_connection` handle for the whole
 /// call.
+///
+/// # Errors
+///
+/// [`Interrupted`] when the caller cancelled while typing was in progress.
 pub unsafe fn infer_member_types_on(
     conn: ffi::duckdb_connection,
     view_name: &str,
     def: &SemanticViewDefinition,
     wanted: Wanted,
-) -> MemberTypes {
-    infer_member_types(view_name, def, wanted, &mut |sql| unsafe {
+    cancelled: &dyn Fn() -> bool,
+) -> Result<MemberTypes, Interrupted> {
+    infer_member_types(view_name, def, wanted, cancelled, &mut |sql| unsafe {
         probe_output_types(conn, sql)
     })
 }
@@ -459,7 +541,17 @@ mod tests {
     }
 
     fn types_on(db: &RawDb, def: &SemanticViewDefinition, wanted: Wanted) -> MemberTypes {
-        unsafe { infer_member_types_on(db.conn, "v", def, wanted) }
+        unsafe { infer_member_types_on(db.conn, "v", def, wanted, &|| false) }
+            .expect("nothing cancels this call")
+    }
+
+    /// [`infer_member_types`] for a caller that is never cancelled.
+    fn infer(
+        def: &SemanticViewDefinition,
+        wanted: Wanted,
+        probe: &mut dyn FnMut(&str) -> Result<Vec<ProbedColumn>, ProbeError>,
+    ) -> MemberTypes {
+        infer_member_types("v", def, wanted, &|| false, probe).expect("nothing cancels this call")
     }
 
     const ORDERS: &[&str] = &[
@@ -542,7 +634,7 @@ mod tests {
         ];
         for (expr, want, own) in cases {
             let got = unsafe { probe_output_types(db.conn, &format!("SELECT {expr} AS c")) }
-                .unwrap_or_else(|e| panic!("probe of {expr} failed: {e}"));
+                .unwrap_or_else(|e| panic!("probe of {expr} failed: {e:?}"));
             assert_eq!(
                 got,
                 vec![ProbedColumn {
@@ -561,7 +653,7 @@ mod tests {
 
     /// Read the single VARCHAR cell of `sql`.
     unsafe fn probe_typeof(db: &RawDb, sql: &str) -> String {
-        let mut result = crate::query::raw_sql::execute_sql_raw(db.conn, sql).expect("typeof");
+        let mut result = crate::query::raw_sql::execute_sql_checked(db.conn, sql).expect("typeof");
         let chunk = ffi::duckdb_result_get_chunk(result, 0);
         let v = crate::query::raw_sql::read_varchar_from_vector(chunk, 0, 0);
         ffi::duckdb_destroy_data_chunk(&mut { chunk });
@@ -686,7 +778,7 @@ mod tests {
              METRICS (o.m1 AS SUM(o.qty), o.m2 AS COUNT(*), o.m3 AS AVG(o.score))",
         );
         let mut calls = 0usize;
-        let t = infer_member_types("v", &def, Wanted::ALL, &mut |sql| {
+        let t = infer(&def, Wanted::ALL, &mut |sql| {
             calls += 1;
             unsafe { probe_output_types(db.conn, sql) }
         });
@@ -696,7 +788,7 @@ mod tests {
         assert_eq!(t.fact("f2", None), "DECIMAL(10,2)");
 
         let mut calls = 0usize;
-        let _ = infer_member_types("v", &def, Wanted::DIMENSIONS, &mut |sql| {
+        let _ = infer(&def, Wanted::DIMENSIONS, &mut |sql| {
             calls += 1;
             unsafe { probe_output_types(db.conn, sql) }
         });
@@ -713,7 +805,7 @@ mod tests {
              DIMENSIONS (o.d1 AS o.region, o.d2 AS o.nope, o.d3 AS o.qty)",
         );
         let mut calls = 0usize;
-        let t = infer_member_types("v", &def, Wanted::DIMENSIONS, &mut |sql| {
+        let t = infer(&def, Wanted::DIMENSIONS, &mut |sql| {
             calls += 1;
             unsafe { probe_output_types(db.conn, sql) }
         });
@@ -731,7 +823,7 @@ mod tests {
             "AS TABLES (o AS orders PRIMARY KEY (id))
              DIMENSIONS (o.d1 AS o.region, o.d2 AS o.qty)",
         );
-        let t = infer_member_types("v", &def, Wanted::DIMENSIONS, &mut |_sql| {
+        let t = infer(&def, Wanted::DIMENSIONS, &mut |_sql| {
             Ok(vec![ProbedColumn {
                 name: "something_else".to_string(),
                 data_type: "INTEGER".to_string(),
@@ -786,5 +878,104 @@ mod tests {
         assert_eq!(t.metric("departures", None), "BIGINT");
         assert_eq!(t.metric("arrivals", None), "BIGINT");
         assert_eq!(t.metric("total_dist", None), "DOUBLE");
+    }
+
+    // ---- Cancellation (PR #248 review) --------------------------------------
+    //
+    // SHOW / DESCRIBE probe on the bind's own connection, whose interrupt flag
+    // nothing sets when the *caller* is cancelled. Typing must therefore stop
+    // on the caller's word, and a probe the engine itself reports as
+    // interrupted must stop it too — never be filed as "type unknown" and
+    // followed by every remaining fallback probe.
+
+    const CANCEL_VIEW: &str = "AS TABLES (o AS orders PRIMARY KEY (id))
+         FACTS (o.f1 AS o.qty)
+         DIMENSIONS (o.d1 AS o.region, o.d2 AS o.nope, o.d3 AS o.qty)
+         METRICS (o.m1 AS SUM(o.qty))";
+
+    /// A probe reporting an interrupt ends typing with `Interrupted`, after
+    /// that one probe: no per-member fallback, no further member kinds.
+    #[test]
+    fn an_interrupted_probe_stops_typing_and_is_reported() {
+        let def = def_from(CANCEL_VIEW);
+        let mut calls = 0usize;
+        let got = infer_member_types("v", &def, Wanted::ALL, &|| false, &mut |_sql| {
+            calls += 1;
+            Err(ProbeError::Interrupted)
+        });
+        assert_eq!(got, Err(Interrupted));
+        assert_eq!(calls, 1, "nothing is probed after the interrupt");
+    }
+
+    /// The caller's cancellation is consulted before every probe, so a cancel
+    /// that lands between probes stops the next one from running.
+    #[test]
+    fn a_cancelled_caller_stops_typing_before_the_next_probe() {
+        let db = db(ORDERS);
+        let def = def_from(CANCEL_VIEW);
+        let calls = std::cell::Cell::new(0usize);
+        // Cancelled as soon as the first probe has run (the dimension batch,
+        // which fails on `o.nope` and would otherwise fall back per member).
+        let cancelled = || calls.get() >= 1;
+        let got = infer_member_types("v", &def, Wanted::ALL, &cancelled, &mut |sql| {
+            calls.set(calls.get() + 1);
+            unsafe { probe_output_types(db.conn, sql) }
+        });
+        assert_eq!(got, Err(Interrupted));
+        assert_eq!(calls.get(), 1, "the cancel is seen before the second probe");
+
+        let calls = std::cell::Cell::new(0usize);
+        let got = infer_member_types("v", &def, Wanted::ALL, &|| true, &mut |_sql| {
+            calls.set(calls.get() + 1);
+            Ok(Vec::new())
+        });
+        assert_eq!(got, Err(Interrupted));
+        assert_eq!(calls.get(), 0, "an already-cancelled caller probes nothing");
+    }
+
+    /// Ordinary probe failures are still per-member and never end typing,
+    /// however many there are.
+    #[test]
+    fn ordinary_probe_failures_do_not_end_typing() {
+        let def = def_from(CANCEL_VIEW);
+        let mut calls = 0usize;
+        let got = infer_member_types("v", &def, Wanted::ALL, &|| false, &mut |_sql| {
+            calls += 1;
+            Err(ProbeError::Failed("Binder Error: nope".to_string()))
+        });
+        assert_eq!(got, Ok(MemberTypes::default()));
+        // dims: batch + 3 singles; facts: 1; metrics: 1.
+        assert_eq!(calls, 4 + 1 + 1, "every fallback probe still runs");
+    }
+
+    /// A probe the engine interrupts is classified as `Interrupted`, not as an
+    /// ordinary failure. The interrupt is fired repeatedly from another thread
+    /// until the statement returns, so it lands after the statement has reset
+    /// the connection's flag however the threads are scheduled.
+    #[test]
+    fn an_engine_interrupt_is_classified_as_interrupted() {
+        struct SendConn(ffi::duckdb_connection);
+        // SAFETY: `duckdb_interrupt` is the C API's cross-thread cancel entry
+        // point; the handle outlives the interrupter (joined below).
+        unsafe impl Send for SendConn {}
+
+        let db = db(&[]);
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let conn = SendConn(db.conn);
+        let stop = std::sync::Arc::clone(&done);
+        let interrupter = std::thread::spawn(move || {
+            let conn = conn;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                unsafe { ffi::duckdb_interrupt(conn.0) };
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        // Runs for minutes unless interrupted.
+        let got = unsafe {
+            probe_output_types(db.conn, "SELECT sum(i) AS s FROM range(1000000000000) t(i)")
+        };
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        interrupter.join().expect("interrupter thread");
+        assert_eq!(got, Err(ProbeError::Interrupted));
     }
 }

@@ -308,5 +308,5 @@ pub(crate) unsafe fn try_infer_schema(
     borrowed: &crate::ddl::read_ffi::BorrowedConnection,
     sql: &str,
 ) -> Result<(Vec<String>, Vec<ffi::duckdb_type>), String> {
-    super::raw_sql::infer_schema_raw(borrowed.as_raw(), sql)
+    super::raw_sql::infer_schema_raw(borrowed.as_raw(), sql).map_err(String::from)
 }

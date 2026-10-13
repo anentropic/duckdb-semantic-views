@@ -13,6 +13,21 @@ use std::ffi::{CStr, CString};
 
 use libduckdb_sys as ffi;
 
+/// A failed statement: `DuckDB`'s error text, and whether `DuckDB` classified
+/// the failure as an interrupt (`DUCKDB_ERROR_INTERRUPT`), so a caller that
+/// otherwise tolerates failures can still tell a cancellation apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawSqlError {
+    pub message: String,
+    pub interrupted: bool,
+}
+
+impl From<RawSqlError> for String {
+    fn from(e: RawSqlError) -> Self {
+        e.message
+    }
+}
+
 /// Execute a SQL string via the `DuckDB` C API and return the result.
 ///
 /// The caller is responsible for calling `duckdb_destroy_result` on the returned
@@ -21,22 +36,44 @@ use libduckdb_sys as ffi;
 /// # Safety
 ///
 /// `conn` must be a valid, non-null `duckdb_connection` handle.
+// Its remaining callers are the `extension`-gated query paths.
+#[cfg_attr(not(feature = "extension"), allow(dead_code))]
 pub(crate) unsafe fn execute_sql_raw(
     conn: ffi::duckdb_connection,
     sql: &str,
 ) -> Result<ffi::duckdb_result, String> {
-    let sql_cstr = CString::new(sql).map_err(|e| e.to_string())?;
+    Ok(execute_sql_checked(conn, sql)?)
+}
+
+/// [`execute_sql_raw`], keeping the failure's error class.
+///
+/// # Safety
+///
+/// `conn` must be a valid, non-null `duckdb_connection` handle.
+pub(crate) unsafe fn execute_sql_checked(
+    conn: ffi::duckdb_connection,
+    sql: &str,
+) -> Result<ffi::duckdb_result, RawSqlError> {
+    let sql_cstr = CString::new(sql).map_err(|e| RawSqlError {
+        message: e.to_string(),
+        interrupted: false,
+    })?;
     let mut result: ffi::duckdb_result = std::mem::zeroed();
     let rc = ffi::duckdb_query(conn, sql_cstr.as_ptr(), &raw mut result);
     if rc != ffi::DuckDBSuccess {
         let err_ptr = ffi::duckdb_result_error(&raw mut result);
-        let err_msg = if err_ptr.is_null() {
+        let message = if err_ptr.is_null() {
             "unknown error".to_string()
         } else {
             CStr::from_ptr(err_ptr).to_string_lossy().into_owned()
         };
+        let interrupted = ffi::duckdb_result_error_type(&raw mut result)
+            == ffi::duckdb_error_type_DUCKDB_ERROR_INTERRUPT;
         ffi::duckdb_destroy_result(&raw mut result);
-        return Err(err_msg);
+        return Err(RawSqlError {
+            message,
+            interrupted,
+        });
     }
     Ok(result)
 }
@@ -44,8 +81,8 @@ pub(crate) unsafe fn execute_sql_raw(
 /// Infer the output column names and C-API type ids of `sql` by executing it.
 ///
 /// The caller supplies a cheap statement (the query path appends `LIMIT 0`).
-/// Returns `Err(msg)` with `DuckDB`'s own error text when the statement fails
-/// to bind or run; callers decide whether that is fatal (`semantic_view()`) or
+/// Returns `Err` with `DuckDB`'s own error text (and its interrupt class) when
+/// the statement fails to bind or run; callers decide whether that is fatal (`semantic_view()`) or
 /// a per-member "type unknown" (the member-type probe).
 ///
 /// # Safety
@@ -54,8 +91,8 @@ pub(crate) unsafe fn execute_sql_raw(
 pub(crate) unsafe fn infer_schema_raw(
     conn: ffi::duckdb_connection,
     sql: &str,
-) -> Result<(Vec<String>, Vec<ffi::duckdb_type>), String> {
-    let mut result = execute_sql_raw(conn, sql)?;
+) -> Result<(Vec<String>, Vec<ffi::duckdb_type>), RawSqlError> {
+    let mut result = execute_sql_checked(conn, sql)?;
 
     // idx_t (u64) column count; `unwrap_or(0)` avoids a 32-bit truncation cast.
     let col_count = usize::try_from(ffi::duckdb_column_count(&raw mut result)).unwrap_or(0);
@@ -95,10 +132,10 @@ pub(crate) unsafe fn infer_schema_raw(
 pub(crate) unsafe fn describe_column_types(
     conn: ffi::duckdb_connection,
     sql: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, RawSqlError> {
     // `DESCRIBE <query>` output: column_name, column_type, null, key, default,
     // extra. Wrapping in a subquery keeps a leading `WITH` legal.
-    let mut result = execute_sql_raw(
+    let mut result = execute_sql_checked(
         conn,
         &format!("DESCRIBE SELECT * FROM ({sql}) __sv_describe"),
     )?;
