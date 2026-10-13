@@ -645,6 +645,8 @@ COUNT(*) on a joined table requires a PRIMARY KEY
 
 **Cause:** A queried metric (directly, via a derived metric, or as a window metric's inner aggregate) is ``COUNT(*)`` on a table other than the base table. Generated joins are ``LEFT JOIN``\ s, so ``COUNT(*)`` would also count the NULL-extended row produced for each base row with no match -- silently inflating the result. The expansion protects against this by rewriting ``COUNT(*)`` to ``COUNT(<first primary key column>)`` for non-base source tables, which requires the table to declare a ``PRIMARY KEY``.
 
+Since v0.13.1 a metric is normally aggregated from its own table, where there are no NULL-extended rows, so this error is rare: it is raised only for the query shapes that still use a base-table ``LEFT JOIN`` (for example a dimension with no source table in a definition stored by an older version).
+
 **Fix:** Declare ``PRIMARY KEY (<cols>)`` for the metric's source table in the ``TABLES`` clause, or define the metric as ``COUNT(<alias>.<column>)`` over a NOT NULL column.
 
 

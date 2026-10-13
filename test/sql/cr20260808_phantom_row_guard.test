@@ -16,6 +16,15 @@
 # its first failing statement, so N cases here yield only one observed red) in
 # src/expand/tests_phantom_row_guard.rs, plus randomized coverage in
 # tests/child_grain_proptest.rs.
+#
+# Since TECH-DEBT #71, a METRIC query is aggregated from each metric's own home
+# table, so on that path no phantom row exists: a childless parent simply has
+# no row (EXP-25 / EXP-26 below), or a NULL child value when a parent-grain
+# metric brings its row in. The guard (`facts::guard_aggregate_args`) still runs
+# and is still load-bearing on the paths that stay base-anchored (TECH-DEBT
+# #78); those are pinned by the unit tests, since this DDL shape no longer
+# reaches them. The FACTS and dimensions-only paths (EXP-28 / EXP-29) are
+# unchanged and still filter the phantom row.
 
 require semantic_views
 
@@ -57,15 +66,17 @@ CREATE SEMANTIC VIEW cr0808_sales AS
     li.max_one AS MAX(1),
     li.s_coalesce AS SUM(COALESCE(li.qty, 99)),
     li.s_parent AS SUM(orate),
-    li.s_qty AS SUM(li.qty)
+    li.s_qty AS SUM(li.qty),
+    o.n_orders AS COUNT(o.id)
   );
 
 # ============================================================
 # EXP-25: the constant-argument fence leaked three ways.
 #
-# Grouped by region, the childless North order has NO line items, so every
-# line-item metric must report the empty-group value: 0 for COUNT, NULL for
-# MIN/MAX. Before the fix each returned 1 -- the phantom row.
+# Grouped by region, the childless North order has NO line items. Before
+# EXP-25 each metric returned 1 for North -- the phantom row; from EXP-25 until
+# #71 the base-anchored query returned the empty-group values `North 0 0 0
+# NULL NULL`. Home-anchored, North has no line-item row and so no result row.
 # ============================================================
 
 query TIIIII rowsort
@@ -77,14 +88,27 @@ FROM semantic_view(
 );
 ----
 East	2	1	2	1	1
-North	0	0	0	NULL	NULL
+
+# Brought in by an order-grain metric, North's line-item metrics are all NULL
+# -- COUNT included (no COALESCE to 0), matching Snowflake. Never 1.
+query TIIIIII rowsort
+SELECT region, n_orders, n_star, n_distinct_one, n_expr, min_one, max_one
+FROM semantic_view(
+  'cr0808_sales',
+  dimensions := ['region'],
+  metrics := ['n_orders', 'n_star', 'n_distinct_one', 'n_expr', 'min_one', 'max_one']
+);
+----
+East	1	2	1	2	1	1
+North	1	NULL	NULL	NULL	NULL	NULL
 
 # ============================================================
 # EXP-26: NULL-insensitive arguments that are not constants at all.
 #
 # SUM(COALESCE(li.qty, 99)) returned 99 for the childless order (the phantom's
 # NULL qty fired the fallback); SUM(orate) -- a line-item-grain metric reaching
-# a fact on the PARENT table -- returned the parent's own rate, 5.
+# a fact on the PARENT table -- returned the parent's own rate, 5. Until #71 the
+# fixed answer was `North NULL NULL`; home-anchored, North has no row.
 # ============================================================
 
 query TII rowsort
@@ -96,7 +120,18 @@ FROM semantic_view(
 );
 ----
 East	5	20
-North	NULL	NULL
+
+# With an order-grain metric alongside: NULL, never 99 or 5.
+query TIII rowsort
+SELECT region, n_orders, s_coalesce, s_parent
+FROM semantic_view(
+  'cr0808_sales',
+  dimensions := ['region'],
+  metrics := ['n_orders', 's_coalesce', 's_parent']
+);
+----
+East	1	5	20
+North	1	NULL	NULL
 
 # Ungrouped, the cross-table fact reference totalled 25 (20 real + the
 # childless order's 5) where 20 is correct.
@@ -164,10 +199,13 @@ East	3
 North	NULL
 
 # ============================================================
-# The no-PRIMARY-KEY case stays a loud error rather than a silent number: with
-# no PK on the child there is no column that tells a phantom row from a real
-# one, so a constant-argument aggregate cannot be guarded at all. MIN(1) joined
-# that family in EXP-25.
+# A child table with no PRIMARY KEY. On the base-anchored path there is no
+# column that tells a phantom row from a real one, so a constant-argument
+# aggregate cannot be guarded and the query errors (MIN(1) joined that family
+# in EXP-25). Since #71 the metric is aggregated from its own home table, which
+# has no phantom rows, so it needs no key: MIN(1) over two real items is 1.
+# The error itself is still pinned on the base-anchored fallback by
+# `expand::tests_phantom_row_guard::no_pk_child_min_constant_errors_loudly`.
 # ============================================================
 
 statement ok
@@ -187,13 +225,17 @@ CREATE SEMANTIC VIEW cr0808_nopk AS
     li.s_qty AS SUM(li.qty)
   );
 
-statement error
+query I
 SELECT * FROM semantic_view('cr0808_nopk', metrics := ['min_one']);
 ----
-has no PRIMARY KEY declared
+1
 
-# An unguardable-by-construction metric does not poison its neighbours: a plain
-# column aggregate on the same PK-less table still answers.
+query TI rowsort
+SELECT * FROM semantic_view('cr0808_nopk', dimensions := ['region'], metrics := ['min_one']);
+----
+East	1
+
+# A plain column aggregate on the same PK-less table answers too.
 query I
 SELECT s_qty FROM semantic_view('cr0808_nopk', metrics := ['s_qty']);
 ----

@@ -190,7 +190,7 @@ fn joined_definition() -> SemanticViewDefinition {
             },
             Metric {
                 name: "customer_count".to_string(),
-                expr: "count(DISTINCT customer_id)".to_string(),
+                expr: "count(DISTINCT customers.id)".to_string(),
                 source_table: Some("customers".to_string()),
                 output_type: None,
                 using_relationships: vec![],
@@ -202,7 +202,7 @@ fn joined_definition() -> SemanticViewDefinition {
             },
             Metric {
                 name: "product_count".to_string(),
-                expr: "count(DISTINCT product_id)".to_string(),
+                expr: "count(DISTINCT products.id)".to_string(),
                 source_table: Some("products".to_string()),
                 output_type: None,
                 using_relationships: vec![],
@@ -214,6 +214,11 @@ fn joined_definition() -> SemanticViewDefinition {
             },
         ],
 
+        // `customer_count` / `product_count` count their OWN table's key. They
+        // counted `orders.customer_id` / `orders.product_id` — a column of the
+        // base table, which bound only while every metric was aggregated over
+        // the base-anchored join. Each is now computed from its own table
+        // (TECH-DEBT #71), where that column does not exist.
         joins: vec![
             // OneToOne so the fan-trap safety check passes for every generated
             // request — this property tests join *exclusion*, not cardinality.

@@ -1,0 +1,151 @@
+# D1 / TECH-DEBT #71: every metric is aggregated from its OWN home table.
+#
+# This is the DuckDB reproduction of the Snowflake fixture Anentropic ran on
+# 2026-10-13 (`d1-snowflake-fixture.sql`); every grid below is Snowflake's
+# answer, copied cell for cell. The model is customers <- orders <- line_items
+# (each arrow many-to-one), and the data deliberately contains:
+#   * a customer with NO orders                (APAC, c_id 3)
+#   * an order with NO line items              (order 12, customer US)
+#   * an order whose customer FK is NULL       (order 13, an "orphan")
+#   * a line item whose order FK is NULL       (item 103, qty 40, an "orphan")
+#
+# What Snowflake settles, and what each query pins:
+#   * an orphan child row IS counted, under a NULL dimension value (Q1, Q3, Q5;
+#     Q4's 225 includes orphan order 13);
+#   * a child metric queried alone gives NO row for a childless parent (Q1 has no
+#     US / APAC row, Q5 no order 12 / 13);
+#   * a childless parent's child COUNT is NULL, not 0, when a parent-grain
+#     metric brings its row in (Q2, Q6);
+#   * co-querying never changes a metric's value (Q1 == Q2, Q5 == Q6 on the
+#     shared columns).
+#
+# Before #71, Q1 / Q3 / Q5 were base-anchored (`FROM c LEFT JOIN o LEFT JOIN
+# li`): the orphan item vanished (Q3 gave 3 / 6), and every childless parent
+# reported a COUNT of 0 (Q1 gave US 0 and APAC 0). Q2 / Q4 / Q6 were already
+# computed per grain, so the same metrics gave different numbers depending on
+# their companions. Q7 / Q8 of the fixture are the standard-SQL `AGG()` form,
+# which this extension does not have yet.
+#
+# The member expressions are written table-qualified (`o.o_id`, not `o_id`):
+# Snowflake resolves a bare column against the member's own table, while this
+# extension splices the expression into a FROM that may also join a table with
+# a same-named column (`o_id` is on both `o` and `li`). The semantics under test
+# are unaffected.
+#
+# Each red query was also confirmed red on its own (one query per scratch file)
+# against the pre-#71 build; the unit twins in `src/expand/tests_home_anchoring.rs`
+# report independently.
+
+require semantic_views
+
+statement ok
+CREATE TABLE d1_customers (c_id INT, region VARCHAR);
+
+statement ok
+CREATE TABLE d1_orders (o_id INT, c_id INT, amount DECIMAL(10,2));
+
+statement ok
+CREATE TABLE d1_line_items (li_id INT, o_id INT, qty INT);
+
+statement ok
+INSERT INTO d1_customers VALUES (1, 'EU'), (2, 'US'), (3, 'APAC');
+
+statement ok
+INSERT INTO d1_orders VALUES (10, 1, 100), (11, 1, 50), (12, 2, 70), (13, NULL, 5);
+
+statement ok
+INSERT INTO d1_line_items VALUES (100, 10, 1), (101, 10, 2), (102, 11, 3), (103, NULL, 40);
+
+statement ok
+CREATE SEMANTIC VIEW d1_sv AS
+  TABLES (
+    c  AS d1_customers  PRIMARY KEY (c_id),
+    o  AS d1_orders     PRIMARY KEY (o_id),
+    li AS d1_line_items PRIMARY KEY (li_id)
+  )
+  RELATIONSHIPS (
+    o_to_c  AS o(c_id)  REFERENCES c,
+    li_to_o AS li(o_id) REFERENCES o
+  )
+  DIMENSIONS (
+    c.cust_region AS c.region,
+    o.order_id    AS o.o_id
+  )
+  METRICS (
+    c.n_customers  AS COUNT(c.c_id),
+    o.n_orders     AS COUNT(o.o_id),
+    o.total_amount AS SUM(o.amount),
+    li.n_items     AS COUNT(li.li_id),
+    li.n_items_all AS COUNT(*),
+    li.total_qty   AS SUM(li.qty)
+  );
+
+# Q1: child metrics alone, by a grandparent dimension. The orphan item is a
+# NULL-region row; US and APAC have no line items and so no row.
+query TIII
+SELECT * FROM semantic_view('d1_sv', dimensions := ['cust_region'],
+                            metrics := ['n_items', 'n_items_all', 'total_qty'])
+ORDER BY cust_region NULLS LAST;
+----
+EU	3	3	6
+NULL	1	1	40
+
+# Q2: the same child metrics co-queried with a customer-grain metric. Identical
+# child values to Q1; US and APAC appear only because n_customers brings them,
+# and their child metrics are NULL (not 0).
+query TIIII
+SELECT * FROM semantic_view('d1_sv', dimensions := ['cust_region'],
+                            metrics := ['n_customers', 'n_items', 'n_items_all', 'total_qty'])
+ORDER BY cust_region NULLS LAST;
+----
+APAC	1	NULL	NULL	NULL
+EU	1	3	3	6
+US	1	NULL	NULL	NULL
+NULL	NULL	1	1	40
+
+# Q3: grand totals. 46, not 6: the orphan item is counted.
+query II
+SELECT * FROM semantic_view('d1_sv', metrics := ['n_items', 'total_qty']);
+----
+4	46
+
+# Q4: with an order-grain metric alongside. 225 includes orphan order 13.
+query RII
+SELECT * FROM semantic_view('d1_sv', metrics := ['total_amount', 'n_items', 'total_qty']);
+----
+225.00	4	46
+
+# Q5: by the parent dimension. Orders 12 and 13 have no items, so no row; the
+# orphan item is the NULL order_id row.
+query III
+SELECT * FROM semantic_view('d1_sv', dimensions := ['order_id'],
+                            metrics := ['n_items', 'total_qty'])
+ORDER BY order_id NULLS LAST;
+----
+10	2	3
+11	1	3
+NULL	1	40
+
+# Q6: with an order-grain metric alongside. Same child values as Q5.
+query IIII
+SELECT * FROM semantic_view('d1_sv', dimensions := ['order_id'],
+                            metrics := ['n_orders', 'n_items', 'total_qty'])
+ORDER BY order_id NULLS LAST;
+----
+10	1	2	3
+11	1	1	3
+12	1	NULL	NULL
+13	1	NULL	NULL
+NULL	NULL	1	40
+
+statement ok
+DROP SEMANTIC VIEW d1_sv;
+
+statement ok
+DROP TABLE d1_line_items;
+
+statement ok
+DROP TABLE d1_orders;
+
+statement ok
+DROP TABLE d1_customers;

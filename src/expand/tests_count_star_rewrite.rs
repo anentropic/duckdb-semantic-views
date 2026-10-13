@@ -19,10 +19,28 @@ fn child_count_def() -> crate::model::SemanticViewDefinition {
         .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"])
 }
 
+/// A request that still takes the BASE-ANCHORED path for a child metric: the
+/// dimension `region` is unqualified (no source table, as only YAML / legacy
+/// JSON can declare it), and an unqualified expression would rebind if the FROM
+/// moved, so the query is not re-anchored at the metric's home table
+/// (TECH-DEBT #71 residual, TECH-DEBT #78). This is where the SG-8 no-PK error
+/// is still reachable, so the error tests below use it; every QUALIFIED
+/// request is anchored at `li` itself, where `COUNT(*)` needs no key.
+fn fallback_req() -> QueryRequest {
+    QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![DimensionName::new("region")],
+        metrics: vec![MetricName::new("item_count")],
+    }
+}
+
 #[test]
 fn test_child_count_star_rewritten_exact_sql() {
-    // SG-8: COUNT(*) on the LEFT-JOINed child must count the child's
-    // PK, not NULL-extended rows (one per childless order).
+    // TECH-DEBT #71: a child metric is anchored at its OWN table, so there is
+    // no NULL-extended row to fence and the query is a plain scan. The SG-8
+    // rewrite to `COUNT(<pk>)` still happens (it runs at resolution, before the
+    // anchor is chosen) and is neutral here: a declared PK is non-NULL.
     let def = child_count_def();
     let req = QueryRequest {
         where_clause: None,
@@ -34,8 +52,7 @@ fn test_child_count_star_rewritten_exact_sql() {
     let expected = "\
 SELECT
     COUNT(\"li\".\"id\") AS \"item_count\"
-FROM \"orders\" AS \"orders\"
-LEFT JOIN \"line_items\" AS \"li\" ON \"li\".\"order_id\" = \"orders\".\"id\"";
+FROM \"line_items\" AS \"li\"";
     assert_eq!(sql, expected);
 }
 
@@ -99,15 +116,18 @@ fn test_child_count_star_without_pk_errors() {
         .clear_dimensions()
         .clear_metrics()
         .with_table("li", "line_items", &[]) // no PK declared
+        .with_dimension("region", "region", None)
         .with_metric("item_count", "COUNT(*)", Some("li"))
         .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
-    let req = QueryRequest {
-        where_clause: None,
-        facts: vec![],
-        dimensions: vec![],
-        metrics: vec![MetricName::new("item_count")],
-    };
-    let err = expand("orders", &def, &req).unwrap_err();
+    // Anchored at `li` itself (TECH-DEBT #71) there is no NULL-extended row,
+    // so a qualified request needs no PK and counts every child row.
+    let sql = expand("orders", &def, &count_req()).expect("home-anchored COUNT(*) needs no PK");
+    assert_eq!(
+        sql,
+        "SELECT\n    COUNT(*) AS \"item_count\"\nFROM \"line_items\" AS \"li\""
+    );
+    // On the base-anchored fallback the rewrite is still impossible.
+    let err = expand("orders", &def, &fallback_req()).unwrap_err();
     match &err {
         ExpandError::CountStarRequiresPrimaryKey {
             view_name,
@@ -154,13 +174,16 @@ fn test_derived_metric_reaching_no_pk_count_star_errors() {
         .clear_dimensions()
         .clear_metrics()
         .with_table("li", "line_items", &[]) // no PK declared
+        .with_dimension("region", "region", None)
         .with_metric("item_count", "COUNT(*)", Some("li"))
         .with_metric("double_items", "item_count * 2", None)
         .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
+    // The base-anchored fallback (see `fallback_req`): the unqualified
+    // dimension keeps the query off the home-anchored path.
     let req = QueryRequest {
         where_clause: None,
         facts: vec![],
-        dimensions: vec![],
+        dimensions: vec![DimensionName::new("region")],
         metrics: vec![MetricName::new("double_items")],
     };
     let err = expand("orders", &def, &req).unwrap_err();
@@ -436,22 +459,27 @@ fn test_a_non_constant_paren_expression_is_not_misread_as_constant() {
         orders_view()
             .clear_dimensions()
             .clear_metrics()
+            .with_dimension("region", "region", None)
             .with_table("li", "line_items", &[]) // no PK declared
             .with_metric("item_count", expr, Some("li"))
             .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"])
     };
+    // On the base-anchored fallback, where the no-PK classification runs.
     let sql = expand(
         "orders",
         &no_pk("SUM((\"li\".\"qty\") + (1))"),
-        &count_req(),
+        &fallback_req(),
     )
     .expect("a row-dependent argument needs no PK");
     assert!(
         !sql.contains("CASE WHEN"),
         "there is no PK to guard with: {sql}"
     );
-    // …while the genuinely parenthesized constant still trips the no-PK error.
-    let err = expand("orders", &no_pk("SUM(( ( 1 ) ))"), &count_req())
+    // …while the genuinely parenthesized constant still trips the no-PK error
+    // on the base-anchored fallback (home-anchored it needs no PK at all).
+    expand("orders", &no_pk("SUM(( ( 1 ) ))"), &count_req())
+        .expect("home-anchored, a constant argument needs no PK");
+    let err = expand("orders", &no_pk("SUM(( ( 1 ) ))"), &fallback_req())
         .expect_err("a constant argument with no PK is unguardable");
     assert!(
         matches!(err, ExpandError::CountStarRequiresPrimaryKey { .. }),
@@ -467,9 +495,13 @@ fn test_child_count_one_without_a_pk_errors() {
         .clear_dimensions()
         .clear_metrics()
         .with_table("li", "line_items", &[]) // no PK declared
+        .with_dimension("region", "region", None)
         .with_metric("item_count", "COUNT(1)", Some("li"))
         .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"]);
-    let err = expand("orders", &def, &count_req()).unwrap_err();
+    // Home-anchored (TECH-DEBT #71) it needs no PK; on the base-anchored
+    // fallback it still cannot be guarded.
+    expand("orders", &def, &count_req()).expect("home-anchored COUNT(1) needs no PK");
+    let err = expand("orders", &def, &fallback_req()).unwrap_err();
     assert!(
         matches!(
             err,

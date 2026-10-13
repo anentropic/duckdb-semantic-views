@@ -66,11 +66,16 @@
 //!   (TECH-DEBT #70, fixed — now live, and the role-playing pair's relationship
 //!   names are drawn from all five identifier styles like every other name)
 //! - **MM-3** — [`mm3_metric_value_changes_when_co_queried_across_grains`]
+//!   (TECH-DEBT #71, fixed — now live: every metric is aggregated from its own
+//!   home table, so (a) and (b) range over metric sets mixing both grains)
 //! - **MM-4** — [`mm4_childless_parent_manufactures_a_null_group_under_a_child_dimension`]
+//!   (fixed by the same change — now live, and (d) groups by the child
+//!   dimension on metric requests)
 //!
-//! The three live properties are scoped away from the still-open cells
-//! (single-grain metric sets for (a)/(b); parent-side grouping for (d)) so the
-//! harness lands green and the findings stay visible.
+//! Every live property now ranges over the cells those findings had fenced
+//! off; the one remaining scope is (d)'s FACTS requests, which keep the
+//! base-anchored row path and so never group by the child dimension
+//! (TECH-DEBT #67, residual (3)).
 
 use std::collections::BTreeSet;
 
@@ -595,11 +600,13 @@ impl Chain {
     }
 }
 
-/// Build a chain whose leaves all sit at one grain and (when `single_role` is
-/// set) all name the same relationship.
-fn arb_chain(grain: Grain, single_role: Option<Role>) -> impl Strategy<Value = Chain> {
+/// Build a chain whose leaves all sit at `grain` — or, with `None`, at EITHER
+/// grain, so one derived metric can span both (the per-grain decomposition,
+/// unreachable here until TECH-DEBT #71) — and (when `single_role` is set) all
+/// name the same relationship.
+fn arb_chain(grain: Option<Grain>, single_role: Option<Role>) -> impl Strategy<Value = Chain> {
     let pool: Vec<usize> = (0..BASE_METRICS.len())
-        .filter(|&i| BASE_METRICS[i].grain == grain)
+        .filter(|&i| grain.is_none_or(|g| BASE_METRICS[i].grain == g))
         .filter(|&i| match single_role {
             Some(r) => BASE_METRICS[i].role == Some(r),
             None => true,
@@ -1132,7 +1139,8 @@ struct AlgebraCase {
     /// Set when the case groups by the role-played table's dimension, so the
     /// scoped join alias is what the numbers depend on.
     groups_by_role_played: bool,
-    grain: Grain,
+    /// The leaves' grain; `None` lets them mix both (TECH-DEBT #71).
+    grain: Option<Grain>,
     role: Option<Role>,
 }
 
@@ -1140,7 +1148,9 @@ fn arb_algebra_case() -> impl Strategy<Value = AlgebraCase> {
     (
         arb_names(),
         arb_data(),
-        prop::sample::select(vec![Grain::Child, Grain::Base]),
+        // `None` mixes both grains in one chain. These cases were excluded while
+        // a metric's value depended on its companions (MM-3, TECH-DEBT #71).
+        prop::sample::select(vec![Some(Grain::Child), Some(Grain::Base), None]),
         // A role is forced 40% of the time; that is the branch that can group by
         // the role-played table's dimension at all.
         prop::option::weighted(0.4, prop::sample::select(vec![Role::Dep, Role::Arr])),
@@ -1161,7 +1171,7 @@ fn arb_algebra_case() -> impl Strategy<Value = AlgebraCase> {
                     // A dimension on the child table forces the query to the
                     // child grain; a base-grain metric alongside it is a fan
                     // trap (refused by design), so it is only offered there.
-                    if dim_mask[2] && grain == Grain::Child {
+                    if dim_mask[2] && grain == Some(Grain::Child) {
                         dims.push(D_LQTY);
                     }
                     // The role-played dimension: legal exactly when every
@@ -1174,8 +1184,8 @@ fn arb_algebra_case() -> impl Strategy<Value = AlgebraCase> {
                     // A child-side predicate needs the child edge joined, which
                     // a base-grain metric cannot tolerate.
                     let pred = match (&pred_seed, grain) {
-                        (Some(p), Grain::Child) => Some(p.clone()),
-                        (Some(p), Grain::Base) if !p.touches_child() => Some(p.clone()),
+                        (Some(p), Some(Grain::Child)) => Some(p.clone()),
+                        (Some(p), _) if !p.touches_child() => Some(p.clone()),
                         _ => None,
                     };
                     AlgebraCase {
@@ -1256,15 +1266,22 @@ fn check_algebra(case: &AlgebraCase) -> Result<(), String> {
     };
     let recomputed = case.chain.recompute(target, &col_of);
 
-    let mut missing = vec!["q_t.p_t IS NULL".to_string()];
+    // Row presence. The derived query must have a row for every key ANY
+    // component has (and no other), because a derived metric spanning grains is
+    // assembled by a FULL OUTER merge of the grains' blocks. A component with no
+    // row at a key — a child metric at a childless parent's key — contributes
+    // NULL there, exactly as it does inside the derived query (Snowflake, D1:
+    // a childless parent's child metric is NULL, never 0). Within one grain
+    // every component has the same row set, so this reduces to "all present".
+    let mut none_present: Vec<String> = Vec::new();
     for n in 0..leaves.len() {
-        missing.push(format!("q_{n}.p_{n} IS NULL"));
+        none_present.push(format!("q_{n}.p_{n} IS NULL"));
     }
 
     let cmp = format!(
-        "WITH {} SELECT count(*) FROM keys{joins} WHERE ({}) OR {}",
+        "WITH {} SELECT count(*) FROM keys{joins} WHERE q_t.p_t IS NULL OR ({}) OR {}",
         ctes.join(", "),
-        missing.join(" OR "),
+        none_present.join(" AND "),
         differs("q_t.v_t", &recomputed)
     );
 
@@ -1289,10 +1306,11 @@ proptest! {
     /// applied to `m1 … mk` queried separately over the same dimensions and the
     /// same `where_clause`.
     ///
-    /// Scope: the leaf metrics share one grain. A derived metric whose leaves
-    /// span two grains takes the per-grain re-anchoring path, which changes a
-    /// component's own value — see
-    /// [`mm3_metric_value_changes_when_co_queried_across_grains`].
+    /// The leaves may span both grains (TECH-DEBT #71): a derived metric over a
+    /// child and a base metric is decomposed per grain, and each component must
+    /// keep the value it has queried alone. Until #71 that was false — see
+    /// [`mm3_metric_value_changes_when_co_queried_across_grains`] — so the leaves
+    /// were held to one grain.
     #[test]
     fn derived_metric_equals_its_components(case in arb_algebra_case()) {
         if let Err(msg) = check_algebra(&case) {
@@ -1314,14 +1332,15 @@ struct RollupCase {
     dims: Vec<usize>,
     pred: Option<Pred>,
     groups_by_role_played: bool,
-    grain: Grain,
+    /// The metrics' grain; `None` lets one request mix both (TECH-DEBT #71).
+    grain: Option<Grain>,
 }
 
 fn arb_rollup_case() -> impl Strategy<Value = RollupCase> {
     (
         arb_names(),
         arb_data(),
-        prop::sample::select(vec![Grain::Child, Grain::Base]),
+        prop::sample::select(vec![Some(Grain::Child), Some(Grain::Base), None]),
         prop::option::weighted(0.4, prop::sample::select(vec![Role::Dep, Role::Arr])),
         prop::collection::vec(any::<bool>(), 3),
         prop::option::weighted(0.6, arb_pred(true)),
@@ -1331,21 +1350,38 @@ fn arb_rollup_case() -> impl Strategy<Value = RollupCase> {
         .prop_map(
             |(names, data, grain, role, dim_mask, pred_seed, want_city, met_mask)| {
                 let eligible: Vec<usize> = (0..BASE_METRICS.len())
-                    .filter(|&i| BASE_METRICS[i].grain == grain)
+                    .filter(|&i| grain.is_none_or(|g| BASE_METRICS[i].grain == g))
                     .filter(|&i| match role {
                         Some(r) => BASE_METRICS[i].role == Some(r),
                         None => true,
                     })
                     .collect();
-                let mut metrics: Vec<usize> = eligible
-                    .iter()
-                    .copied()
-                    .filter(|&i| met_mask[i])
-                    .take(3)
-                    .collect();
-                if metrics.is_empty() {
-                    metrics.push(eligible[0]);
-                }
+                // A mixed request (`grain == None`) takes its picks from EACH
+                // grain separately, so it really spans both: the masked
+                // selection alone favours the child metrics, which come first.
+                let pick = |pool: Vec<usize>, n: usize| -> Vec<usize> {
+                    let mut out: Vec<usize> = pool
+                        .iter()
+                        .copied()
+                        .filter(|&i| met_mask[i])
+                        .take(n)
+                        .collect();
+                    if out.is_empty() {
+                        out.extend(pool.first().copied());
+                    }
+                    out
+                };
+                let metrics: Vec<usize> = match grain {
+                    Some(_) => pick(eligible.clone(), 3),
+                    None => {
+                        let (child, base): (Vec<usize>, Vec<usize>) = eligible
+                            .iter()
+                            .partition(|&&i| BASE_METRICS[i].grain == Grain::Child);
+                        let mut both = pick(child, 2);
+                        both.extend(pick(base, 2));
+                        both
+                    }
+                };
                 let mut dims = Vec::new();
                 if dim_mask[0] {
                     dims.push(D_REGION);
@@ -1353,7 +1389,7 @@ fn arb_rollup_case() -> impl Strategy<Value = RollupCase> {
                 if dim_mask[1] {
                     dims.push(D_CNAME);
                 }
-                if dim_mask[2] && grain == Grain::Child {
+                if dim_mask[2] && grain == Some(Grain::Child) {
                     dims.push(D_LQTY);
                 }
                 let groups_by_role_played = want_city && role.is_some();
@@ -1361,8 +1397,8 @@ fn arb_rollup_case() -> impl Strategy<Value = RollupCase> {
                     dims.push(D_CITY);
                 }
                 let pred = match (&pred_seed, grain) {
-                    (Some(p), Grain::Child) => Some(p.clone()),
-                    (Some(p), Grain::Base) if !p.touches_child() => Some(p.clone()),
+                    (Some(p), Some(Grain::Child)) => Some(p.clone()),
+                    (Some(p), _) if !p.touches_child() => Some(p.clone()),
                     _ => None,
                 };
                 RollupCase {
@@ -1470,7 +1506,7 @@ fn arb_phantom_case() -> impl Strategy<Value = PhantomCase> {
         arb_names(),
         arb_data(),
         prop::option::weighted(0.4, prop::sample::select(vec![Role::Dep, Role::Arr])),
-        prop::collection::vec(any::<bool>(), 2),
+        prop::collection::vec(any::<bool>(), 3),
         prop::option::weighted(0.6, arb_pred(true)),
         any::<bool>(),
         prop::collection::vec(any::<bool>(), BASE_METRICS.len()),
@@ -1502,10 +1538,17 @@ fn arb_phantom_case() -> impl Strategy<Value = PhantomCase> {
                 if dim_mask[1] {
                     dims.push(D_CNAME);
                 }
-                // NOT the child dimension: grouping by one puts the childless
-                // parent in a manufactured NULL group on the aggregate path —
-                // see `mm4_…`. A role-played dimension needs the request to
-                // carry USING, which a FACTS-only request cannot.
+                // The child dimension, on a METRICS request: grouping by it
+                // manufactured a NULL group for the childless parent while a
+                // child metric was base-anchored (MM-4); home-table anchoring
+                // (TECH-DEBT #71) gives the parent no row at all. A FACTS
+                // request keeps the base-anchored row path, whose phantom
+                // filter needs every member on ONE table (TECH-DEBT #67 (3)).
+                if dim_mask[2] && !facts_request {
+                    dims.push(D_LQTY);
+                }
+                // A role-played dimension needs the request to carry USING,
+                // which a FACTS-only request cannot.
                 let groups_by_role_played = want_city && role.is_some() && !facts_request;
                 if groups_by_role_played {
                     dims.push(D_CITY);
@@ -1879,23 +1922,66 @@ fn generator_reaches_the_role_playing_edges() {
 #[test]
 fn generator_reaches_both_join_directions() {
     let cases = sample(&arb_algebra_case(), 256);
-    let child = cases.iter().filter(|c| c.grain == Grain::Child).count();
-    let base = cases.len() - child;
+    let child = cases
+        .iter()
+        .filter(|c| c.grain == Some(Grain::Child))
+        .count();
+    let base = cases
+        .iter()
+        .filter(|c| c.grain == Some(Grain::Base))
+        .count();
     assert!(
-        child >= 64,
+        child >= 48,
         "only {child}/256 algebra cases used the child grain"
     );
     assert!(
-        base >= 64,
+        base >= 48,
         "only {base}/256 algebra cases used the base grain"
+    );
+    // TECH-DEBT #71: a chain that really spans BOTH grains, so the derived
+    // metric is decomposed and the property compares a per-grain assembly
+    // against its components queried one at a time.
+    let spanning = cases
+        .iter()
+        .filter(|c| {
+            let grains: BTreeSet<Grain> = c
+                .chain
+                .leaves(c.chain.target)
+                .iter()
+                .map(|&l| BASE_METRICS[l].grain)
+                .collect();
+            grains.len() == 2
+        })
+        .count();
+    assert!(
+        spanning >= 24,
+        "only {spanning}/256 algebra cases had a derived metric spanning both grains"
     );
 
     let rollups = sample(&arb_rollup_case(), 256);
-    let r_child = rollups.iter().filter(|c| c.grain == Grain::Child).count();
-    let r_base = rollups.len() - r_child;
+    let r_child = rollups
+        .iter()
+        .filter(|c| c.grain == Some(Grain::Child))
+        .count();
+    let r_base = rollups
+        .iter()
+        .filter(|c| c.grain == Some(Grain::Base))
+        .count();
     assert!(
-        r_child >= 64 && r_base >= 64,
+        r_child >= 48 && r_base >= 48,
         "roll-up grains are lopsided: child={r_child} base={r_base}"
+    );
+    let r_mixed = rollups
+        .iter()
+        .filter(|c| {
+            let grains: BTreeSet<Grain> =
+                c.metrics.iter().map(|&i| BASE_METRICS[i].grain).collect();
+            grains.len() == 2
+        })
+        .count();
+    assert!(
+        r_mixed >= 24,
+        "only {r_mixed}/256 roll-up cases queried both grains in one request"
     );
 
     // The child dimension — grouping BELOW the base — must also be reached.
@@ -2399,25 +2485,26 @@ fn mm2_role_playing_with_a_quoted_relationship_name() {
         .unwrap_or_else(|e| panic!("emitted SQL must parse, got: {e}\nSQL:\n{sql}"));
 }
 
-/// **MM-3** — a metric's VALUE changes when it is co-queried with a metric of
-/// another grain. Silent wrong number.
+/// **MM-3** (TECH-DEBT #71, fixed) — a metric's VALUE changed when it was
+/// co-queried with a metric of another grain. Silent wrong number.
 ///
-/// A single-grain request is base-anchored (`FROM o LEFT JOIN li`); a
-/// multi-grain request routes through `per_grain`, which anchors each grain's
-/// CTE at its OWN table (`FROM li`, no join). The two disagree in two ways, and
+/// A single-grain request was base-anchored (`FROM o LEFT JOIN li`); a
+/// multi-grain request routed through `per_grain`, which anchors each grain's
+/// CTE at its OWN table (`FROM li`, no join). The two disagreed in two ways, and
 /// this test pins both:
 ///
-/// - a child row whose foreign key is NULL (legal data, not a broken FK) is
+/// - a child row whose foreign key is NULL (legal data, not a broken FK) was
 ///   dropped by the base-anchored query and counted by the child-anchored CTE:
-///   `s_amt` is 12 alone and 112 alongside `s_rate`;
-/// - a base row with no children contributes `COUNT(*) = 0` to the
-///   base-anchored query and NO ROW to the child-anchored CTE, so the FULL OUTER
-///   JOIN reports NULL: `n_li` is 0 alone and NULL alongside `s_rate`.
+///   `s_amt` was 12 alone and 112 alongside `s_rate`;
+/// - a base row with no children contributed `COUNT(*) = 0` to the
+///   base-anchored query and NO ROW to the child-anchored CTE: `n_li` was 0
+///   alone and NULL alongside `s_rate`. (With no dimensions there is a single
+///   row either way, so this half shows only as the orphan: 1 vs 2.)
 ///
-/// Per-grain anchoring is deliberate (TECH-DEBT #35/#36) but the resulting
-/// value-instability of an individual metric is recorded nowhere.
+/// Snowflake settled which answer is right (D1): the home-table one. Both
+/// queries now agree on it, and the numbers are pinned too, so a regression to
+/// the base-anchored answer on BOTH sides cannot pass by agreeing.
 #[test]
-#[ignore = "MM-3: per-grain re-anchoring changes a component metric's own value"]
 fn mm3_metric_value_changes_when_co_queried_across_grains() {
     let names = fixed_names();
     let def = build_def(&names, None);
@@ -2455,10 +2542,13 @@ fn mm3_metric_value_changes_when_co_queried_across_grains() {
         value(&[n_li.clone(), s_rate.clone()], &n_li),
         "COUNT over the child must not change when a base-grain metric joins the request"
     );
+    // And the agreed value is the home-table one: the orphan child row counts.
+    assert_eq!(value(&[s_amt.clone()], &s_amt), "112");
+    assert_eq!(value(&[n_li.clone()], &n_li), "2");
 }
 
-/// **MM-4** — the aggregate path still manufactures a NULL group for a
-/// childless parent when the query groups by a CHILD dimension.
+/// **MM-4** (fixed by TECH-DEBT #71) — the aggregate path manufactured a NULL
+/// group for a childless parent when the query grouped by a CHILD dimension.
 ///
 /// EXP-29 fenced the row-level shapes: a dimensions-only `SELECT DISTINCT` and a
 /// FACTS request over one below-base table both filter the phantom with
@@ -2467,9 +2557,10 @@ fn mm3_metric_value_changes_when_co_queried_across_grains() {
 /// which fixes the value but not the group key, so a childless parent still
 /// contributes a `(NULL, 0)` / `(NULL, NULL)` row describing nothing.
 ///
-/// Not listed among TECH-DEBT #67's three recorded residuals.
+/// Recorded as TECH-DEBT #67 residual (4). Home-table anchoring removes it at
+/// the root: the child metric is computed `FROM li`, where a childless parent
+/// has no row to manufacture a group from.
 #[test]
-#[ignore = "MM-4: aggregate + child dimension still emits the join-manufactured NULL group"]
 fn mm4_childless_parent_manufactures_a_null_group_under_a_child_dimension() {
     let names = fixed_names();
     let def = build_def(&names, None);

@@ -222,6 +222,7 @@ pub(super) fn expand_window_metrics(
             &dims,
             &where_tables,
             &std::collections::HashMap::new(),
+            &[],
         )
     } else {
         push_from_base(&mut sql, def, "\n    ");

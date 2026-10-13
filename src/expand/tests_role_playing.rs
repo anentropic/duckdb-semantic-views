@@ -1366,7 +1366,14 @@ fn td69_fence_metric_below_the_role_played_table_is_rejected() {
 }
 
 /// CONTROL: with only ONE relationship to `a` there is no role to pick, so the
-/// same metric keeps expanding (three departures at elevation 100).
+/// same metric keeps expanding.
+///
+/// The number is the metric's HOME-table answer (TECH-DEBT #71): `raw_elev` is
+/// declared on `a`, so it sums `a`'s rows — 100 + 7 = 107, airport B included
+/// though no flight departs from it. It was 300 (three departures at elevation
+/// 100) while a metric on a one-to-one neighbour of the base table was summed
+/// over the base-anchored join, which counted airport A once per flight — the
+/// declared one-to-one the data does not honour.
 #[test]
 #[cfg(not(feature = "extension"))]
 fn td69_metric_on_a_single_relationship_parent_still_expands() {
@@ -1380,7 +1387,7 @@ fn td69_metric_on_a_single_relationship_parent_still_expands() {
     let sql = expand("v", &def, &metrics_req(&[], &["raw_elev"])).unwrap();
     assert_eq!(
         run_rows(&role_numbers_db(), &sql),
-        vec![(None, 300.0)],
+        vec![(None, 107.0)],
         "{sql}"
     );
 }

@@ -283,6 +283,7 @@ pub(super) fn build_snapshot_block(
             &dims,
             &na_dim_sources,
             &std::collections::HashMap::new(),
+            &[],
         ),
         None => resolve_joins_pkfk(def, &dims, resolved_mets, &na_dim_sources),
     };

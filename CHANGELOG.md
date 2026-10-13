@@ -9,7 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Every metric is now aggregated from its own table, so a metric on a child table can
+  return different numbers when queried on its own.** Following Snowflake, a metric such as
+  `li.total_qty AS SUM(li.qty)` on a line-items table is computed from the line items
+  themselves and then joined out to the queried dimensions, rather than from the base table
+  `LEFT JOIN`ed to its children. Two things change for a child-table metric queried by
+  itself: a child row whose foreign key is NULL is now counted, under a NULL dimension
+  value, where it used to be left out; and a parent with no children no longer gets a row
+  (it used to get `0` for a count and `NULL` otherwise). When a parent-table metric is
+  queried alongside, the childless parent's row is still there, with the child metric
+  `NULL`. `COUNT(*)` or `COUNT(1)` on a child table with no `PRIMARY KEY` is now answered
+  instead of raising an error. Dimensions-only and `facts := [...]` queries are unchanged.
+  See *Metric grain* in the docs for the full rules.
+
 ### Fixed
+
+- **A metric's value no longer depends on which other metrics are queried with it.**
+  Adding a metric from another table to a query used to switch a child-table metric over to
+  per-table aggregation, so the same metric could return, for example, `12` on its own and
+  `112` next to a parent-table metric (the difference being line items with no order), or
+  `0` on its own and `NULL` co-queried for an order with no line items. Both queries now
+  return the same value. This also holds for derived, semi-additive (`NON ADDITIVE BY`) and
+  window metrics over a child-table metric, and for `where_clause` filters on parent or
+  child members.
+- **Grouping a child-table metric by a child-table dimension no longer produces an extra
+  `NULL` group** for parents with no children.
 
 - **A `USING` metric can aggregate a fact on the role-playing table.** A metric such as
   `f.dep_elev USING (dep_airport) AS SUM(a.elev)`, where `elev` is a fact on the

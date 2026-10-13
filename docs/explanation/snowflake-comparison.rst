@@ -360,8 +360,19 @@ parent row with no children is not dropped.
 
 Before v0.12.0 the generated SQL was always anchored ``FROM <base table>``, so
 these queries were rejected with a fan trap error rather than silently inflated.
-Single-grain queries are unchanged: they are still a single base-anchored
-``SELECT``.
+
+.. versionchanged:: 0.13.1
+
+   This now holds for a query with a single grain too. A metric on a child of
+   the base table, queried on its own, is aggregated from the child table and
+   joined out to the dimensions, as in Snowflake -- it used to be computed over
+   ``FROM <base table> LEFT JOIN <child>``. So a child row whose foreign key is
+   NULL is counted under a ``NULL`` dimension value, a parent with no children
+   has no row (or a ``NULL`` child metric when a parent-table metric brings its
+   row in), and a metric's value never depends on what else is queried. See
+   :ref:`explanation-grain-orphans`. Only a query whose metrics all live on the
+   base table is still a single base-anchored ``SELECT``; there the base table
+   is every metric's own table, so the two coincide.
 
 Four boundaries apply:
 
@@ -375,8 +386,9 @@ Four boundaries apply:
   aggregation does not make these answerable -- the metric's rows genuinely fan
   across the dimension's values, so there is no single correct value per group.
 - A **window metric** whose inner aggregate lives on a non-base table is computed
-  at its own grain -- the inner aggregation is anchored at that table, so it is
-  not inflated by the base-table join. Window metrics whose inner aggregates sit
+  at its own grain -- the inner aggregation is anchored at that table (a parent
+  or a child of the base table), so it is neither inflated nor thinned by a
+  base-table join. Window metrics whose inner aggregates sit
   at *different* grains still error, as those grains would need joining before the
   window runs.
 - An **active semi-additive metric** snapshots at its own grain, whether it is

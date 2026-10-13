@@ -11,6 +11,22 @@
 //! Fixture (shared with the review): base `o(id, region, rate)` = (1,'E',10),
 //! (2,'N',5); child `li(id, order_id, qty)` = (1,1,2),(2,1,3). Order 2 is
 //! childless, so `FROM "o" LEFT JOIN "li"` NULL-extends it.
+//!
+//! # Since TECH-DEBT #71
+//!
+//! A child metric is now aggregated from its OWN table (`FROM "li" LEFT JOIN
+//! "o"`), where there is no phantom row at all: a childless parent has no row
+//! for a child metric queried alone, and a NULL one when a metric of its own
+//! grain brings the row in (Snowflake, D1). [`childless_metric_value`] asserts
+//! both for every metric these tests declare.
+//!
+//! The guard is still load-bearing on the shapes that keep the base-anchored
+//! path for a child metric (TECH-DEBT #78). The values below are measured on
+//! one of them — a request grouped by `region_u`, the same `o.region` declared
+//! WITHOUT a source table, which only YAML / legacy JSON can produce and which
+//! is never re-anchored because its binding would move with the FROM. So the
+//! EXP-25/26 numbers keep their meaning: what the guard makes the phantom row
+//! contribute where a phantom row still exists.
 
 use super::*;
 use crate::expand::test_helpers::TestFixtureExt;
@@ -38,16 +54,34 @@ fn child_def() -> SemanticViewDefinition {
                 synonyms: vec![],
             },
         ],
-        dimensions: vec![Dimension {
-            name: "region".to_string(),
-            expr: "o.region".to_string(),
+        dimensions: vec![
+            Dimension {
+                name: "region".to_string(),
+                expr: "o.region".to_string(),
+                source_table: Some("o".to_string()),
+                output_type: None,
+                comment: None,
+                synonyms: vec![],
+                is_filter: false,
+            },
+            // The base-anchored fallback's dimension: see the module docs.
+            Dimension {
+                name: "region_u".to_string(),
+                expr: "o.region".to_string(),
+                source_table: None,
+                output_type: None,
+                comment: None,
+                synonyms: vec![],
+                is_filter: false,
+            },
+        ],
+        // An order-grain metric, co-queried to bring the childless parent's row in.
+        metrics: vec![crate::model::Metric {
+            name: "n_orders".to_string(),
+            expr: "COUNT(o.id)".to_string(),
             source_table: Some("o".to_string()),
-            output_type: None,
-            comment: None,
-            synonyms: vec![],
-            is_filter: false,
+            ..Default::default()
         }],
-        metrics: vec![],
         joins: vec![Join {
             from_alias: "li".to_string(),
             table: "o".to_string(),
@@ -79,20 +113,69 @@ fn fixture_db() -> duckdb::Connection {
     conn
 }
 
-/// Expand a single-metric, single-dimension (`region`) request and return the
-/// value of the metric for the CHILDLESS parent (`region = 'N'`), as an
-/// `Option<i64>` so a legitimate NULL is distinguishable from 0.
-fn childless_metric_value(def: &SemanticViewDefinition, metric: &str) -> Option<i64> {
-    let req = QueryRequest {
+/// TECH-DEBT #71: on the home-anchored path a childless parent has NO row for a
+/// child metric queried alone, and a NULL value (never 0, never the phantom's
+/// constant) when the order-grain `n_orders` brings its row in.
+fn assert_home_anchored_childless(def: &SemanticViewDefinition, metric: &str) {
+    let conn = fixture_db();
+    let by_region = |metrics: Vec<MetricName>| QueryRequest {
         where_clause: None,
         facts: vec![],
         dimensions: vec![DimensionName::new("region")],
+        metrics,
+    };
+    let alone = expand("v", def, &by_region(vec![MetricName::new(metric)]))
+        .unwrap_or_else(|e| panic!("expand failed for {metric}: {e}"));
+    let n_rows: i64 = conn
+        .query_row(
+            &format!("SELECT count(*) FROM ({alone}) q WHERE region = 'N'"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{alone}"));
+    assert_eq!(
+        n_rows, 0,
+        "a childless parent has no row for {metric} alone:\n{alone}"
+    );
+    let co = expand(
+        "v",
+        def,
+        &by_region(vec![MetricName::new(metric), MetricName::new("n_orders")]),
+    )
+    .unwrap_or_else(|e| panic!("expand failed for {metric} + n_orders: {e}"));
+    let value: Option<String> = conn
+        .query_row(
+            &format!(
+                "SELECT CAST(q.{} AS VARCHAR) FROM ({co}) q WHERE region = 'N'",
+                quote_ident(metric)
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|e| panic!("query failed: {e}\nSQL:\n{co}"));
+    assert_eq!(
+        value, None,
+        "a childless parent's {metric} is NULL when co-queried:\n{co}"
+    );
+}
+
+/// Expand a single-metric request grouped by the base-anchored fallback's
+/// `region_u` and return the value of the metric for the CHILDLESS parent
+/// (`region_u = 'N'`), as an `Option<i64>` so a legitimate NULL is
+/// distinguishable from 0 — after asserting the home-anchored behaviour of the
+/// same metric ([`assert_home_anchored_childless`]).
+fn childless_metric_value(def: &SemanticViewDefinition, metric: &str) -> Option<i64> {
+    assert_home_anchored_childless(def, metric);
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![DimensionName::new("region_u")],
         metrics: vec![MetricName::new(metric)],
     };
     let sql = expand("v", def, &req).unwrap_or_else(|e| panic!("expand failed for {metric}: {e}"));
     let conn = fixture_db();
     conn.query_row(
-        &format!("SELECT m FROM ({sql}) q WHERE region = 'N'"),
+        &format!("SELECT m FROM ({sql}) q WHERE region_u = 'N'"),
         [],
         |r| r.get::<_, Option<i64>>(0),
     )
@@ -458,21 +541,24 @@ fn count_star_is_not_double_guarded() {
 }
 
 /// A second argument is not part of the guarded value: `STRING_AGG`'s separator
-/// must survive verbatim, and the result must still be executable SQL.
+/// must survive verbatim, and the result must still be executable SQL. Run on
+/// the base-anchored fallback (`region_u`), where the guard has a phantom row
+/// to exclude.
 #[test]
 fn string_agg_separator_is_left_alone() {
     let def = child_def().with_metric("m", "STRING_AGG(li.qty, ',')", Some("li"));
+    assert_home_anchored_childless(&def, "m");
     let req = QueryRequest {
         where_clause: None,
         facts: vec![],
-        dimensions: vec![DimensionName::new("region")],
+        dimensions: vec![DimensionName::new("region_u")],
         metrics: vec![MetricName::new("m")],
     };
     let sql = expand("v", &def, &req).unwrap();
     let conn = fixture_db();
     let got: Option<String> = conn
         .query_row(
-            &format!("SELECT m FROM ({sql}) q WHERE region = 'E'"),
+            &format!("SELECT m FROM ({sql}) q WHERE region_u = 'E'"),
             [],
             |r| r.get(0),
         )
@@ -480,7 +566,7 @@ fn string_agg_separator_is_left_alone() {
     assert_eq!(got.as_deref(), Some("2,3"), "SQL:\n{sql}");
     let childless: Option<String> = conn
         .query_row(
-            &format!("SELECT m FROM ({sql}) q WHERE region = 'N'"),
+            &format!("SELECT m FROM ({sql}) q WHERE region_u = 'N'"),
             [],
             |r| r.get(0),
         )
@@ -516,21 +602,23 @@ fn ordered_aggregate_stays_valid_sql() {
 }
 
 /// A `FILTER` clause sits outside the parentheses; the guard rewrites only the
-/// argument, and the two compose (the phantom row is excluded either way).
+/// argument, and the two compose (the phantom row is excluded either way). Run
+/// on the base-anchored fallback (`region_u`), where the phantom exists.
 #[test]
 fn filtered_aggregate_stays_valid_sql() {
     let def = child_def().with_metric("m", "COUNT(1) FILTER (WHERE li.qty > 2)", Some("li"));
+    assert_home_anchored_childless(&def, "m");
     let req = QueryRequest {
         where_clause: None,
         facts: vec![],
-        dimensions: vec![DimensionName::new("region")],
+        dimensions: vec![DimensionName::new("region_u")],
         metrics: vec![MetricName::new("m")],
     };
     let sql = expand("v", &def, &req).unwrap();
     let conn = fixture_db();
     let e_val: Option<i64> = conn
         .query_row(
-            &format!("SELECT m FROM ({sql}) q WHERE region = 'E'"),
+            &format!("SELECT m FROM ({sql}) q WHERE region_u = 'E'"),
             [],
             |r| r.get(0),
         )
@@ -538,7 +626,7 @@ fn filtered_aggregate_stays_valid_sql() {
     assert_eq!(e_val, Some(1), "SQL:\n{sql}");
     let n_val: Option<i64> = conn
         .query_row(
-            &format!("SELECT m FROM ({sql}) q WHERE region = 'N'"),
+            &format!("SELECT m FROM ({sql}) q WHERE region_u = 'N'"),
             [],
             |r| r.get(0),
         )
@@ -615,17 +703,25 @@ fn guard_skips_the_star_argument() {
 }
 
 /// A metric on a non-base table with no declared PRIMARY KEY cannot be guarded
-/// at all. Today that is a loud error for the shapes that are definitely wrong
-/// (`COUNT(*)`, constant arguments) — including the MIN/MAX/AVG spellings
-/// EXP-25 added to the family.
+/// at all. On the base-anchored fallback that is still a loud error for the
+/// shapes that are definitely wrong (`COUNT(*)`, constant arguments) —
+/// including the MIN/MAX/AVG spellings EXP-25 added to the family. Anchored at
+/// its own table (TECH-DEBT #71) the metric needs no key: there is no phantom.
 #[test]
 fn no_pk_child_min_constant_errors_loudly() {
     let mut def = child_def().with_metric("m", "MIN(1)", Some("li"));
     def.tables[1].pk_columns.clear();
-    let req = QueryRequest {
+    let home = QueryRequest {
         where_clause: None,
         facts: vec![],
         dimensions: vec![],
+        metrics: vec![MetricName::new("m")],
+    };
+    expand("v", &def, &home).expect("home-anchored, MIN(1) needs no PRIMARY KEY");
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![DimensionName::new("region_u")],
         metrics: vec![MetricName::new("m")],
     };
     let err = expand("v", &def, &req).expect_err("no-PK child constant aggregate must error");

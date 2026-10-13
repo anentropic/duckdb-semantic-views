@@ -49,15 +49,16 @@ SELECT GET_DDL('SEMANTIC_VIEW', 'cr718_v') LIKE '%"Item Count" AS COUNT(*)%';
 ----
 true
 
-# Plain aggregate query on the quoted-name child metric: COUNT(*) on the
-# non-base table is rewritten to COUNT(li.id), so the childless EU order counts
-# 0, not 1. The metric's output column is cleanly named `Item Count` — the
-# stored name's quotes are stripped before quoting (EXP-7) — and `SELECT *`
-# reads the two columns positionally regardless.
+# Plain aggregate query on the quoted-name child metric. Since TECH-DEBT #71
+# the metric is aggregated from its own home table (`FROM cr718_items`), so the
+# childless EU order contributes no row at all (Snowflake semantics) -- before
+# #71 the base-anchored LEFT JOIN gave it a row with count 0. The metric's
+# output column is cleanly named `Item Count` — the stored name's quotes are
+# stripped before quoting (EXP-7) — and `SELECT *` reads the two columns
+# positionally regardless.
 query TI rowsort
 SELECT * FROM semantic_view('cr718_v', dimensions := ['region'], metrics := ['"Item Count"']);
 ----
-EU	0
 US	3
 
 # EXP-6 guard — the window CTE's inner aggregate must use the REWRITTEN count.
@@ -75,13 +76,16 @@ SELECT count(*) FROM explain_semantic_view('cr718_v', dimensions := ['region', '
 
 # End-to-end numeric guard — the window sum over the quoted-name base metric.
 # Partition = queried dims minus EXCLUDING channel = {region}; within a region
-# all rows are ORDER BY peers, so each sees the region's full sum. EU has only
-# the childless order, so its rolling sum is 0 (a raw COUNT(*) would make it 1).
+# all rows are ORDER BY peers, so each sees the region's full sum. Since
+# TECH-DEBT #71 the window's inner aggregate is home-anchored at `li`, so EU --
+# which has only the childless order -- has no row (before #71: `EU web 0`).
+# On the home table a raw COUNT(*) and COUNT(li.id) agree, so this row set no
+# longer discriminates the EXP-6 lookup miss on its own; the two EXPLAIN guards
+# above still do.
 query TTI rowsort
 SELECT region, channel, CAST(rolling AS BIGINT)
 FROM semantic_view('cr718_v', dimensions := ['region', 'channel'], metrics := ['rolling']);
 ----
-EU	web	0
 US	store	3
 US	web	3
 

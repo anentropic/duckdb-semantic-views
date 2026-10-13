@@ -664,22 +664,20 @@ fn root_grain_window_metric_stays_base_anchored() {
     );
 }
 
-/// A window metric whose inner aggregate is on a CHILD of the base table stays
-/// base-anchored — re-anchoring there would be a correctness REGRESSION, not an
-/// optimisation.
+/// A window metric whose inner aggregate is on a CHILD of the base table is
+/// anchored at that child (TECH-DEBT #71).
 ///
-/// `FROM orders LEFT JOIN line_items` already yields each line-item row once, so
-/// nothing is inflated, and that LEFT JOIN deliberately keeps an order with no
-/// line items as a NULL-extended row whose `COUNT` is 0. Flipping to
-/// `FROM line_items LEFT JOIN orders` would DROP that order from the result
-/// entirely. Per-grain's own planner may re-anchor either way because it FULL
-/// OUTER JOINs the grain CTEs; this single-CTE path has no such reassembly, so it
-/// only re-anchors toward the "one" side, where base-anchoring genuinely fans.
-///
-/// Caught by `cr20260718_quoted_metric_window.test`, whose childless EU order
-/// disappeared when the direction was not checked.
+/// This was the opposite guard: `FROM orders LEFT JOIN line_items` kept an
+/// order with no line items as a NULL-extended row whose `COUNT` is 0, and
+/// `FROM line_items LEFT JOIN orders` drops it — which
+/// `cr20260718_quoted_metric_window.test` caught as its childless EU order
+/// disappearing. Snowflake settled (D1) that the disappearance is right: the
+/// inner metric queried on its own has no row for that order, and the window
+/// must run over the same groups the inner metric has. The base-anchored CTE
+/// also lost every line item whose `order_id` is NULL. Numbers:
+/// `tests_home_anchoring::window_over_a_child_metric_is_home_anchored`.
 #[test]
-fn window_metric_on_a_child_table_stays_base_anchored() {
+fn window_metric_on_a_child_table_is_anchored_at_the_child() {
     let def = orders_with_child_line_items()
         .with_metric("rolling_items", "SUM(item_count)", Some("li"))
         .with_window_spec(
@@ -697,12 +695,8 @@ fn window_metric_on_a_child_table_stays_base_anchored() {
     let sql = expand("sales", &def, &req(&["order_status"], &["rolling_items"]))
         .expect("a child-grain window metric was always answerable");
     assert!(
-        sql.contains(r#"FROM "orders" AS "o""#),
-        "must stay anchored at the base table so childless parents survive: {sql}"
-    );
-    assert!(
-        sql.contains("LEFT JOIN"),
-        "the outer-join that preserves childless parents must remain: {sql}"
+        sql.contains("FROM \"line_items\" AS \"li\"\n    LEFT JOIN \"orders\" AS \"o\""),
+        "__sv_agg must anchor at the inner metric's own table and join OUT: {sql}"
     );
 }
 
@@ -1284,27 +1278,31 @@ fn using_does_not_rescue_a_where_clause_on_the_role_played_table() {
     );
 }
 
-/// Guard: the relaxation is narrow. A metric whose `USING` names a relationship
-/// to a table reached only ONE way is not what this increment threads — the
-/// base-anchored path scopes that alias itself — so it keeps declining rather
-/// than being guessed at here.
+/// A metric whose `USING` names a relationship to a table reached only ONE way.
+///
+/// This was a guard that the per-grain path declined such a query (it errored
+/// with the fan-trap fence). TECH-DEBT #71 deliberately widens it: a `USING`
+/// relationship whose target no queried dimension or `where_clause` member sits
+/// on scopes nothing — here `l_to_f` is the ONLY edge from `l` to `f`, so the
+/// grain CTE's join through it is the join `USING` names — and declining kept
+/// the child metric off its home table, so its value depended on its companions
+/// (MM-3). The CTE must still join `f` through that edge and then the role the
+/// co-queried `flight_count` names.
 #[test]
-fn using_naming_a_non_role_played_relationship_still_declines() {
+fn using_naming_a_non_role_played_relationship_is_honoured_per_grain() {
     let def = flights_using_fixture().with_using_relationship("leg_count", &["l_to_f"]);
-    let err = expand(
+    let sql = expand(
         "flights_sv",
         &def,
         &req(&["dep_city"], &["flight_count", "leg_count"]),
     )
-    .expect_err("USING on a single-edge relationship is not threaded by this path");
+    .expect("USING on the only relationship to a table scopes nothing ambiguous");
     assert!(
-        matches!(
-            err,
-            ExpandError::MetricFanTrap { .. }
-                | ExpandError::FanTrap { .. }
-                | ExpandError::RootGrainFanTrap { .. }
+        sql.contains(
+            "FROM \"legs\" AS \"l\"\n    LEFT JOIN \"flights\" AS \"f\" ON \"l\".\"flight_id\" = \"f\".\"id\"\n    \
+             LEFT JOIN \"airports\" AS \"a__dep\""
         ),
-        "expected the v0.11.0 fan-trap error, got: {err}"
+        "the leg grain must reach the dimension through l_to_f and the named role:\n{sql}"
     );
 }
 
@@ -1401,15 +1399,15 @@ fn active_semi_additive_snapshot_anchors_at_its_own_grain() {
     );
 }
 
-/// GRAIN-11 guard — DIRECTION. A metric at a CHILD grain must NOT be
-/// re-anchored, and not merely as an optimisation: `FROM base LEFT JOIN child`
-/// already yields each child row once, and the LEFT JOIN deliberately keeps
-/// childless parents as NULL-extended rows. Flipping to `FROM child` would
-/// silently DROP those groups. This single-CTE path has no FULL OUTER JOIN
-/// reassembly to restore them, so it must stay base-anchored — the same
-/// restriction `window_cte_anchor` documents.
+/// GRAIN-11 — DIRECTION, reversed by TECH-DEBT #71. A metric at a CHILD grain
+/// is now re-anchored too. This used to be refused because `FROM base LEFT
+/// JOIN child` kept a childless parent as a NULL-extended group and `FROM
+/// child` drops it; Snowflake settled (D1) that dropping it is right — a child
+/// metric queried alone has no row for a parent with no children — and that
+/// the child rows whose foreign key is NULL, which the base-anchored join lost,
+/// are counted. Numbers: `tests_home_anchoring::semi_additive_child_metric_is_home_anchored`.
 #[test]
-fn child_grain_semi_additive_is_not_re_anchored() {
+fn child_grain_semi_additive_is_re_anchored_at_its_own_table() {
     let def = base_table(minimal_def("o", "d", "d", "m", "count(*)"), "orders", "id")
         .clear_dimensions()
         .clear_metrics()
@@ -1423,10 +1421,14 @@ fn child_grain_semi_additive_is_not_re_anchored() {
         )
         .with_pkfk_join("li_to_o", "li", "o", &["order_id"], &["id"]);
     let sql = expand("sv", &def, &req(&["order_status"], &["item_total"]))
-        .expect("a child-grain semi-additive metric is already correct base-anchored");
+        .expect("a child-grain semi-additive metric is answerable");
     assert!(
-        sql.contains(r#"FROM "orders" AS "o""#),
-        "must stay anchored at the base table so childless groups survive:\n{sql}"
+        sql.contains("FROM \"line_items\" AS \"li\"\n    LEFT JOIN \"orders\" AS \"o\""),
+        "the snapshot must anchor at the metric's own table and join OUT:\n{sql}"
+    );
+    assert!(
+        sql.contains("RANK()"),
+        "still the snapshot shape, just re-anchored:\n{sql}"
     );
 }
 
