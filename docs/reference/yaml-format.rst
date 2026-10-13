@@ -573,14 +573,14 @@ Each entry in the ``joins`` list declares a FK/PK relationship between tables. T
      - Target table alias (the table being joined to).
    * - ``from_alias``
      - string
-     - No
-     - ``""``
+     - Yes
+     -
      - Source table alias containing the FK columns.
    * - ``fk_columns``
      - list of string
-     - No
-     - ``[]``
-     - FK column names on the source table.
+     - Yes
+     -
+     - FK column names on the source table. At least one is required; ``CREATE`` rejects a relationship without any.
    * - ``ref_columns``
      - list of string
      - No
@@ -588,9 +588,9 @@ Each entry in the ``joins`` list declares a FK/PK relationship between tables. T
      - Referenced columns on the target table. Defaults to the target's primary key if omitted.
    * - ``name``
      - string
-     - No
-     - null
-     - Relationship name. Required for role-playing dimensions (``using_relationships``).
+     - Yes
+     -
+     - Relationship name, referenced by ``using_relationships`` for role-playing dimensions.
    * - ``cardinality``
      - string
      - No

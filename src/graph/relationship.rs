@@ -157,8 +157,21 @@ impl RelationshipGraph {
     ///
     /// An orphan is a non-root node that appears in neither edges keys nor
     /// reverse keys (i.e., it has no outgoing or incoming relationship edges).
+    ///
+    /// When the root itself has no edge, every table is reported together by
+    /// [`Self::check_connected`] instead (its "base table … is not connected"
+    /// message names the real defect), so this check stands aside. Candidates
+    /// are visited in sorted order, so the table named does not depend on
+    /// `HashSet` iteration order.
     pub fn check_no_orphans(&self) -> Result<(), String> {
-        for node in &self.all_nodes {
+        let has_edge =
+            |node: &String| self.edges.contains_key(node) || self.reverse.contains_key(node);
+        if !has_edge(&self.root) {
+            return Ok(());
+        }
+        let mut nodes: Vec<&String> = self.all_nodes.iter().collect();
+        nodes.sort_unstable();
+        for node in nodes {
             if node == &self.root {
                 continue;
             }
@@ -195,7 +208,8 @@ impl RelationshipGraph {
     /// join each hop with an ON clause naming both sides explicitly.
     ///
     /// Run after the orphan check, so every table reaching here has at least
-    /// one edge unless it is the root itself.
+    /// one edge unless the root itself has none (in which case the orphan
+    /// check stood aside and this reports every table at once).
     pub fn check_connected(&self) -> Result<(), String> {
         let mut seen: HashSet<&str> = HashSet::new();
         let mut stack: Vec<&str> = vec![self.root.as_str()];
@@ -350,9 +364,32 @@ fn check_source_tables_reachable(
     Ok(())
 }
 
+/// Reject a relationship with no foreign-key columns.
+///
+/// The DDL grammar always produces FK columns; YAML does not require them. A
+/// stored pre-Phase-24 row may lack them too, but stored rows never reach this
+/// (CREATE-only) check — the query-time fan-trap fence owns those.
+fn check_relationships_have_fk_columns(def: &SemanticViewDefinition) -> Result<(), String> {
+    match def.joins.iter().find(|j| j.fk_columns.is_empty()) {
+        None => Ok(()),
+        Some(j) => {
+            let name = j
+                .name
+                .as_deref()
+                .map_or_else(String::new, |n| format!("'{n}' "));
+            Err(format!(
+                "relationship {name}from '{}' to '{}' declares no foreign-key columns; \
+                 the form is 'rel_name AS from_alias(fk_cols) REFERENCES to_alias'",
+                j.from_alias, j.table
+            ))
+        }
+    }
+}
+
 /// Validate the relationship graph of a semantic view definition.
 ///
 /// Runs all define-time checks:
+/// 0. Every relationship declares FK columns
 /// 1. Self-reference detection (`from_alias` == `to_alias`)
 /// 2. Cycle detection (Kahn's algorithm)
 /// 3. Diamond detection (multiple parents)
@@ -363,13 +400,19 @@ fn check_source_tables_reachable(
 ///
 /// Returns `Ok(graph)` if valid, or `Err` with a descriptive message.
 ///
-/// **Legacy skip:** If no joins have non-empty `fk_columns`, or if `tables`
-/// is empty, returns `Ok` with a default empty graph. This preserves backward
-/// compatibility with Phase 10/11 definitions.
+/// **Single-table skip:** a view with at most one table and no relationship
+/// has no graph to validate, so it returns `Ok` with an empty graph — exactly
+/// as before, so a single-table view's acceptance is unchanged.
+///
+/// This used to be a wider "legacy skip" that fired whenever no relationship
+/// carried `fk_columns`, for pre-Phase-24 definitions. But this function runs
+/// only at CREATE (`ddl::define::enrich_definition_for_create`) — stored rows
+/// are never re-validated on load — so the skip protected no stored
+/// definition and only let two unusable shapes through CREATE: several tables
+/// with no relationship at all (disconnected, TECH-DEBT #72) and a
+/// relationship with no FK columns (YAML).
 pub fn validate_graph(def: &SemanticViewDefinition) -> Result<RelationshipGraph, ParseError> {
-    // Legacy skip: no Phase 24 joins -> skip graph validation entirely.
-    let has_pkfk_joins = def.joins.iter().any(|j| !j.fk_columns.is_empty());
-    if !has_pkfk_joins || def.tables.is_empty() {
+    if def.tables.is_empty() || (def.tables.len() == 1 && def.joins.is_empty()) {
         return Ok(RelationshipGraph {
             edges: HashMap::new(),
             reverse: HashMap::new(),
@@ -377,6 +420,11 @@ pub fn validate_graph(def: &SemanticViewDefinition) -> Result<RelationshipGraph,
             root: String::new(),
         });
     }
+
+    // 0. Every relationship must carry FK columns. `from_definition` skips an
+    //    FK-less join (the pre-Phase-24 stored encoding), so without this an
+    //    FK-less YAML relationship would silently vanish from the graph.
+    check_relationships_have_fk_columns(def).map_err(ParseError::positionless)?;
 
     let graph = RelationshipGraph::from_definition(def).map_err(ParseError::positionless)?;
 
@@ -706,9 +754,11 @@ mod tests {
         #[test]
         fn graph_accepted_iff_connected(case in arb_graph_case()) {
             let def = build_graph_case(&case);
-            // Legacy skip: a definition with no relationship at all is not
-            // graph-validated, so only cases with an edge are meaningful.
-            proptest::prop_assume!(!def.joins.is_empty());
+            // No `prop_assume!` on the relationship count: a several-table
+            // definition with NO relationship (one table per component) used
+            // to skip graph validation entirely and was filtered out here. It
+            // is the plainest disconnected graph there is, so it is checked
+            // like every other case.
             let n_main = case.main_parents.len();
             let n_det = case.detached_parents.len();
             let result = validate_graph(&def);
@@ -727,9 +777,11 @@ mod tests {
                 };
                 let root_isolated = if case.detached_first { n_det == 1 } else { n_main == 1 };
                 if root_isolated {
-                    // A one-table root component with any edge elsewhere is
-                    // NOT an orphan-check failure (the root is exempt), so
-                    // connectivity is what must report it.
+                    // A one-table root component is NOT an orphan-check
+                    // failure (the root is exempt, and an edgeless root defers
+                    // the other edgeless tables to the connectivity check), so
+                    // connectivity is what must report it — with edges
+                    // elsewhere or with no relationship in the view at all.
                     proptest::prop_assert!(
                         msg.contains(&format!("base table '{root_side}0'")),
                         "expected the isolated base table to be named: {msg}"
@@ -857,12 +909,118 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Legacy definitions skip validation
+    // The former "legacy skip" (TECH-DEBT #72 follow-up)
     // -----------------------------------------------------------------------
+    //
+    // `validate_graph` runs only at CREATE (`enrich_definition_for_create`);
+    // stored rows are never re-validated on load. It used to skip every check
+    // when no relationship carried `fk_columns`, which let two shapes through
+    // CREATE that no query could use: several tables and no relationships at
+    // all (the #72 disconnected graph, minus the edge that triggered the
+    // check), and a YAML relationship with no FK columns (which the query-time
+    // fan-trap fence then reports as a "legacy pre-Phase-24 definition").
+
+    /// Two tables, zero relationships. Every member on `c` emitted
+    /// `FROM "o" … c.region` — `Binder Error: Referenced table "c" not found`.
+    /// Rejected now with #72's own error, naming the base table.
+    #[test]
+    fn multi_table_view_with_no_relationships_rejected() {
+        let def = make_def(
+            vec![("o", "orders", vec!["id"]), ("c", "customers", vec!["id"])],
+            vec![],
+            vec![("region", Some("c"))],
+            vec![("revenue", Some("o"))],
+        );
+        let err = validate_graph(&def)
+            .expect_err("two tables with no relationship must be rejected")
+            .message;
+        assert!(
+            err.contains("base table 'o'") && err.contains("not connected") && err.contains("'c'"),
+            "expected #72's base-table error naming 'o' and listing 'c', got: {err}"
+        );
+    }
+
+    /// Three tables, zero relationships: every table is edgeless, so the
+    /// orphan check would have named whichever non-root table a `HashSet`
+    /// yielded first. The base-table message lists them all, sorted.
+    #[test]
+    fn several_unrelated_tables_get_one_deterministic_error() {
+        let def = make_def(
+            vec![
+                ("o", "orders", vec!["id"]),
+                ("p", "products", vec!["id"]),
+                ("c", "customers", vec!["id"]),
+            ],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let err = validate_graph(&def)
+            .expect_err("unrelated tables must be rejected")
+            .message;
+        assert!(
+            err.contains("base table 'o'") && err.contains("('c', 'p')"),
+            "expected the base-table error listing 'c', 'p' in order, got: {err}"
+        );
+    }
+
+    /// With several edgeless non-root tables the orphan check named whichever
+    /// one `HashSet` iteration reached first, so the same definition could
+    /// report a different table from one CREATE to the next. It names the
+    /// alphabetically first now, every time.
+    #[test]
+    fn orphan_error_is_deterministic() {
+        let make = || {
+            make_def(
+                vec![
+                    ("o", "orders", vec!["id"]),
+                    ("c", "customers", vec!["id"]),
+                    ("z", "z_table", vec!["id"]),
+                    ("y", "y_table", vec!["id"]),
+                    ("x", "x_table", vec!["id"]),
+                    ("w", "w_table", vec!["id"]),
+                ],
+                vec![("o", "c", vec!["customer_id"])],
+                vec![],
+                vec![],
+            )
+        };
+        for _ in 0..64 {
+            let err = validate_graph(&make()).unwrap_err().message;
+            assert!(
+                err.starts_with("orphan table 'w'"),
+                "expected the alphabetically first orphan 'w', got: {err}"
+            );
+        }
+    }
+
+    /// A relationship with no FK columns (reachable through YAML, which does
+    /// not require `fk_columns`) used to switch graph validation off for the
+    /// whole definition. Every query then failed the fan-trap fence with a
+    /// misleading "legacy pre-Phase-24 definition format" error.
+    #[test]
+    fn relationship_without_fk_columns_rejected() {
+        let mut def = make_def(
+            vec![("o", "orders", vec!["id"]), ("c", "customers", vec!["id"])],
+            vec![("o", "c", vec![])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("o_to_c".to_string());
+        let err = validate_graph(&def)
+            .expect_err("a relationship with no FK columns must be rejected")
+            .message;
+        assert!(
+            err.contains("'o_to_c'") && err.contains("no foreign-key columns"),
+            "expected the error to name the relationship, got: {err}"
+        );
+    }
 
     #[test]
-    fn legacy_empty_fk_columns_skips_validation() {
-        // Legacy join with empty fk_columns -> validate_graph returns Ok.
+    fn relationship_without_fk_columns_rejected_on_a_single_table_view() {
+        // The single-table exemption covers only a view with no relationship
+        // at all; an FK-less relationship is rejected even when TABLES has one
+        // entry (here it targets a table that is not declared).
         let mut def = SemanticViewDefinition {
             tables: vec![TableRef {
                 alias: "o".to_string(),
@@ -888,11 +1046,15 @@ mod tests {
             resolution_schema_name: None,
             comment: None,
         };
+        let err = validate_graph(&def)
+            .expect_err("an FK-less relationship must be rejected on a one-table view too")
+            .message;
         assert!(
-            validate_graph(&def).is_ok(),
-            "legacy definitions should skip validation"
+            err.contains("no foreign-key columns") && err.contains("'customers'"),
+            "expected the FK-less relationship to be named by its target, got: {err}"
         );
-        // Also test with empty tables.
+        // An empty TABLES list still skips: there is no graph to validate, and
+        // the TABLES-clause checks own that error.
         def.tables.clear();
         assert!(
             validate_graph(&def).is_ok(),

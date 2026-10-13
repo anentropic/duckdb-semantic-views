@@ -202,6 +202,16 @@ Graph validation errors
 
    orphan table '<alias>' is not connected by any relationship; did you mean '<suggestion>'?
 
+   base table '<alias>' (the first table in TABLES) is not connected by any
+   relationship to the other tables ('<alias>', ...); declare a relationship that
+   reaches it, or list a connected table first
+
+   table '<alias>' is not reachable from the base table '<alias>' (the first table
+   in TABLES) through any chain of relationships; unreachable: '<alias>', ...
+
+   relationship '<name>' from '<alias>' to '<alias>' declares no foreign-key columns;
+   the form is 'rel_name AS from_alias(fk_cols) REFERENCES to_alias'
+
 **Cause:** The relationship graph violates tree structure requirements.
 
 **Fix:**
@@ -210,6 +220,8 @@ Graph validation errors
 - **Cycle:** Follow the chain in the error message to find the circular dependency and remove it.
 - **Diamond:** One target table is reached from two different source tables. Naming the relationships does not help; declare the shared table a second time under another alias (for example ``s_a AS stores`` and ``s_b AS stores``) so each path has its own copy. Several relationships from the *same* source table to one target are allowed; that is the role-playing pattern (see :ref:`howto-role-playing`).
 - **Orphan:** Add a relationship that connects the table, or remove it from ``TABLES``.
+- **Not connected / not reachable:** Every table must be reachable from the first table in ``TABLES``. Add the missing relationship, or remove the table. A view that lists several tables but no ``RELATIONSHIPS`` at all gets the base-table form of this error.
+- **No foreign-key columns:** A YAML ``joins`` entry needs ``fk_columns`` (the DDL form always has them).
 
 
 Key missing on a relationship target
