@@ -15,12 +15,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `f.dep_elev USING (dep_airport) AS SUM(a.elev)`, where `elev` is a fact on the
   role-played `airports` table, used to fail with `Referenced table "a" not found`. It now
   reads the fact from the instance of the table its `USING` names, so each role returns its
-  own number.
+  own number — also when the metric is the inner aggregate of a window metric, is
+  semi-additive, or spells its relationship more than once in a different case
+  (`USING (dep_airport, DEP_AIRPORT)`).
 - **A member that reaches a fact on a role-playing table without naming a role is rejected
   instead of silently using the first-declared relationship.** A metric without `USING`, a
   dimension, or a fact on a table reached only through the role-playing table previously
   returned the first-declared relationship's numbers; such a query now raises an ambiguity
-  error naming the member, the fact and the relationships to choose from.
+  error naming the member, the fact and the relationships to choose from. This includes the
+  inner metric of a window metric.
+- **A metric declared on a role-playing table is rejected instead of silently using the
+  first-declared relationship.** A metric such as `a.total_elev AS SUM(a.elevation)` on the
+  role-played `airports` table cannot name a role (a `USING` relationship must start at the
+  metric's own table), yet where no fan trap stopped it — the relationships declared
+  one-to-one — it returned the first-declared relationship's numbers. Such a query (and one
+  on a table reached only through the role-playing table) now raises an ambiguity error;
+  declare the metric on the referencing table with `USING` instead.
+- **A window or derived metric over a metric that reaches a fact across a fanning
+  relationship is rejected, like the metric itself.** Querying such a metric directly
+  raised a fan-trap error, but through a window metric or a derived metric it joined the
+  fanning table without the check.
 - **Quoted relationship names work on role-playing relationships.** A relationship named
   with a quoted identifier (`"Dep Airport"`, or a name with an embedded `""`) used to make
   every query that went through it fail with a parser error.

@@ -153,10 +153,19 @@ fact gives a different number per role:
 arrival airports'; ``elev_climb`` composes both roles and keeps them apart.
 
 The metric's ``USING`` must name exactly one relationship to the table the fact
-lives on. A member that reaches such a fact with no single role to pick -- a
-metric without ``USING``, a dimension, or a fact on a table reached only
-*through* the role-playing table -- is rejected as ambiguous at query time (see
+lives on (spelling that relationship twice, in any case, still names one). The
+role carries through to a window metric over such a metric
+(``f.dep_elev_by_flight AS SUM(dep_elev) OVER (PARTITION BY flight_id)``) and
+to a semi-additive one. A member that reaches such a fact with no single role
+to pick -- a metric without ``USING`` (including one used as a window metric's
+inner aggregate), a dimension, or a fact on a table reached only *through* the
+role-playing table -- is rejected as ambiguous at query time (see
 :ref:`howto-rp-errors`).
+
+Declare such metrics on the *referencing* table, as above. A metric declared on
+the role-playing table itself (``a.total_elev AS SUM(a.elevation)``) cannot
+name a role -- a ``USING`` relationship must start at the metric's own table --
+so it is rejected as ambiguous too.
 
 Relationship names may be quoted identifiers (``"Dep Airport" AS f(...)
 REFERENCES a`` with ``USING ("Dep Airport")``), including names with spaces or
@@ -311,6 +320,14 @@ Troubleshooting
    table. Previously such a member silently read the first-declared
    relationship's rows. Add ``USING`` to the metric, or declare the fact on a
    non-role-playing table. See :ref:`howto-rp-facts`.
+
+**A metric is declared on a role-playing table**
+   A metric whose own table is a role-playing table (or is reached only through
+   one) is rejected as ambiguous: ``USING`` cannot be attached to it, since a
+   ``USING`` relationship must start at the metric's own table. Previously, when
+   no fan trap stopped it (one-to-one relationships), it silently read the
+   first-declared relationship's rows. Declare the metric on the referencing
+   table with ``USING`` instead. See :ref:`howto-rp-facts`.
 
 **Semi-additive metric snapshotting on a role-playing dimension**
    .. versionchanged:: 0.11.0
