@@ -48,7 +48,13 @@ from pathlib import Path
 
 # Add test/integration to path for helpers import
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_ducklake_helpers import attach_ducklake, get_ext_dir, get_extension_path, load_extension
+from test_ducklake_helpers import (
+    attach_ducklake,
+    exit_skipped_if_offline,
+    get_ext_dir,
+    get_extension_path,
+    load_extension,
+)
 
 
 def setup_synthetic_ducklake(ext_dir: str) -> tuple:
@@ -80,7 +86,13 @@ def setup_synthetic_ducklake(ext_dir: str) -> tuple:
     )
 
     try:
-        catalog_con.execute("INSTALL ducklake")
+        try:
+            catalog_con.execute("INSTALL ducklake")
+        except duckdb.IOException as e:
+            catalog_con.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            exit_skipped_if_offline("test/integration/test_ducklake_ci.py", e)
+            raise
         catalog_con.execute("LOAD ducklake")
         catalog_con.execute(f"ATTACH 'ducklake:{ducklake_file}' AS jaffle (DATA_PATH '{data_dir}')")
 
