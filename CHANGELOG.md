@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queried alongside, the childless parent's row is still there, with the child metric
   `NULL`. `COUNT(*)` or `COUNT(1)` on a child table with no `PRIMARY KEY` is now answered
   instead of raising an error. Dimensions-only and `facts := [...]` queries are unchanged.
+  A member expression that uses an unqualified column belonging to *another* table (which
+  Snowflake rejects) may now fail with a "not found" error in queries where that table is
+  no longer joined; qualify the column or define a fact on the other table.
   See *Metric grain* in the docs for the full rules.
 
 ### Fixed

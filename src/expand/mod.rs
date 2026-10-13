@@ -45,6 +45,8 @@ mod tests_fan_trap;
 // Pins NUMBERS (executes the SQL in-memory), so gated like
 // `tests_phantom_row_guard` below.
 #[cfg(all(test, not(feature = "extension")))]
+mod tests_bare_column_scoping;
+#[cfg(all(test, not(feature = "extension")))]
 mod tests_home_anchoring;
 #[cfg(test)]
 mod tests_join_emission_regression;

@@ -324,7 +324,7 @@ Declares named grouping expressions available for queries.
 
 .. note::
 
-   **Column qualification in expressions.** The ``<alias>.<dim_name>`` on the left of ``AS`` (the logical name) must always carry its table-alias prefix. Column references *inside the expression* on the right of ``AS`` may be either qualified (``o.region``) or unqualified (``region``). Unqualified references resolve fine in single-table views, but in multi-table views they can raise an ambiguity error when more than one joined table exposes the same column name. Qualifying expression columns (``alias.column``) is recommended -- it is unambiguous in every case, which is why all examples in these docs use it. The same rule applies to ``METRICS`` and ``FACTS`` expressions.
+   **Column qualification in expressions.** The ``<alias>.<dim_name>`` on the left of ``AS`` (the logical name) must always carry its table-alias prefix. Column references *inside the expression* on the right of ``AS`` may be either qualified (``o.region``) or unqualified (``region``). Unqualified references resolve fine in single-table views, but in multi-table views they can raise an ambiguity error when more than one joined table exposes the same column name. Qualifying expression columns (``alias.column``) is recommended -- it is unambiguous in every case, which is why all examples in these docs use it. The same rule applies to ``METRICS`` and ``FACTS`` expressions. An unqualified column that belongs to *another* table is not rejected at ``CREATE`` (Snowflake rejects it): it binds to that table when the query happens to join it -- possibly at a different grain from the member -- and fails with a "not found" error when it does not. Qualify it, or define a fact on the other table.
 
 **Validation rules:**
 

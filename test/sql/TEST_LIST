@@ -115,3 +115,4 @@ test/sql/role_playing_facts_and_quoted_names.test
 test/sql/role_playing_window_and_table_metrics.test
 test/sql/d1_home_table_anchoring.test
 test/sql/d1_home_table_anchoring_paths.test
+test/sql/bare_column_scoping.test

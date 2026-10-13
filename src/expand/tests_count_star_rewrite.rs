@@ -23,7 +23,7 @@ fn child_count_def() -> crate::model::SemanticViewDefinition {
 /// dimension `region` is unqualified (no source table, as only YAML / legacy
 /// JSON can declare it), and an unqualified expression would rebind if the FROM
 /// moved, so the query is not re-anchored at the metric's home table
-/// (TECH-DEBT #71 residual, TECH-DEBT #78). This is where the SG-8 no-PK error
+/// (TECH-DEBT #71 residual, TECH-DEBT #81). This is where the SG-8 no-PK error
 /// is still reachable, so the error tests below use it; every QUALIFIED
 /// request is anchored at `li` itself, where `COUNT(*)` needs no key.
 fn fallback_req() -> QueryRequest {

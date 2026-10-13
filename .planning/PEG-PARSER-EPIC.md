@@ -218,7 +218,7 @@ code overlap with the spike branch, so the two run side by side.
   home-table anchored, with D1 settled by the Snowflake fixture (Q1–Q6 reproduced in
   `test/sql/d1_home_table_anchoring.test`). The shapes the per-grain planner still
   declines, and the unchanged dimensions-only / FACTS row semantics, are TECH-DEBT
-  #80; Phases 4 and 7 should target the home-anchored emitter, not those fallbacks.
+  #81; Phases 4 and 7 should target the home-anchored emitter, not those fallbacks.
 - **0c:** #51 member `data_type`, **read-side**: probe at `SHOW`/`DESCRIBE` bind
   time, as `query::table_function::try_infer_schema` already does for queries. It
   has no parser dependency. It also cannot be done at CREATE under the grammar,
