@@ -103,10 +103,10 @@ TABLE	err_source	(empty)	BASE_TABLE_NAME	err_source
 TABLE	err_source	(empty)	PRIMARY_KEY	["id"]
 DIMENSION	id	err_source	TABLE	err_source
 DIMENSION	id	err_source	EXPRESSION	id
-DIMENSION	id	err_source	DATA_TYPE	(empty)
+DIMENSION	id	err_source	DATA_TYPE	INTEGER
 METRIC	total	err_source	TABLE	err_source
 METRIC	total	err_source	EXPRESSION	SUM(val)
-METRIC	total	err_source	DATA_TYPE	(empty)
+METRIC	total	err_source	DATA_TYPE	DOUBLE
 METRIC	total	err_source	ACCESS_MODIFIER	PUBLIC
 
 # Normal SQL unaffected

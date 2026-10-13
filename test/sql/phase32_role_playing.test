@@ -225,9 +225,9 @@ San Francisco	1
 query TTTTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN p32_flights_view;
 ----
-memory	main	p32_flights_view	p32_airports	city	(empty)	[]	(empty)
-memory	main	p32_flights_view	p32_airports	country	(empty)	[]	(empty)
-memory	main	p32_flights_view	p32_flights	carrier	(empty)	[]	(empty)
+memory	main	p32_flights_view	p32_airports	city	VARCHAR	[]	(empty)
+memory	main	p32_flights_view	p32_airports	country	VARCHAR	[]	(empty)
+memory	main	p32_flights_view	p32_flights	carrier	VARCHAR	[]	(empty)
 
 # ============================================================
 # Test 12: SHOW SEMANTIC METRICS resolves aliases to table names
@@ -236,9 +236,9 @@ memory	main	p32_flights_view	p32_flights	carrier	(empty)	[]	(empty)
 query TTTTTTTT rowsort
 SHOW SEMANTIC METRICS IN p32_flights_view;
 ----
-memory	main	p32_flights_view	(empty)	total_flights	(empty)	[]	(empty)
-memory	main	p32_flights_view	p32_flights	arrival_count	(empty)	[]	(empty)
-memory	main	p32_flights_view	p32_flights	departure_count	(empty)	[]	(empty)
+memory	main	p32_flights_view	(empty)	total_flights	BIGINT	[]	(empty)
+memory	main	p32_flights_view	p32_flights	arrival_count	BIGINT	[]	(empty)
+memory	main	p32_flights_view	p32_flights	departure_count	BIGINT	[]	(empty)
 
 # ============================================================
 # Test 13: DESCRIBE shows actual table names for role-playing view
@@ -265,23 +265,23 @@ RELATIONSHIP	arr_airport	p32_flights	FOREIGN_KEY	["arrival_code"]
 RELATIONSHIP	arr_airport	p32_flights	REF_KEY	["airport_code"]
 DIMENSION	city	p32_airports	TABLE	p32_airports
 DIMENSION	city	p32_airports	EXPRESSION	a.city
-DIMENSION	city	p32_airports	DATA_TYPE	(empty)
+DIMENSION	city	p32_airports	DATA_TYPE	VARCHAR
 DIMENSION	country	p32_airports	TABLE	p32_airports
 DIMENSION	country	p32_airports	EXPRESSION	a.country
-DIMENSION	country	p32_airports	DATA_TYPE	(empty)
+DIMENSION	country	p32_airports	DATA_TYPE	VARCHAR
 DIMENSION	carrier	p32_flights	TABLE	p32_flights
 DIMENSION	carrier	p32_flights	EXPRESSION	f.carrier
-DIMENSION	carrier	p32_flights	DATA_TYPE	(empty)
+DIMENSION	carrier	p32_flights	DATA_TYPE	VARCHAR
 METRIC	departure_count	p32_flights	TABLE	p32_flights
 METRIC	departure_count	p32_flights	EXPRESSION	COUNT(*)
-METRIC	departure_count	p32_flights	DATA_TYPE	(empty)
+METRIC	departure_count	p32_flights	DATA_TYPE	BIGINT
 METRIC	departure_count	p32_flights	ACCESS_MODIFIER	PUBLIC
 METRIC	arrival_count	p32_flights	TABLE	p32_flights
 METRIC	arrival_count	p32_flights	EXPRESSION	COUNT(*)
-METRIC	arrival_count	p32_flights	DATA_TYPE	(empty)
+METRIC	arrival_count	p32_flights	DATA_TYPE	BIGINT
 METRIC	arrival_count	p32_flights	ACCESS_MODIFIER	PUBLIC
 DERIVED_METRIC	total_flights	(empty)	EXPRESSION	departure_count + arrival_count
-DERIVED_METRIC	total_flights	(empty)	DATA_TYPE	(empty)
+DERIVED_METRIC	total_flights	(empty)	DATA_TYPE	BIGINT
 DERIVED_METRIC	total_flights	(empty)	ACCESS_MODIFIER	PUBLIC
 
 # ============================================================

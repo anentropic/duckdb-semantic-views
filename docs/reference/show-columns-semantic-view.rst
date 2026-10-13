@@ -57,7 +57,7 @@ Returns one row per queryable column with 8 columns:
      - The dimension, fact, or metric name.
    * - ``data_type``
      - VARCHAR
-     - The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+     - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``kind``
      - VARCHAR
      - The column kind: ``DIMENSION``, ``FACT``, ``METRIC``, or ``DERIVED_METRIC``.
@@ -127,19 +127,19 @@ Examples
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬────────────────────┬─────────────┬───────────┬────────────────┬───────────────────────────┬────────────┐
-   │ database_name │ schema_name │ semantic_view_name │ column_name │ data_type │ kind           │ expression                │ comment    │
-   ├───────────────┼─────────────┼────────────────────┼─────────────┼───────────┼────────────────┼───────────────────────────┼────────────┤
-   │ memory        │ main        │ shop               │ avg_order   │           │ DERIVED_METRIC │ revenue / order_count     │            │
-   │ memory        │ main        │ shop               │ region      │           │ DIMENSION      │ o.region                  │            │
-   │ memory        │ main        │ shop               │ raw_amount  │           │ FACT           │ o.quantity * o.price      │ Line total │
-   │ memory        │ main        │ shop               │ order_count │           │ METRIC         │ COUNT(o.id)               │            │
-   │ memory        │ main        │ shop               │ revenue     │           │ METRIC         │ SUM(o.quantity * o.price) │            │
-   └───────────────┴─────────────┴────────────────────┴─────────────┴───────────┴────────────────┴───────────────────────────┴────────────┘
+   ┌───────────────┬─────────────┬────────────────────┬─────────────┬───────────────┬────────────────┬───────────────────────────┬────────────┐
+   │ database_name │ schema_name │ semantic_view_name │ column_name │ data_type     │ kind           │ expression                │ comment    │
+   ├───────────────┼─────────────┼────────────────────┼─────────────┼───────────────┼────────────────┼───────────────────────────┼────────────┤
+   │ memory        │ main        │ shop               │ avg_order   │ DOUBLE        │ DERIVED_METRIC │ revenue / order_count     │            │
+   │ memory        │ main        │ shop               │ region      │ VARCHAR       │ DIMENSION      │ o.region                  │            │
+   │ memory        │ main        │ shop               │ raw_amount  │ DECIMAL(18,2) │ FACT           │ o.quantity * o.price      │ Line total │
+   │ memory        │ main        │ shop               │ order_count │ BIGINT        │ METRIC         │ COUNT(o.id)               │            │
+   │ memory        │ main        │ shop               │ revenue     │ DECIMAL(38,2) │ METRIC         │ SUM(o.quantity * o.price) │            │
+   └───────────────┴─────────────┴────────────────────┴─────────────┴───────────────┴────────────────┴───────────────────────────┴────────────┘
 
 ``avg_order`` is a ``DERIVED_METRIC`` because it has no table alias and its expression names two other metrics. A derived metric may not contain an aggregate function of its own -- ``avg_order AS revenue / COUNT(*)`` is rejected at ``CREATE``, which is why the order count is declared as the base metric ``o.order_count`` first. See :ref:`howto-derived-metrics`.
 
-``data_type`` is empty for every row here because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`GET_DDL <ref-get-ddl>` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+The example tables use ``VARCHAR`` text columns, ``DATE`` dates, ``INTEGER`` quantities and ``DECIMAL(10,2)`` amounts and prices. ``data_type`` is each member's type as a query returns it -- an aggregate's own type, not its input's: ``COUNT`` is ``BIGINT``, ``SUM`` of a ``DECIMAL(10,2)`` is ``DECIMAL(38,2)``, and a ratio of two metrics is ``DOUBLE``. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 **Error: view does not exist:**
 

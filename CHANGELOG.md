@@ -11,6 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`SHOW SEMANTIC DIMENSIONS` / `METRICS` / `FACTS`, `SHOW COLUMNS IN SEMANTIC VIEW`,
+  `SHOW SEMANTIC DIMENSIONS FOR METRIC` and `DESCRIBE SEMANTIC VIEW` report each member's
+  data type again.** The `data_type` column (and the `DATA_TYPE` rows of `DESCRIBE`) has been
+  empty for every view created since v0.10.0. It now reports the type the member's column
+  has in a `semantic_view()` query, in DuckDB's spelling: an aggregate's own type rather than
+  its input's (`COUNT` is `BIGINT`, `AVG` is `DOUBLE`, `SUM` of an integer column is `BIGINT`,
+  as the query returns it), for dimensions, facts, derived, window, semi-additive, PRIVATE
+  and role-played members alike. The type is worked out when the command runs, so it follows a source column
+  whose type changes after `CREATE`. A member whose source table or column no longer exists
+  reports an empty `data_type` instead of making the whole command fail. The cross-view forms
+  (`SHOW SEMANTIC METRICS` without `IN`) take about a millisecond or two longer per view.
+  Cancelling one of these commands (Ctrl-C, `interrupt()`, an ADBC cancel) stops the type
+  lookup promptly with an `INTERRUPT` error, rather than once every view has been typed.
+- **`SHOW SEMANTIC DIMENSIONS FOR METRIC` marks a window metric's dimensions `required` however
+  they are spelled.** A dimension named in the window's `ORDER BY` or `PARTITION BY [EXCLUDING]`
+  as `alias.name` (`ORDER BY s.placed`) or quoted in a different case (`ORDER BY "PLACED"`) was
+  reported `required = false`, although querying the metric without it fails.
 - **A `USING` metric can aggregate a fact on the role-playing table.** A metric such as
   `f.dep_elev USING (dep_airport) AS SUM(a.elev)`, where `elev` is a fact on the
   role-played `airports` table, used to fail with `Referenced table "a" not found`. It now
