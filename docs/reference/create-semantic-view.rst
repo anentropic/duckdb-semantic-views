@@ -295,7 +295,7 @@ Facts can reference other facts by name. The extension resolves dependencies in 
 
 **Reported data type:**
 
-As with dimensions and metrics, ``CREATE`` records no output type for a fact. The ``data_type`` column reported by :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is empty for every view created since v0.10.0, and populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+As with dimensions and metrics, ``CREATE`` records no output type for a fact. The ``data_type`` column reported by :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is worked out when that command runs: it is the type of the fact's expression over the current source columns. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 
 .. _ref-create-dimensions:
@@ -333,14 +333,14 @@ Declares named grouping expressions available for queries.
 
 **Reported data type:**
 
-``CREATE`` does not record an output type for a dimension, and no surface can declare one: the DDL grammar above has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`ref-get-ddl` could not carry it (a restored view silently lost the cast). The ``data_type`` column reported by :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is therefore empty for every view created since v0.10.0, and populated only for views stored before that release.
+``CREATE`` does not record an output type for a dimension, and no surface can declare one: the DDL grammar above has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`ref-get-ddl` could not carry it (a restored view silently lost the cast). To force a type, write the cast into the expression (``CAST(o.code AS VARCHAR)``).
 
-Query results are still fully typed -- :ref:`semantic_view() <ref-semantic-view-function>` infers each output column when the query is bound. Only the catalog metadata is silent about types. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+The ``data_type`` column reported by :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is worked out when that command runs, the same way :ref:`semantic_view() <ref-semantic-view-function>` types its output columns when a query is bound. It therefore always matches the type a query returns, and follows a source column whose type changes after ``CREATE``. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 .. versionchanged:: 0.10.0
 
-   The define-time inference pass was removed. Views created before this
-   change keep whatever ``data_type`` they were stored with.
+   The define-time inference pass was removed. ``data_type`` was empty for
+   new views until it became a read-time probe (see the release notes).
 
 
 .. _ref-create-metrics:
@@ -466,7 +466,7 @@ See :ref:`howto-window-metrics` for details on both modes.
 
 **Reported data type:**
 
-As with dimensions, ``CREATE`` does not record an output type for a metric. The ``data_type`` column reported by :ref:`SHOW SEMANTIC METRICS <ref-show-semantic-metrics>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is empty for every view created since v0.10.0, and populated only for views stored before that release. The metric's result column is typed when the query is bound, not when the view is defined. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+As with dimensions, ``CREATE`` does not record an output type for a metric. The ``data_type`` column reported by :ref:`SHOW SEMANTIC METRICS <ref-show-semantic-metrics>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is worked out when that command runs and is the type of the aggregate, not of its input: ``COUNT`` is ``BIGINT``, ``AVG`` is ``DOUBLE``, and ``SUM`` of an integer column is ``BIGINT`` -- the type :ref:`semantic_view() <ref-semantic-view-function>` returns it as. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 
 .. _ref-create-materializations:

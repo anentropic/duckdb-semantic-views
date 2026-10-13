@@ -133,6 +133,50 @@ impl BorrowedConnection {
 // they would encourage passing BorrowedConnection around without
 // unwrapping intent at each FFI boundary.
 
+extern "C" {
+    /// Defined in `cpp/src/shim.cpp`: the interrupt flag of the `ClientContext`
+    /// whose table-function bind is running on this thread (`false` outside one).
+    fn sv_bind_caller_interrupted() -> bool;
+}
+
+/// Whether the caller of the table function now binding has been cancelled.
+///
+/// A bind dispatcher runs on a fresh `Connection(*context.db)` with its own
+/// interrupt flag, which `duckdb_interrupt` on the caller never sets; this reads
+/// the caller's flag instead, so long-running bind work (the member-type probes)
+/// can stop between statements.
+#[must_use]
+pub fn bind_caller_interrupted() -> bool {
+    // SAFETY: a plain flag read; no arguments, callable from any thread.
+    unsafe { sv_bind_caller_interrupted() }
+}
+
+/// Type `wanted`'s members of `def` for a SHOW / DESCRIBE bind on this bind's
+/// connection (TECH-DEBT #51). A member that cannot be typed is simply absent;
+/// the only error is the caller's cancellation, which stops probing at once.
+///
+/// # Errors
+///
+/// `Interrupted!` when the bind's caller was cancelled mid-probe. The C++ bind
+/// helpers raise that as a bare `InterruptException`.
+pub fn member_types_for_bind(
+    borrowed: &BorrowedConnection,
+    view_name: &str,
+    def: &crate::model::SemanticViewDefinition,
+    wanted: crate::query::member_types::Wanted,
+) -> Result<crate::query::member_types::MemberTypes, String> {
+    // SAFETY: `borrowed` is the live per-call connection of this bind.
+    Ok(unsafe {
+        crate::query::member_types::infer_member_types_on(
+            borrowed.as_raw(),
+            view_name,
+            def,
+            wanted,
+            &bind_caller_interrupted,
+        )
+    }?)
+}
+
 /// Probe whether `semantic_layer._definitions` exists on the given borrowed
 /// connection.
 ///

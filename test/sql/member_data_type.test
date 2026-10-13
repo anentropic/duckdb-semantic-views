@@ -1,0 +1,401 @@
+# TECH-DEBT #51 (PAR-2): SHOW SEMANTIC {DIMENSIONS,METRICS,FACTS},
+# SHOW COLUMNS IN SEMANTIC VIEW, SHOW SEMANTIC DIMENSIONS FOR METRIC and
+# DESCRIBE SEMANTIC VIEW report each member's `data_type`.
+#
+# The type is probed on the READ side, at SHOW / DESCRIBE bind time, by
+# expanding a request for the member and binding it with a LIMIT 0 probe —
+# the same mechanism `semantic_view()` uses to declare its output columns. So
+# the reported type is exactly what `typeof()` of that member's column returns
+# from `semantic_view()`, in DuckDB's spelling. That includes the query path's
+# own normalisation: `SUM` over an integer column is HUGEINT in plain DuckDB but
+# `semantic_view()` returns it as BIGINT, so BIGINT is reported.
+#
+# Nothing is stored at CREATE, so the type follows the source columns: a
+# column whose type changes after CREATE is reported with its new type, and a
+# member whose source no longer binds (a dropped table or column) reports an
+# empty `data_type` rather than failing the whole SHOW / DESCRIBE.
+#
+# Each `# CASE` block below is self-contained after the setup and was watched
+# going red individually against the pre-fix build (the runner halts a file at
+# its first failure, so the file was split one case per file for that check).
+
+require semantic_views
+
+statement ok
+CREATE TABLE dt_customers (id INTEGER PRIMARY KEY, "Name" VARCHAR, tier SMALLINT);
+
+statement ok
+CREATE TABLE dt_orders (id INTEGER PRIMARY KEY, cust_id INTEGER, amount DECIMAL(10,2),
+    qty INTEGER, region VARCHAR, placed DATE, score DOUBLE, tags VARCHAR[]);
+
+statement ok
+INSERT INTO dt_customers VALUES (1, 'Ann', 1), (2, 'Bob', 2);
+
+statement ok
+INSERT INTO dt_orders VALUES
+    (1, 1, 10.50, 2, 'EU', '2024-01-01', 1.5, ['a']),
+    (2, 2, 20.00, 3, 'US', '2024-01-02', 2.5, ['b', 'c']);
+
+statement ok
+CREATE SEMANTIC VIEW dt_sv AS
+TABLES (
+    o AS dt_orders PRIMARY KEY (id),
+    c AS dt_customers PRIMARY KEY (id)
+)
+RELATIONSHIPS ( oc AS o(cust_id) REFERENCES c )
+FACTS (
+    o.line_total AS o.amount * o.qty,
+    PRIVATE o.raw_score AS o.score
+)
+DIMENSIONS (
+    o.region AS o.region,
+    o.placed AS o.placed,
+    o.tags AS o.tags,
+    c."Customer Name" AS c."Name",
+    c.tier AS c.tier
+)
+METRICS (
+    o.order_count AS COUNT(o.id),
+    o.avg_qty AS AVG(o.qty),
+    o.total_qty AS SUM(o.qty),
+    o.total_amount AS SUM(o.amount),
+    o.last_placed AS MAX(o.placed),
+    PRIVATE o.score_sum AS SUM(o.raw_score),
+    avg_order AS total_amount / order_count,
+    o.qty_lag AS LAG(total_qty, 1) OVER (ORDER BY placed),
+    o.closing_amount NON ADDITIVE BY (placed) AS SUM(o.amount)
+);
+
+# CASE dimension: plain VARCHAR and DATE columns
+query TT
+SELECT name, data_type FROM show_semantic_dimensions('dt_sv') WHERE name IN ('region', 'placed') ORDER BY name
+----
+placed	DATE
+region	VARCHAR
+
+# CASE dimension: quoted mixed-case member over a quoted mixed-case column, on a joined table
+query TT
+SELECT name, data_type FROM show_semantic_dimensions('dt_sv') WHERE name IN ('"Customer Name"', 'tier') ORDER BY name
+----
+"Customer Name"	VARCHAR
+tier	SMALLINT
+
+# CASE dimension: a nested (LIST) type keeps its child type
+query TTTTTTTT
+SHOW SEMANTIC DIMENSIONS LIKE 'tags' IN dt_sv
+----
+memory	main	dt_sv	dt_orders	tags	VARCHAR[]	[]	(empty)
+
+# CASE metric: COUNT is BIGINT
+query TTTTTTTT
+SHOW SEMANTIC METRICS LIKE 'order_count' IN dt_sv
+----
+memory	main	dt_sv	dt_orders	order_count	BIGINT	[]	(empty)
+
+# CASE metric: AVG over INTEGER is DOUBLE, not the input's INTEGER
+query TT
+SELECT name, data_type FROM show_semantic_metrics('dt_sv') WHERE name = 'avg_qty'
+----
+avg_qty	DOUBLE
+
+# CASE metric: SUM over INTEGER is reported as semantic_view() returns it
+# (BIGINT; plain DuckDB would say HUGEINT)
+query TT
+SELECT name, data_type FROM show_semantic_metrics('dt_sv') WHERE name = 'total_qty'
+----
+total_qty	BIGINT
+
+# CASE metric: SUM over DECIMAL(10,2) widens to DECIMAL(38,2); MAX keeps DATE
+query TT
+SELECT name, data_type FROM show_semantic_metrics('dt_sv') WHERE name IN ('total_amount', 'last_placed') ORDER BY name
+----
+last_placed	DATE
+total_amount	DECIMAL(38,2)
+
+# CASE derived metric: DECIMAL / BIGINT is DOUBLE
+query TT
+SELECT name, data_type FROM show_semantic_metrics('dt_sv') WHERE name = 'avg_order'
+----
+avg_order	DOUBLE
+
+# CASE window metric (needs its ORDER BY dimension to be probed)
+query TT
+SELECT name, data_type FROM show_semantic_metrics('dt_sv') WHERE name = 'qty_lag'
+----
+qty_lag	BIGINT
+
+# CASE semi-additive metric (cannot share a probe with the derived metric)
+query TT
+SELECT name, data_type FROM show_semantic_metrics('dt_sv') WHERE name = 'closing_amount'
+----
+closing_amount	DECIMAL(38,2)
+
+# CASE PRIVATE metric and PRIVATE fact are typed too, though they cannot be queried
+query TT
+SELECT name, data_type FROM show_semantic_metrics('dt_sv') WHERE name = 'score_sum'
+----
+score_sum	DOUBLE
+
+# CASE fact: DECIMAL(10,2) * INTEGER
+query TTTTTTTT
+SHOW SEMANTIC FACTS IN dt_sv
+----
+memory	main	dt_sv	dt_orders	line_total	DECIMAL(18,2)	[]	(empty)
+memory	main	dt_sv	dt_orders	raw_score	DOUBLE	[]	(empty)
+
+# CASE the cross-view SHOW form (no IN) reports the same types
+query TT
+SELECT name, data_type FROM show_semantic_metrics_all() WHERE semantic_view_name = 'dt_sv' AND name IN ('order_count', 'avg_qty') ORDER BY name
+----
+avg_qty	DOUBLE
+order_count	BIGINT
+
+# CASE DESCRIBE SEMANTIC VIEW DATA_TYPE rows
+query TTT
+SELECT object_kind, object_name, property_value FROM describe_semantic_view('dt_sv')
+WHERE property = 'DATA_TYPE' AND object_name IN ('region', 'line_total', 'total_qty', 'avg_order', 'qty_lag')
+ORDER BY object_name
+----
+DERIVED_METRIC	avg_order	DOUBLE
+FACT	line_total	DECIMAL(18,2)
+METRIC	qty_lag	BIGINT
+DIMENSION	region	VARCHAR
+METRIC	total_qty	BIGINT
+
+# CASE SHOW COLUMNS IN SEMANTIC VIEW
+query TT
+SELECT column_name, data_type FROM show_columns_in_semantic_view('dt_sv')
+WHERE column_name IN ('tier', 'line_total', 'avg_qty') ORDER BY column_name
+----
+avg_qty	DOUBLE
+line_total	DECIMAL(18,2)
+tier	SMALLINT
+
+# CASE SHOW SEMANTIC DIMENSIONS FOR METRIC
+query TT
+SELECT name, data_type FROM show_semantic_dimensions_for_metric('dt_sv', 'order_count') WHERE name IN ('region', 'tier') ORDER BY name
+----
+region	VARCHAR
+tier	SMALLINT
+
+# ============================================================
+# The invariant: data_type is typeof() of the queried column. These are
+# controls — they passed before the fix too — pinning that the types above
+# are what semantic_view() really returns.
+# ============================================================
+
+query TTTTTT
+SELECT typeof(total_qty), typeof(order_count), typeof(avg_qty), typeof(total_amount), typeof(last_placed), typeof(avg_order)
+FROM semantic_view('dt_sv', metrics := ['total_qty', 'order_count', 'avg_qty', 'total_amount', 'last_placed', 'avg_order']) LIMIT 1
+----
+BIGINT	BIGINT	DOUBLE	DECIMAL(38,2)	DATE	DOUBLE
+
+query TTTT
+SELECT typeof("Customer Name"), typeof(tier), typeof(tags), typeof(placed)
+FROM semantic_view('dt_sv', dimensions := ['Customer Name', 'tier', 'tags', 'placed']) LIMIT 1
+----
+VARCHAR	SMALLINT	VARCHAR[]	DATE
+
+query T
+SELECT typeof(qty_lag) FROM semantic_view('dt_sv', dimensions := ['placed'], metrics := ['qty_lag']) LIMIT 1
+----
+BIGINT
+
+query T
+SELECT typeof(closing_amount) FROM semantic_view('dt_sv', metrics := ['closing_amount']) LIMIT 1
+----
+DECIMAL(38,2)
+
+query T
+SELECT typeof(line_total) FROM semantic_view('dt_sv', facts := ['line_total']) LIMIT 1
+----
+DECIMAL(18,2)
+
+# ============================================================
+# The type is read-side, so it follows a source column changed after CREATE.
+# ============================================================
+
+statement ok
+CREATE TABLE dt_evolve (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+CREATE SEMANTIC VIEW dt_evolve_sv AS
+TABLES (e AS dt_evolve PRIMARY KEY (id))
+DIMENSIONS (e.v AS e.v)
+METRICS (e.v_max AS MAX(e.v));
+
+# CASE a column retyped after CREATE is reported with its new type
+statement ok
+ALTER TABLE dt_evolve ALTER v TYPE DOUBLE;
+
+query TT
+SELECT name, data_type FROM show_semantic_metrics('dt_evolve_sv')
+----
+v_max	DOUBLE
+
+# ============================================================
+# A member whose source no longer binds reports an empty type; the rest of
+# the view is still typed and nothing errors.
+# ============================================================
+
+statement ok
+CREATE TABLE dt_keep (id INTEGER PRIMARY KEY, k VARCHAR, n BIGINT);
+
+statement ok
+CREATE TABLE dt_gone (id INTEGER PRIMARY KEY, keep_id INTEGER, g DOUBLE);
+
+statement ok
+CREATE SEMANTIC VIEW dt_broken_sv AS
+TABLES (
+    k AS dt_keep PRIMARY KEY (id),
+    g AS dt_gone PRIMARY KEY (id)
+)
+RELATIONSHIPS ( gk AS g(keep_id) REFERENCES k )
+DIMENSIONS (
+    k.k AS k.k,
+    k.n_dim AS k.n,
+    g.g_dim AS g.g
+)
+METRICS (
+    k.n_total AS SUM(k.n),
+    g.g_total AS SUM(g.g)
+);
+
+statement ok
+ALTER TABLE dt_keep DROP COLUMN n;
+
+# CASE a dropped source column empties only the members that read it
+query TT
+SELECT name, data_type FROM show_semantic_dimensions('dt_broken_sv') ORDER BY name
+----
+g_dim	DOUBLE
+k	VARCHAR
+n_dim	(empty)
+
+statement ok
+DROP TABLE dt_gone;
+
+# CASE a dropped source table: SHOW still succeeds, the dropped table's members are empty
+query TT
+SELECT name, data_type FROM show_semantic_metrics('dt_broken_sv') ORDER BY name
+----
+g_total	(empty)
+n_total	(empty)
+
+query TTT
+SELECT object_kind, object_name, property_value FROM describe_semantic_view('dt_broken_sv')
+WHERE property = 'DATA_TYPE' ORDER BY object_kind, object_name
+----
+DIMENSION	g_dim	(empty)
+DIMENSION	k	VARCHAR
+DIMENSION	n_dim	(empty)
+METRIC	g_total	(empty)
+METRIC	n_total	(empty)
+
+# ============================================================
+# A view in a non-default schema over tables in that schema.
+# ============================================================
+
+statement ok
+CREATE SCHEMA dt_s;
+
+statement ok
+CREATE TABLE dt_s.items (id INTEGER PRIMARY KEY, price FLOAT, sku UUID);
+
+statement ok
+CREATE SEMANTIC VIEW dt_s.items_sv AS
+TABLES (i AS dt_s.items PRIMARY KEY (id))
+DIMENSIONS (i.sku AS i.sku)
+METRICS (i.top_price AS MAX(i.price), i.n AS COUNT(*));
+
+# CASE a view in a non-default schema is probed against that schema's tables
+query TTTT
+SELECT schema_name, name, data_type, table_name FROM show_semantic_metrics('dt_s.items_sv') ORDER BY name
+----
+dt_s	n	BIGINT	dt_s.items
+dt_s	top_price	FLOAT	dt_s.items
+
+query TT
+SELECT name, data_type FROM show_semantic_dimensions_all() WHERE schema_name = 'dt_s'
+----
+sku	UUID
+
+# ============================================================
+# Types semantic_view() declares differently from the raw expression: an ENUM
+# or STRUCT column is returned as VARCHAR, so that is what is reported.
+# ============================================================
+
+statement ok
+CREATE TYPE dt_mood AS ENUM ('ok', 'sad');
+
+statement ok
+CREATE TABLE dt_odd (id INTEGER PRIMARY KEY, mood dt_mood, info STRUCT(a INTEGER), big HUGEINT);
+
+statement ok
+INSERT INTO dt_odd VALUES (1, 'ok', {'a': 1}, 5);
+
+statement ok
+CREATE SEMANTIC VIEW dt_odd_sv AS
+TABLES (x AS dt_odd PRIMARY KEY (id))
+DIMENSIONS (x.mood AS x.mood, x.info AS x.info, x.big AS x.big);
+
+# CASE ENUM / STRUCT / HUGEINT dimensions report what semantic_view() returns
+query TT
+SELECT name, data_type FROM show_semantic_dimensions('dt_odd_sv') ORDER BY name
+----
+big	BIGINT
+info	VARCHAR
+mood	VARCHAR
+
+query TTT
+SELECT typeof(big), typeof(info), typeof(mood) FROM semantic_view('dt_odd_sv', dimensions := ['big', 'info', 'mood'])
+----
+BIGINT	VARCHAR	VARCHAR
+
+# ============================================================
+# Role-playing: two relationships to the same table make its members ambiguous
+# when queried without a role, so the plain probe is rejected. Their type does
+# not depend on the role, and they are typed on a single-role copy.
+# ============================================================
+
+statement ok
+CREATE TABLE dt_airports (code VARCHAR PRIMARY KEY, city VARCHAR, elevation INTEGER);
+
+statement ok
+CREATE TABLE dt_flights (id INTEGER PRIMARY KEY, dep VARCHAR, arr VARCHAR, carrier VARCHAR);
+
+statement ok
+INSERT INTO dt_airports VALUES ('SFO', 'San Francisco', 4), ('JFK', 'New York', 4);
+
+statement ok
+INSERT INTO dt_flights VALUES (1, 'SFO', 'JFK', 'AA');
+
+statement ok
+CREATE SEMANTIC VIEW dt_rp AS
+TABLES (f AS dt_flights PRIMARY KEY (id), a AS dt_airports PRIMARY KEY (code))
+RELATIONSHIPS (dep_ap AS f(dep) REFERENCES a, arr_ap AS f(arr) REFERENCES a)
+FACTS (a.elev_m AS a.elevation * 0.3048)
+DIMENSIONS (a.city AS a.city, f.carrier AS f.carrier)
+METRICS (
+  f.departures USING (dep_ap) AS COUNT(*),
+  a.max_elevation AS MAX(a.elevation)
+);
+
+# CASE role-played dimension, fact and metric are typed
+query TTT
+SELECT name, data_type, kind FROM (
+  SELECT name, data_type, 'D' AS kind FROM show_semantic_dimensions('dt_rp')
+  UNION ALL SELECT name, data_type, 'F' FROM show_semantic_facts('dt_rp')
+  UNION ALL SELECT name, data_type, 'M' FROM show_semantic_metrics('dt_rp')
+) ORDER BY kind, name
+----
+carrier	VARCHAR	D
+city	VARCHAR	D
+elev_m	DECIMAL(15,4)	F
+departures	BIGINT	M
+max_elevation	INTEGER	M
+
+query T
+SELECT typeof(city) FROM semantic_view('dt_rp', dimensions := ['city'], metrics := ['departures'])
+----
+VARCHAR

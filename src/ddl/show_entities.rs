@@ -13,12 +13,12 @@
 //! same list, in the same order, that Snowflake's `SHOW SEMANTIC …` commands
 //! return.
 //!
-//! `data_type` is whatever was persisted in the JSON definition, which since
-//! v0.10.0 means the **declared** output type and nothing else: CREATE-time
-//! inference was removed and no SQL DDL surface can declare a type, so only a
-//! YAML definition setting `output_type` produces a non-empty value. Snowflake
-//! populates this column with the member's actual type — see TECH-DEBT #51
-//! (PAR-2) for the read-side probe that would close the gap.
+//! `data_type` is the type `semantic_view()` returns for the member, probed at
+//! this bind on its connection by `query::member_types` (TECH-DEBT #51): one
+//! probe per view for the kind being listed, falling back to one per member
+//! when a batch cannot be expanded or bound. A member whose source no longer
+//! binds reports an empty `data_type` (or a legacy definition's declared
+//! `output_type`); the listing itself never fails on that account.
 //!
 //! Materializations (7 columns, different tail) and the two-arg
 //! `dimensions_for_metric` variant keep their own modules; both route through
@@ -29,10 +29,11 @@
 use crate::catalog::CatalogReader;
 use crate::ddl::describe::format_json_array;
 use crate::ddl::read_ffi::{
-    probe_catalog_table_present, read_str_arg, run_dispatcher, serialize_varchar_rows,
-    BorrowedConnection,
+    member_types_for_bind, probe_catalog_table_present, read_str_arg, run_dispatcher,
+    serialize_varchar_rows, BorrowedConnection,
 };
 use crate::model::SemanticViewDefinition;
+use crate::query::member_types::{MemberTypes, Wanted};
 
 /// Which entity slice of a definition a SHOW command reports on.
 #[derive(Clone, Copy)]
@@ -40,6 +41,29 @@ enum EntityKind {
     Dimensions,
     Metrics,
     Facts,
+}
+
+impl EntityKind {
+    /// The member kind whose types this listing needs probed.
+    fn wanted(self) -> Wanted {
+        match self {
+            Self::Dimensions => Wanted::DIMENSIONS,
+            Self::Metrics => Wanted::METRICS,
+            Self::Facts => Wanted::FACTS,
+        }
+    }
+}
+
+/// Probe the reported types of `kind`'s members of `def` on this bind's
+/// connection (TECH-DEBT #51). Errs only when the caller was cancelled, which
+/// ends the whole listing rather than moving on to the next view.
+fn probe_types(
+    kind: EntityKind,
+    borrowed: &BorrowedConnection,
+    view_name: &str,
+    def: &SemanticViewDefinition,
+) -> Result<MemberTypes, String> {
+    member_types_for_bind(borrowed, view_name, def, kind.wanted())
 }
 
 /// A single 8-column row of `SHOW SEMANTIC {DIMENSIONS,METRICS,FACTS}` output.
@@ -78,16 +102,17 @@ fn collect_entities(
     kind: EntityKind,
     view_name: &str,
     def: &SemanticViewDefinition,
+    types: &MemberTypes,
 ) -> Vec<EntityRow> {
     let db_name = def.database_name.clone().unwrap_or_default();
     let sch_name = def.schema_name.clone().unwrap_or_default();
     let alias_map = def.alias_to_table_map();
 
-    // Dimension / Metric / Fact all expose (name, source_table, output_type,
-    // synonyms, comment); build one row from those five fields.
+    // Dimension / Metric / Fact all expose (name, source_table, synonyms,
+    // comment); build one row from those plus the member's reported type.
     let build = |name: &str,
                  source_table: Option<&String>,
-                 output_type: Option<&String>,
+                 data_type: String,
                  synonyms: &[String],
                  comment: Option<&String>| {
         let table_name = source_table
@@ -99,7 +124,7 @@ fn collect_entities(
             semantic_view_name: view_name.to_string(),
             table_name,
             name: name.to_string(),
-            data_type: output_type.cloned().unwrap_or_default(),
+            data_type,
             synonyms: format_json_array(synonyms),
             comment: comment.cloned().unwrap_or_default(),
         }
@@ -113,7 +138,7 @@ fn collect_entities(
                 build(
                     &d.name,
                     d.source_table.as_ref(),
-                    d.output_type.as_ref(),
+                    types.dimension(&d.name, d.output_type.as_ref()),
                     &d.synonyms,
                     d.comment.as_ref(),
                 )
@@ -126,7 +151,7 @@ fn collect_entities(
                 build(
                     &m.name,
                     m.source_table.as_ref(),
-                    m.output_type.as_ref(),
+                    types.metric(&m.name, m.output_type.as_ref()),
                     &m.synonyms,
                     m.comment.as_ref(),
                 )
@@ -139,7 +164,7 @@ fn collect_entities(
                 build(
                     &f.name,
                     f.source_table.as_ref(),
-                    f.output_type.as_ref(),
+                    types.fact(&f.name, f.output_type.as_ref()),
                     &f.synonyms,
                     f.comment.as_ref(),
                 )
@@ -162,7 +187,8 @@ fn show_entities_all(kind: EntityKind, borrowed: &BorrowedConnection) -> Result<
         let Ok(def) = SemanticViewDefinition::from_json(name, json) else {
             continue;
         };
-        for r in collect_entities(kind, name, &def) {
+        let types = probe_types(kind, borrowed, name, &def)?;
+        for r in collect_entities(kind, name, &def, &types) {
             rows.push(r.into_cells());
         }
     }
@@ -193,7 +219,8 @@ fn show_entities_one(
     // for this specific view, so a corrupt definition must surface loudly
     // instead of silently returning zero rows.
     let def = SemanticViewDefinition::from_json(&view_name, &json)?;
-    let mut internal = collect_entities(kind, &view_name, &def);
+    let types = probe_types(kind, borrowed, &view_name, &def)?;
+    let mut internal = collect_entities(kind, &view_name, &def, &types);
     internal.sort_by(|a, b| a.name.cmp(&b.name));
     let rows: Vec<Vec<String>> = internal.into_iter().map(EntityRow::into_cells).collect();
     serialize_varchar_rows(&rows)

@@ -125,21 +125,17 @@ unsafe fn show_dims_for_metric(
         });
     };
 
-    let required_dim_names: HashSet<String> = if let Some(ref ws) = met.window_spec {
-        let mut names = HashSet::new();
-        for dn in &ws.excluding_dims {
-            names.insert(dn.to_ascii_lowercase());
-        }
-        for dn in &ws.partition_dims {
-            names.insert(dn.to_ascii_lowercase());
-        }
-        for ob in &ws.order_by {
-            names.insert(ob.expr.to_ascii_lowercase());
-        }
-        names
-    } else {
-        HashSet::new()
-    };
+    // A window metric's PARTITION BY [EXCLUDING] / ORDER BY references,
+    // resolved (bare, dotted or quoted) to their declared dimensions by the
+    // same resolver the query-time `WindowMetricRequiredDimension` check uses,
+    // keyed by the canonical identifier. A raw `to_ascii_lowercase()` of the
+    // reference used to miss `ORDER BY s.placed` and `ORDER BY "PLACED"` (the
+    // #28 name-matcher class), reporting `required = false` for a dimension
+    // the query then demanded.
+    let required_dim_names: HashSet<String> = crate::expand::window_required_dimensions(&def, met)
+        .iter()
+        .map(|n| crate::ident::normalize_ident_part(n))
+        .collect();
 
     let met_tables: Vec<String> = if let Some(ref st) = met.source_table {
         vec![st.to_ascii_lowercase()]
@@ -151,6 +147,13 @@ unsafe fn show_dims_for_metric(
     };
 
     let alias_map = def.alias_to_table_map();
+    // TECH-DEBT #51: probe the dimensions' types on this bind's connection.
+    let types = crate::ddl::read_ffi::member_types_for_bind(
+        borrowed,
+        &view_name,
+        &def,
+        crate::query::member_types::Wanted::DIMENSIONS,
+    )?;
     let mut rows: Vec<(Vec<String>, bool)> = if def.joins.is_empty() {
         def.dimensions
             .iter()
@@ -164,9 +167,9 @@ unsafe fn show_dims_for_metric(
                     vec![
                         table_name,
                         d.name.clone(),
-                        d.output_type.clone().unwrap_or_default(),
+                        types.dimension(&d.name, d.output_type.as_ref()),
                     ],
-                    required_dim_names.contains(&d.name.to_ascii_lowercase()),
+                    required_dim_names.contains(&crate::ident::normalize_ident_part(&d.name)),
                 )
             })
             .collect()
@@ -202,9 +205,9 @@ unsafe fn show_dims_for_metric(
                     vec![
                         table_name,
                         d.name.clone(),
-                        d.output_type.clone().unwrap_or_default(),
+                        types.dimension(&d.name, d.output_type.as_ref()),
                     ],
-                    required_dim_names.contains(&d.name.to_ascii_lowercase()),
+                    required_dim_names.contains(&crate::ident::normalize_ident_part(&d.name)),
                 )
             })
             .collect()
