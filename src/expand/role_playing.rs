@@ -6,7 +6,7 @@ use super::facts::{
     collect_derived_metric_using, collect_referenced_facts, collect_transitive_metric_names,
 };
 use super::join_resolver::scoped_join_alias;
-use super::types::{AmbiguousMemberFactPathError, ExpandError};
+use super::types::{AmbiguousMemberFactPathError, AmbiguousMetricPathError, ExpandError};
 
 /// Determine which relationships point to a given table alias in the definition.
 ///
@@ -229,16 +229,22 @@ pub(super) fn check_where_clause_role_playing_path(
 ///   rewrite does not rename, so the descendant hangs off the bare instance.
 ///
 /// A derived metric is checked through the base metrics it inlines, where the
-/// fact references (and the `USING`) live. A member's reference to a fact on
-/// its OWN table is left to the checks that already govern that table
-/// (`find_using_context` for a dimension on the role-playing table).
+/// fact references (and the `USING`) live, and a window metric through its
+/// inner aggregate. A dimension's reference to a fact on its OWN table is left
+/// to the checks that already govern that table (`find_using_context` for a
+/// dimension on the role-playing table). A metric's own table gets no such
+/// pass: a metric declared ON (or below) the role-playing table can never name
+/// a role, so it is rejected with [`ExpandError::AmbiguousMetricPath`]
+/// whatever it aggregates (PR #247 review).
 pub(super) fn check_member_fact_role_playing_path(
     view_name: &str,
     def: &SemanticViewDefinition,
     resolved_dims: &[&crate::model::Dimension],
     resolved_mets: &[&crate::model::Metric],
 ) -> Result<(), ExpandError> {
-    if def.facts.is_empty() || def.joins.is_empty() {
+    // Not `def.facts.is_empty()`: a metric on a role-played table needs no fact
+    // to bind to an arbitrary role (the own-table check below).
+    if def.joins.is_empty() {
         return Ok(());
     }
     let ambiguous = |member_name: &str, fact_name: String, fact_table: String, rp: String| {
@@ -267,13 +273,17 @@ pub(super) fn check_member_fact_role_playing_path(
         }
     }
 
-    // Base metrics only: a derived metric contributes the base metrics it
-    // inlines, deduplicated by canonical name.
+    // Qualified metrics only, each once: a derived metric contributes the
+    // qualified metrics it inlines, and a window metric — itself qualified —
+    // contributes its inner aggregate too (PR #247 review: stopping at the first
+    // qualified metric never looked inside a window, so an unscoped inner
+    // metric over a role-played fact was never checked).
+    // `collect_transitive_metric_names` follows both edges and includes the
+    // metric itself.
     let mut bases: Vec<&crate::model::Metric> = Vec::new();
     for met in resolved_mets {
-        if met.source_table.is_some() {
+        if met.source_table.is_some() && !bases.iter().any(|b| std::ptr::eq(*b, *met)) {
             bases.push(met);
-            continue;
         }
         for name in collect_transitive_metric_names(met, &def.metrics) {
             if let Some(base) = def.metrics.iter().find(|m| {
@@ -288,6 +298,27 @@ pub(super) fn check_member_fact_role_playing_path(
 
     for base in bases {
         let own = base.source_table.as_ref().map(|t| t.to_ascii_lowercase());
+        // A metric declared ON (or below) the role-playing table is joined
+        // through `tree_parent` — the first-declared relationship — whatever it
+        // aggregates, and it cannot name a role: a `USING` relationship must
+        // originate from the metric's own table (`validate_using_relationships`),
+        // so no relationship TO that table is ever nameable from it (PR #247
+        // review). Checked before its fact references, which on its own table
+        // the loop below deliberately skips.
+        if let Some(own_table) = own.as_deref() {
+            if let Some(rp) = role_playing_on_path(view_name, def, own_table)? {
+                let available_relationships = relationships_to_table(def, &rp);
+                return Err(ExpandError::AmbiguousMetricPath {
+                    detail: Box::new(AmbiguousMetricPathError {
+                        view_name: view_name.to_string(),
+                        metric_name: base.name.clone(),
+                        metric_table: own_table.to_string(),
+                        role_playing_table: rp,
+                        available_relationships,
+                    }),
+                });
+            }
+        }
         for (fact_name, fact_table) in collect_referenced_facts(&base.expr, &def.facts) {
             if own.as_deref() == Some(fact_table.as_str()) {
                 continue;

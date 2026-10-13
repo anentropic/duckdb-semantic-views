@@ -220,6 +220,30 @@ fn push_bare_join<'a>(
     });
 }
 
+/// `resolved_mets` plus, transitively, every metric a window metric among them
+/// names as its inner aggregate, each once, in first-reached order.
+fn with_window_inner_metrics<'m>(
+    resolved_mets: &[&'m crate::model::Metric],
+    all_metrics: &'m [crate::model::Metric],
+) -> Vec<&'m crate::model::Metric> {
+    let mut out: Vec<&crate::model::Metric> = resolved_mets.to_vec();
+    let mut i = 0;
+    while i < out.len() {
+        if let Some(ref ws) = out[i].window_spec {
+            if let Some(inner) = all_metrics
+                .iter()
+                .find(|m| crate::ident::ident_matches(&m.name, &ws.inner_metric))
+            {
+                if !out.iter().any(|m| std::ptr::eq(*m, inner)) {
+                    out.push(inner);
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Resolve which joins are needed using graph-based PK/FK resolution (Phase 26+32).
 ///
 /// Builds a `RelationshipGraph` from the definition, collects needed table
@@ -246,6 +270,15 @@ pub(super) fn resolve_joins_pkfk<'a>(
     let Ok(graph) = RelationshipGraph::from_definition(def) else {
         return Vec::new(); // Graph was validated at define time
     };
+
+    // A window metric's inner aggregate is computed in `__sv_agg` against these
+    // joins, so the inner metric needs them as much as a queried one does: its
+    // `USING` scoped joins and the tables its inlined facts reach. A window
+    // metric is qualified (it carries the source table of its declaration), so
+    // none of the derived-metric walks below reach it (PR #247 review — the
+    // inlined fact named `a__dep_airport` while no scoped join was emitted).
+    let with_inner = with_window_inner_metrics(resolved_mets, &def.metrics);
+    let resolved_mets: &[&crate::model::Metric] = &with_inner;
 
     let root = &graph.root;
 

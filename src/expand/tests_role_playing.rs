@@ -1150,3 +1150,237 @@ fn td69_fence_using_metric_over_a_fact_below_the_role_played_table_is_rejected()
         other => panic!("expected AmbiguousMemberFactPath, got: {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// PR #247 review follow-ups: the #69 rewrite and its fence, on the paths the
+// first cut did not walk — a WINDOW metric over a USING inner metric, a
+// semi-additive USING metric, mixed-case duplicate USING spellings, and a
+// metric declared ON the role-played table (which can never carry a USING of
+// its own: a USING relationship must originate from the metric's table).
+// ---------------------------------------------------------------------------
+
+/// `role_played_fact_def` plus a window metric (qualified, as DDL stores it)
+/// over `inner`, partitioned by the base-table `carrier` dimension.
+fn role_played_window_def(inner: &str) -> SemanticViewDefinition {
+    let mut def = role_played_fact_def();
+    def.metrics.push(Metric {
+        name: "win".to_string(),
+        expr: format!("SUM({inner}) OVER (PARTITION BY carrier)"),
+        source_table: Some("f".to_string()),
+        window_spec: Some(crate::model::WindowSpec {
+            window_function: "SUM".to_string(),
+            inner_metric: inner.to_string(),
+            partition_dims: vec!["carrier".to_string()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    def
+}
+
+/// Review finding (window): the window metric is qualified, so the join
+/// resolver never followed its inner metric's `USING` — the inlined fact named
+/// `a__dep_airport` but no scoped join was emitted and `__sv_agg` did not bind.
+/// c1 departs twice (2 x 100), c2 once.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn td69_window_over_a_using_metric_over_a_role_played_fact_binds_to_its_role() {
+    let sql = expand(
+        "v",
+        &role_played_window_def("dep_elev"),
+        &metrics_req(&["carrier"], &["win"]),
+    )
+    .unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![
+            (Some("c1".to_string()), 200.0),
+            (Some("c2".to_string()), 100.0)
+        ],
+        "{sql}"
+    );
+}
+
+/// The window over the OTHER role reads the other instance (elevation 7).
+#[test]
+#[cfg(not(feature = "extension"))]
+fn td69_window_over_the_other_role_reads_the_other_instance() {
+    let sql = expand(
+        "v",
+        &role_played_window_def("arr_elev"),
+        &metrics_req(&["carrier"], &["win"]),
+    )
+    .unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![
+            (Some("c1".to_string()), 14.0),
+            (Some("c2".to_string()), 7.0)
+        ],
+        "{sql}"
+    );
+}
+
+/// Review finding (window, fence half): the fence's `source_table.is_some()`
+/// branch treated the window metric itself as the base and never looked at its
+/// inner metric, so an inner metric with NO `USING` over the role-played fact
+/// was never checked.
+#[test]
+fn td69_fence_window_over_an_unscoped_role_played_fact_is_rejected() {
+    let mut def = role_played_window_def("any_elev");
+    def.metrics.push(Metric {
+        name: "any_elev".to_string(),
+        expr: "SUM(elev)".to_string(),
+        source_table: Some("f".to_string()),
+        ..Default::default()
+    });
+    expect_member_fact_ambiguity(&def, &metrics_req(&["carrier"], &["win"]), "any_elev");
+}
+
+/// A semi-additive `USING` metric over the role-played fact. `NON ADDITIVE BY
+/// (carrier)` keeps the latest carrier (`c2`, one flight): 100 departing.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn td69_semi_additive_using_metric_over_a_role_played_fact_binds_to_its_role() {
+    let mut def = role_played_fact_def();
+    def.metrics.push(Metric {
+        name: "latest_arr_elev".to_string(),
+        expr: "SUM(elev)".to_string(),
+        source_table: Some("f".to_string()),
+        using_relationships: vec!["arr_airport".to_string()],
+        non_additive_by: vec![crate::model::NonAdditiveDim {
+            dimension: "carrier".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let sql = expand("v", &def, &metrics_req(&[], &["latest_arr_elev"])).unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(None, 7.0)],
+        "{sql}"
+    );
+}
+
+/// Review finding (dedup): `USING (dep_airport, DEP_AIRPORT)` names ONE
+/// relationship — validation, the fence and the join resolver all fold case —
+/// but the fact rewrite counted the two spellings as two roles, skipped the
+/// rewrite, and left the fact on the never-joined bare alias.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn td69_duplicate_using_spellings_name_one_role() {
+    let mut def = role_played_fact_def();
+    def.metrics.push(Metric {
+        name: "dep_elev_twice_named".to_string(),
+        expr: "SUM(elev)".to_string(),
+        source_table: Some("f".to_string()),
+        using_relationships: vec!["dep_airport".to_string(), "DEP_AIRPORT".to_string()],
+        ..Default::default()
+    });
+    let sql = expand("v", &def, &metrics_req(&[], &["dep_elev_twice_named"])).unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(None, 300.0)],
+        "{sql}"
+    );
+}
+
+/// `role_played_fact_def` with both role-playing edges declared ONE-TO-ONE, so
+/// the fan-trap fence (which rejects a many-to-one parent-table metric outright)
+/// does not stand in front of the role-playing one.
+fn one_to_one_role_played_fact_def() -> SemanticViewDefinition {
+    let mut def = role_played_fact_def();
+    for j in &mut def.joins {
+        j.cardinality = Cardinality::OneToOne;
+    }
+    def
+}
+
+fn metric_on(table: &str, name: &str, expr: &str) -> Metric {
+    Metric {
+        name: name.to_string(),
+        expr: expr.to_string(),
+        source_table: Some(table.to_string()),
+        ..Default::default()
+    }
+}
+
+fn expect_metric_path_ambiguity(def: &SemanticViewDefinition, req: &QueryRequest, member: &str) {
+    match expand("v", def, req) {
+        Err(ExpandError::AmbiguousMetricPath { detail }) => {
+            assert_eq!(detail.metric_name, member);
+            assert_eq!(detail.role_playing_table, "a");
+        }
+        Err(other) => panic!("expected AmbiguousMetricPath, got: {other}"),
+        Ok(sql) => panic!("accepted, binding to an arbitrary role:\n{sql}"),
+    }
+}
+
+/// Review finding (same-table metric): a metric declared ON the role-played
+/// table over its own fact skipped the fence (`own == fact_table`), and the
+/// base-anchored join bound bare `a` through the first-declared edge: 300 (the
+/// departure role) for no reason but declaration order.
+#[test]
+fn td69_fence_metric_on_the_role_played_table_over_its_own_fact_is_rejected() {
+    let mut def = one_to_one_role_played_fact_def();
+    def.metrics.push(metric_on("a", "any_elev", "SUM(elev)"));
+    expect_metric_path_ambiguity(&def, &metrics_req(&[], &["any_elev"]), "any_elev");
+}
+
+/// The same hole without a fact: a raw column on the role-played table. Not a
+/// fact reference at all, so no member-fact fence can see it — the metric's own
+/// grain table is what has no role.
+#[test]
+fn td69_fence_metric_on_the_role_played_table_over_a_raw_column_is_rejected() {
+    let mut def = one_to_one_role_played_fact_def();
+    def.metrics
+        .push(metric_on("a", "raw_elev", "SUM(a.elevation)"));
+    expect_metric_path_ambiguity(&def, &metrics_req(&["carrier"], &["raw_elev"]), "raw_elev");
+}
+
+/// A derived metric over such a metric is rejected through the base it inlines.
+#[test]
+fn td69_fence_derived_metric_over_a_role_played_table_metric_is_rejected() {
+    let mut def = one_to_one_role_played_fact_def();
+    def.metrics
+        .push(metric_on("a", "raw_elev", "SUM(a.elevation)"));
+    def.metrics.push(Metric {
+        name: "twice_raw".to_string(),
+        expr: "raw_elev * 2".to_string(),
+        ..Default::default()
+    });
+    expect_metric_path_ambiguity(&def, &metrics_req(&[], &["twice_raw"]), "raw_elev");
+}
+
+/// A metric on a DESCENDANT of the role-played table hangs off the bare,
+/// first-declared instance just the same.
+#[test]
+fn td69_fence_metric_below_the_role_played_table_is_rejected() {
+    let mut def = flights_airports_regions_def();
+    for j in &mut def.joins {
+        j.cardinality = Cardinality::OneToOne;
+    }
+    def.metrics
+        .push(metric_on("r", "region_rows", "COUNT(r.region_id)"));
+    expect_metric_path_ambiguity(&def, &metrics_req(&[], &["region_rows"]), "region_rows");
+}
+
+/// CONTROL: with only ONE relationship to `a` there is no role to pick, so the
+/// same metric keeps expanding (three departures at elevation 100).
+#[test]
+#[cfg(not(feature = "extension"))]
+fn td69_metric_on_a_single_relationship_parent_still_expands() {
+    let mut def = one_to_one_role_played_fact_def();
+    def.joins
+        .retain(|j| j.name.as_deref() == Some("dep_airport"));
+    def.metrics
+        .retain(|m| m.using_relationships.is_empty() && m.source_table.is_some());
+    def.metrics
+        .push(metric_on("a", "raw_elev", "SUM(a.elevation)"));
+    let sql = expand("v", &def, &metrics_req(&[], &["raw_elev"])).unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(None, 300.0)],
+        "{sql}"
+    );
+}

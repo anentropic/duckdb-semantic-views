@@ -1070,7 +1070,8 @@ pub(super) fn inline_derived_metrics_with_joins(
 /// `USING` names relationships; each resolves (by the same case-insensitive name
 /// match `join_resolver::resolve_joins_pkfk` uses to emit the scoped join) to
 /// its target table. A target named by exactly ONE of the metric's
-/// relationships is rewritten; a target named by several has no single role to
+/// relationships (however many spellings of it the `USING` lists) is
+/// rewritten; a target named by several distinct ones has no single role to
 /// pick and is left alone, as is the metric's own table, which is never joined
 /// under a scoped alias. Member expressions cannot reference another table's
 /// raw columns (#52), so on a DDL-created view any reference to a scoped table
@@ -1080,8 +1081,13 @@ fn rewrite_using_scoped_refs(expr: &str, met: &crate::model::Metric, joins: &[Jo
         return expr.to_string();
     }
     let own = met.source_table.as_deref().map(normalize_ident_part);
-    // target table -> the relationships of this metric that reach it.
-    let mut by_target: Vec<(String, Vec<&str>)> = Vec::new();
+    // target table -> the distinct relationships (join edges) of this metric
+    // that reach it. Distinct by the EDGE a spelling resolves to, not by the
+    // spelling: `USING (dep_airport, DEP_AIRPORT)` names one relationship —
+    // validation, the role-playing fence and the join resolver all fold case
+    // to find it — so it is one role, and must be rewritten as one (PR #247
+    // review). Counting spellings left the fact on the never-joined bare alias.
+    let mut by_target: Vec<(String, Vec<(&str, &Join)>)> = Vec::new();
     for rel in &met.using_relationships {
         let rel_lower = rel.to_ascii_lowercase();
         let Some(join) = joins.iter().find(|j| {
@@ -1097,16 +1103,16 @@ fn rewrite_using_scoped_refs(expr: &str, met: &crate::model::Metric, joins: &[Jo
         }
         match by_target.iter_mut().find(|(t, _)| *t == target) {
             Some((_, rels)) => {
-                if !rels.contains(&rel.as_str()) {
-                    rels.push(rel.as_str());
+                if !rels.iter().any(|(_, j)| std::ptr::eq(*j, join)) {
+                    rels.push((rel.as_str(), join));
                 }
             }
-            None => by_target.push((target, vec![rel.as_str()])),
+            None => by_target.push((target, vec![(rel.as_str(), join)])),
         }
     }
     let mut out = expr.to_string();
     for (target, rels) in &by_target {
-        if let [rel] = rels.as_slice() {
+        if let [(rel, _)] = rels.as_slice() {
             let scoped = super::join_resolver::scoped_join_alias(target, rel);
             out = super::join_resolver::rewrite_to_scoped_alias(&out, target, &scoped);
         }
