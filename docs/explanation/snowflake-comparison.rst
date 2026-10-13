@@ -331,16 +331,30 @@ Snowflake populates the ``data_type`` column of
 (and the ``DATA_TYPE`` rows of :ref:`DESCRIBE <ref-describe-semantic-view>`) with the
 member's actual data type.
 
-Here the column reports the **declared** output type and nothing else, and no
-surface declares one. There is no type inference: ``CREATE`` no longer probes the
-underlying tables (v0.10.0 removed the define-time inference pass), and the read
-side does not probe either. A :ref:`YAML <ref-yaml-format>` definition could once
-declare an ``output_type``, but that field was withdrawn because no DDL clause can
-carry it -- :ref:`GET_DDL <ref-get-ddl>` dropped it silently and a restored view lost the cast. The
-column is therefore empty for every view created since v0.10.0, and populated only
-for views stored before that release. Reporting the type an expression actually
-produces would need a probe on the read path, at ``SHOW`` / ``DESCRIBE`` bind
-time; that is a known limitation and is not implemented today.
+The same holds here. The type is not stored at ``CREATE``; it is worked out
+when the ``SHOW`` / ``DESCRIBE`` command runs, by preparing the query
+:ref:`semantic_view() <ref-semantic-view-function>` would run for the member and
+reading its column type. So ``data_type`` follows the current source columns, and it
+is always the type a query returns for that member:
+
+- **DuckDB type names.** Types are spelled the way DuckDB spells them
+  (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``, ``VARCHAR[]``), not as Snowflake would
+  (``TEXT``, ``NUMBER(38,0)``).
+- **The query's own type, not DuckDB's raw one.** ``semantic_view()`` returns a
+  ``HUGEINT`` result (for example ``SUM`` over an integer column) as ``BIGINT``, and
+  ``ENUM`` / ``STRUCT`` / ``MAP`` columns as ``VARCHAR``; ``data_type`` reports those
+  returned types.
+- **When a member cannot be typed** -- its source table or column was dropped or
+  renamed after ``CREATE`` -- ``data_type`` is empty for that member, and the command
+  still succeeds for the rest. Querying the member reports the underlying error.
+- **PRIVATE members** are typed too, though they cannot be queried directly.
+- **Role-played members** -- on a table that several relationships point at -- are
+  typed too, although querying one needs a metric whose ``USING`` names the role. The
+  type is the same whichever role is used.
+
+The cross-view forms (``SHOW SEMANTIC METRICS`` without ``IN``, or with
+``IN SCHEMA``) type the members of every view, so they take longer as the catalog
+grows: roughly a millisecond or two per view.
 
 
 .. _explanation-sf-metric-grain:

@@ -514,7 +514,7 @@ Each entry in the ``facts`` list declares a named row-level expression. Facts ca
      - null
      - **No longer accepted.** Write the cast into the expression instead
        (see the dimension table above). :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>`
-       reports an empty ``data_type`` for every newly created view as a result.
+       reports the expression's actual type without it.
    * - ``comment``
      - string
      - No

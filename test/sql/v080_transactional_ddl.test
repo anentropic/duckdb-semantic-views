@@ -279,8 +279,8 @@ FROM list_semantic_views() WHERE name = 'v080_create_commit'
 ----
 true	true	true
 
-# Type inference is gated to file-backed DBs (v0.7.1 design); this
-# sqllogictest runs in-memory so data_type stays empty. The metadata
+# Member types are not stored at CREATE: SHOW / DESCRIBE probe them at
+# read time (TECH-DEBT #51, test/sql/member_data_type.test). The metadata
 # IS NOT NULL checks above already prove the shared enrichment ran.
 
 # ------------------------------------------------------------------

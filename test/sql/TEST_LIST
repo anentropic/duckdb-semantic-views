@@ -114,3 +114,5 @@ test/sql/graph_connectivity.test
 test/sql/role_playing_facts_and_quoted_names.test
 test/sql/relationship_names_and_qualifiers.test
 test/sql/role_playing_window_and_table_metrics.test
+test/sql/member_data_type.test
+test/sql/show_dims_for_metric_required_refs.test

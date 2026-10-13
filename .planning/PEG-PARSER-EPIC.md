@@ -153,7 +153,7 @@ Checked against docs.snowflake.com on 2026-10-12. "P#" is the phase in §5.
 | Query items as expressions with `[AS] alias`, `tbl.*`, ad-hoc aggregates of dims/facts in METRICS | GA | names only (#76) | P4 |
 | Standard SQL: `SELECT d, AGG(m) FROM sv WHERE … GROUP BY … HAVING …` | GA 2026-03 | none | P5 |
 | SHOW/DESCRIBE usable as subqueries | (DuckDB idiom) | no (#77) | P3 |
-| `data_type` in SHOW/DESCRIBE | populated | empty (#51) | P0c |
+| `data_type` in SHOW/DESCRIBE | populated | populated, read-side probe (#51 ✅) | P0c ✅ |
 | BI discovery (view appears with typed columns) | n/a (Snowflake catalog) | none | P5 |
 | `VARIABLES (...)` + query-time `VARIABLES v => val` | GA 2026-06 | none | P6 |
 | Logical table as `alias AS (<query>)` | GA 2026-06 | none | P6 |
@@ -218,7 +218,7 @@ code overlap with the spike branch, so the two run side by side.
 - **0b, gated on D1:** TECH-DEBT #71 (HIGH), a metric's value changing with its
   co-queried metrics. See §6. It is a deliberate numbers change, so it does not
   block Phases 1 to 3. It must land before Phases 4 and 7 add emission shapes.
-- **0c:** #51 member `data_type`, **read-side**: probe at `SHOW`/`DESCRIBE` bind
+- **0c (✅ done, branch `claude/phase0c-data-type`):** #51 member `data_type`, **read-side**: probe at `SHOW`/`DESCRIBE` bind
   time, as `query::table_function::try_infer_schema` already does for queries. It
   has no parser dependency. It also cannot be done at CREATE under the grammar,
   because the transform has no context and a function called from the lowered DML

@@ -1,0 +1,58 @@
+# SHOW SEMANTIC DIMENSIONS FOR METRIC flags a dimension `required` when a
+# window metric's PARTITION BY [EXCLUDING] / ORDER BY names it — i.e. when
+# `semantic_view()` refuses the metric without it
+# (`WindowMetricRequiredDimension`).
+#
+# The flag compared each window reference with a bare `to_ascii_lowercase()`
+# against the dimension's stored name, while the query-time check resolves the
+# reference (bare, dotted or quoted) to its declared dimension — the #28
+# name-matcher class. So a dotted `ORDER BY s.placed`, or a quoted reference to
+# an unquoted declaration, reported `required = false` for a dimension the query
+# then demanded. Found while adding the TECH-DEBT #51 member-type probe, which
+# resolves the same references through `expand::window_required_dimensions`;
+# the flag now uses that resolver too.
+#
+# Each case was confirmed red individually against the unfixed build.
+
+require semantic_views
+
+statement ok
+CREATE TABLE rr_sales (id INTEGER PRIMARY KEY, placed DATE, region VARCHAR, qty INTEGER);
+
+statement ok
+CREATE SEMANTIC VIEW rr_sv AS
+TABLES (s AS rr_sales PRIMARY KEY (id))
+DIMENSIONS (s.placed AS s.placed, s.region AS s.region)
+METRICS (
+    s.total AS SUM(s.qty),
+    s.lag_dotted AS LAG(total, 1) OVER (ORDER BY s.placed),
+    s.lag_quoted AS LAG(total, 1) OVER (ORDER BY "PLACED"),
+    s.avg_excl AS AVG(total) OVER (PARTITION BY EXCLUDING "REGION" ORDER BY placed)
+);
+
+# The query side requires the dotted reference's dimension.
+statement error
+SELECT * FROM semantic_view('rr_sv', metrics := ['lag_dotted'])
+----
+requires dimension
+
+# CASE a dotted ORDER BY reference marks its dimension required
+query TT
+SELECT name, required FROM show_semantic_dimensions_for_metric('rr_sv', 'lag_dotted') ORDER BY name
+----
+placed	true
+region	false
+
+# CASE a quoted ORDER BY reference to an unquoted declaration marks it required
+query TT
+SELECT name, required FROM show_semantic_dimensions_for_metric('rr_sv', 'lag_quoted') ORDER BY name
+----
+placed	true
+region	false
+
+# CASE a quoted PARTITION BY EXCLUDING reference to an unquoted declaration marks it required
+query TT
+SELECT name, required FROM show_semantic_dimensions_for_metric('rr_sv', 'avg_excl') ORDER BY name
+----
+placed	true
+region	true

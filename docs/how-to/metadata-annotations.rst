@@ -225,9 +225,9 @@ The :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>`, :ref:`SHOW S
 .. code-block:: text
 
    ┌───────────────┬─────────────┬────────────────────┬────────────┬────────┬───────────┬──────────────────────────────┬─────────┐
-   │ database_name │ schema_name │ semantic_view_name │ table_name │  name  │ data_type │           synonyms           │ comment │
+   │ database_name │ schema_name │ semantic_view_name │ table_name │ name   │ data_type │ synonyms                     │ comment │
    ├───────────────┼─────────────┼────────────────────┼────────────┼────────┼───────────┼──────────────────────────────┼─────────┤
-   │ memory        │ main        │ sales              │ orders     │ region │           │ ["sales_region","territory"] │         │
+   │ memory        │ main        │ sales              │ orders     │ region │ VARCHAR   │ ["sales_region","territory"] │         │
    └───────────────┴─────────────┴────────────────────┴────────────┴────────┴───────────┴──────────────────────────────┴─────────┘
 
 This output is for the ``sales`` view from :ref:`howto-annotations-synonyms`. Its ``region`` dimension has synonyms but no comment.

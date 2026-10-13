@@ -130,31 +130,31 @@ RELATIONSHIP	order_to_customer	p29_orders	FOREIGN_KEY	["customer_id"]
 RELATIONSHIP	order_to_customer	p29_orders	REF_KEY	["id"]
 FACT	net_price	p29_line_items	TABLE	p29_line_items
 FACT	net_price	p29_line_items	EXPRESSION	li.extended_price * (1 - li.discount)
-FACT	net_price	p29_line_items	DATA_TYPE	(empty)
+FACT	net_price	p29_line_items	DATA_TYPE	DECIMAL(18,4)
 FACT	net_price	p29_line_items	ACCESS_MODIFIER	PUBLIC
 FACT	tax_amount	p29_line_items	TABLE	p29_line_items
 FACT	tax_amount	p29_line_items	EXPRESSION	li.net_price * li.tax_rate
-FACT	tax_amount	p29_line_items	DATA_TYPE	(empty)
+FACT	tax_amount	p29_line_items	DATA_TYPE	DECIMAL(18,6)
 FACT	tax_amount	p29_line_items	ACCESS_MODIFIER	PUBLIC
 DIMENSION	region	p29_orders	TABLE	p29_orders
 DIMENSION	region	p29_orders	EXPRESSION	o.region
-DIMENSION	region	p29_orders	DATA_TYPE	(empty)
+DIMENSION	region	p29_orders	DATA_TYPE	VARCHAR
 DIMENSION	country	p29_customers	TABLE	p29_customers
 DIMENSION	country	p29_customers	EXPRESSION	c.country
-DIMENSION	country	p29_customers	DATA_TYPE	(empty)
+DIMENSION	country	p29_customers	DATA_TYPE	VARCHAR
 DIMENSION	state	p29_customers	TABLE	p29_customers
 DIMENSION	state	p29_customers	EXPRESSION	c.state
-DIMENSION	state	p29_customers	DATA_TYPE	(empty)
+DIMENSION	state	p29_customers	DATA_TYPE	VARCHAR
 DIMENSION	city	p29_customers	TABLE	p29_customers
 DIMENSION	city	p29_customers	EXPRESSION	c.city
-DIMENSION	city	p29_customers	DATA_TYPE	(empty)
+DIMENSION	city	p29_customers	DATA_TYPE	VARCHAR
 METRIC	total_net	p29_line_items	TABLE	p29_line_items
 METRIC	total_net	p29_line_items	EXPRESSION	SUM(li.net_price)
-METRIC	total_net	p29_line_items	DATA_TYPE	(empty)
+METRIC	total_net	p29_line_items	DATA_TYPE	DECIMAL(38,4)
 METRIC	total_net	p29_line_items	ACCESS_MODIFIER	PUBLIC
 METRIC	total_tax	p29_line_items	TABLE	p29_line_items
 METRIC	total_tax	p29_line_items	EXPRESSION	SUM(li.tax_amount)
-METRIC	total_tax	p29_line_items	DATA_TYPE	(empty)
+METRIC	total_tax	p29_line_items	DATA_TYPE	DECIMAL(38,6)
 METRIC	total_tax	p29_line_items	ACCESS_MODIFIER	PUBLIC
 
 # ============================================================

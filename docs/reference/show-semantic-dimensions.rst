@@ -118,7 +118,7 @@ Returns one row per dimension with 8 columns:
      - The dimension name as declared in the ``DIMENSIONS`` clause.
    * - ``data_type``
      - VARCHAR
-     - The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+     - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``synonyms``
      - VARCHAR
      - JSON array of synonym strings (e.g., ``["territory","sales_region"]``). ``[]`` when no synonyms are set.
@@ -145,14 +145,14 @@ Given a semantic view ``orders_sv`` with three dimensions:
    ┌───────────────┬─────────────┬────────────────────┬────────────┬───────────────┬───────────┬──────────┬─────────┐
    │ database_name │ schema_name │ semantic_view_name │ table_name │ name          │ data_type │ synonyms │ comment │
    ├───────────────┼─────────────┼────────────────────┼────────────┼───────────────┼───────────┼──────────┼─────────┤
-   │ memory        │ main        │ orders_sv          │ customers  │ customer_name │           │ []       │         │
-   │ memory        │ main        │ orders_sv          │ orders     │ order_date    │           │ []       │         │
-   │ memory        │ main        │ orders_sv          │ customers  │ region        │           │ []       │         │
+   │ memory        │ main        │ orders_sv          │ customers  │ customer_name │ VARCHAR   │ []       │         │
+   │ memory        │ main        │ orders_sv          │ orders     │ order_date    │ DATE      │ []       │         │
+   │ memory        │ main        │ orders_sv          │ customers  │ region        │ VARCHAR   │ []       │         │
    └───────────────┴─────────────┴────────────────────┴────────────┴───────────────┴───────────┴──────────┴─────────┘
 
 The ``table_name`` column shows the actual physical table name, not the alias used in the DDL.
 
-``data_type`` is empty here because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`GET_DDL <ref-get-ddl>` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. Reporting the type an expression actually produces would require probing it on the read side, at ``SHOW`` bind time; that is a known limitation and is not implemented today. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+The example tables use ``VARCHAR`` text columns, ``DATE`` dates, ``INTEGER`` quantities and ``DECIMAL(10,2)`` amounts and prices. ``data_type`` is each member's type as a query returns it -- an aggregate's own type, not its input's: ``COUNT`` is ``BIGINT``, ``SUM`` of a ``DECIMAL(10,2)`` is ``DECIMAL(38,2)``, and a ratio of two metrics is ``DOUBLE``. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 **List dimensions across all views:**
 
