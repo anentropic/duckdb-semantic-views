@@ -290,11 +290,36 @@ test-get-ddl-qualified: build
 test-interrupt: build
     uv run test/integration/test_query_interrupt.py
 
+# Run every examples/*.py against the debug extension and fail on any error.
+# Each example runs under `uv run --script`, so it gets the dependencies its own
+# PEP 723 header declares (transactional_ddl.py: adbc-driver-manager, pyarrow).
+# Nothing is skipped silently: scripts/run_examples.py prints PASS / FAIL /
+# SKIPPED / XFAIL / XPASS for every file, and its two allow-lists are explicit:
+#   - NEEDS_DOWNLOADED_EXTENSION (race_guards_and_unification.py autoloads
+#     `autocomplete`): run normally; SKIPPED loudly only with
+#     SV_OFFLINE_EXTENSIONS=1, which is refused when CI is set;
+#   - EXPECTED_FAILURES: a known failure must fail with its recorded error and
+#     cite a TECH-DEBT entry; any other error is a FAIL.
+# Pass example file names to run a subset: `just test-examples basic_ddl_and_query.py`.
+# Run every examples/*.py against the debug extension (fails on any error)
+test-examples *examples: build
+    python3 scripts/run_examples.py {{examples}}
+
+# Guards the sqllogictest wrapper (scripts/run_sqllogictest.py) that `just
+# test-sql` runs through: a skipped `require semantic_views`, a file that
+# executes zero statements, and a file the runner cannot parse must each fail
+# the run, which the bare runner reports as success. Uses the configure/venv
+# runner, so it needs `make configure` (done by `build`).
+# Check that the sqllogictest wrapper fails runs that silently skip
+test-sqllogictest-guards: build
+    make patch-runner
+    configure/venv/bin/python test/integration/test_sqllogictest_guards.py
+
 # All Python integration suites against the built extension. This is the
 # exact set the `python-integration` CI job runs (IntegrationChecks.yml) —
 # keep the two in sync by editing THIS recipe, not the workflow.
 # (test-ducklake-ci is excluded: it has its own dedicated CI job.)
-test-integration: test-legacy-schema-spelling test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-attach-migration test-readonly-fresh-drop test-chunk-boundary test-differential test-show-scope-case test-show-scope-qualified test-get-ddl-qualified test-interrupt
+test-integration: test-legacy-schema-spelling test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-attach-migration test-readonly-fresh-drop test-chunk-boundary test-differential test-show-scope-case test-show-scope-qualified test-get-ddl-qualified test-interrupt test-examples test-sqllogictest-guards
 
 # Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + all Python integration suites
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.

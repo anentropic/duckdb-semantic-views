@@ -42,6 +42,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TABLES` had no relationship, or the relationships formed two separate groups, the view
   was accepted and every query failed with a binder error. `CREATE SEMANTIC VIEW` now
   rejects the definition and names the unreachable table.
+- **`examples/metadata_and_metrics.py` runs again.** It wrote `NON ADDITIVE BY` after `AS`,
+  a parenthesized `PARTITION BY EXCLUDING` list and a window metric over a column instead
+  of a metric — all rejected at `CREATE` — and queried a metric as a fact. It also printed
+  the wrong columns of `SHOW COLUMNS`, `SHOW SEMANTIC VIEWS` and `DESCRIBE`.
+  `examples/snowflake_parity.py` printed the creation time instead of the view name. Every
+  example now runs in CI, so an example that stops working fails the build.
+
+### Known limitations
+
+- **Semantic-view DDL must be sent one statement per call.** A query string that combines
+  it with other statements (for example one Python `execute()` call holding `CREATE TABLE
+  …; CREATE SEMANTIC VIEW …`) fails with `parser_override is not active for this
+  connection`, and the `SET` that message suggests does not help. Split the string into one
+  call per statement. See "One Statement per Call" in the transactional DDL and limitations
+  page.
 
 ## [0.13.0] - 2026-09-30
 

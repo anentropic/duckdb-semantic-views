@@ -151,7 +151,7 @@ print("\n=== Section 3: SHOW SEMANTIC commands with filtering ===")
 # List all semantic views
 print("\nSHOW SEMANTIC VIEWS:")
 for row in con.execute("SHOW SEMANTIC VIEWS").fetchall():
-    print(f"  {row[0]}")
+    print(f"  {row[1]}")  # columns: created_on, name, kind, database_name, schema_name, comment
 
 # Show dimensions in a view
 print("\nSHOW SEMANTIC DIMENSIONS IN shop:")

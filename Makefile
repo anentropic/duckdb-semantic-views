@@ -36,6 +36,18 @@ include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 # Rust owns the entry point (semantic_views_init_c_api), C++ helper registers hooks.
 UNSTABLE_C_API_FLAG=--abi-type C_STRUCT_UNSTABLE
 
+# Run sqllogictest through a strict wrapper instead of the bare
+# `python -m duckdb_sqllogictest` base.Makefile sets (overridden AFTER the
+# include, and BEFORE the `:=` TEST_RUNNER_FILE_LIST_* definitions below, which
+# capture it). The bare runner exits 0 when `require semantic_views` is
+# SKIPPED -- a missing or renamed extension file skipped all 115 files and
+# printed "115 test files passed" -- and also when a file cannot be parsed or
+# runs zero statements. scripts/run_sqllogictest.py takes the same arguments
+# and fails each of those; test/integration/test_sqllogictest_guards.py
+# (`just test-sqllogictest-guards`) pins every case. The extension-ci-tools
+# submodule is left untouched.
+TEST_RUNNER=$(PYTHON_VENV_BIN) scripts/run_sqllogictest.py --required-extension semantic_views
+
 # The DuckDB the C++ shim is compiled against. build.rs links the amalgamation
 # INTO the extension binary (the parser hook the shim registers is C++ internals
 # with no C-API equivalent), so it is an ABI contract with whatever engine loads

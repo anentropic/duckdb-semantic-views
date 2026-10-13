@@ -147,6 +147,16 @@ jobs:
       # test-sql (the `sqllogictest` job below) and test-ducklake-ci (the
       # `ducklake-ci-check` job above). The list itself lives in the Justfile's
       # `test-integration` recipe so local dev and CI cannot drift.
+      #
+      # That list includes `test-examples` (every examples/*.py, run under
+      # `uv run --script` against this job's extension; fails on any non-zero
+      # exit -- see scripts/run_examples.py for its two explicit allow-lists)
+      # and `test-sqllogictest-guards` (proves the sqllogictest wrapper the
+      # `sqllogictest` job below runs through fails a run that skips
+      # `require semantic_views` or executes nothing). Both need network:
+      # uv fetches each example's PEP 723 dependencies, and
+      # race_guards_and_unification.py autoloads `autocomplete`.
+      # SV_OFFLINE_EXTENSIONS is refused here because CI is set.
       - name: Run Python integration suites
         run: just test-integration
 
@@ -193,5 +203,13 @@ jobs:
       # the runner cannot test against a different DuckDB than the one the
       # extension was built for). Plain `just test-sql` would rebuild the
       # extension this job just downloaded.
+      #
+      # The runner is scripts/run_sqllogictest.py (the Makefile's TEST_RUNNER),
+      # not the bare `python -m duckdb_sqllogictest`: it fails the run when
+      # `require semantic_views` would be SKIPPED (a missing or renamed
+      # extension file), when a listed file never runs, and when a file runs
+      # zero statements -- all of which the bare runner reports as success.
+      # Its last line, "sqllogictest: N file(s) ran, M statements/queries
+      # executed", is the check that the suite really ran.
       - name: Run SQL logic tests
         run: just test-sql-prebuilt

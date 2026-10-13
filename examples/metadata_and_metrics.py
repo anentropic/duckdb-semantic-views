@@ -69,6 +69,7 @@ AS
     bal_to_acct AS b(account_id) REFERENCES a
   )
   FACTS (
+    b.deposit_amount AS b.deposits,
     PRIVATE b.balance_change AS b.balance - LAG(b.balance) OVER (
         PARTITION BY b.account_id ORDER BY b.balance_date
     )
@@ -83,22 +84,21 @@ AS
   METRICS (
     b.total_deposits AS SUM(b.deposits)
       COMMENT = 'Sum of all deposits',
-    b.latest_balance AS SUM(b.balance)
-      NON ADDITIVE BY (b.balance_date)
+    b.latest_balance NON ADDITIVE BY (b.balance_date) AS SUM(b.balance)
       COMMENT = 'Most recent balance (snapshot metric)',
-    b.daily_deposit_share AS SUM(b.deposits)
-      OVER (PARTITION BY EXCLUDING (a.region))
-      COMMENT = 'Deposit share within region partition'
+    b.all_region_deposits AS SUM(total_deposits)
+      OVER (PARTITION BY EXCLUDING region)
+      COMMENT = 'Deposits across all regions for the same day'
   );
 """)
 
 print("  Created semantic view 'banking' with:")
 print("  - View-level COMMENT")
 print("  - Table-level COMMENTs and SYNONYMS")
-print("  - PRIVATE fact (balance_change)")
+print("  - Public fact (deposit_amount) and PRIVATE fact (balance_change)")
 print("  - Dimension COMMENTs and SYNONYMS")
 print("  - Semi-additive metric (latest_balance)")
-print("  - Window function metric (daily_deposit_share)")
+print("  - Window function metric (all_region_deposits)")
 
 # ============================================================
 # Section 3: SHOW TERSE / SHOW COLUMNS / IN SCHEMA
@@ -112,11 +112,14 @@ for row in con.execute("SHOW TERSE SEMANTIC VIEWS").fetchall():
 
 print("\nSHOW COLUMNS IN SEMANTIC VIEW banking:")
 for row in con.execute("SHOW COLUMNS IN SEMANTIC VIEW banking").fetchall():
-    print(f"  kind={row[0]}, name={row[1]}")
+    # columns: database_name, schema_name, semantic_view_name, column_name,
+    #          data_type, kind, expression, comment
+    print(f"  kind={row[5]}, name={row[3]}")
 
 print("\nSHOW SEMANTIC VIEWS IN SCHEMA main:")
 for row in con.execute("SHOW SEMANTIC VIEWS IN SCHEMA main").fetchall():
-    print(f"  {row[0]} (comment: {row[4]})")
+    # columns: created_on, name, kind, database_name, schema_name, comment
+    print(f"  {row[1]} (comment: {row[5]})")
 
 # ============================================================
 # Section 4: ALTER COMMENT + GET_DDL
@@ -127,12 +130,12 @@ print("\n=== Section 4: ALTER COMMENT + GET_DDL ===")
 con.execute("ALTER SEMANTIC VIEW banking SET COMMENT = 'Updated: banking analytics v2'")
 print("After ALTER SET COMMENT:")
 for row in con.execute("SHOW SEMANTIC VIEWS LIKE 'banking'").fetchall():
-    print(f"  comment: {row[4]}")
+    print(f"  comment: {row[5]}")
 
 con.execute("ALTER SEMANTIC VIEW banking UNSET COMMENT")
 print("\nAfter ALTER UNSET COMMENT:")
 for row in con.execute("SHOW SEMANTIC VIEWS LIKE 'banking'").fetchall():
-    print(f"  comment: {row[4]}")
+    print(f"  comment: {row[5]}")
 
 # Restore comment for GET_DDL demo
 con.execute("ALTER SEMANTIC VIEW banking SET COMMENT = 'Daily account balance analytics'")
@@ -165,12 +168,12 @@ print("\nNote: PRIVATE facts/metrics excluded from wildcard expansion")
 
 print("\n=== Section 6: Queryable FACTS ===")
 
-# Note: balance_change is PRIVATE so we query deposits as a fact-level value
-# Facts return unaggregated row-level results
+# balance_change is PRIVATE, so only the public deposit_amount fact is
+# queryable. Facts return unaggregated row-level results.
 print("\nRow-level fact query (deposits per day per account):")
 for row in con.execute("""
     SELECT * FROM semantic_view('banking',
-        facts := ['total_deposits'],
+        facts := ['deposit_amount'],
         dimensions := ['region', 'balance_date']
     ) ORDER BY region, balance_date
 """).fetchall():
@@ -181,7 +184,7 @@ print("\nFacts + metrics mutual exclusion:")
 try:
     con.execute("""
         SELECT * FROM semantic_view('banking',
-            facts := ['total_deposits'],
+            facts := ['deposit_amount'],
             metrics := ['latest_balance']
         )
     """)
@@ -223,17 +226,17 @@ for row in con.execute("""
 
 print("\n=== Section 8: Window function metrics ===")
 
-# daily_deposit_share: PARTITION BY EXCLUDING (region)
+# all_region_deposits: SUM(total_deposits) OVER (PARTITION BY EXCLUDING region)
 # When querying with dimensions [region, balance_date],
 # the window partitions by balance_date only (region excluded)
-print("\nDeposit share by region and date (window metric):")
+print("\nAll-region deposits next to each region, per date (window metric):")
 for row in con.execute("""
     SELECT * FROM semantic_view('banking',
         dimensions := ['region', 'balance_date'],
-        metrics := ['daily_deposit_share']
+        metrics := ['all_region_deposits']
     ) ORDER BY balance_date, region
 """).fetchall():
-    print(f"  {row[0]}, {row[1]}: deposit_share={row[2]}")
+    print(f"  {row[0]}, {row[1]}: all_region_deposits={row[2]}")
 
 # Window + aggregate mixing produces error
 print("\nWindow + aggregate mixing:")
@@ -241,7 +244,7 @@ try:
     con.execute("""
         SELECT * FROM semantic_view('banking',
             dimensions := ['region'],
-            metrics := ['total_deposits', 'daily_deposit_share']
+            metrics := ['total_deposits', 'all_region_deposits']
         )
     """)
 except Exception as e:
@@ -256,7 +259,8 @@ print("\n=== Section 9: DESCRIBE -- Metadata in output ===")
 rows = con.execute("DESCRIBE SEMANTIC VIEW banking").fetchall()
 # Show metadata-related properties
 for row in rows:
-    if row[3] in ('comment', 'synonyms', 'access_modifier'):
-        print(f"  {row[0]} {row[1]}: {row[3]} = {row[4]}")
+    # columns: object_kind, object_name, parent_entity, property, property_value
+    if row[3] in ('COMMENT', 'SYNONYMS', 'ACCESS_MODIFIER'):
+        print(f"  {row[0] or 'VIEW'} {row[1] or 'banking'}: {row[3]} = {row[4]}")
 
 print("\n=== Done ===")
