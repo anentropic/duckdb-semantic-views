@@ -336,31 +336,87 @@ fn check_source_tables_reachable(
     graph: &RelationshipGraph,
 ) -> Result<(), String> {
     let available: Vec<String> = graph.all_nodes.iter().cloned().collect();
-    for dim in &def.dimensions {
-        if let Some(ref st) = dim.source_table {
-            let st_lower = st.to_ascii_lowercase();
-            if !graph.all_nodes.contains(&st_lower) {
-                let suggestion = suggest_closest(&st_lower, &available);
-                let mut msg = format!("unknown source table '{st}'");
-                if let Some(s) = suggestion {
-                    let _ = write!(msg, "; did you mean '{s}'?");
-                }
-                return Err(msg);
+    check_member_source_tables(def, &available, |st| {
+        graph.all_nodes.contains(&st.to_ascii_lowercase())
+    })
+}
+
+/// Check that every dim/metric `source_table` is a declared alias of a
+/// single-table view (TECH-DEBT #78).
+///
+/// A single-table view has no relationship graph, so it skips
+/// [`check_source_tables_reachable`]; this applies the same check, with the
+/// same message, against its one alias. The qualifier is matched with
+/// [`crate::ident::ident_matches`] — `o`, `O` and `"O"` all name alias `o` —
+/// so every spelling of the declared alias that CREATE accepted before is
+/// still accepted; only a qualifier naming no declared table is rejected.
+fn check_single_table_source_tables(def: &SemanticViewDefinition) -> Result<(), String> {
+    let available: Vec<String> = def
+        .tables
+        .iter()
+        .map(|t| t.alias.to_ascii_lowercase())
+        .collect();
+    check_member_source_tables(def, &available, |st| {
+        def.tables
+            .iter()
+            .any(|t| crate::ident::ident_matches(&t.alias, st))
+    })
+}
+
+/// Shared body of the dim/metric `source_table` checks: the first
+/// `source_table` for which `is_declared` is false is reported as
+/// `unknown source table '<st>'`, with the closest of `available` suggested.
+fn check_member_source_tables(
+    def: &SemanticViewDefinition,
+    available: &[String],
+    is_declared: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let source_tables = def
+        .dimensions
+        .iter()
+        .filter_map(|d| d.source_table.as_deref())
+        .chain(def.metrics.iter().filter_map(|m| m.source_table.as_deref()));
+    for st in source_tables {
+        if !is_declared(st) {
+            let suggestion = suggest_closest(&st.to_ascii_lowercase(), available);
+            let mut msg = format!("unknown source table '{st}'");
+            if let Some(s) = suggestion {
+                let _ = write!(msg, "; did you mean '{s}'?");
             }
+            return Err(msg);
         }
     }
-    for met in &def.metrics {
-        if let Some(ref st) = met.source_table {
-            let st_lower = st.to_ascii_lowercase();
-            if !graph.all_nodes.contains(&st_lower) {
-                let suggestion = suggest_closest(&st_lower, &available);
-                let mut msg = format!("unknown source table '{st}'");
-                if let Some(s) = suggestion {
-                    let _ = write!(msg, "; did you mean '{s}'?");
-                }
-                return Err(msg);
-            }
+    Ok(())
+}
+
+/// Reject two relationships with the same name (TECH-DEBT #79).
+///
+/// Relationship names are one namespace per view (as in Snowflake), compared
+/// as identifiers, case-insensitively and quoted or not: `route`, `ROUTE` and `"route"` are one name
+/// ([`crate::ident::normalize_ident_part`], the key member-name uniqueness
+/// uses too). Every lookup by name — `USING (r)`, the join resolver, the
+/// role-playing fence, the fact rewrite, the per-grain path — takes the first
+/// match, so a duplicate would silently mean whichever was declared first.
+///
+/// CREATE-only, like the rest of [`validate_graph`]: a stored row that
+/// already carries a duplicate name keeps loading, with "first wins" reads.
+fn check_relationship_names_unique(def: &SemanticViewDefinition) -> Result<(), String> {
+    let mut seen: HashMap<String, &crate::model::Join> = HashMap::new();
+    for j in &def.joins {
+        let Some(name) = j.name.as_deref() else {
+            continue;
+        };
+        let key = crate::ident::normalize_ident_part(name);
+        if let Some(first) = seen.get(&key) {
+            let first_name = first.name.as_deref().unwrap_or_default();
+            return Err(format!(
+                "duplicate relationship name '{first_name}': '{first_name}' ({} -> {}) and \
+                 '{name}' ({} -> {}) name the same relationship; relationship names must be \
+                 unique within a semantic view (compared case-insensitively, quoted or not)",
+                first.from_alias, first.table, j.from_alias, j.table
+            ));
         }
+        seen.insert(key, j);
     }
     Ok(())
 }
@@ -391,6 +447,7 @@ fn check_relationships_have_fk_columns(def: &SemanticViewDefinition) -> Result<(
 ///
 /// Runs all define-time checks:
 /// 0. Every relationship declares FK columns
+/// 0b. Relationship names are unique (`ident_matches` identity)
 /// 1. Self-reference detection (`from_alias` == `to_alias`)
 /// 2. Cycle detection (Kahn's algorithm)
 /// 3. Diamond detection (multiple parents)
@@ -402,8 +459,10 @@ fn check_relationships_have_fk_columns(def: &SemanticViewDefinition) -> Result<(
 /// Returns `Ok(graph)` if valid, or `Err` with a descriptive message.
 ///
 /// **Single-table skip:** a view with at most one table and no relationship
-/// has no graph to validate, so it returns `Ok` with an empty graph — exactly
-/// as before, so a single-table view's acceptance is unchanged.
+/// has no graph to validate, so it returns `Ok` with an empty graph after one
+/// check: each dim/metric table qualifier must name the declared table
+/// (TECH-DEBT #78), with the same `unknown source table` message a
+/// multi-table view gets from step 7.
 ///
 /// This used to be a wider "legacy skip" that fired whenever no relationship
 /// carried `fk_columns`, for pre-Phase-24 definitions. But this function runs
@@ -414,6 +473,9 @@ fn check_relationships_have_fk_columns(def: &SemanticViewDefinition) -> Result<(
 /// relationship with no FK columns (YAML).
 pub fn validate_graph(def: &SemanticViewDefinition) -> Result<RelationshipGraph, ParseError> {
     if def.tables.is_empty() || (def.tables.len() == 1 && def.joins.is_empty()) {
+        // No graph, but a member's table qualifier must still name the one
+        // declared table (TECH-DEBT #78), with the multi-table message.
+        check_single_table_source_tables(def).map_err(ParseError::positionless)?;
         return Ok(RelationshipGraph {
             edges: HashMap::new(),
             reverse: HashMap::new(),
@@ -426,6 +488,11 @@ pub fn validate_graph(def: &SemanticViewDefinition) -> Result<RelationshipGraph,
     //    FK-less join (the pre-Phase-24 stored encoding), so without this an
     //    FK-less YAML relationship would silently vanish from the graph.
     check_relationships_have_fk_columns(def).map_err(ParseError::positionless)?;
+
+    // 0b. Relationship names are unique (TECH-DEBT #79). Before the diamond
+    //     check, so a duplicated role-playing name gets this message rather
+    //     than "diamond: two paths".
+    check_relationship_names_unique(def).map_err(ParseError::positionless)?;
 
     let graph = RelationshipGraph::from_definition(def).map_err(ParseError::positionless)?;
 
@@ -927,9 +994,11 @@ mod tests {
         let err = validate_graph(&def)
             .expect_err("`dep` and `\"dep\"` name the same relationship")
             .message;
+        // Since TECH-DEBT #79 the name-uniqueness check runs before the
+        // diamond check, so this reports the duplicate name, not "diamond".
         assert!(
-            err.contains("diamond"),
-            "expected a diamond error, got: {err}"
+            err.contains("duplicate relationship name 'dep'"),
+            "expected a duplicate-name error, got: {err}"
         );
         // Control: genuinely distinct names (one of them quoted) still pass.
         def.joins[1].name = Some("\"Arr\"".to_string());
@@ -937,6 +1006,167 @@ mod tests {
             validate_graph(&def).is_ok(),
             "{:?}",
             validate_graph(&def).err().map(|e| e.message)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TECH-DEBT #79: relationship names are unique within a view
+    // -----------------------------------------------------------------------
+
+    /// Two relationships named `r` to DIFFERENT targets: no diamond, so the
+    /// role-playing name check never compared them, and every lookup by name
+    /// (`USING (r)`, the join resolver, the fences) silently took the first.
+    #[test]
+    fn duplicate_relationship_names_to_different_targets_rejected() {
+        let mut def = make_def(
+            vec![
+                ("f", "flights", vec!["id"]),
+                ("a", "airports", vec!["id"]),
+                ("c", "carriers", vec!["id"]),
+            ],
+            vec![("f", "a", vec!["dep_id"]), ("f", "c", vec!["carrier_id"])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("r".to_string());
+        def.joins[1].name = Some("r".to_string());
+        let err = validate_graph(&def)
+            .expect_err("two relationships named `r` must be rejected")
+            .message;
+        assert!(
+            err.contains("duplicate relationship name 'r'"),
+            "expected a duplicate-name error, got: {err}"
+        );
+    }
+
+    /// The same name spelled differently — case and quoting — is still one
+    /// name under DuckDB's identifier rule (`ident_matches`).
+    #[test]
+    fn duplicate_relationship_names_differing_in_case_and_quoting_rejected() {
+        let mut def = make_def(
+            vec![
+                ("f", "flights", vec!["id"]),
+                ("a", "airports", vec!["id"]),
+                ("c", "carriers", vec!["id"]),
+            ],
+            vec![("f", "a", vec!["dep_id"]), ("f", "c", vec!["carrier_id"])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("route".to_string());
+        def.joins[1].name = Some("\"ROUTE\"".to_string());
+        let err = validate_graph(&def)
+            .expect_err("`route` and `\"ROUTE\"` are one name")
+            .message;
+        assert!(
+            err.contains("duplicate relationship name 'route'") && err.contains("\"ROUTE\""),
+            "expected a duplicate-name error naming both spellings, got: {err}"
+        );
+    }
+
+    /// The same name on two edges to ONE target was rejected only as a
+    /// generic "diamond: two paths" — it now gets the specific error.
+    #[test]
+    fn duplicate_role_playing_relationship_names_get_the_duplicate_name_error() {
+        let mut def = make_def(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![("f", "a", vec!["dep_id"]), ("f", "a", vec!["arr_id"])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("dep".to_string());
+        def.joins[1].name = Some("DEP".to_string());
+        let err = validate_graph(&def).unwrap_err().message;
+        assert!(
+            err.contains("duplicate relationship name 'dep'"),
+            "expected the duplicate-name error, got: {err}"
+        );
+    }
+
+    /// Control: distinct names (one quoted) and an unnamed relationship pass.
+    #[test]
+    fn distinct_relationship_names_accepted() {
+        let mut def = make_def(
+            vec![
+                ("f", "flights", vec!["id"]),
+                ("a", "airports", vec!["id"]),
+                ("c", "carriers", vec!["id"]),
+            ],
+            vec![("f", "a", vec!["dep_id"]), ("f", "c", vec!["carrier_id"])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("dep".to_string());
+        def.joins[1].name = Some("\"Dep Carrier\"".to_string());
+        assert!(
+            validate_graph(&def).is_ok(),
+            "{:?}",
+            validate_graph(&def).err()
+        );
+        def.joins[1].name = None;
+        assert!(
+            validate_graph(&def).is_ok(),
+            "{:?}",
+            validate_graph(&def).err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TECH-DEBT #78: a single-table view checks member qualifiers too
+    // -----------------------------------------------------------------------
+
+    /// `x.foo AS 1` in a one-table view: the single-table skip bypassed
+    /// `check_source_tables_reachable`, so the undeclared `x` was accepted,
+    /// while the same member in a multi-table view was rejected.
+    #[test]
+    fn single_table_dimension_with_undeclared_qualifier_rejected() {
+        let def = make_def(
+            vec![("o", "orders", vec!["id"])],
+            vec![],
+            vec![("foo", Some("x"))],
+            vec![("revenue", Some("o"))],
+        );
+        let err = validate_graph(&def)
+            .expect_err("an undeclared table qualifier must be rejected")
+            .message;
+        assert!(
+            err.contains("unknown source table 'x'") && err.contains("did you mean 'o'"),
+            "expected the multi-table error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn single_table_metric_with_undeclared_qualifier_rejected() {
+        let def = make_def(
+            vec![("o", "orders", vec!["id"])],
+            vec![],
+            vec![],
+            vec![("revenue", Some("x"))],
+        );
+        let err = validate_graph(&def)
+            .expect_err("an undeclared table qualifier must be rejected")
+            .message;
+        assert!(err.contains("unknown source table 'x'"), "{err}");
+    }
+
+    /// Control: unqualified members, and members qualified by the declared
+    /// alias in any case, stay valid.
+    #[test]
+    fn single_table_declared_or_absent_qualifier_accepted() {
+        let def = make_def(
+            vec![("o", "orders", vec!["id"])],
+            vec![],
+            vec![
+                ("region", Some("O")),
+                ("quoted", Some("\"O\"")),
+                ("bare", None),
+            ],
+            vec![("revenue", Some("o")), ("derived", None)],
+        );
+        assert!(
+            validate_graph(&def).is_ok(),
+            "{:?}",
+            validate_graph(&def).err()
         );
     }
 

@@ -194,8 +194,9 @@ SELECT * FROM semantic_view('p0a_mixed_quoting', metrics := ['dep_elev']);
 ----
 5460
 
-# `dep` and `"dep"` are ONE name, so two relationships to the same table named
-# that way are a diamond, exactly like `dep` / `DEP`.
+# `dep` and `"dep"` are ONE name, so two relationships named that way are
+# rejected as a duplicate relationship name, exactly like `dep` / `DEP`
+# (TECH-DEBT #79; before that check this was reported as a diamond).
 statement error
 CREATE SEMANTIC VIEW p0a_quoting_duplicate AS
   TABLES (
@@ -213,4 +214,4 @@ CREATE SEMANTIC VIEW p0a_quoting_duplicate AS
     f.departures USING (dep) AS COUNT(*)
   );
 ----
-diamond
+duplicate relationship name 'dep'
