@@ -413,3 +413,63 @@ fn child_metric_grouped_by_its_role_played_dimension() {
         vec!["A|1", "B|1", "NULL|1"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Relationship names on the per-grain path resolve like everywhere else
+// (`graph::find_relationship` / `RelNameMatch`, #249).
+// ---------------------------------------------------------------------------
+
+/// `per_grain_joins_each_role_a_fact_metric_names` with the `USING` names
+/// spelled differently from their declarations: `"Dep"` (quoted, other case)
+/// and `ARR` both name the declared relationship under DuckDB's identifier
+/// rules. The scoped fact join each grain CTE needs must be found from that
+/// spelling, as the base-anchored resolver finds it; otherwise the CTE names
+/// the scoped alias `rewrite_using_scoped_refs` wrote without joining it.
+#[test]
+fn per_grain_scoped_fact_join_resolves_a_using_spelled_differently() {
+    let mut def = role_def();
+    for m in &mut def.metrics {
+        match m.name.as_str() {
+            "dep_alt" => m.using_relationships = vec!["\"Dep\"".to_string()],
+            "arr_alt" => m.using_relationships = vec!["ARR".to_string()],
+            _ => {}
+        }
+    }
+    assert_eq!(
+        rows(
+            &def,
+            &role_db(),
+            &req(&[], &["n_li", "dep_alt", "arr_alt"], None)
+        ),
+        vec!["3|300|400"]
+    );
+}
+
+/// A semi-additive child metric whose `USING` names the one-part quoted
+/// relationship `"x.y"` (to `ap`, which the query never reaches), in a view
+/// whose `o -> c` relationship is the two-part `x.y` — a different name
+/// (#249). The query reaches `c`, not `ap`, so the `USING` scopes nothing and
+/// the snapshot CTE re-anchors at the child, as in
+/// `semi_additive_child_metric_is_home_anchored`. Matching relationship names
+/// with the lossy `ident_matches` took `x.y` for `"x.y"` and kept the metric
+/// base-anchored (EU 3, US / APAC NULL, the orphan item dropped).
+#[test]
+fn snapshot_reanchor_resolves_using_by_relationship_identity() {
+    let mut def = d1_def();
+    def.joins[0].name = Some("x.y".to_string());
+    def.tables.push(table("ap", &["code"]));
+    def.joins
+        .push(many_to_one("\"x.y\"", "o", "ap", "ap_code", "code"));
+    let def = def
+        .with_dimension("item_id", "li.li_id", Some("li"))
+        .with_metric("last_qty", "SUM(li.qty)", Some("li"))
+        .with_non_additive_by("last_qty", &[("item_id", SortOrder::Asc, NullsOrder::Last)])
+        .with_using_relationship("last_qty", &["\"x.y\""]);
+    let conn = d1_db();
+    conn.execute_batch("ALTER TABLE d1_o ADD COLUMN ap_code INT; CREATE TABLE d1_ap (code INT);")
+        .expect("extend the D1 fixture");
+    assert_eq!(
+        rows(&def, &conn, &req(&["cust_region"], &["last_qty"], None)),
+        vec!["EU|3", "NULL|40"]
+    );
+}

@@ -1005,18 +1005,14 @@ fn using_scopes_a_touched_table(
         return false;
     }
     let touched = touched_tables(def, resolved_dims, resolved_mets, extra_tables, true);
+    // Resolved with the shared `graph::find_relationship` (#249), never
+    // `ident_matches`: that folds the one-part `"x.y"` and the two-part `x.y`
+    // together, which are different relationship names. A name that resolves
+    // to nothing is treated as scoping a touched table (decline, unchanged).
     resolved_mets.iter().any(|m| {
         m.using_relationships.iter().any(|rel| {
-            def.joins.iter().any(|j| {
-                j.name
-                    .as_ref()
-                    .is_some_and(|n| crate::ident::ident_matches(n, rel))
-                    && touched.contains(&j.table.to_ascii_lowercase())
-            }) || !def.joins.iter().any(|j| {
-                j.name
-                    .as_ref()
-                    .is_some_and(|n| crate::ident::ident_matches(n, rel))
-            })
+            crate::graph::find_relationship(&def.joins, rel)
+                .is_none_or(|j| touched.contains(&j.table.to_ascii_lowercase()))
         })
     })
 }
@@ -1532,11 +1528,9 @@ fn group_scoped_fact_joins<'a>(def: &'a SemanticViewDefinition, group: &Group) -
         for m in reached {
             let fact_tables = super::facts::collect_referenced_fact_tables(&m.expr, &def.facts);
             for rel in &m.using_relationships {
-                let Some(join) = def
-                    .joins
-                    .iter()
-                    .find(|j| j.name.as_ref().is_some_and(|n| n.eq_ignore_ascii_case(rel)))
-                else {
+                // The shared resolver (#249), as `rewrite_using_scoped_refs`
+                // used to requalify the fact: `"Dep"` and `DEP` name `dep`.
+                let Some(join) = crate::graph::find_relationship(&def.joins, rel) else {
                     continue;
                 };
                 if fact_tables
