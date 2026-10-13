@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use crate::errors::ParseError;
-use crate::model::SemanticViewDefinition;
+use crate::model::{Join, SemanticViewDefinition};
 use crate::util::suggest_closest;
 
 /// A directed relationship graph built from TABLES + RELATIONSHIPS.
@@ -132,16 +132,26 @@ impl RelationshipGraph {
                     !joins_to_node.is_empty() && joins_to_node.iter().all(|j| j.name.is_some());
 
                 if all_named {
-                    // Check all names are unique under DuckDB's identifier
-                    // rule: `dep`, `DEP` and `"dep"` are one name.
-                    let mut seen_names = HashSet::new();
-                    let all_unique = joins_to_node.iter().all(|j| {
-                        seen_names
-                            .insert(crate::ident::normalize_ident_part(j.name.as_ref().unwrap()))
-                    });
-                    if all_unique {
-                        continue; // Role-playing: allow this diamond
+                    // Each role is joined under the scoped alias
+                    // `<table>__<normalize_ident_part(name)>`, so the names must
+                    // differ after normalization: `dep`, `DEP` and `"dep"` are
+                    // one name, and so — for the alias, though they are two
+                    // relationship names — are `x.y` and `"x.y"`.
+                    let mut seen_names: HashMap<String, &str> = HashMap::new();
+                    for j in &joins_to_node {
+                        let name = j.name.as_deref().unwrap_or_default();
+                        let key = crate::ident::normalize_ident_part(name);
+                        if let Some(first) = seen_names.get(&key) {
+                            return Err(format!(
+                                "relationships '{first}' and '{name}' to '{node}' would both be \
+                                 joined as '{}__{key}'; role-playing relationships to one table \
+                                 need names that differ once quotes are removed and case is folded",
+                                crate::ident::normalize_ident_part(node)
+                            ));
+                        }
+                        seen_names.insert(key, name);
                     }
+                    continue; // Role-playing: allow this diamond
                 }
 
                 return Err(format!(
@@ -392,21 +402,23 @@ fn check_member_source_tables(
 /// Reject two relationships with the same name (TECH-DEBT #79).
 ///
 /// Relationship names are one namespace per view (as in Snowflake), compared
-/// as identifiers, case-insensitively and quoted or not: `route`, `ROUTE` and `"route"` are one name
-/// ([`crate::ident::normalize_ident_part`], the key member-name uniqueness
-/// uses too). Every lookup by name — `USING (r)`, the join resolver, the
-/// role-playing fence, the fact rewrite, the per-grain path — takes the first
-/// match, so a duplicate would silently mean whichever was declared first.
+/// as identifiers, case-insensitively and quoted or not: `route`, `ROUTE` and
+/// `"route"` are one name. The key is [`crate::ident::ident_key`], which keeps
+/// identifier parts apart, so the two-part `x.y` and the one-part `"x.y"` are
+/// two names — the same identity [`RelNameMatch`] resolves `USING` by. Every
+/// lookup by name — `USING (r)`, the join resolver, the role-playing fence,
+/// the fact rewrite, the per-grain path — takes the first match, so a
+/// duplicate would silently mean whichever was declared first.
 ///
 /// CREATE-only, like the rest of [`validate_graph`]: a stored row that
 /// already carries a duplicate name keeps loading, with "first wins" reads.
 fn check_relationship_names_unique(def: &SemanticViewDefinition) -> Result<(), String> {
-    let mut seen: HashMap<String, &crate::model::Join> = HashMap::new();
+    let mut seen: HashMap<crate::ident::IdentKey, &crate::model::Join> = HashMap::new();
     for j in &def.joins {
         let Some(name) = j.name.as_deref() else {
             continue;
         };
-        let key = crate::ident::normalize_ident_part(name);
+        let key = crate::ident::ident_key(name);
         if let Some(first) = seen.get(&key) {
             let first_name = first.name.as_deref().unwrap_or_default();
             return Err(format!(
@@ -441,6 +453,74 @@ fn check_relationships_have_fk_columns(def: &SemanticViewDefinition) -> Result<(
             ))
         }
     }
+}
+
+/// Which declared relationships a relationship name — a `USING` entry, or the
+/// stored spelling of a resolved role — denotes. Every lookup of a
+/// relationship by name goes through this (or [`find_relationship`]), so the
+/// `USING` validation, the join resolver, the role-playing fences, the fact
+/// rewrite and the per-grain path all agree on which edge a name means.
+///
+/// Two rules, in order:
+///
+/// 1. **By spelling**, if any declared name matches the requested one
+///    ignoring ASCII case — the rule every lookup used before PR #249. A view
+///    stored before then may hold two relationships whose names differ only by
+///    quoting (`dep` and `"dep"`, which the role-playing check then accepted as
+///    two roles), and `USING ("dep")` meant the quoted one. CREATE now rejects
+///    such a pair, but a stored row is never re-validated, so the spelling
+///    match keeps its every `USING` resolving to the edge it always did.
+/// 2. **As an identifier** otherwise ([`crate::ident::ident_key`]): quotes
+///    stripped and case folded per part, so `USING (dep_airport)` names a
+///    relationship declared `"Dep_Airport"`. Part boundaries are kept: the
+///    two-part `x.y` (also spelled `"x"."y"`) and the one-part `"x.y"` are
+///    different names.
+///
+/// For a view CREATE accepted since #249 the two rules never disagree: names
+/// are unique under rule 2 ([`check_relationship_names_unique`]), and a
+/// spelling match is also an identifier match.
+pub(crate) struct RelNameMatch<'r> {
+    requested: &'r str,
+    by_spelling: bool,
+    key: crate::ident::IdentKey,
+}
+
+impl<'r> RelNameMatch<'r> {
+    /// Decide, once, which rule `requested` is matched by among `joins`.
+    pub(crate) fn new(joins: &[Join], requested: &'r str) -> Self {
+        let by_spelling = joins.iter().any(|j| {
+            j.name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(requested))
+        });
+        Self {
+            requested,
+            by_spelling,
+            key: crate::ident::ident_key(requested),
+        }
+    }
+
+    /// Does the declared (stored) relationship name `stored` match?
+    pub(crate) fn matches(&self, stored: &str) -> bool {
+        if self.by_spelling {
+            stored.eq_ignore_ascii_case(self.requested)
+        } else {
+            crate::ident::ident_key(stored) == self.key
+        }
+    }
+
+    /// Is `join` a relationship this name denotes?
+    pub(crate) fn matches_join(&self, join: &Join) -> bool {
+        join.name.as_deref().is_some_and(|n| self.matches(n))
+    }
+}
+
+/// The relationship `requested` names: the first declared one that
+/// [`RelNameMatch`] matches. "First" only matters for a stored row that
+/// predates the uniqueness check and repeats a name exactly.
+pub(crate) fn find_relationship<'a>(joins: &'a [Join], requested: &str) -> Option<&'a Join> {
+    let m = RelNameMatch::new(joins, requested);
+    joins.iter().find(|j| m.matches_join(j))
 }
 
 /// Validate the relationship graph of a semantic view definition.
@@ -1080,6 +1160,56 @@ mod tests {
         assert!(
             err.contains("duplicate relationship name 'dep'"),
             "expected the duplicate-name error, got: {err}"
+        );
+    }
+
+    /// PR #249 review: `x.y` (two identifier parts) and `"x.y"` (one part
+    /// containing a dot) are different identifiers, so two relationships so
+    /// named are distinct. Joining the normalized parts into one string made
+    /// both `x.y` and rejected them as a duplicate.
+    #[test]
+    fn dotted_one_part_and_two_part_relationship_names_are_distinct() {
+        let mut def = make_def(
+            vec![
+                ("f", "flights", vec!["id"]),
+                ("a", "airports", vec!["id"]),
+                ("c", "carriers", vec!["id"]),
+            ],
+            vec![("f", "a", vec!["dep_id"]), ("f", "c", vec!["carrier_id"])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("x.y".to_string());
+        def.joins[1].name = Some("\"x.y\"".to_string());
+        assert!(
+            validate_graph(&def).is_ok(),
+            "{:?}",
+            validate_graph(&def).err().map(|e| e.message)
+        );
+        // Control: the same two parts spelled with quotes ARE one name.
+        def.joins[1].name = Some("\"X\".\"y\"".to_string());
+        let err = validate_graph(&def).unwrap_err().message;
+        assert!(err.contains("duplicate relationship name 'x.y'"), "{err}");
+    }
+
+    /// `x.y` and `"x.y"` as two roles of ONE table are distinct names, but a
+    /// role's scoped join alias is `<table>__<normalized name>`, so both would
+    /// be joined as `a__x.y`. That pair is rejected with a message naming the
+    /// shared alias rather than as a duplicate name.
+    #[test]
+    fn role_playing_names_sharing_a_scoped_alias_rejected() {
+        let mut def = make_def(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![("f", "a", vec!["dep_id"]), ("f", "a", vec!["arr_id"])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("x.y".to_string());
+        def.joins[1].name = Some("\"x.y\"".to_string());
+        let err = validate_graph(&def).unwrap_err().message;
+        assert!(
+            err.contains("'x.y' and '\"x.y\"'") && err.contains("a__x.y"),
+            "expected the shared-alias error, got: {err}"
         );
     }
 

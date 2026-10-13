@@ -304,7 +304,7 @@ Each entry in the ``dimensions`` list declares a named grouping expression.
      - string
      - No
      - null
-     - Table alias this dimension comes from. Used for join dependency resolution. Must be an alias declared in ``tables`` (any case or quoting), also in a single-table view.
+     - Table alias this dimension comes from. Used for join dependency resolution. Must be an alias declared in ``tables`` (any case), also in a single-table view. Write it unquoted: a quoted alias such as ``'"O"'`` is accepted only in a single-table view (a known limitation).
    * - ``output_type``
      - string
      - No
@@ -379,7 +379,7 @@ Each entry in the ``metrics`` list declares a named aggregation, derived metric,
      - string
      - No
      - null
-     - Table alias. Present for base metrics, absent for derived metrics. Must be an alias declared in ``tables`` (any case or quoting), also in a single-table view.
+     - Table alias. Present for base metrics, absent for derived metrics. Must be an alias declared in ``tables`` (any case), also in a single-table view. Write it unquoted: a quoted alias such as ``'"O"'`` is accepted only in a single-table view (a known limitation).
    * - ``output_type``
      - string
      - No

@@ -530,7 +530,7 @@ fn rebuild_expr(
 /// The role each role-played table plays in **this** query: lowercased table
 /// alias -> the relationship a co-queried metric's `USING`
 /// named for it, as DECLARED (its stored spelling, quotes and all). Compare a
-/// value with `ident::ident_matches`, never `==`: a `USING` entry may spell the
+/// value with `graph::RelNameMatch`, never `==`: a `USING` entry may spell the
 /// same identifier differently (`dep` / `"Dep"`). `scoped_join_alias`
 /// normalizes it, so every spelling yields the same alias.
 ///
@@ -911,15 +911,19 @@ fn is_eligible(
     // where the base-anchored path still scopes the alias — is left on that
     // path, unchanged, rather than guessed at here.
     let roles = scoped_roles(def, resolved_dims, resolved_mets);
+    // A relationship `rel` names is threaded when the role resolved for its
+    // table is that same relationship, both matched by `graph::RelNameMatch`.
+    // For a view stored before #249 with `dep` and `"dep"` to one table, both
+    // share the scoped alias and `roles` holds the first-declared; a `USING`
+    // naming the other one is not threaded, and the base-anchored path keeps it.
     let using_is_threaded = |m: &Metric| {
         m.using_relationships.iter().all(|rel| {
+            let named = crate::graph::RelNameMatch::new(&def.joins, rel);
             def.joins.iter().any(|j| {
-                j.name
-                    .as_ref()
-                    .is_some_and(|n| crate::ident::ident_matches(n, rel))
+                named.matches_join(j)
                     && roles
                         .get(&j.table.to_ascii_lowercase())
-                        .is_some_and(|role| crate::ident::ident_matches(role, rel))
+                        .is_some_and(|role| named.matches(role))
             })
         })
     };
@@ -1348,11 +1352,7 @@ pub(super) fn anchor_joins<'a>(
                 if !emitted.insert(scoped.clone()) {
                     continue;
                 }
-                if let Some(join) = def.joins.iter().find(|j| {
-                    j.name
-                        .as_ref()
-                        .is_some_and(|n| crate::ident::ident_matches(n, rel))
-                }) {
+                if let Some(join) = crate::graph::find_relationship(&def.joins, rel) {
                     joins.push(ResolvedJoin {
                         emit_alias: scoped,
                         bare_alias: to.clone(),

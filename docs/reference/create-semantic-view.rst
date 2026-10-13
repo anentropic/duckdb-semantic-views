@@ -331,7 +331,11 @@ Declares named grouping expressions available for queries.
 
 - Dimension names must be unique within the view (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). For example, ``region`` and ``Region`` cannot both appear in the same ``DIMENSIONS`` clause. See :ref:`ref-err-name-uniqueness`.
 - A dimension name cannot collide with any metric name (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). See :ref:`ref-err-name-uniqueness`.
-- The table alias that qualifies the dimension name must be declared in ``TABLES``, in any case or quoting (``o``, ``O`` or ``"O"`` for alias ``o``). This applies to a single-table view too: ``x.foo`` in a view whose only table is ``o`` is rejected with ``unknown source table 'x'; did you mean 'o'?``. Metrics follow the same rule.
+- The table alias that qualifies the dimension name must be declared in ``TABLES``, in any case (``o`` or ``O`` for alias ``o``). This applies to a single-table view too: ``x.foo`` in a view whose only table is ``o`` is rejected with ``unknown source table 'x'; did you mean 'o'?``. Metrics follow the same rule.
+
+  .. note::
+
+     A *quoted* qualifier (``"O".region`` for alias ``o``) is currently accepted only in a single-table view. In a view with several tables, ``CREATE`` rejects it with ``unknown source table '"O"'`` even though DuckDB treats ``"O"`` as the same identifier as ``o``; facts reject it in every view. Write the qualifier unquoted. This is a known limitation.
 
 **Reported data type:**
 
@@ -457,7 +461,7 @@ See :ref:`howto-window-metrics` for details on both modes.
 - A metric name cannot collide with any dimension name (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). See :ref:`ref-err-name-uniqueness`.
 - Derived metrics must not contain aggregate functions.
 - Circular derived metric references are rejected.
-- ``USING`` relationship names must match declared relationships. Names match the way DuckDB matches identifiers: case-insensitively, whether or not they are quoted, so ``USING (dep_airport)`` names a relationship declared as ``"Dep_Airport"``. Two relationships whose names differ only in case or quoting (``dep`` and ``"dep"``) are the same name.
+- ``USING`` relationship names must match declared relationships. Names match the way DuckDB matches identifiers: case-insensitively, whether or not they are quoted, so ``USING (dep_airport)`` names a relationship declared as ``"Dep_Airport"``. Two relationships whose names differ only in case or quoting (``dep`` and ``"dep"``) are the same name. A name keeps its parts, though: the quoted ``"x.y"`` is one identifier containing a dot, so it is a different name from the two-part ``x.y`` (which ``"x"."y"`` also spells).
 - ``NON ADDITIVE BY`` dimension names must match declared dimensions.
 - Window metric inner metric name must match a declared metric.
 - Window metric ``EXCLUDING`` dimension names must match declared dimensions.

@@ -17,8 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unless both pointed at the same table, and `USING (r)` then silently meant whichever
   was declared first. `CREATE` (and `CREATE … FROM YAML`) now fails with
   `duplicate relationship name '<name>'`, naming both relationships. A role-playing pair
-  that repeats a name reports this error instead of the former "diamond" error. Views
-  already stored keep loading.
+  that repeats a name reports this error instead of the former "diamond" error. A name
+  keeps its parts: the quoted `"x.y"` is one identifier and a different name from the
+  two-part `x.y` (also spelled `"x"."y"`), and `USING` matches it the same way. Two
+  role-playing relationships to one table whose names differ only that way are rejected,
+  because both would be joined under the same alias. Views already stored keep loading,
+  and a `USING` in them keeps naming the relationship it named before, including in a
+  view that holds two relationships whose names differ only in quoting.
 - **`CREATE SEMANTIC VIEW` rejects a single-table member qualified by an undeclared
   table alias.** In a view whose only table is `o`, a dimension or metric named
   `x.foo` was accepted. It now fails with `unknown source table 'x'; did you mean 'o'?`,

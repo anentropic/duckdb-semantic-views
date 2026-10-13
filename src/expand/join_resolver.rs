@@ -292,11 +292,7 @@ pub(super) fn resolve_joins_pkfk<'a>(
     let add_scoped = |scoped_joins: &mut Vec<(String, &'a Join)>,
                       role_playing: &mut HashSet<String>,
                       using_rel: &str| {
-        if let Some(join) = def.joins.iter().find(|j| {
-            j.name
-                .as_ref()
-                .is_some_and(|n| crate::ident::ident_matches(n, using_rel))
-        }) {
+        if let Some(join) = crate::graph::find_relationship(&def.joins, using_rel) {
             let to_alias = join.table.to_ascii_lowercase();
             // `scoped_join_alias` normalizes the name, so every spelling of
             // one relationship yields the same alias.

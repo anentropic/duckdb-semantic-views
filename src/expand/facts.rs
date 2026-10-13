@@ -1084,16 +1084,15 @@ fn rewrite_using_scoped_refs(expr: &str, met: &crate::model::Metric, joins: &[Jo
     // target table -> the distinct relationships (join edges) of this metric
     // that reach it. Distinct by the EDGE a spelling resolves to, not by the
     // spelling: `USING (dep_airport, "DEP_AIRPORT")` names one relationship —
-    // validation, the role-playing fence and the join resolver all match it
-    // with `ident_matches` (DuckDB identifier rule) — so it is one role, and must be rewritten as one (PR #247
-    // review). Counting spellings left the fact on the never-joined bare alias.
+    // validation, the role-playing fence and the join resolver all resolve it
+    // with `graph::find_relationship` — so it is one role, and must be
+    // rewritten as one (PR #247 review). Counting spellings left the fact on
+    // the never-joined bare alias. Conversely a view stored before #249 may
+    // hold `dep` and `"dep"` as two edges; those spellings resolve to two
+    // edges, so the fact is not rewritten (and the #69 fence reports it).
     let mut by_target: Vec<(String, Vec<(&str, &Join)>)> = Vec::new();
     for rel in &met.using_relationships {
-        let Some(join) = joins.iter().find(|j| {
-            j.name
-                .as_ref()
-                .is_some_and(|n| crate::ident::ident_matches(n, rel))
-        }) else {
+        let Some(join) = crate::graph::find_relationship(joins, rel) else {
             continue;
         };
         let target = normalize_ident_part(&join.table);
@@ -1915,6 +1914,36 @@ mod tests {
             is_filter: false,
             access: AccessModifier::Public,
         }
+    }
+
+    // --- rewrite_using_scoped_refs: legacy stored names (PR #249 review) ---
+
+    /// A pre-#249 stored row holding `dep` and `"dep"` as two roles of `a`
+    /// (CREATE then compared names by spelling). `USING (dep, "dep")` names two
+    /// different edges, so the fact has no single role and must stay on the
+    /// bare alias — the #69 fence reports it. Resolving both spellings to the
+    /// first identifier match counted one edge and rewrote the reference.
+    #[test]
+    fn rewrite_using_scoped_refs_keeps_two_legacy_spellings_as_two_roles() {
+        let join = |name: &str, fk: &str| Join {
+            table: "a".to_string(),
+            from_alias: "f".to_string(),
+            fk_columns: vec![fk.to_string()],
+            name: Some(name.to_string()),
+            ..Default::default()
+        };
+        let joins = vec![join("dep", "dep_code"), join("\"dep\"", "arr_code")];
+        let met = make_metric_with_using("m", "SUM(a.elevation)", Some("f"), &["dep", "\"dep\""]);
+        assert_eq!(
+            rewrite_using_scoped_refs("SUM(a.elevation)", &met, &joins),
+            "SUM(a.elevation)"
+        );
+        // Control: one spelling names one edge, which is rewritten.
+        let met = make_metric_with_using("m", "SUM(a.elevation)", Some("f"), &["\"dep\""]);
+        assert_eq!(
+            rewrite_using_scoped_refs("SUM(a.elevation)", &met, &joins),
+            "SUM(a__dep.elevation)"
+        );
     }
 
     // --- collect_derived_metric_using tests ---
