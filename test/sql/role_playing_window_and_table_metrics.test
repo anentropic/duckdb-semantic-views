@@ -145,3 +145,57 @@ query II
 SELECT * FROM semantic_view('p0c_legs_view', metrics := ['dep_leg_elev', 'arr_leg_elev']);
 ----
 113	5447
+
+# The fence the window join walk passes: following a window's inner metric
+# also joins the tables ITS fact references reach, so the referenced-fact fan
+# fence follows it too. A base-table metric over a CHILD-table fact is fenced
+# when queried directly; through a window (or a derived metric) the child table
+# was joined with no fence.
+
+statement ok
+CREATE TABLE p0c_orders (id INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO p0c_orders VALUES (1, 'east'), (2, 'west');
+
+statement ok
+CREATE TABLE p0c_lines (id INTEGER, order_id INTEGER, qty INTEGER);
+
+statement ok
+INSERT INTO p0c_lines VALUES (1, 1, 5), (2, 1, 7), (3, 2, 1);
+
+statement ok
+CREATE SEMANTIC VIEW p0c_orders_view AS
+  TABLES (
+    o AS p0c_orders PRIMARY KEY (id),
+    li AS p0c_lines PRIMARY KEY (id)
+  )
+  RELATIONSHIPS (
+    li_to_o AS li(order_id) REFERENCES o
+  )
+  FACTS (
+    li.liq AS li.qty
+  )
+  DIMENSIONS (
+    o.region AS o.region
+  )
+  METRICS (
+    o.li_qty AS SUM(li.liq),
+    o.li_qty_w AS SUM(li_qty) OVER (PARTITION BY region),
+    li_qty_twice AS li_qty * 2
+  );
+
+statement error
+SELECT * FROM semantic_view('p0c_orders_view', dimensions := ['region'], metrics := ['li_qty']);
+----
+fan trap detected -- 'li_qty' (table 'o')
+
+statement error
+SELECT * FROM semantic_view('p0c_orders_view', dimensions := ['region'], metrics := ['li_qty_w']);
+----
+fan trap detected -- 'li_qty' (table 'o')
+
+statement error
+SELECT * FROM semantic_view('p0c_orders_view', dimensions := ['region'], metrics := ['li_qty_twice']);
+----
+fan trap detected -- 'li_qty' (table 'o')

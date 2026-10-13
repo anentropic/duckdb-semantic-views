@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::model::{Cardinality, Metric, SemanticViewDefinition};
 
-use super::facts::{collect_derived_metric_grain, collect_referenced_facts};
+use super::facts::{
+    collect_derived_metric_grain, collect_referenced_facts, collect_transitive_metric_names,
+};
 use super::types::{ExpandError, FanTrapError, MetricFanTrapError, ReferencedFactFanTrapError};
 use super::where_clause::WhereMember;
 
@@ -762,7 +764,30 @@ pub(super) fn check_referenced_fact_fan_traps(
             .map_or_else(|| vec![root.clone()], |st| vec![st.to_ascii_lowercase()]);
         members.push((dim.name.as_str(), tables, dim.expr.as_str()));
     }
+    // Every metric a queried one inlines or aggregates through — a derived
+    // metric's base metrics and a window metric's inner aggregate — is fenced
+    // under its own name and grain, because the join resolver joins the tables
+    // THEIR fact references reach (PR #247 review: a window's inner metric over
+    // a child-table fact was joined unfenced once the resolver learned to
+    // follow it; the derived-metric walk had the same blind spot). The metric
+    // itself comes first, so a directly-queried one is reported under its own
+    // name exactly as before; its dependencies follow in declaration order, so
+    // the member an error names is deterministic.
+    let mut metric_members: Vec<&Metric> = Vec::new();
     for met in resolved_mets {
+        let deps = collect_transitive_metric_names(met, &def.metrics);
+        let reached = std::iter::once(*met).chain(
+            def.metrics
+                .iter()
+                .filter(|m| deps.contains(&crate::ident::normalize_ident_part(&m.name))),
+        );
+        for m in reached {
+            if !metric_members.iter().any(|seen| std::ptr::eq(*seen, m)) {
+                metric_members.push(m);
+            }
+        }
+    }
+    for met in metric_members {
         members.push((
             met.name.as_str(),
             metric_grain(met, def).anchored(&root),

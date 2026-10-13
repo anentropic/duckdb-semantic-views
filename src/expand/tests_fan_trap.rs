@@ -954,3 +954,63 @@ fn exp27_the_fanning_join_really_does_double_the_metric() {
          is the 2x EXP-27 emitted silently"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR #247 review follow-up: the join resolver now joins the tables a WINDOW
+// metric's inner aggregate reaches through its fact references (so a role-
+// played fact under a USING inner metric binds). The referenced-fact fan fence
+// must see the same set, or a child-table fact reached through a window's
+// inner metric is joined unfenced and the inner aggregate silently inflates.
+// ---------------------------------------------------------------------------
+
+/// `exp27_def` plus a base-table metric over the CHILD fact `liq`, a window
+/// metric over it, and a derived metric over it.
+fn window_over_fanning_fact_def() -> SemanticViewDefinition {
+    exp27_def()
+        .with_metric("li_qty", "SUM(liq)", Some("o"))
+        .with_metric("li_qty_w", "SUM(li_qty) OVER ()", Some("o"))
+        .with_window_spec(
+            "li_qty_w",
+            crate::model::WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "li_qty".to_string(),
+                ..Default::default()
+            },
+        )
+        .with_metric("li_qty_twice", "li_qty * 2", None)
+}
+
+fn expect_referenced_fact_fan_trap(def: &SemanticViewDefinition, metric: &str, member: &str) {
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![DimensionName::new("region")],
+        metrics: vec![MetricName::new(metric)],
+    };
+    match expand("v", def, &req) {
+        Err(ExpandError::ReferencedFactFanTrap { detail }) => {
+            assert_eq!(detail.member_name, member);
+            assert_eq!(detail.fact_table, "li");
+        }
+        Err(other) => panic!("expected ReferencedFactFanTrap, got: {other}"),
+        Ok(sql) => panic!("the fanning child table was joined unfenced:\n{sql}"),
+    }
+}
+
+/// CONTROL: queried directly, the base metric is fenced already.
+#[test]
+fn referenced_fact_fan_trap_direct_metric_is_fenced() {
+    expect_referenced_fact_fan_trap(&window_over_fanning_fact_def(), "li_qty", "li_qty");
+}
+
+/// The window metric's inner aggregate reaches the child fact.
+#[test]
+fn referenced_fact_fan_trap_window_inner_metric_is_fenced() {
+    expect_referenced_fact_fan_trap(&window_over_fanning_fact_def(), "li_qty_w", "li_qty");
+}
+
+/// A derived metric over the same base metric.
+#[test]
+fn referenced_fact_fan_trap_derived_metric_is_fenced() {
+    expect_referenced_fact_fan_trap(&window_over_fanning_fact_def(), "li_qty_twice", "li_qty");
+}
