@@ -9,3 +9,11 @@ pub mod table_function;
 // the default `cargo test` / clippy / coverage runs even though the FFI
 // entrypoints that call them are `extension`-gated (TC-8).
 pub mod wire;
+
+// Raw C-API query helpers (schema inference, DESCRIBE, VARCHAR reads) shared by
+// `table_function`, `explain` and `member_types`; always compiled so `cargo
+// test` drives them against the bundled DuckDB.
+pub mod raw_sql;
+
+// Read-side member type probing for SHOW / DESCRIBE `data_type` (TECH-DEBT #51).
+pub mod member_types;

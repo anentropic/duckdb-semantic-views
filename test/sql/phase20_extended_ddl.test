@@ -205,10 +205,10 @@ TABLE	sv_test	(empty)	BASE_TABLE_NAME	sv_test
 TABLE	sv_test	(empty)	PRIMARY_KEY	["region"]
 DIMENSION	region	sv_test	TABLE	sv_test
 DIMENSION	region	sv_test	EXPRESSION	region
-DIMENSION	region	sv_test	DATA_TYPE	(empty)
+DIMENSION	region	sv_test	DATA_TYPE	VARCHAR
 METRIC	total_amount	sv_test	TABLE	sv_test
 METRIC	total_amount	sv_test	EXPRESSION	SUM(amount)
-METRIC	total_amount	sv_test	DATA_TYPE	(empty)
+METRIC	total_amount	sv_test	DATA_TYPE	DOUBLE
 METRIC	total_amount	sv_test	ACCESS_MODIFIER	PUBLIC
 
 # Case insensitive: lowercase describe
@@ -221,10 +221,10 @@ TABLE	sv_test	(empty)	BASE_TABLE_NAME	sv_test
 TABLE	sv_test	(empty)	PRIMARY_KEY	["region"]
 DIMENSION	region	sv_test	TABLE	sv_test
 DIMENSION	region	sv_test	EXPRESSION	region
-DIMENSION	region	sv_test	DATA_TYPE	(empty)
+DIMENSION	region	sv_test	DATA_TYPE	VARCHAR
 METRIC	total_amount	sv_test	TABLE	sv_test
 METRIC	total_amount	sv_test	EXPRESSION	SUM(amount)
-METRIC	total_amount	sv_test	DATA_TYPE	(empty)
+METRIC	total_amount	sv_test	DATA_TYPE	DOUBLE
 METRIC	total_amount	sv_test	ACCESS_MODIFIER	PUBLIC
 
 # Error: describe nonexistent view
@@ -323,10 +323,10 @@ TABLE	sv_test	(empty)	BASE_TABLE_NAME	sv_test
 TABLE	sv_test	(empty)	PRIMARY_KEY	["region"]
 DIMENSION	region	sv_test	TABLE	sv_test
 DIMENSION	region	sv_test	EXPRESSION	region
-DIMENSION	region	sv_test	DATA_TYPE	(empty)
+DIMENSION	region	sv_test	DATA_TYPE	VARCHAR
 METRIC	total_amount	sv_test	TABLE	sv_test
 METRIC	total_amount	sv_test	EXPRESSION	SUM(amount)
-METRIC	total_amount	sv_test	DATA_TYPE	(empty)
+METRIC	total_amount	sv_test	DATA_TYPE	DOUBLE
 METRIC	total_amount	sv_test	ACCESS_MODIFIER	PUBLIC
 
 # Step 3: SHOW -- verify it appears in the list
@@ -358,10 +358,10 @@ TABLE	sv_test	(empty)	BASE_TABLE_NAME	sv_test
 TABLE	sv_test	(empty)	PRIMARY_KEY	["region"]
 DIMENSION	region	sv_test	TABLE	sv_test
 DIMENSION	region	sv_test	EXPRESSION	region
-DIMENSION	region	sv_test	DATA_TYPE	(empty)
+DIMENSION	region	sv_test	DATA_TYPE	VARCHAR
 METRIC	avg_amount	sv_test	TABLE	sv_test
 METRIC	avg_amount	sv_test	EXPRESSION	AVG(amount)
-METRIC	avg_amount	sv_test	DATA_TYPE	(empty)
+METRIC	avg_amount	sv_test	DATA_TYPE	DOUBLE
 METRIC	avg_amount	sv_test	ACCESS_MODIFIER	PUBLIC
 
 # Step 6: DROP

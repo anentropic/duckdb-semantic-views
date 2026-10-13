@@ -198,23 +198,23 @@ RELATIONSHIP	order_to_product	p28_orders	FOREIGN_KEY	["product_id"]
 RELATIONSHIP	order_to_product	p28_orders	REF_KEY	["id"]
 DIMENSION	customer_name	p28_customers	TABLE	p28_customers
 DIMENSION	customer_name	p28_customers	EXPRESSION	c.name
-DIMENSION	customer_name	p28_customers	DATA_TYPE	(empty)
+DIMENSION	customer_name	p28_customers	DATA_TYPE	VARCHAR
 DIMENSION	product_name	p28_products	TABLE	p28_products
 DIMENSION	product_name	p28_products	EXPRESSION	p.name
-DIMENSION	product_name	p28_products	DATA_TYPE	(empty)
+DIMENSION	product_name	p28_products	DATA_TYPE	VARCHAR
 DIMENSION	region	p28_orders	TABLE	p28_orders
 DIMENSION	region	p28_orders	EXPRESSION	o.region
-DIMENSION	region	p28_orders	DATA_TYPE	(empty)
+DIMENSION	region	p28_orders	DATA_TYPE	VARCHAR
 DIMENSION	tier	p28_customers	TABLE	p28_customers
 DIMENSION	tier	p28_customers	EXPRESSION	c.tier
-DIMENSION	tier	p28_customers	DATA_TYPE	(empty)
+DIMENSION	tier	p28_customers	DATA_TYPE	VARCHAR
 METRIC	total_revenue	p28_orders	TABLE	p28_orders
 METRIC	total_revenue	p28_orders	EXPRESSION	sum(o.amount)
-METRIC	total_revenue	p28_orders	DATA_TYPE	(empty)
+METRIC	total_revenue	p28_orders	DATA_TYPE	DECIMAL(38,2)
 METRIC	total_revenue	p28_orders	ACCESS_MODIFIER	PUBLIC
 METRIC	order_count	p28_orders	TABLE	p28_orders
 METRIC	order_count	p28_orders	EXPRESSION	count(*)
-METRIC	order_count	p28_orders	DATA_TYPE	(empty)
+METRIC	order_count	p28_orders	DATA_TYPE	BIGINT
 METRIC	order_count	p28_orders	ACCESS_MODIFIER	PUBLIC
 
 # ============================================================

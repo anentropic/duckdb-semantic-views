@@ -6,21 +6,22 @@
 """
 uv run examples/type_inference.py
 
-Demonstrates v0.7.1 features:
-  - DDL-time type inference for dimensions and metrics
-  - Inferred DATA_TYPE in DESCRIBE, SHOW SEMANTIC DIMENSIONS/METRICS, SHOW COLUMNS
-  - DECIMAL avoidance (parameterized types left empty to avoid lossy CAST)
-  - In-memory vs file-backed behavior
+Demonstrates member data types in SHOW / DESCRIBE (TECH-DEBT #51):
+  - DATA_TYPE in DESCRIBE, SHOW SEMANTIC DIMENSIONS/METRICS, SHOW COLUMNS
+  - an aggregate reports its own type (COUNT -> BIGINT, AVG -> DOUBLE,
+    SUM of DECIMAL(10,2) -> DECIMAL(38,2), SUM of INTEGER -> BIGINT as
+    semantic_view() returns it)
+  - the type is worked out when SHOW runs, so it follows a source column
+    whose type changes after CREATE, and an unbindable member reports ''
+
+(Before this, v0.7.1 inferred types at CREATE for file-backed databases only,
+and from v0.10.0 the column was empty.)
 
 Requires a debug build: just build
 """
 import duckdb
 import os
 import tempfile
-
-# ============================================================
-# File-backed database (type inference active)
-# ============================================================
 
 tmpdir = tempfile.mkdtemp()
 db_path = os.path.join(tmpdir, "type_inference_demo.duckdb")
@@ -61,18 +62,18 @@ METRICS (
 """)
 
 # DESCRIBE shows DATA_TYPE for each dimension and metric
-print("=== DESCRIBE SEMANTIC VIEW (file-backed) ===")
+print("=== DESCRIBE SEMANTIC VIEW ===")
 for row in con.execute("DESCRIBE SEMANTIC VIEW sales").fetchall():
     kind, name, parent, prop, val = row
     if prop == "DATA_TYPE":
         print(f"  {kind:12s} {name:14s} DATA_TYPE = {val or '(empty)'}")
 
-# SHOW SEMANTIC DIMENSIONS with inferred data_type
+# SHOW SEMANTIC DIMENSIONS with each dimension's data_type
 print("\n=== SHOW SEMANTIC DIMENSIONS ===")
 for row in con.execute("SHOW SEMANTIC DIMENSIONS IN sales").fetchall():
     print(f"  {row[4]:14s} data_type={row[5] or '(empty)'}")
 
-# SHOW SEMANTIC METRICS with inferred data_type
+# SHOW SEMANTIC METRICS: an aggregate reports its own type, not its input's
 print("\n=== SHOW SEMANTIC METRICS ===")
 for row in con.execute("SHOW SEMANTIC METRICS IN sales").fetchall():
     print(f"  {row[4]:14s} data_type={row[5] or '(empty)'}")
@@ -82,38 +83,21 @@ print("\n=== SHOW COLUMNS IN SEMANTIC VIEW ===")
 for row in con.execute("SHOW COLUMNS IN SEMANTIC VIEW sales").fetchall():
     print(f"  {row[3]:14s} data_type={row[4] or '(empty)':10s} kind={row[5]}")
 
-# Note: SUM(o.total) where total is DECIMAL(10,2) produces empty data_type
-# because DECIMAL is a parameterized type and bare "DECIMAL" would lose
-# the precision/scale, causing a lossy CAST. This is intentional.
+# The type is probed when SHOW runs, not stored at CREATE: retype a column and
+# the metric over it follows.
+con.execute("ALTER TABLE orders ALTER quantity TYPE DOUBLE")
+print("\n=== after ALTER TABLE orders ALTER quantity TYPE DOUBLE ===")
+for row in con.execute("SHOW SEMANTIC METRICS LIKE 'total_qty' IN sales").fetchall():
+    print(f"  {row[4]:14s} data_type={row[5] or '(empty)'}")
+
+# A member whose source no longer binds reports an empty data_type; the rest
+# of the view is still typed and SHOW does not fail.
+con.execute("ALTER TABLE orders DROP COLUMN unit_price")
+print("\n=== after ALTER TABLE orders DROP COLUMN unit_price ===")
+for row in con.execute("SHOW SEMANTIC METRICS IN sales").fetchall():
+    print(f"  {row[4]:14s} data_type={row[5] or '(empty)'}")
 
 con.close()
-
-# ============================================================
-# In-memory database (no type inference)
-# ============================================================
-
-con_mem = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-con_mem.execute("LOAD 'build/debug/semantic_views.duckdb_extension'")
-
-con_mem.execute("""
-CREATE TABLE orders (id INTEGER, region VARCHAR, amount DOUBLE);
-INSERT INTO orders VALUES (1, 'US', 100), (2, 'EU', 200);
-
-CREATE SEMANTIC VIEW sales_mem AS
-TABLES (o AS orders PRIMARY KEY (id))
-DIMENSIONS (o.region AS o.region)
-METRICS (o.revenue AS SUM(o.amount));
-""")
-
-print("\n=== SHOW SEMANTIC DIMENSIONS (in-memory, no inference) ===")
-for row in con_mem.execute("SHOW SEMANTIC DIMENSIONS IN sales_mem").fetchall():
-    print(f"  {row[4]:14s} data_type={row[5] or '(empty)'}")
-
-print("\n=== SHOW SEMANTIC METRICS (in-memory, no inference) ===")
-for row in con_mem.execute("SHOW SEMANTIC METRICS IN sales_mem").fetchall():
-    print(f"  {row[4]:14s} data_type={row[5] or '(empty)'}")
-
-con_mem.close()
 
 # Cleanup
 import shutil

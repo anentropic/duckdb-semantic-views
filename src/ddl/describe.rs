@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::catalog::CatalogReader;
 use crate::model::{AccessModifier, SemanticViewDefinition};
+use crate::query::member_types::MemberTypes;
 
 // ---------------------------------------------------------------------------
 // Phase 65 Plan 05 Task 3 (Wave 2) — sv_describe_semantic_view_bind_rust
@@ -68,6 +69,16 @@ unsafe fn describe_view_rows(
     let def = SemanticViewDefinition::from_json(&name, &json)?;
     let alias_map = def.alias_to_table_map();
     let base_table = def.base_table().to_string();
+    // TECH-DEBT #51: DATA_TYPE rows report each member's type as probed now,
+    // on this bind's connection (see `query::member_types`).
+    let types = unsafe {
+        crate::query::member_types::infer_member_types_on(
+            borrowed.as_raw(),
+            &name,
+            &def,
+            crate::query::member_types::Wanted::ALL,
+        )
+    };
 
     let mut internal: Vec<DescribeRow> = Vec::new();
     if let Some(ref comment) = def.comment {
@@ -81,9 +92,9 @@ unsafe fn describe_view_rows(
     }
     collect_table_rows(&def, &mut internal);
     collect_relationship_rows(&def, &alias_map, &mut internal);
-    collect_fact_rows(&def, &base_table, &alias_map, &mut internal);
-    collect_dimension_rows(&def, &base_table, &alias_map, &mut internal);
-    collect_metric_rows(&def, &base_table, &alias_map, &mut internal);
+    collect_fact_rows(&def, &base_table, &alias_map, &types, &mut internal);
+    collect_dimension_rows(&def, &base_table, &alias_map, &types, &mut internal);
+    collect_metric_rows(&def, &base_table, &alias_map, &types, &mut internal);
     collect_materialization_rows(&def, &mut internal);
 
     let rows: Vec<Vec<String>> = internal
@@ -265,6 +276,7 @@ fn collect_fact_rows(
     def: &SemanticViewDefinition,
     base_table: &str,
     alias_map: &HashMap<String, String>,
+    types: &MemberTypes,
     rows: &mut Vec<DescribeRow>,
 ) {
     for fact in &def.facts {
@@ -293,7 +305,7 @@ fn collect_fact_rows(
             object_name: fact.name.clone(),
             parent_entity: parent.clone(),
             property: "DATA_TYPE".to_string(),
-            property_value: fact.output_type.clone().unwrap_or_default(),
+            property_value: types.fact(&fact.name, fact.output_type.as_ref()),
         });
         if let Some(ref comment) = fact.comment {
             rows.push(DescribeRow {
@@ -343,6 +355,7 @@ fn collect_dimension_rows(
     def: &SemanticViewDefinition,
     base_table: &str,
     alias_map: &HashMap<String, String>,
+    types: &MemberTypes,
     rows: &mut Vec<DescribeRow>,
 ) {
     for dim in &def.dimensions {
@@ -371,7 +384,7 @@ fn collect_dimension_rows(
             object_name: dim.name.clone(),
             parent_entity: parent.clone(),
             property: "DATA_TYPE".to_string(),
-            property_value: dim.output_type.clone().unwrap_or_default(),
+            property_value: types.dimension(&dim.name, dim.output_type.as_ref()),
         });
         if let Some(ref comment) = dim.comment {
             rows.push(DescribeRow {
@@ -415,6 +428,7 @@ fn collect_metric_rows(
     def: &SemanticViewDefinition,
     base_table: &str,
     alias_map: &HashMap<String, String>,
+    types: &MemberTypes,
     rows: &mut Vec<DescribeRow>,
 ) {
     for metric in &def.metrics {
@@ -455,7 +469,7 @@ fn collect_metric_rows(
             object_name: metric.name.clone(),
             parent_entity: parent.clone(),
             property: "DATA_TYPE".to_string(),
-            property_value: metric.output_type.clone().unwrap_or_default(),
+            property_value: types.metric(&metric.name, metric.output_type.as_ref()),
         });
         if let Some(ref comment) = metric.comment {
             rows.push(DescribeRow {
@@ -649,7 +663,13 @@ mod tests {
         };
         let alias_map = def.alias_to_table_map();
         let mut rows = Vec::new();
-        collect_metric_rows(&def, "orders", &alias_map, &mut rows);
+        collect_metric_rows(
+            &def,
+            "orders",
+            &alias_map,
+            &MemberTypes::default(),
+            &mut rows,
+        );
 
         // Find the WINDOW_SPEC row
         let ws_row = rows
@@ -724,7 +744,13 @@ mod tests {
         };
         let alias_map = def.alias_to_table_map();
         let mut rows = Vec::new();
-        collect_metric_rows(&def, "orders", &alias_map, &mut rows);
+        collect_metric_rows(
+            &def,
+            "orders",
+            &alias_map,
+            &MemberTypes::default(),
+            &mut rows,
+        );
 
         let ws_row = rows
             .iter()
@@ -791,8 +817,20 @@ mod tests {
         let def = filter_def(true, true);
         let alias_map = def.alias_to_table_map();
         let mut rows = Vec::new();
-        collect_dimension_rows(&def, "orders", &alias_map, &mut rows);
-        collect_fact_rows(&def, "orders", &alias_map, &mut rows);
+        collect_dimension_rows(
+            &def,
+            "orders",
+            &alias_map,
+            &MemberTypes::default(),
+            &mut rows,
+        );
+        collect_fact_rows(
+            &def,
+            "orders",
+            &alias_map,
+            &MemberTypes::default(),
+            &mut rows,
+        );
 
         let dim_row = rows
             .iter()
@@ -818,8 +856,20 @@ mod tests {
         let def = filter_def(false, false);
         let alias_map = def.alias_to_table_map();
         let mut rows = Vec::new();
-        collect_dimension_rows(&def, "orders", &alias_map, &mut rows);
-        collect_fact_rows(&def, "orders", &alias_map, &mut rows);
+        collect_dimension_rows(
+            &def,
+            "orders",
+            &alias_map,
+            &MemberTypes::default(),
+            &mut rows,
+        );
+        collect_fact_rows(
+            &def,
+            "orders",
+            &alias_map,
+            &MemberTypes::default(),
+            &mut rows,
+        );
         assert!(
             !rows.iter().any(|r| r.property == "LABELS"),
             "no spurious LABELS row for a plain member"
@@ -832,8 +882,20 @@ mod tests {
         let def = filter_def(true, false);
         let alias_map = def.alias_to_table_map();
         let mut rows = Vec::new();
-        collect_dimension_rows(&def, "orders", &alias_map, &mut rows);
-        collect_fact_rows(&def, "orders", &alias_map, &mut rows);
+        collect_dimension_rows(
+            &def,
+            "orders",
+            &alias_map,
+            &MemberTypes::default(),
+            &mut rows,
+        );
+        collect_fact_rows(
+            &def,
+            "orders",
+            &alias_map,
+            &MemberTypes::default(),
+            &mut rows,
+        );
         let labelled: Vec<&str> = rows
             .iter()
             .filter(|r| r.property == "LABELS")
@@ -849,7 +911,13 @@ mod tests {
         let def = filter_def(false, true);
         let alias_map = def.alias_to_table_map();
         let mut rows = Vec::new();
-        collect_fact_rows(&def, "orders", &alias_map, &mut rows);
+        collect_fact_rows(
+            &def,
+            "orders",
+            &alias_map,
+            &MemberTypes::default(),
+            &mut rows,
+        );
         let props: Vec<&str> = rows.iter().map(|r| r.property.as_str()).collect();
         let labels_at = props.iter().position(|p| *p == "LABELS").expect("LABELS");
         let access_at = props

@@ -46,13 +46,13 @@ CREATE SEMANTIC VIEW sns_plain AS
 query TTTTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN "sns weird view"
 ----
-memory	main	sns weird view	sns_sales	region	(empty)	[]	(empty)
+memory	main	sns weird view	sns_sales	region	VARCHAR	[]	(empty)
 
 # ...and the same slot on a different SHOW entity.
 query TTTTTTTT rowsort
 SHOW SEMANTIC METRICS IN "sns weird view"
 ----
-memory	main	sns weird view	sns_sales	"total amount"	(empty)	[]	(empty)
+memory	main	sns weird view	sns_sales	"total amount"	BIGINT	[]	(empty)
 
 # ============================================================
 # Test 2: `FOR METRIC` with a quoted, whitespace-bearing name.
@@ -64,7 +64,7 @@ memory	main	sns weird view	sns_sales	"total amount"	(empty)	[]	(empty)
 query TTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN "sns weird view" FOR METRIC "total amount"
 ----
-sns_sales	region	(empty)	false
+sns_sales	region	VARCHAR	false
 
 # ============================================================
 # Test 3: the CONSUMER half — a quoted reference to an UNQUOTED declaration.
@@ -83,13 +83,13 @@ sns_sales	region	(empty)	false
 query TTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN sns_plain FOR METRIC "plain_total"
 ----
-sns_sales	region	(empty)	false
+sns_sales	region	VARCHAR	false
 
 # ...and the reverse spelling, to pin that the normalisation is symmetric.
 query TTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN "sns weird view" FOR METRIC "TOTAL AMOUNT"
 ----
-sns_sales	region	(empty)	false
+sns_sales	region	VARCHAR	false
 
 # ============================================================
 # Test 4: `IN SCHEMA` with a quoted, whitespace-bearing name.
@@ -145,7 +145,7 @@ SHOW SEMANTIC VIEWS LIKE 'sns%' IN SCHEMA "main" LIMIT 5
 query TTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN sns_plain FOR METRIC plain_total
 ----
-sns_sales	region	(empty)	false
+sns_sales	region	VARCHAR	false
 
 statement ok
 SHOW SEMANTIC VIEWS IN SCHEMA main
@@ -194,7 +194,7 @@ CREATE SEMANTIC VIEW sns_b AS
 query TTTTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN "sns_a.sns_b"
 ----
-memory	main	sns_a.sns_b	sns_sales	region	(empty)	[]	(empty)
+memory	main	sns_a.sns_b	sns_sales	region	VARCHAR	[]	(empty)
 
 # The control: the tail-named view is reachable on its own spelling, so the
 # case above is proved to have resolved the quoted name rather than merely
@@ -202,7 +202,7 @@ memory	main	sns_a.sns_b	sns_sales	region	(empty)	[]	(empty)
 query TTTTTTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN sns_b
 ----
-memory	main	sns_b	sns_sales	id	(empty)	[]	(empty)
+memory	main	sns_b	sns_sales	id	INTEGER	[]	(empty)
 
 # Cleanup
 statement ok

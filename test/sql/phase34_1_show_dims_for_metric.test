@@ -30,8 +30,8 @@ CREATE SEMANTIC VIEW simple_sv AS
 query TTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN simple_sv FOR METRIC total
 ----
-p34fm_sales	product	(empty)	false
-p34fm_sales	region	(empty)	false
+p34fm_sales	product	VARCHAR	false
+p34fm_sales	region	VARCHAR	false
 
 # ============================================================
 # Setup: multi-table view with fan trap potential
@@ -88,8 +88,8 @@ CREATE SEMANTIC VIEW star_sv AS
 query TTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN star_sv FOR METRIC order_total
 ----
-p34fm_customers	customer_country	(empty)	false
-p34fm_customers	customer_name	(empty)	false
+p34fm_customers	customer_country	VARCHAR	false
+p34fm_customers	customer_name	VARCHAR	false
 
 # ============================================================
 # Test 3: line_item_sum metric (source: li)
@@ -101,9 +101,9 @@ p34fm_customers	customer_name	(empty)	false
 query TTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN star_sv FOR METRIC line_item_sum
 ----
-p34fm_customers	customer_country	(empty)	false
-p34fm_customers	customer_name	(empty)	false
-p34fm_line_items	item_qty	(empty)	false
+p34fm_customers	customer_country	VARCHAR	false
+p34fm_customers	customer_name	VARCHAR	false
+p34fm_line_items	item_qty	INTEGER	false
 
 # ============================================================
 # Test 4: Non-existent metric
@@ -156,7 +156,7 @@ CREATE SEMANTIC VIEW derived_sv AS
 query TTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN derived_sv FOR METRIC double_total
 ----
-p34fm_customers	customer_name	(empty)	false
+p34fm_customers	customer_name	VARCHAR	false
 
 # ============================================================
 # Test 7: Case insensitivity
@@ -165,7 +165,7 @@ p34fm_customers	customer_name	(empty)	false
 query TTTT rowsort
 show semantic dimensions in derived_sv for metric order_total
 ----
-p34fm_customers	customer_name	(empty)	false
+p34fm_customers	customer_name	VARCHAR	false
 
 # ============================================================
 # Cleanup

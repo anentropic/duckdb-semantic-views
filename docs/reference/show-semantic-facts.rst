@@ -118,7 +118,7 @@ Returns one row per fact with 8 columns:
      - The fact name as declared in the ``FACTS`` clause.
    * - ``data_type``
      - VARCHAR
-     - The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+     - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``synonyms``
      - VARCHAR
      - JSON array of synonym strings (e.g., ``["discounted_price"]``). ``[]`` when no synonyms are set.
@@ -142,13 +142,13 @@ Given a semantic view ``orders_sv`` with one fact:
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬──────────────────────┬────────────┬────────────┬────────────────┬──────────┬─────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name       │ data_type      │ synonyms │ comment │
-   ├───────────────┼─────────────┼──────────────────────┼────────────┼────────────┼────────────────┼──────────┼─────────┤
-   │ memory        │ main        │ orders_sv            │ orders     │ raw_amount │                │ []       │         │
-   └───────────────┴─────────────┴──────────────────────┴────────────┴────────────┴────────────────┴──────────┴─────────┘
+   ┌───────────────┬─────────────┬────────────────────┬────────────┬────────────┬───────────────┬──────────┬─────────┐
+   │ database_name │ schema_name │ semantic_view_name │ table_name │ name       │ data_type     │ synonyms │ comment │
+   ├───────────────┼─────────────┼────────────────────┼────────────┼────────────┼───────────────┼──────────┼─────────┤
+   │ memory        │ main        │ orders_sv          │ orders     │ raw_amount │ DECIMAL(10,2) │ []       │         │
+   └───────────────┴─────────────┴────────────────────┴────────────┴────────────┴───────────────┴──────────┴─────────┘
 
-``data_type`` is empty here because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`GET_DDL <ref-get-ddl>` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. Reporting the type an expression actually produces would require probing it on the read side, at ``SHOW`` bind time; that is a known limitation and is not implemented today. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+The example tables use ``VARCHAR`` text columns, ``DATE`` dates, ``INTEGER`` quantities and ``DECIMAL(10,2)`` amounts and prices. ``data_type`` is each member's type as a query returns it -- an aggregate's own type, not its input's: ``COUNT`` is ``BIGINT``, ``SUM`` of a ``DECIMAL(10,2)`` is ``DECIMAL(38,2)``, and a ratio of two metrics is ``DOUBLE``. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 **List facts across all views:**
 
@@ -199,14 +199,14 @@ Facts can reference other facts. Consider a view with two chained facts:
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬──────────────────────┬────────────┬────────────┬────────────────┬──────────┬─────────┐
-   │ database_name │ schema_name │ semantic_view_name   │ table_name │ name       │ data_type      │ synonyms │ comment │
-   ├───────────────┼─────────────┼──────────────────────┼────────────┼────────────┼────────────────┼──────────┼─────────┤
-   │ memory        │ main        │ tpch_analysis        │ line_items │ net_price  │                │ []       │         │
-   │ memory        │ main        │ tpch_analysis        │ line_items │ tax_amount │                │ []       │         │
-   └───────────────┴─────────────┴──────────────────────┴────────────┴────────────┴────────────────┴──────────┴─────────┘
+   ┌───────────────┬─────────────┬────────────────────┬────────────┬────────────┬───────────────┬──────────┬─────────┐
+   │ database_name │ schema_name │ semantic_view_name │ table_name │ name       │ data_type     │ synonyms │ comment │
+   ├───────────────┼─────────────┼────────────────────┼────────────┼────────────┼───────────────┼──────────┼─────────┤
+   │ memory        │ main        │ tpch_analysis      │ line_items │ net_price  │ DECIMAL(18,4) │ []       │         │
+   │ memory        │ main        │ tpch_analysis      │ line_items │ tax_amount │ DECIMAL(18,6) │ []       │         │
+   └───────────────┴─────────────┴────────────────────┴────────────┴────────────┴───────────────┴──────────┴─────────┘
 
-Both facts show an empty ``data_type``, including ``net_price``, whose expression uses only physical columns: no type is inferred for either. Chained references (``tax_amount`` references ``li.net_price``) are resolved at query expansion time regardless.
+Assuming ``extended_price DECIMAL(12,2)`` and ``discount`` / ``tax_rate DECIMAL(4,2)``, each fact reports the type of its expression with the referenced fact substituted in: ``tax_amount`` is typed through ``li.net_price``. Chained references are resolved the same way at query expansion time.
 
 **Error: view does not exist:**
 

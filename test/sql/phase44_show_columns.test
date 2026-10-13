@@ -41,12 +41,12 @@ CREATE SEMANTIC VIEW orders_sv AS
 query TTTTTTTT rowsort
 SHOW COLUMNS IN SEMANTIC VIEW orders_sv
 ----
-memory	main	orders_sv	avg_revenue	(empty)	DERIVED_METRIC	total_revenue / order_count	(empty)
-memory	main	orders_sv	order_count	(empty)	METRIC	COUNT(*)	(empty)
-memory	main	orders_sv	order_date	(empty)	DIMENSION	o.order_date	(empty)
-memory	main	orders_sv	raw_amount	(empty)	FACT	o.amount	Raw order amount
-memory	main	orders_sv	region	(empty)	DIMENSION	o.region	Geographic region
-memory	main	orders_sv	total_revenue	(empty)	METRIC	SUM(o.amount)	Total revenue
+memory	main	orders_sv	avg_revenue	DOUBLE	DERIVED_METRIC	total_revenue / order_count	(empty)
+memory	main	orders_sv	order_count	BIGINT	METRIC	COUNT(*)	(empty)
+memory	main	orders_sv	order_date	DATE	DIMENSION	o.order_date	(empty)
+memory	main	orders_sv	raw_amount	DECIMAL(10,2)	FACT	o.amount	Raw order amount
+memory	main	orders_sv	region	VARCHAR	DIMENSION	o.region	Geographic region
+memory	main	orders_sv	total_revenue	DECIMAL(38,2)	METRIC	SUM(o.amount)	Total revenue
 
 # ============================================================
 # Test 2: Dimensions show kind=DIMENSION

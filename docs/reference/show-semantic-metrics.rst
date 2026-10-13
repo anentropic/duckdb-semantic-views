@@ -7,7 +7,7 @@
 SHOW SEMANTIC METRICS
 ========================
 
-Lists metrics registered in one or all semantic views. Each row describes a single metric with its name, source table, declared data type, synonyms, and comment. Both base metrics and derived metrics are included.
+Lists metrics registered in one or all semantic views. Each row describes a single metric with its name, source table, data type, synonyms, and comment. Both base metrics and derived metrics are included.
 
 
 .. _ref-show-metrics-syntax:
@@ -118,7 +118,7 @@ Returns one row per metric with 8 columns:
      - The metric name as declared in the ``METRICS`` clause.
    * - ``data_type``
      - VARCHAR
-     - The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+     - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``synonyms``
      - VARCHAR
      - JSON array of synonym strings (e.g., ``["total_sales","gmv"]``). ``[]`` when no synonyms are set.
@@ -142,14 +142,14 @@ Given a semantic view ``orders_sv`` with two base metrics:
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬────────────────────┬────────────┬──────────────┬───────────┬──────────┬─────────┐
-   │ database_name │ schema_name │ semantic_view_name │ table_name │ name         │ data_type │ synonyms │ comment │
-   ├───────────────┼─────────────┼────────────────────┼────────────┼──────────────┼───────────┼──────────┼─────────┤
-   │ memory        │ main        │ orders_sv          │ orders     │ order_count  │           │ []       │         │
-   │ memory        │ main        │ orders_sv          │ orders     │ total_amount │           │ []       │         │
-   └───────────────┴─────────────┴────────────────────┴────────────┴──────────────┴───────────┴──────────┴─────────┘
+   ┌───────────────┬─────────────┬────────────────────┬────────────┬──────────────┬───────────────┬──────────┬─────────┐
+   │ database_name │ schema_name │ semantic_view_name │ table_name │ name         │ data_type     │ synonyms │ comment │
+   ├───────────────┼─────────────┼────────────────────┼────────────┼──────────────┼───────────────┼──────────┼─────────┤
+   │ memory        │ main        │ orders_sv          │ orders     │ order_count  │ BIGINT        │ []       │         │
+   │ memory        │ main        │ orders_sv          │ orders     │ total_amount │ DECIMAL(38,2) │ []       │         │
+   └───────────────┴─────────────┴────────────────────┴────────────┴──────────────┴───────────────┴──────────┴─────────┘
 
-``data_type`` is empty here because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`GET_DDL <ref-get-ddl>` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. Reporting the type an expression actually produces would require probing it on the read side, at ``SHOW`` bind time; that is a known limitation and is not implemented today. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+The example tables use ``VARCHAR`` text columns, ``DATE`` dates, ``INTEGER`` quantities and ``DECIMAL(10,2)`` amounts and prices. ``data_type`` is each member's type as a query returns it -- an aggregate's own type, not its input's: ``COUNT`` is ``BIGINT``, ``SUM`` of a ``DECIMAL(10,2)`` is ``DECIMAL(38,2)``, and a ratio of two metrics is ``DOUBLE``. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 **List metrics across all views:**
 
@@ -185,16 +185,16 @@ Derived metrics reference other metrics rather than a specific physical table. T
 
 .. code-block:: text
 
-   ┌───────────────┬─────────────┬────────────────────┬────────────┬─────────┬───────────┬──────────┬─────────┐
-   │ database_name │ schema_name │ semantic_view_name │ table_name │ name    │ data_type │ synonyms │ comment │
-   ├───────────────┼─────────────┼────────────────────┼────────────┼─────────┼───────────┼──────────┼─────────┤
-   │ memory        │ main        │ profit_analysis    │ line_items │ cost    │           │ []       │         │
-   │ memory        │ main        │ profit_analysis    │            │ margin  │           │ []       │         │
-   │ memory        │ main        │ profit_analysis    │            │ profit  │           │ []       │         │
-   │ memory        │ main        │ profit_analysis    │ line_items │ revenue │           │ []       │         │
-   └───────────────┴─────────────┴────────────────────┴────────────┴─────────┴───────────┴──────────┴─────────┘
+   ┌───────────────┬─────────────┬────────────────────┬────────────┬─────────┬───────────────┬──────────┬─────────┐
+   │ database_name │ schema_name │ semantic_view_name │ table_name │ name    │ data_type     │ synonyms │ comment │
+   ├───────────────┼─────────────┼────────────────────┼────────────┼─────────┼───────────────┼──────────┼─────────┤
+   │ memory        │ main        │ profit_analysis    │ line_items │ cost    │ DECIMAL(38,2) │ []       │         │
+   │ memory        │ main        │ profit_analysis    │            │ margin  │ DOUBLE        │ []       │         │
+   │ memory        │ main        │ profit_analysis    │            │ profit  │ DECIMAL(38,2) │ []       │         │
+   │ memory        │ main        │ profit_analysis    │ line_items │ revenue │ DECIMAL(38,2) │ []       │         │
+   └───────────────┴─────────────┴────────────────────┴────────────┴─────────┴───────────────┴──────────┴─────────┘
 
-Base metrics (``revenue``, ``cost``) show their physical table name. Derived metrics (``profit``, ``margin``) show an empty ``table_name`` because they reference other metrics rather than a specific table. ``data_type`` is empty for all four, for the reason given above.
+Base metrics (``revenue``, ``cost``) show their physical table name. Derived metrics (``profit``, ``margin``) show an empty ``table_name`` because they reference other metrics rather than a specific table. ``profit`` keeps the ``DECIMAL`` type of the two sums it subtracts; ``margin`` divides them and is ``DOUBLE``.
 
 **Error: view does not exist:**
 

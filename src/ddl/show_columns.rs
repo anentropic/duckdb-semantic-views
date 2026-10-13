@@ -70,7 +70,16 @@ unsafe fn show_columns_rows(
         .lookup(&view, &search_path)?
         .ok_or_else(|| crate::catalog::view_not_found_msg(&view.to_string()))?;
     let def = SemanticViewDefinition::from_json(&view_name, &json)?;
-    let rows: Vec<Vec<String>> = collect_column_rows(&def, &view_name)
+    // TECH-DEBT #51: probe each column's type on this bind's connection.
+    let types = unsafe {
+        crate::query::member_types::infer_member_types_on(
+            borrowed.as_raw(),
+            &view_name,
+            &def,
+            crate::query::member_types::Wanted::ALL,
+        )
+    };
+    let rows: Vec<Vec<String>> = collect_column_rows(&def, &view_name, &types)
         .into_iter()
         .map(|r| {
             vec![
@@ -109,7 +118,11 @@ struct ShowColumnRow {
 /// Collect column rows from a semantic view definition.
 /// Includes all dimensions, public facts, and public metrics.
 /// Derived metrics (no `source_table`) get kind "`DERIVED_METRIC`".
-fn collect_column_rows(def: &SemanticViewDefinition, view_name: &str) -> Vec<ShowColumnRow> {
+fn collect_column_rows(
+    def: &SemanticViewDefinition,
+    view_name: &str,
+    types: &crate::query::member_types::MemberTypes,
+) -> Vec<ShowColumnRow> {
     let database_name = def.database_name.clone().unwrap_or_default();
     let schema_name = def.schema_name.clone().unwrap_or_default();
     let mut rows = Vec::new();
@@ -120,7 +133,7 @@ fn collect_column_rows(def: &SemanticViewDefinition, view_name: &str) -> Vec<Sho
             schema_name: schema_name.clone(),
             semantic_view_name: view_name.to_string(),
             column_name: dim.name.clone(),
-            data_type: dim.output_type.clone().unwrap_or_default(),
+            data_type: types.dimension(&dim.name, dim.output_type.as_ref()),
             kind: "DIMENSION".to_string(),
             expression: dim.expr.clone(),
             comment: dim.comment.clone().unwrap_or_default(),
@@ -136,7 +149,7 @@ fn collect_column_rows(def: &SemanticViewDefinition, view_name: &str) -> Vec<Sho
             schema_name: schema_name.clone(),
             semantic_view_name: view_name.to_string(),
             column_name: fact.name.clone(),
-            data_type: fact.output_type.clone().unwrap_or_default(),
+            data_type: types.fact(&fact.name, fact.output_type.as_ref()),
             kind: "FACT".to_string(),
             expression: fact.expr.clone(),
             comment: fact.comment.clone().unwrap_or_default(),
@@ -157,7 +170,7 @@ fn collect_column_rows(def: &SemanticViewDefinition, view_name: &str) -> Vec<Sho
             schema_name: schema_name.clone(),
             semantic_view_name: view_name.to_string(),
             column_name: metric.name.clone(),
-            data_type: metric.output_type.clone().unwrap_or_default(),
+            data_type: types.metric(&metric.name, metric.output_type.as_ref()),
             kind: kind.to_string(),
             expression: metric.expr.clone(),
             comment: metric.comment.clone().unwrap_or_default(),
