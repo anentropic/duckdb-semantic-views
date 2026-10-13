@@ -60,13 +60,8 @@ NEEDS_DOWNLOADED_EXTENSION: dict[str, str] = {
 # Examples that are known to fail, keyed by file name: (substring the failure
 # output must contain, why). Every entry needs a TECH-DEBT reference.
 EXPECTED_FAILURES: dict[str, tuple[str, str]] = {
-    "type_inference.py": (
-        "parser_override is not active",
-        "its in-memory section sends CREATE TABLE + INSERT + CREATE SEMANTIC VIEW "
-        "in ONE execute() string, which semantic-view DDL does not support "
-        "(TECH-DEBT #83). PR #248 rewrites this example without that section; "
-        "delete this entry once it has merged.",
-    ),
+    # Empty. examples/type_inference.py was listed here (TECH-DEBT #83) until
+    # PR #248 rewrote it without the multi-statement execute() call.
 }
 
 

@@ -22,15 +22,27 @@ runner would have reported success without actually testing anything:
    ``require notwindows`` (see scripts/patch_sqllogictest.py), which BuildAll
    legitimately hits on Windows/macOS. Those skips are listed loudly at the end.
    Anything else (``halt``, unsupported statements, decorators) is a failure.
+5. A file that hits one of the runner's ``ignore_error_messages`` ("HTTP",
+   "Unable to connect") fails. Upstream treats such an error as a PASS: the
+   failing query's expected result is never checked, and the file reports
+   SUCCESS. The only exception is the local offline opt-in: with
+   ``SV_OFFLINE_EXTENSIONS=1`` (refused when ``CI`` is set), a file passed as
+   ``--offline-excused FILE`` -- the Makefile passes its
+   ``OFFLINE_EXTENSION_TESTS`` list, the files that need an extension
+   downloaded from extensions.duckdb.org -- is reported loudly as SKIPPED
+   instead. Any other file that hits a network error still fails, offline or
+   not.
 
 The required extensions default to ``semantic_views``; pass
-``--required-extension NAME`` (repeatable) to change that. Every other
-argument is forwarded to the runner untouched.
+``--required-extension NAME`` (repeatable) to change that. ``--offline-excused
+FILE`` (repeatable) is described in 5. Every other argument is forwarded to the
+runner untouched.
 
 The upstream package is pinned by extension-ci-tools and already patched by
-scripts/patch_sqllogictest.py; this wrapper hooks four of its methods
-(``SQLLogicRunner.reset``, ``SQLLogicContext.execute_statement`` /
-``execute_query``, ``SQLLogicTestExecutor.execute_test``). If a runner bump
+scripts/patch_sqllogictest.py; this wrapper hooks five of its methods
+(``SQLLogicRunner.reset`` / ``skip_error_message``,
+``SQLLogicContext.execute_statement`` / ``execute_query``,
+``SQLLogicTestExecutor.execute_test``). If a runner bump
 renames them, the ``getattr`` checks below fail loudly rather than letting the
 guards go quiet.
 """
@@ -38,6 +50,7 @@ guards go quiet.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from dataclasses import dataclass, field
 
@@ -52,6 +65,7 @@ class FileOutcome:
     executed: int = 0
     skip_reason: str = ""
     requires: set[str] = field(default_factory=set)
+    network_errors: list[str] = field(default_factory=list)
 
 
 def _require_params(test) -> set[str]:
@@ -75,22 +89,34 @@ def _hook(cls, name):
 def main() -> int:
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--required-extension", action="append", default=None)
+    pre.add_argument("--offline-excused", action="append", default=[])
     pre.add_argument("--file-list")
     pre.add_argument("--file-path")
     ours, _ = pre.parse_known_args()
     required = {e.lower() for e in (ours.required_extension or ["semantic_views"])}
 
-    # Strip our own option; forward everything else to the upstream runner.
+    offline = os.environ.get("SV_OFFLINE_EXTENSIONS") == "1"
+    if offline and os.environ.get("CI"):
+        print(
+            "ERROR: SV_OFFLINE_EXTENSIONS=1 excuses network failures and is for local "
+            f"offline runs only; refusing because CI={os.environ['CI']!r}",
+            file=sys.stderr,
+        )
+        return 1
+    excused = {os.path.normpath(p) for p in ours.offline_excused}
+
+    # Strip our own options; forward everything else to the upstream runner.
+    own_options = ("--required-extension", "--offline-excused")
     forwarded = []
     skip_next = False
     for arg in sys.argv[1:]:
         if skip_next:
             skip_next = False
             continue
-        if arg == "--required-extension":
+        if arg in own_options:
             skip_next = True
             continue
-        if arg.startswith("--required-extension="):
+        if arg.startswith(tuple(o + "=" for o in own_options)):
             continue
         forwarded.append(arg)
 
@@ -113,6 +139,17 @@ def main() -> int:
         self.required_requires.update(required)
 
     result.SQLLogicRunner.reset = reset
+
+    # 5. Record every error the runner would wave through as a network error.
+    orig_skip_error_message = _hook(result.SQLLogicRunner, "skip_error_message")
+
+    def skip_error_message(self, message):
+        ignored = orig_skip_error_message(self, message)
+        if ignored and current:
+            current[-1].network_errors.append(str(message).splitlines()[0])
+        return ignored
+
+    result.SQLLogicRunner.skip_error_message = skip_error_message
 
     # 3. Count executed statements/queries (loop bodies included).
     for method in ("execute_statement", "execute_query"):
@@ -168,6 +205,19 @@ def main() -> int:
 
     for outcome in outcomes.values():
         needs_required = bool(outcome.requires & required)
+        if outcome.network_errors:
+            first = outcome.network_errors[0]
+            if offline and os.path.normpath(outcome.path) in excused:
+                allowed_skips.append(
+                    f"SKIPPED (SV_OFFLINE_EXTENSIONS=1): {outcome.path} -- needs a DuckDB "
+                    f"extension downloaded from extensions.duckdb.org; hit: {first}"
+                )
+            else:
+                problems.append(
+                    f"{outcome.path}: hit an ignored network error, which the runner "
+                    f"counts as a pass without checking the result: {first}"
+                )
+            continue
         if outcome.result == "SUCCESS":
             if needs_required and outcome.executed == 0:
                 problems.append(
@@ -189,7 +239,10 @@ def main() -> int:
             problems.append(f"{outcome.path}: result {outcome.result}")
 
     for line in allowed_skips:
-        print(f"SKIPPED (allowed, require not met on this platform): {line}")
+        if line.startswith("SKIPPED"):
+            print(line)
+        else:
+            print(f"SKIPPED (allowed, require not met on this platform): {line}")
 
     ran = sum(1 for o in outcomes.values() if o.result == "SUCCESS")
     statements = sum(o.executed for o in outcomes.values())
@@ -205,7 +258,7 @@ def main() -> int:
 
     print(
         f"sqllogictest: {ran} file(s) ran, {statements} statements/queries executed"
-        + (f", {len(allowed_skips)} platform skip(s)" if allowed_skips else "")
+        + (f", {len(allowed_skips)} skipped (listed above)" if allowed_skips else "")
     )
     return 0
 

@@ -46,7 +46,15 @@ UNSTABLE_C_API_FLAG=--abi-type C_STRUCT_UNSTABLE
 # and fails each of those; test/integration/test_sqllogictest_guards.py
 # (`just test-sqllogictest-guards`) pins every case. The extension-ci-tools
 # submodule is left untouched.
-TEST_RUNNER=$(PYTHON_VENV_BIN) scripts/run_sqllogictest.py --required-extension semantic_views
+#
+# The wrapper also fails any file that hits an error the runner silently
+# ignores ("HTTP" / "Unable to connect" count as a PASS upstream). Under the
+# local-only SV_OFFLINE_EXTENSIONS=1 opt-in, the files in
+# OFFLINE_EXTENSION_TESTS -- the ones that need an extension downloaded from
+# extensions.duckdb.org -- are excused and reported as SKIPPED instead. The
+# list is expanded when the `:=` lines below capture TEST_RUNNER, so it may be
+# defined anywhere above them; while it is undefined nothing is excused.
+TEST_RUNNER=$(PYTHON_VENV_BIN) scripts/run_sqllogictest.py --required-extension semantic_views $(foreach t,$(OFFLINE_EXTENSION_TESTS),--offline-excused $(t))
 
 # The DuckDB the C++ shim is compiled against. build.rs links the amalgamation
 # INTO the extension binary (the parser hook the shim registers is C++ internals

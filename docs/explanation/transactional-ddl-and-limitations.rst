@@ -242,9 +242,9 @@ Send each semantic-view statement to DuckDB on its own. A query string that hold
 
 .. code-block:: text
 
-   Parser Error: semantic_views: parser_override is not active for this connection (allow_parser_override_extension is 'DEFAULT' or 'STRICT'). Re-enable with: SET allow_parser_override_extension='FALLBACK';
+   Parser Error: semantic_views: semantic-view DDL must be sent as its own statement, one statement per call. This query string also contains other statements; send each statement in a separate call (a single trailing ';' is fine).
 
-In this case the advice in the message does not apply: the setting is fine, and changing it does not help. Split the string into one call per statement instead (a single trailing semicolon is fine):
+Split the string into one call per statement (a single trailing semicolon is fine):
 
 .. code-block:: python
 
@@ -279,7 +279,7 @@ After disabling the PEG parser, restore the setting with one statement:
 
    SET allow_parser_override_extension = 'FALLBACK';
 
-Sessions that never call ``disable_peg_parser`` are unaffected: the extension installs the setting at load time and leaves it in place. If you see this error without having called ``disable_peg_parser``, the cause is almost certainly a multi-statement query string -- see :ref:`explanation-txn-ddl-one-statement`.
+Sessions that never call ``disable_peg_parser`` are unaffected: the extension installs the setting at load time and leaves it in place. (Semantic-view DDL inside a multi-statement query string fails with a different message; see :ref:`explanation-txn-ddl-one-statement`.)
 
 
 .. _explanation-txn-ddl-summary:

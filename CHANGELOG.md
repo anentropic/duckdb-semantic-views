@@ -59,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TABLES` had no relationship, or the relationships formed two separate groups, the view
   was accepted and every query failed with a binder error. `CREATE SEMANTIC VIEW` now
   rejects the definition and names the unreachable table.
+- **Semantic-view DDL inside a multi-statement query string now says what is wrong.** It
+  used to fail with `parser_override is not active for this connection … Re-enable with: SET
+  allow_parser_override_extension='FALLBACK'`, although the setting was fine and changing
+  it did nothing. The error now says that semantic-view DDL must be sent as its own
+  statement, one statement per call. The original message is kept for the case it was
+  written for, when the setting really has been switched off.
 - **`examples/metadata_and_metrics.py` runs again.** It wrote `NON ADDITIVE BY` after `AS`,
   a parenthesized `PARTITION BY EXCLUDING` list and a window metric over a column instead
   of a metric — all rejected at `CREATE` — and queried a metric as a fact. It also printed
@@ -70,10 +76,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Semantic-view DDL must be sent one statement per call.** A query string that combines
   it with other statements (for example one Python `execute()` call holding `CREATE TABLE
-  …; CREATE SEMANTIC VIEW …`) fails with `parser_override is not active for this
-  connection`, and the `SET` that message suggests does not help. Split the string into one
-  call per statement. See "One Statement per Call" in the transactional DDL and limitations
-  page.
+  …; CREATE SEMANTIC VIEW …`) is rejected. Split the string into one call per statement.
+  See "One Statement per Call" in the transactional DDL and limitations page.
 
 ## [0.13.0] - 2026-09-30
 

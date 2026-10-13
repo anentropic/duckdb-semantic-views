@@ -28,11 +28,29 @@ wrapper script in isolation:
   unparseable_file     the runner cannot parse the file, logs it to its skip
                        log and moves on -- no SKIPPED line, no failure.
   halted_file          `halt` ends the file early; reported as SKIPPED.
+  network_error_http   a `query` fails with an error containing "HTTP" after an
+                       earlier statement ran. The runner's
+                       `ignore_error_messages` ({"HTTP", "Unable to connect"})
+                       treats that as a pass: the query's result is never
+                       checked and the file reports SUCCESS.
+  network_error_unable_to_connect  the same, for "Unable to connect".
+  offline_not_excused  under SV_OFFLINE_EXTENSIONS=1 a network error is still a
+                       failure for a file NOT on the offline list.
+  offline_refused_in_ci  SV_OFFLINE_EXTENSIONS=1 with CI set is refused.
 
   control_pass         a normal file: must still exit 0.
   control_platform     `require windows` on a non-Windows host: a legitimate
                        platform skip, must still exit 0 (BuildAll runs the
                        suite on Windows and macOS, where such skips are real).
+  control_offline_excused  under SV_OFFLINE_EXTENSIONS=1 (CI unset), a file
+                       the Makefile lists as needing a downloaded extension
+                       (`--offline-excused`) may hit a network error: it must
+                       exit 0 AND say SKIPPED loudly.
+
+The four network/offline scenarios after the first two drive the wrapper
+script directly rather than through make, because they need the offline
+variable set and CI unset, which the CI job running this file cannot provide
+through make.
 
 Each guard scenario must exit non-zero AND print its own reason (so an
 unrelated failure cannot pass for the guard working); each control must exit 0.
@@ -107,6 +125,19 @@ SELECT 1
 1
 """
 
+NETWORK_ERROR_TEST = """\
+# name: {name}
+require semantic_views
+
+statement ok
+CREATE TABLE t (id INTEGER)
+
+query I
+SELECT error('{message}: simulated by test_sqllogictest_guards.py')
+----
+1
+"""
+
 PLATFORM_SKIP_TEST = """\
 # name: {name}
 require semantic_views
@@ -135,6 +166,42 @@ def run_make(
             "test_debug",
             f"EXTENSION_NAME={extension_name}",
             f"TEST_LIST_PATH={test_list}",
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+
+
+def run_wrapper(
+    workdir: Path, test_body: str, env_overrides: dict, extra_args: tuple = ()
+) -> subprocess.CompletedProcess:
+    """Run scripts/run_sqllogictest.py directly, as the Makefile's TEST_RUNNER does."""
+    test_file = workdir / "case.test"
+    test_file.write_text(test_body.format(name=test_file))
+    test_list = workdir / "TEST_LIST"
+    test_list.write_text(f"{test_file}\n")
+    env = dict(os.environ)
+    for key in ("SV_OFFLINE_EXTENSIONS", "CI"):
+        env.pop(key, None)
+    env.update(env_overrides)
+    args = [arg.format(test_file=test_file) for arg in extra_args]
+    return subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_sqllogictest.py",
+            "--required-extension",
+            "semantic_views",
+            "--test-dir",
+            "test/sql",
+            "--file-list",
+            str(test_list),
+            "--external-extension",
+            str(REAL_EXTENSION),
+            *args,
         ],
         cwd=REPO_ROOT,
         env=env,
@@ -176,6 +243,38 @@ def case_halted_file(workdir: Path):
     return run_make(workdir, HALTED_TEST), "HALT was encountered"
 
 
+def case_network_error_http(workdir: Path):
+    body = NETWORK_ERROR_TEST.replace("{message}", "HTTP Error 503")
+    return run_make(workdir, body), "ignored network error"
+
+
+def case_network_error_unable_to_connect(workdir: Path):
+    body = NETWORK_ERROR_TEST.replace("{message}", "Unable to connect")
+    return run_make(workdir, body), "ignored network error"
+
+
+def case_offline_not_excused(workdir: Path):
+    body = NETWORK_ERROR_TEST.replace("{message}", "HTTP Error 503")
+    return run_wrapper(workdir, body, {"SV_OFFLINE_EXTENSIONS": "1"}), "ignored network error"
+
+
+def case_offline_refused_in_ci(workdir: Path):
+    return run_wrapper(
+        workdir, GOOD_TEST, {"SV_OFFLINE_EXTENSIONS": "1", "CI": "true"}
+    ), "refusing because CI='true'"
+
+
+def case_control_offline_excused(workdir: Path):
+    body = NETWORK_ERROR_TEST.replace("{message}", "HTTP Error 503")
+    proc = run_wrapper(
+        workdir,
+        body,
+        {"SV_OFFLINE_EXTENSIONS": "1"},
+        ("--offline-excused", "{test_file}"),
+    )
+    return proc, "SKIPPED (SV_OFFLINE_EXTENSIONS=1)"
+
+
 def case_control_pass(workdir: Path):
     return run_make(workdir, GOOD_TEST), None
 
@@ -190,8 +289,13 @@ CASES = [
     case_zero_statements,
     case_unparseable_file,
     case_halted_file,
+    case_network_error_http,
+    case_network_error_unable_to_connect,
+    case_offline_not_excused,
+    case_offline_refused_in_ci,
     case_control_pass,
     case_control_platform,
+    case_control_offline_excused,
 ]
 
 
@@ -208,13 +312,18 @@ def main() -> int:
             proc, marker = case(workdir)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
-        # A control (marker None) must exit 0. A guard case must exit non-zero
-        # AND say why: a non-zero exit for some unrelated reason (a crash in
-        # the wrapper, a broken Makefile) must not pass for the guard working.
-        should_pass = marker is None
+        # A control (case_control_*) must exit 0, and print its marker when it
+        # has one. A guard case must exit non-zero AND say why: a non-zero exit
+        # for some unrelated reason (a crash in the wrapper, a broken Makefile)
+        # must not pass for the guard working.
+        should_pass = name.startswith("control_")
         passed = proc.returncode == 0
-        expectation = "exit 0" if should_pass else f"a non-zero exit mentioning {marker!r}"
-        if passed == should_pass and (should_pass or marker in proc.stdout):
+        expectation = (
+            ("exit 0" if marker is None else f"exit 0 mentioning {marker!r}")
+            if should_pass
+            else f"a non-zero exit mentioning {marker!r}"
+        )
+        if passed == should_pass and (marker is None or marker in proc.stdout):
             print(f"ok    {name}: exit {proc.returncode} ({expectation} expected)")
         else:
             failed.append(name)
