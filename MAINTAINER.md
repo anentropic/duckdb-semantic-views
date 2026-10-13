@@ -184,7 +184,7 @@ The crate has two Cargo feature configurations (think of features as build-time 
 
 | Feature | When Used | What It Enables |
 |---------|-----------|-----------------|
-| `default` (`duckdb/bundled`) | `cargo test`, fuzzing | Compiles DuckDB from source into the binary. Enables `Connection::open_in_memory()` for unit tests. |
+| `default` (`duckdb/bundled`, `duckdb/json`) | `cargo test`, fuzzing | Compiles DuckDB from source into the binary. Enables `Connection::open_in_memory()` for unit tests. `duckdb/json` statically links DuckDB's json extension, which the catalog-migration tests need (`json_merge_patch`); without it DuckDB downloads json at test time, which fails offline. It is a default feature, not a `[dev-dependencies]` feature, because resolver 2 unifies dev-dependency features into `cargo test --no-default-features --features extension` too, where `duckdb/json` would pull in `duckdb/bundled`. |
 | `extension` (`duckdb/loadable-extension`, `duckdb/vscalar`) | `just build`, CI builds | Produces a loadable `.duckdb_extension` file. Uses function-pointer stubs instead of bundled DuckDB. |
 
 This split exists because DuckDB loadable extensions cannot be tested as standalone binaries -- the function-pointer stubs are only initialized when DuckDB loads the extension at runtime. The `bundled` feature sidesteps this for unit tests.
@@ -290,12 +290,23 @@ Fix: `rustup update stable`
 | `just test-rust` | Unit tests (model, catalog, expand) | Runs `cargo nextest run` with bundled DuckDB -- fast, no extension loading |
 | `just test-sql` | SQL logic tests (DDL + query round-trips) | Builds the extension, loads it in DuckDB, and runs the `.test` files **enumerated in `test/sql/TEST_LIST`** — the runner takes `--file-list`, not a directory glob, so a file missing from that list is silently skipped. `just check-test-list` makes that a hard error. |
 | `just test-sql-prebuilt` | The above, minus the build | Same body as `test-sql` (which is defined as `build` + this), for callers that already have `build/debug/semantic_views.duckdb_extension`. CI's `SQL logic tests` job uses it because it downloads a prebuilt artifact; running `test-sql` there would rebuild what it just downloaded. |
-| `just test-ducklake-ci` | DuckLake integration (synthetic data) | Builds extension, runs the Python DuckLake CI test — the leg included in `test-all` |
+| `just test-ducklake-ci` | DuckLake integration (synthetic data) | Builds extension, runs the Python DuckLake CI test — the leg included in `test-all`. With `SV_OFFLINE_EXTENSIONS=1` (local only, see below) it prints a `SKIPPED` line and exits 0 when the `ducklake` extension cannot be downloaded. |
 | `just test-ducklake` | DuckLake integration (real jaffle-shop data) | Builds extension, runs the Python test against DuckLake tables; requires `just setup-ducklake` first |
 | `just test-integration` | Python integration suites | Runs the full `test/integration/*.py` suite list (caret, ADBC, multi-db, concurrency, differential, interrupt, …) |
 | `just test-interrupt` | Query cancellation (TECH-DEBT #42) | Builds the extension and fires `con.interrupt()` from a second thread mid-query; asserts `semantic_view()` aborts early (not just eventually) and reports a bare `Interrupted!`, then the same for the SHOW / DESCRIBE member-type probes (single-view, DIMENSIONS FOR METRIC and cross-view) over a source whose bind expands thousands of globs. Part of `test-integration`. |
 | `just test-legacy-schema-spelling` | Legacy-catalog migration (TECH-DEBT #44) | Builds a real pre-scoping database file (`_definitions` keyed on `name` alone), opens it through a real `LOAD`, and asserts the migration records the **catalog's** spelling of a schema rather than the row's — then that `CREATE OR REPLACE` replaces the migrated row instead of duplicating it. Part of `test-integration`. |
 | `just test-all` | Rust + SQL logic + DuckLake CI + integration | Runs `test-rust`, `test-sql`, `test-ducklake-ci`, and `test-integration` sequentially |
+
+#### Offline runs: `SV_OFFLINE_EXTENSIONS=1` (local only)
+
+Two legs need a DuckDB extension that is neither in the pip `duckdb` wheel nor in this repo, so DuckDB downloads it from `extensions.duckdb.org` on first use: `test/sql/peg_compat.test` (`CALL enable_peg_parser()` autoloads `autocomplete`) and `just test-ducklake-ci` (`INSTALL ducklake`). Behind a proxy that blocks that host they fail, and `peg_compat.test` halts the whole sqllogictest run at its first PEG statement.
+
+Setting `SV_OFFLINE_EXTENSIONS=1` (e.g. `SV_OFFLINE_EXTENSIONS=1 just test-sql`) makes both report themselves instead:
+
+- the Makefile's `test_extension_{debug,release}_internal` targets (behind `just test-sql` / `make test_debug`) run a copy of `TEST_LIST` without the files in `OFFLINE_EXTENSION_TESTS` (written to `build/test_list_offline`), print `SKIPPED (SV_OFFLINE_EXTENSIONS=1): <file> -- … NOT run` for each, and end with `N test files passed (single process) -- 1 SKIPPED offline`;
+- `test/integration/test_ducklake_ci.py` prints a `SKIPPED` line and exits 0 when `INSTALL ducklake` fails (`test_ducklake_helpers.exit_skipped_if_offline`).
+
+It is an explicit opt-in on purpose. A sqllogictest `require autocomplete` would skip silently wherever the extension cannot load, CI included, so a broken download in CI would switch the coverage off without a red. Without the variable nothing changes (CI runs both and fails hard if it cannot load the extension), and with it set **and** `CI` set (GitHub Actions sets `CI=true`) both the Makefile and the Python helper refuse to run. A new test file that needs a downloadable extension goes in `OFFLINE_EXTENSION_TESTS` in the Makefile.
 | `just coverage` | Coverage report | Runs unit tests with `cargo-llvm-cov`, fails if below 80% line coverage |
 | `just lint` | Code quality (authoritative) | `cargo fmt --check` + full default-features `cargo clippy` + `cargo deny check`. The clippy step compiles the ~25 MB bundled DuckDB, so a cold run is ~10 min. |
 | `just lint-fast` | Fast lint (pre-commit) | `cargo fmt --check` + the extension-feature clippy with `SV_SKIP_CPP_BUILD` (no C++ build). What the pre-commit hook runs; lints the same production code in ~1 min cold, seconds warm. |

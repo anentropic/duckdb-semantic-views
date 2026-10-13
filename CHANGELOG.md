@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`CREATE SEMANTIC VIEW` rejects two relationships with the same name.** Relationship
+  names are one namespace per view, compared the way DuckDB compares identifiers, so `r`,
+  `R` and `"r"` are the same name. Two relationships sharing a name used to be accepted
+  unless both pointed at the same table, and `USING (r)` then silently meant whichever
+  was declared first. `CREATE` (and `CREATE … FROM YAML`) now fails with
+  `duplicate relationship name '<name>'`, naming both relationships. A role-playing pair
+  that repeats a name reports this error instead of the former "diamond" error. A name
+  keeps its parts: the quoted `"x.y"` is one identifier and a different name from the
+  two-part `x.y` (also spelled `"x"."y"`), and `USING` matches it the same way. Two
+  role-playing relationships to one table whose names differ only that way are rejected,
+  because both would be joined under the same alias. Views already stored keep loading,
+  and a `USING` in them keeps naming the relationship it named before, including in a
+  view that holds two relationships whose names differ only in quoting.
+- **`CREATE SEMANTIC VIEW` rejects a single-table member qualified by an undeclared
+  table alias.** In a view whose only table is `o`, a dimension or metric named
+  `x.foo` was accepted. It now fails with `unknown source table 'x'; did you mean 'o'?`,
+  the error a multi-table view already gave. An unqualified member, or one qualified by
+  the declared alias in any case or quoting (`o`, `O`, `"O"`), is still accepted. Views
+  already stored keep loading.
+
 ### Fixed
 
 - **`SHOW SEMANTIC DIMENSIONS` / `METRICS` / `FACTS`, `SHOW COLUMNS IN SEMANTIC VIEW`,
@@ -56,9 +78,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a quoted identifier (`"Dep Airport"`, or a name with an embedded `""`) used to make
   every query that went through it fail with a parser error.
 - **A table not connected to the base table is rejected at `CREATE`.** If the first table in
-  `TABLES` had no relationship, or the relationships formed two separate groups, the view
-  was accepted and every query failed with a binder error. `CREATE SEMANTIC VIEW` now
-  rejects the definition and names the unreachable table.
+  `TABLES` had no relationship, the relationships formed two separate groups, or the view
+  listed several tables with no `RELATIONSHIPS` at all, the view was accepted and every
+  query that needed an unconnected table failed with a binder error. `CREATE SEMANTIC VIEW`
+  (and `CREATE … FROM YAML`) now rejects the definition and names the unreachable table.
+  Views already stored keep loading. When several tables are unconnected, the error now
+  names the same one every time.
+- **A YAML relationship without `fk_columns` is rejected at `CREATE`.** It used to be
+  accepted, and every query on the view then failed with a misleading "legacy
+  definition format" error.
+- **Relationship names match the way DuckDB matches identifiers.** A relationship declared
+  quoted (`"Dep_Airport"`) is now named by `USING (dep_airport)`, and the converse; both
+  used to be rejected as an unknown relationship. Two role-playing relationships named
+  `dep` and `"dep"` are now rejected as a duplicate name, as `dep` and `DEP` already were.
 
 ## [0.13.0] - 2026-09-30
 

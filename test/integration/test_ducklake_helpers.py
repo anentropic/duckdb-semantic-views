@@ -7,6 +7,7 @@ test_ducklake_ci.py (CI).
 """
 
 import os
+import sys
 from pathlib import Path
 
 
@@ -21,6 +22,36 @@ def get_ext_dir() -> str:
     ext_dir = get_project_root() / "test" / "data" / "duckdb_extensions"
     ext_dir.mkdir(parents=True, exist_ok=True)
     return str(ext_dir)
+
+
+def exit_skipped_if_offline(what: str, error: Exception) -> None:
+    """
+    Offline-mode escape hatch for a DuckDB extension that cannot be downloaded.
+
+    Called when installing a downloadable extension (e.g. ``ducklake``) failed.
+    With ``SV_OFFLINE_EXTENSIONS=1`` -- the same opt-in the Makefile's
+    sqllogictest target honours (see CLAUDE.md, "Offline amalgamation
+    fallback") -- print a loud SKIPPED line and exit 0, so a sandbox that cannot
+    reach extensions.duckdb.org can still run the rest of ``just test-all``.
+
+    Otherwise return, and the caller re-raises: without the variable the test
+    fails exactly as before. The variable is refused when ``CI`` is set, so CI
+    can never turn this coverage off.
+    """
+    if os.environ.get("SV_OFFLINE_EXTENSIONS") != "1":
+        return
+    if os.environ.get("CI"):
+        print(
+            "ERROR: SV_OFFLINE_EXTENSIONS=1 skips tests and is for local offline runs only; "
+            f"refusing because CI={os.environ['CI']!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(
+        f"SKIPPED (SV_OFFLINE_EXTENSIONS=1): {what} -- could not install a DuckDB extension "
+        f"from extensions.duckdb.org; NOT run. ({str(error).splitlines()[0]})"
+    )
+    sys.exit(0)
 
 
 def get_extension_path() -> Path:

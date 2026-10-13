@@ -254,8 +254,9 @@ Cardinality is used for :ref:`fan trap detection <howto-fan-traps>`.
 - Cycles are rejected: ``cycle detected in relationships: a -> b -> a``.
 - Several named relationships from the **same** source table to the same target are allowed. This is the role-playing pattern (``dep_airport`` and ``arr_airport`` from ``flights`` to ``airports``); pick the path per metric with ``USING``.
 - One target reached from two **different** source tables is a diamond, and is rejected whatever the relationships are named: ``diamond: 's' is reachable from multiple tables ('a', 'b'); the join path is ambiguous.`` To model it, declare the shared table twice under two aliases, one per path, so each is joined once.
+- Relationship names must be unique within the view, whichever tables the relationships connect. Names are compared the way DuckDB compares identifiers (case-insensitively, quoted or not), so ``route`` and ``"ROUTE"`` are the same name: ``duplicate relationship name 'route'``. A role-playing pair that repeats a name gets this error too.
 - Self-references (``from_alias`` equals ``to_alias``) are rejected.
-- Orphan tables (declared in ``TABLES`` but not connected by any relationship) are rejected once the view declares at least one relationship. A view with several tables and no ``RELATIONSHIPS`` clause is not checked this way; a query that needs one of the unconnected tables then fails when it is bound.
+- Every table must be reachable from the base table (the first table in ``TABLES``) through some chain of relationships, in either direction. An orphan table (declared in ``TABLES`` but not connected by any relationship), a base table with no relationship, two separate groups of related tables, and several tables with no ``RELATIONSHIPS`` clause at all are all rejected, naming the table that cannot be reached. A single-table view needs no relationships.
 
 
 .. _ref-create-facts:
@@ -330,6 +331,11 @@ Declares named grouping expressions available for queries.
 
 - Dimension names must be unique within the view (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). For example, ``region`` and ``Region`` cannot both appear in the same ``DIMENSIONS`` clause. See :ref:`ref-err-name-uniqueness`.
 - A dimension name cannot collide with any metric name (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). See :ref:`ref-err-name-uniqueness`.
+- The table alias that qualifies the dimension name must be declared in ``TABLES``, in any case (``o`` or ``O`` for alias ``o``). This applies to a single-table view too: ``x.foo`` in a view whose only table is ``o`` is rejected with ``unknown source table 'x'; did you mean 'o'?``. Metrics follow the same rule.
+
+  .. note::
+
+     A *quoted* qualifier (``"O".region`` for alias ``o``) is currently accepted only in a single-table view. In a view with several tables, ``CREATE`` rejects it with ``unknown source table '"O"'`` even though DuckDB treats ``"O"`` as the same identifier as ``o``; facts reject it in every view. Write the qualifier unquoted. This is a known limitation.
 
 **Reported data type:**
 
@@ -455,7 +461,7 @@ See :ref:`howto-window-metrics` for details on both modes.
 - A metric name cannot collide with any dimension name (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). See :ref:`ref-err-name-uniqueness`.
 - Derived metrics must not contain aggregate functions.
 - Circular derived metric references are rejected.
-- ``USING`` relationship names must match declared relationships.
+- ``USING`` relationship names must match declared relationships. Names match the way DuckDB matches identifiers: case-insensitively, whether or not they are quoted, so ``USING (dep_airport)`` names a relationship declared as ``"Dep_Airport"``. Two relationships whose names differ only in case or quoting (``dep`` and ``"dep"``) are the same name. A name keeps its parts, though: the quoted ``"x.y"`` is one identifier containing a dot, so it is a different name from the two-part ``x.y`` (which ``"x"."y"`` also spells).
 - ``NON ADDITIVE BY`` dimension names must match declared dimensions.
 - Window metric inner metric name must match a declared metric.
 - Window metric ``EXCLUDING`` dimension names must match declared dimensions.
