@@ -24,7 +24,20 @@ crate-type = ["cdylib", "lib"]
 # When running unit tests (default):
 #   cargo test
 #   (bundled DuckDB — Connection::open_in_memory() works)
-default = ["duckdb/bundled"]
+#
+# `duckdb/json` statically links DuckDB's json extension into that bundled
+# test build. The catalog-migration tests (`catalog::tests`) call
+# `json_merge_patch` / `json_extract`; without it DuckDB autoloads json from
+# extensions.duckdb.org, which fails offline or behind a proxy that blocks it
+# ("Failed to download extension json"). It is a DEFAULT feature rather than a
+# `[dev-dependencies]` feature on purpose: with resolver 2 (edition 2021) a
+# dev-dependency feature is unified into every `cargo test` build, including
+# `cargo test --no-default-features --features extension` (`just test-rust`),
+# where `duckdb/json` would drag in `duckdb/bundled` and compile a second full
+# DuckDB amalgamation into a build that deliberately has none. As a default
+# feature it never reaches the shipped extension either, which is always built
+# with `--no-default-features --features extension` (see the Makefile).
+default = ["duckdb/bundled", "duckdb/json"]
 extension = ["duckdb/loadable-extension", "duckdb/vscalar", "dep:cc"]
 arbitrary = ["dep:arbitrary"]
 

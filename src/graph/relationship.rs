@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use crate::errors::ParseError;
-use crate::model::SemanticViewDefinition;
+use crate::model::{Join, SemanticViewDefinition};
 use crate::util::suggest_closest;
 
 /// A directed relationship graph built from TABLES + RELATIONSHIPS.
@@ -132,15 +132,26 @@ impl RelationshipGraph {
                     !joins_to_node.is_empty() && joins_to_node.iter().all(|j| j.name.is_some());
 
                 if all_named {
-                    // Check all names are unique (case-insensitive)
-                    let mut seen_names = HashSet::new();
-                    let all_unique = joins_to_node.iter().all(|j| {
-                        let name_lower = j.name.as_ref().unwrap().to_ascii_lowercase();
-                        seen_names.insert(name_lower)
-                    });
-                    if all_unique {
-                        continue; // Role-playing: allow this diamond
+                    // Each role is joined under the scoped alias
+                    // `<table>__<normalize_ident_part(name)>`, so the names must
+                    // differ after normalization: `dep`, `DEP` and `"dep"` are
+                    // one name, and so — for the alias, though they are two
+                    // relationship names — are `x.y` and `"x.y"`.
+                    let mut seen_names: HashMap<String, &str> = HashMap::new();
+                    for j in &joins_to_node {
+                        let name = j.name.as_deref().unwrap_or_default();
+                        let key = crate::ident::normalize_ident_part(name);
+                        if let Some(first) = seen_names.get(&key) {
+                            return Err(format!(
+                                "relationships '{first}' and '{name}' to '{node}' would both be \
+                                 joined as '{}__{key}'; role-playing relationships to one table \
+                                 need names that differ once quotes are removed and case is folded",
+                                crate::ident::normalize_ident_part(node)
+                            ));
+                        }
+                        seen_names.insert(key, name);
                     }
+                    continue; // Role-playing: allow this diamond
                 }
 
                 return Err(format!(
@@ -157,8 +168,21 @@ impl RelationshipGraph {
     ///
     /// An orphan is a non-root node that appears in neither edges keys nor
     /// reverse keys (i.e., it has no outgoing or incoming relationship edges).
+    ///
+    /// When the root itself has no edge, every table is reported together by
+    /// [`Self::check_connected`] instead (its "base table … is not connected"
+    /// message names the real defect), so this check stands aside. Candidates
+    /// are visited in sorted order, so the table named does not depend on
+    /// `HashSet` iteration order.
     pub fn check_no_orphans(&self) -> Result<(), String> {
-        for node in &self.all_nodes {
+        let has_edge =
+            |node: &String| self.edges.contains_key(node) || self.reverse.contains_key(node);
+        if !has_edge(&self.root) {
+            return Ok(());
+        }
+        let mut nodes: Vec<&String> = self.all_nodes.iter().collect();
+        nodes.sort_unstable();
+        for node in nodes {
             if node == &self.root {
                 continue;
             }
@@ -195,7 +219,8 @@ impl RelationshipGraph {
     /// join each hop with an ON clause naming both sides explicitly.
     ///
     /// Run after the orphan check, so every table reaching here has at least
-    /// one edge unless it is the root itself.
+    /// one edge unless the root itself has none (in which case the orphan
+    /// check stood aside and this reports every table at once).
     pub fn check_connected(&self) -> Result<(), String> {
         let mut seen: HashSet<&str> = HashSet::new();
         let mut stack: Vec<&str> = vec![self.root.as_str()];
@@ -321,38 +346,188 @@ fn check_source_tables_reachable(
     graph: &RelationshipGraph,
 ) -> Result<(), String> {
     let available: Vec<String> = graph.all_nodes.iter().cloned().collect();
-    for dim in &def.dimensions {
-        if let Some(ref st) = dim.source_table {
-            let st_lower = st.to_ascii_lowercase();
-            if !graph.all_nodes.contains(&st_lower) {
-                let suggestion = suggest_closest(&st_lower, &available);
-                let mut msg = format!("unknown source table '{st}'");
-                if let Some(s) = suggestion {
-                    let _ = write!(msg, "; did you mean '{s}'?");
-                }
-                return Err(msg);
+    check_member_source_tables(def, &available, |st| {
+        graph.all_nodes.contains(&st.to_ascii_lowercase())
+    })
+}
+
+/// Check that every dim/metric `source_table` is a declared alias of a
+/// single-table view (TECH-DEBT #78).
+///
+/// A single-table view has no relationship graph, so it skips
+/// [`check_source_tables_reachable`]; this applies the same check, with the
+/// same message, against its one alias. The qualifier is matched with
+/// [`crate::ident::ident_matches`] — `o`, `O` and `"O"` all name alias `o` —
+/// so every spelling of the declared alias that CREATE accepted before is
+/// still accepted; only a qualifier naming no declared table is rejected.
+fn check_single_table_source_tables(def: &SemanticViewDefinition) -> Result<(), String> {
+    let available: Vec<String> = def
+        .tables
+        .iter()
+        .map(|t| t.alias.to_ascii_lowercase())
+        .collect();
+    check_member_source_tables(def, &available, |st| {
+        def.tables
+            .iter()
+            .any(|t| crate::ident::ident_matches(&t.alias, st))
+    })
+}
+
+/// Shared body of the dim/metric `source_table` checks: the first
+/// `source_table` for which `is_declared` is false is reported as
+/// `unknown source table '<st>'`, with the closest of `available` suggested.
+fn check_member_source_tables(
+    def: &SemanticViewDefinition,
+    available: &[String],
+    is_declared: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    let source_tables = def
+        .dimensions
+        .iter()
+        .filter_map(|d| d.source_table.as_deref())
+        .chain(def.metrics.iter().filter_map(|m| m.source_table.as_deref()));
+    for st in source_tables {
+        if !is_declared(st) {
+            let suggestion = suggest_closest(&st.to_ascii_lowercase(), available);
+            let mut msg = format!("unknown source table '{st}'");
+            if let Some(s) = suggestion {
+                let _ = write!(msg, "; did you mean '{s}'?");
             }
-        }
-    }
-    for met in &def.metrics {
-        if let Some(ref st) = met.source_table {
-            let st_lower = st.to_ascii_lowercase();
-            if !graph.all_nodes.contains(&st_lower) {
-                let suggestion = suggest_closest(&st_lower, &available);
-                let mut msg = format!("unknown source table '{st}'");
-                if let Some(s) = suggestion {
-                    let _ = write!(msg, "; did you mean '{s}'?");
-                }
-                return Err(msg);
-            }
+            return Err(msg);
         }
     }
     Ok(())
 }
 
+/// Reject two relationships with the same name (TECH-DEBT #79).
+///
+/// Relationship names are one namespace per view (as in Snowflake), compared
+/// as identifiers, case-insensitively and quoted or not: `route`, `ROUTE` and
+/// `"route"` are one name. The key is [`crate::ident::ident_key`], which keeps
+/// identifier parts apart, so the two-part `x.y` and the one-part `"x.y"` are
+/// two names — the same identity [`RelNameMatch`] resolves `USING` by. Every
+/// lookup by name — `USING (r)`, the join resolver, the role-playing fence,
+/// the fact rewrite, the per-grain path — takes the first match, so a
+/// duplicate would silently mean whichever was declared first.
+///
+/// CREATE-only, like the rest of [`validate_graph`]: a stored row that
+/// already carries a duplicate name keeps loading, with "first wins" reads.
+fn check_relationship_names_unique(def: &SemanticViewDefinition) -> Result<(), String> {
+    let mut seen: HashMap<crate::ident::IdentKey, &crate::model::Join> = HashMap::new();
+    for j in &def.joins {
+        let Some(name) = j.name.as_deref() else {
+            continue;
+        };
+        let key = crate::ident::ident_key(name);
+        if let Some(first) = seen.get(&key) {
+            let first_name = first.name.as_deref().unwrap_or_default();
+            return Err(format!(
+                "duplicate relationship name '{first_name}': '{first_name}' ({} -> {}) and \
+                 '{name}' ({} -> {}) name the same relationship; relationship names must be \
+                 unique within a semantic view (compared case-insensitively, quoted or not)",
+                first.from_alias, first.table, j.from_alias, j.table
+            ));
+        }
+        seen.insert(key, j);
+    }
+    Ok(())
+}
+
+/// Reject a relationship with no foreign-key columns.
+///
+/// The DDL grammar always produces FK columns; YAML does not require them. A
+/// stored pre-Phase-24 row may lack them too, but stored rows never reach this
+/// (CREATE-only) check — the query-time fan-trap fence owns those.
+fn check_relationships_have_fk_columns(def: &SemanticViewDefinition) -> Result<(), String> {
+    match def.joins.iter().find(|j| j.fk_columns.is_empty()) {
+        None => Ok(()),
+        Some(j) => {
+            let name = j
+                .name
+                .as_deref()
+                .map_or_else(String::new, |n| format!("'{n}' "));
+            Err(format!(
+                "relationship {name}from '{}' to '{}' declares no foreign-key columns; \
+                 the form is 'rel_name AS from_alias(fk_cols) REFERENCES to_alias'",
+                j.from_alias, j.table
+            ))
+        }
+    }
+}
+
+/// Which declared relationships a relationship name — a `USING` entry, or the
+/// stored spelling of a resolved role — denotes. Every lookup of a
+/// relationship by name goes through this (or [`find_relationship`]), so the
+/// `USING` validation, the join resolver, the role-playing fences, the fact
+/// rewrite and the per-grain path all agree on which edge a name means.
+///
+/// Two rules, in order:
+///
+/// 1. **By spelling**, if any declared name matches the requested one
+///    ignoring ASCII case — the rule every lookup used before PR #249. A view
+///    stored before then may hold two relationships whose names differ only by
+///    quoting (`dep` and `"dep"`, which the role-playing check then accepted as
+///    two roles), and `USING ("dep")` meant the quoted one. CREATE now rejects
+///    such a pair, but a stored row is never re-validated, so the spelling
+///    match keeps its every `USING` resolving to the edge it always did.
+/// 2. **As an identifier** otherwise ([`crate::ident::ident_key`]): quotes
+///    stripped and case folded per part, so `USING (dep_airport)` names a
+///    relationship declared `"Dep_Airport"`. Part boundaries are kept: the
+///    two-part `x.y` (also spelled `"x"."y"`) and the one-part `"x.y"` are
+///    different names.
+///
+/// For a view CREATE accepted since #249 the two rules never disagree: names
+/// are unique under rule 2 ([`check_relationship_names_unique`]), and a
+/// spelling match is also an identifier match.
+pub(crate) struct RelNameMatch<'r> {
+    requested: &'r str,
+    by_spelling: bool,
+    key: crate::ident::IdentKey,
+}
+
+impl<'r> RelNameMatch<'r> {
+    /// Decide, once, which rule `requested` is matched by among `joins`.
+    pub(crate) fn new(joins: &[Join], requested: &'r str) -> Self {
+        let by_spelling = joins.iter().any(|j| {
+            j.name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(requested))
+        });
+        Self {
+            requested,
+            by_spelling,
+            key: crate::ident::ident_key(requested),
+        }
+    }
+
+    /// Does the declared (stored) relationship name `stored` match?
+    pub(crate) fn matches(&self, stored: &str) -> bool {
+        if self.by_spelling {
+            stored.eq_ignore_ascii_case(self.requested)
+        } else {
+            crate::ident::ident_key(stored) == self.key
+        }
+    }
+
+    /// Is `join` a relationship this name denotes?
+    pub(crate) fn matches_join(&self, join: &Join) -> bool {
+        join.name.as_deref().is_some_and(|n| self.matches(n))
+    }
+}
+
+/// The relationship `requested` names: the first declared one that
+/// [`RelNameMatch`] matches. "First" only matters for a stored row that
+/// predates the uniqueness check and repeats a name exactly.
+pub(crate) fn find_relationship<'a>(joins: &'a [Join], requested: &str) -> Option<&'a Join> {
+    let m = RelNameMatch::new(joins, requested);
+    joins.iter().find(|j| m.matches_join(j))
+}
+
 /// Validate the relationship graph of a semantic view definition.
 ///
 /// Runs all define-time checks:
+/// 0. Every relationship declares FK columns
+/// 0b. Relationship names are unique (`ident_matches` identity)
 /// 1. Self-reference detection (`from_alias` == `to_alias`)
 /// 2. Cycle detection (Kahn's algorithm)
 /// 3. Diamond detection (multiple parents)
@@ -363,13 +538,24 @@ fn check_source_tables_reachable(
 ///
 /// Returns `Ok(graph)` if valid, or `Err` with a descriptive message.
 ///
-/// **Legacy skip:** If no joins have non-empty `fk_columns`, or if `tables`
-/// is empty, returns `Ok` with a default empty graph. This preserves backward
-/// compatibility with Phase 10/11 definitions.
+/// **Single-table skip:** a view with at most one table and no relationship
+/// has no graph to validate, so it returns `Ok` with an empty graph after one
+/// check: each dim/metric table qualifier must name the declared table
+/// (TECH-DEBT #78), with the same `unknown source table` message a
+/// multi-table view gets from step 7.
+///
+/// This used to be a wider "legacy skip" that fired whenever no relationship
+/// carried `fk_columns`, for pre-Phase-24 definitions. But this function runs
+/// only at CREATE (`ddl::define::enrich_definition_for_create`) — stored rows
+/// are never re-validated on load — so the skip protected no stored
+/// definition and only let two unusable shapes through CREATE: several tables
+/// with no relationship at all (disconnected, TECH-DEBT #72) and a
+/// relationship with no FK columns (YAML).
 pub fn validate_graph(def: &SemanticViewDefinition) -> Result<RelationshipGraph, ParseError> {
-    // Legacy skip: no Phase 24 joins -> skip graph validation entirely.
-    let has_pkfk_joins = def.joins.iter().any(|j| !j.fk_columns.is_empty());
-    if !has_pkfk_joins || def.tables.is_empty() {
+    if def.tables.is_empty() || (def.tables.len() == 1 && def.joins.is_empty()) {
+        // No graph, but a member's table qualifier must still name the one
+        // declared table (TECH-DEBT #78), with the multi-table message.
+        check_single_table_source_tables(def).map_err(ParseError::positionless)?;
         return Ok(RelationshipGraph {
             edges: HashMap::new(),
             reverse: HashMap::new(),
@@ -377,6 +563,16 @@ pub fn validate_graph(def: &SemanticViewDefinition) -> Result<RelationshipGraph,
             root: String::new(),
         });
     }
+
+    // 0. Every relationship must carry FK columns. `from_definition` skips an
+    //    FK-less join (the pre-Phase-24 stored encoding), so without this an
+    //    FK-less YAML relationship would silently vanish from the graph.
+    check_relationships_have_fk_columns(def).map_err(ParseError::positionless)?;
+
+    // 0b. Relationship names are unique (TECH-DEBT #79). Before the diamond
+    //     check, so a duplicated role-playing name gets this message rather
+    //     than "diamond: two paths".
+    check_relationship_names_unique(def).map_err(ParseError::positionless)?;
 
     let graph = RelationshipGraph::from_definition(def).map_err(ParseError::positionless)?;
 
@@ -706,9 +902,11 @@ mod tests {
         #[test]
         fn graph_accepted_iff_connected(case in arb_graph_case()) {
             let def = build_graph_case(&case);
-            // Legacy skip: a definition with no relationship at all is not
-            // graph-validated, so only cases with an edge are meaningful.
-            proptest::prop_assume!(!def.joins.is_empty());
+            // No `prop_assume!` on the relationship count: a several-table
+            // definition with NO relationship (one table per component) used
+            // to skip graph validation entirely and was filtered out here. It
+            // is the plainest disconnected graph there is, so it is checked
+            // like every other case.
             let n_main = case.main_parents.len();
             let n_det = case.detached_parents.len();
             let result = validate_graph(&def);
@@ -727,9 +925,11 @@ mod tests {
                 };
                 let root_isolated = if case.detached_first { n_det == 1 } else { n_main == 1 };
                 if root_isolated {
-                    // A one-table root component with any edge elsewhere is
-                    // NOT an orphan-check failure (the root is exempt), so
-                    // connectivity is what must report it.
+                    // A one-table root component is NOT an orphan-check
+                    // failure (the root is exempt, and an edgeless root defers
+                    // the other edgeless tables to the connectivity check), so
+                    // connectivity is what must report it — with edges
+                    // elsewhere or with no relationship in the view at all.
                     proptest::prop_assert!(
                         msg.contains(&format!("base table '{root_side}0'")),
                         "expected the isolated base table to be named: {msg}"
@@ -856,13 +1056,363 @@ mod tests {
         assert_eq!(order1, order2, "topological sort must be deterministic");
     }
 
+    /// Two role-playing relationships whose names differ only in QUOTING
+    /// (`dep` and `"dep"`) are one identifier under DuckDB's rules, so they are
+    /// the same name used twice — rejected exactly like `dep` / `DEP`. An
+    /// ASCII-lowercase comparison kept the quotes, accepted the pair as two
+    /// roles, and both then mapped to the one scoped alias `a__dep`.
+    #[test]
+    fn role_playing_names_differing_only_in_quoting_are_one_name() {
+        let mut def = make_def(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![("f", "a", vec!["dep_id"]), ("f", "a", vec!["arr_id"])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("dep".to_string());
+        def.joins[1].name = Some("\"dep\"".to_string());
+        let err = validate_graph(&def)
+            .expect_err("`dep` and `\"dep\"` name the same relationship")
+            .message;
+        // Since TECH-DEBT #79 the name-uniqueness check runs before the
+        // diamond check, so this reports the duplicate name, not "diamond".
+        assert!(
+            err.contains("duplicate relationship name 'dep'"),
+            "expected a duplicate-name error, got: {err}"
+        );
+        // Control: genuinely distinct names (one of them quoted) still pass.
+        def.joins[1].name = Some("\"Arr\"".to_string());
+        assert!(
+            validate_graph(&def).is_ok(),
+            "{:?}",
+            validate_graph(&def).err().map(|e| e.message)
+        );
+    }
+
     // -----------------------------------------------------------------------
-    // Legacy definitions skip validation
+    // TECH-DEBT #79: relationship names are unique within a view
     // -----------------------------------------------------------------------
 
+    /// Two relationships named `r` to DIFFERENT targets: no diamond, so the
+    /// role-playing name check never compared them, and every lookup by name
+    /// (`USING (r)`, the join resolver, the fences) silently took the first.
     #[test]
-    fn legacy_empty_fk_columns_skips_validation() {
-        // Legacy join with empty fk_columns -> validate_graph returns Ok.
+    fn duplicate_relationship_names_to_different_targets_rejected() {
+        let mut def = make_def(
+            vec![
+                ("f", "flights", vec!["id"]),
+                ("a", "airports", vec!["id"]),
+                ("c", "carriers", vec!["id"]),
+            ],
+            vec![("f", "a", vec!["dep_id"]), ("f", "c", vec!["carrier_id"])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("r".to_string());
+        def.joins[1].name = Some("r".to_string());
+        let err = validate_graph(&def)
+            .expect_err("two relationships named `r` must be rejected")
+            .message;
+        assert!(
+            err.contains("duplicate relationship name 'r'"),
+            "expected a duplicate-name error, got: {err}"
+        );
+    }
+
+    /// The same name spelled differently — case and quoting — is still one
+    /// name under DuckDB's identifier rule (`ident_matches`).
+    #[test]
+    fn duplicate_relationship_names_differing_in_case_and_quoting_rejected() {
+        let mut def = make_def(
+            vec![
+                ("f", "flights", vec!["id"]),
+                ("a", "airports", vec!["id"]),
+                ("c", "carriers", vec!["id"]),
+            ],
+            vec![("f", "a", vec!["dep_id"]), ("f", "c", vec!["carrier_id"])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("route".to_string());
+        def.joins[1].name = Some("\"ROUTE\"".to_string());
+        let err = validate_graph(&def)
+            .expect_err("`route` and `\"ROUTE\"` are one name")
+            .message;
+        assert!(
+            err.contains("duplicate relationship name 'route'") && err.contains("\"ROUTE\""),
+            "expected a duplicate-name error naming both spellings, got: {err}"
+        );
+    }
+
+    /// The same name on two edges to ONE target was rejected only as a
+    /// generic "diamond: two paths" — it now gets the specific error.
+    #[test]
+    fn duplicate_role_playing_relationship_names_get_the_duplicate_name_error() {
+        let mut def = make_def(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![("f", "a", vec!["dep_id"]), ("f", "a", vec!["arr_id"])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("dep".to_string());
+        def.joins[1].name = Some("DEP".to_string());
+        let err = validate_graph(&def).unwrap_err().message;
+        assert!(
+            err.contains("duplicate relationship name 'dep'"),
+            "expected the duplicate-name error, got: {err}"
+        );
+    }
+
+    /// PR #249 review: `x.y` (two identifier parts) and `"x.y"` (one part
+    /// containing a dot) are different identifiers, so two relationships so
+    /// named are distinct. Joining the normalized parts into one string made
+    /// both `x.y` and rejected them as a duplicate.
+    #[test]
+    fn dotted_one_part_and_two_part_relationship_names_are_distinct() {
+        let mut def = make_def(
+            vec![
+                ("f", "flights", vec!["id"]),
+                ("a", "airports", vec!["id"]),
+                ("c", "carriers", vec!["id"]),
+            ],
+            vec![("f", "a", vec!["dep_id"]), ("f", "c", vec!["carrier_id"])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("x.y".to_string());
+        def.joins[1].name = Some("\"x.y\"".to_string());
+        assert!(
+            validate_graph(&def).is_ok(),
+            "{:?}",
+            validate_graph(&def).err().map(|e| e.message)
+        );
+        // Control: the same two parts spelled with quotes ARE one name.
+        def.joins[1].name = Some("\"X\".\"y\"".to_string());
+        let err = validate_graph(&def).unwrap_err().message;
+        assert!(err.contains("duplicate relationship name 'x.y'"), "{err}");
+    }
+
+    /// `x.y` and `"x.y"` as two roles of ONE table are distinct names, but a
+    /// role's scoped join alias is `<table>__<normalized name>`, so both would
+    /// be joined as `a__x.y`. That pair is rejected with a message naming the
+    /// shared alias rather than as a duplicate name.
+    #[test]
+    fn role_playing_names_sharing_a_scoped_alias_rejected() {
+        let mut def = make_def(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![("f", "a", vec!["dep_id"]), ("f", "a", vec!["arr_id"])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("x.y".to_string());
+        def.joins[1].name = Some("\"x.y\"".to_string());
+        let err = validate_graph(&def).unwrap_err().message;
+        assert!(
+            err.contains("'x.y' and '\"x.y\"'") && err.contains("a__x.y"),
+            "expected the shared-alias error, got: {err}"
+        );
+    }
+
+    /// Control: distinct names (one quoted) and an unnamed relationship pass.
+    #[test]
+    fn distinct_relationship_names_accepted() {
+        let mut def = make_def(
+            vec![
+                ("f", "flights", vec!["id"]),
+                ("a", "airports", vec!["id"]),
+                ("c", "carriers", vec!["id"]),
+            ],
+            vec![("f", "a", vec!["dep_id"]), ("f", "c", vec!["carrier_id"])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("dep".to_string());
+        def.joins[1].name = Some("\"Dep Carrier\"".to_string());
+        assert!(
+            validate_graph(&def).is_ok(),
+            "{:?}",
+            validate_graph(&def).err()
+        );
+        def.joins[1].name = None;
+        assert!(
+            validate_graph(&def).is_ok(),
+            "{:?}",
+            validate_graph(&def).err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TECH-DEBT #78: a single-table view checks member qualifiers too
+    // -----------------------------------------------------------------------
+
+    /// `x.foo AS 1` in a one-table view: the single-table skip bypassed
+    /// `check_source_tables_reachable`, so the undeclared `x` was accepted,
+    /// while the same member in a multi-table view was rejected.
+    #[test]
+    fn single_table_dimension_with_undeclared_qualifier_rejected() {
+        let def = make_def(
+            vec![("o", "orders", vec!["id"])],
+            vec![],
+            vec![("foo", Some("x"))],
+            vec![("revenue", Some("o"))],
+        );
+        let err = validate_graph(&def)
+            .expect_err("an undeclared table qualifier must be rejected")
+            .message;
+        assert!(
+            err.contains("unknown source table 'x'") && err.contains("did you mean 'o'"),
+            "expected the multi-table error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn single_table_metric_with_undeclared_qualifier_rejected() {
+        let def = make_def(
+            vec![("o", "orders", vec!["id"])],
+            vec![],
+            vec![],
+            vec![("revenue", Some("x"))],
+        );
+        let err = validate_graph(&def)
+            .expect_err("an undeclared table qualifier must be rejected")
+            .message;
+        assert!(err.contains("unknown source table 'x'"), "{err}");
+    }
+
+    /// Control: unqualified members, and members qualified by the declared
+    /// alias in any case, stay valid.
+    #[test]
+    fn single_table_declared_or_absent_qualifier_accepted() {
+        let def = make_def(
+            vec![("o", "orders", vec!["id"])],
+            vec![],
+            vec![
+                ("region", Some("O")),
+                ("quoted", Some("\"O\"")),
+                ("bare", None),
+            ],
+            vec![("revenue", Some("o")), ("derived", None)],
+        );
+        assert!(
+            validate_graph(&def).is_ok(),
+            "{:?}",
+            validate_graph(&def).err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The former "legacy skip" (TECH-DEBT #72 follow-up)
+    // -----------------------------------------------------------------------
+    //
+    // `validate_graph` runs only at CREATE (`enrich_definition_for_create`);
+    // stored rows are never re-validated on load. It used to skip every check
+    // when no relationship carried `fk_columns`, which let two shapes through
+    // CREATE that no query could use: several tables and no relationships at
+    // all (the #72 disconnected graph, minus the edge that triggered the
+    // check), and a YAML relationship with no FK columns (which the query-time
+    // fan-trap fence then reports as a "legacy pre-Phase-24 definition").
+
+    /// Two tables, zero relationships. Every member on `c` emitted
+    /// `FROM "o" … c.region` — `Binder Error: Referenced table "c" not found`.
+    /// Rejected now with #72's own error, naming the base table.
+    #[test]
+    fn multi_table_view_with_no_relationships_rejected() {
+        let def = make_def(
+            vec![("o", "orders", vec!["id"]), ("c", "customers", vec!["id"])],
+            vec![],
+            vec![("region", Some("c"))],
+            vec![("revenue", Some("o"))],
+        );
+        let err = validate_graph(&def)
+            .expect_err("two tables with no relationship must be rejected")
+            .message;
+        assert!(
+            err.contains("base table 'o'") && err.contains("not connected") && err.contains("'c'"),
+            "expected #72's base-table error naming 'o' and listing 'c', got: {err}"
+        );
+    }
+
+    /// Three tables, zero relationships: every table is edgeless, so the
+    /// orphan check would have named whichever non-root table a `HashSet`
+    /// yielded first. The base-table message lists them all, sorted.
+    #[test]
+    fn several_unrelated_tables_get_one_deterministic_error() {
+        let def = make_def(
+            vec![
+                ("o", "orders", vec!["id"]),
+                ("p", "products", vec!["id"]),
+                ("c", "customers", vec!["id"]),
+            ],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let err = validate_graph(&def)
+            .expect_err("unrelated tables must be rejected")
+            .message;
+        assert!(
+            err.contains("base table 'o'") && err.contains("('c', 'p')"),
+            "expected the base-table error listing 'c', 'p' in order, got: {err}"
+        );
+    }
+
+    /// With several edgeless non-root tables the orphan check named whichever
+    /// one `HashSet` iteration reached first, so the same definition could
+    /// report a different table from one CREATE to the next. It names the
+    /// alphabetically first now, every time.
+    #[test]
+    fn orphan_error_is_deterministic() {
+        let make = || {
+            make_def(
+                vec![
+                    ("o", "orders", vec!["id"]),
+                    ("c", "customers", vec!["id"]),
+                    ("z", "z_table", vec!["id"]),
+                    ("y", "y_table", vec!["id"]),
+                    ("x", "x_table", vec!["id"]),
+                    ("w", "w_table", vec!["id"]),
+                ],
+                vec![("o", "c", vec!["customer_id"])],
+                vec![],
+                vec![],
+            )
+        };
+        for _ in 0..64 {
+            let err = validate_graph(&make()).unwrap_err().message;
+            assert!(
+                err.starts_with("orphan table 'w'"),
+                "expected the alphabetically first orphan 'w', got: {err}"
+            );
+        }
+    }
+
+    /// A relationship with no FK columns (reachable through YAML, which does
+    /// not require `fk_columns`) used to switch graph validation off for the
+    /// whole definition. Every query then failed the fan-trap fence with a
+    /// misleading "legacy pre-Phase-24 definition format" error.
+    #[test]
+    fn relationship_without_fk_columns_rejected() {
+        let mut def = make_def(
+            vec![("o", "orders", vec!["id"]), ("c", "customers", vec!["id"])],
+            vec![("o", "c", vec![])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("o_to_c".to_string());
+        let err = validate_graph(&def)
+            .expect_err("a relationship with no FK columns must be rejected")
+            .message;
+        assert!(
+            err.contains("'o_to_c'") && err.contains("no foreign-key columns"),
+            "expected the error to name the relationship, got: {err}"
+        );
+    }
+
+    #[test]
+    fn relationship_without_fk_columns_rejected_on_a_single_table_view() {
+        // The single-table exemption covers only a view with no relationship
+        // at all; an FK-less relationship is rejected even when TABLES has one
+        // entry (here it targets a table that is not declared).
         let mut def = SemanticViewDefinition {
             tables: vec![TableRef {
                 alias: "o".to_string(),
@@ -888,11 +1438,15 @@ mod tests {
             resolution_schema_name: None,
             comment: None,
         };
+        let err = validate_graph(&def)
+            .expect_err("an FK-less relationship must be rejected on a one-table view too")
+            .message;
         assert!(
-            validate_graph(&def).is_ok(),
-            "legacy definitions should skip validation"
+            err.contains("no foreign-key columns") && err.contains("'customers'"),
+            "expected the FK-less relationship to be named by its target, got: {err}"
         );
-        // Also test with empty tables.
+        // An empty TABLES list still skips: there is no graph to validate, and
+        // the TABLES-clause checks own that error.
         def.tables.clear();
         assert!(
             validate_graph(&def).is_ok(),

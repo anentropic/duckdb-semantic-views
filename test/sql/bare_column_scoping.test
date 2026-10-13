@@ -1,4 +1,4 @@
-# TECH-DEBT #82: bare (unqualified) column references in member expressions.
+# TECH-DEBT #83: bare (unqualified) column references in member expressions.
 #
 # Snowflake scopes a member expression to its own logical table. This
 # extension splices the expression verbatim into the query's FROM, so a bare
@@ -11,7 +11,7 @@
 #   * a cross-table bare reference (`amount` exists only on `o`, used in a
 #     metric on `li`) is accepted at CREATE and binds to `o.amount` when `o` is
 #     joined -- a silent cross-grain number Snowflake would reject at CREATE.
-#     The `known gap` query pins today's wrong answer; it flips when #82 is fixed.
+#     The `known gap` query pins today's wrong answer; it flips when #83 is fixed.
 # The workaround is to qualify every column (create-semantic-view.rst, "Column
 # qualification in expressions"). The unit twins, one per case, are in
 # src/expand/tests_bare_column_scoping.rs.
@@ -109,7 +109,7 @@ EU	21
 US	12
 NULL	13
 
-# KNOWN GAP (TECH-DEBT #82): `li.li_amount AS SUM(amount)` reads a column of
+# KNOWN GAP (TECH-DEBT #83): `li.li_amount AS SUM(amount)` reads a column of
 # `o`. Grouped by region, `o` is joined, so it sums each order's amount once per
 # line item: EU 250 (order 10 counted twice). Snowflake rejects the definition.
 query TI

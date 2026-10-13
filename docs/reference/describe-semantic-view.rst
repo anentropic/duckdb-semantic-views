@@ -139,7 +139,7 @@ Rows appear in definition order: the view-level comment (when one is set), then 
       * - ``EXPRESSION``
         - The row-level SQL expression defining the fact.
       * - ``DATA_TYPE``
-        - The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+        - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
       * - ``COMMENT``
         - The fact comment text. Only emitted when a comment is set.
       * - ``SYNONYMS``
@@ -163,7 +163,7 @@ Rows appear in definition order: the view-level comment (when one is set), then 
       * - ``EXPRESSION``
         - The SQL expression defining the dimension.
       * - ``DATA_TYPE``
-        - The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+        - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
       * - ``COMMENT``
         - The dimension comment text. Only emitted when a comment is set.
       * - ``SYNONYMS``
@@ -185,7 +185,7 @@ Rows appear in definition order: the view-level comment (when one is set), then 
       * - ``EXPRESSION``
         - The aggregate SQL expression defining the metric.
       * - ``DATA_TYPE``
-        - The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+        - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
       * - ``COMMENT``
         - The metric comment text. Only emitted when a comment is set.
       * - ``SYNONYMS``
@@ -209,7 +209,7 @@ Rows appear in definition order: the view-level comment (when one is set), then 
       * - ``EXPRESSION``
         - The expression composing other metrics.
       * - ``DATA_TYPE``
-        - The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+        - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
       * - ``COMMENT``
         - The derived metric comment text. Only emitted when a comment is set.
       * - ``SYNONYMS``
@@ -267,21 +267,21 @@ Examples
 
 .. code-block:: text
 
-   ┌─────────────┬─────────────┬───────────────┬──────────────────────────┬──────────────────┐
-   │ object_kind │ object_name │ parent_entity │ property                 │ property_value   │
-   ├─────────────┼─────────────┼───────────────┼──────────────────────────┼──────────────────┤
-   │ TABLE       │ orders      │               │ BASE_TABLE_DATABASE_NAME │ memory           │
-   │ TABLE       │ orders      │               │ BASE_TABLE_SCHEMA_NAME   │ main             │
-   │ TABLE       │ orders      │               │ BASE_TABLE_NAME          │ orders           │
-   │ TABLE       │ orders      │               │ PRIMARY_KEY              │ ["id"]           │
-   │ DIMENSION   │ region      │ orders        │ TABLE                    │ orders           │
-   │ DIMENSION   │ region      │ orders        │ EXPRESSION               │ o.region         │
-   │ DIMENSION   │ region      │ orders        │ DATA_TYPE                │                  │
-   │ METRIC      │ total       │ orders        │ TABLE                    │ orders           │
-   │ METRIC      │ total       │ orders        │ EXPRESSION               │ SUM(o.amount)    │
-   │ METRIC      │ total       │ orders        │ DATA_TYPE                │                  │
-   │ METRIC      │ total       │ orders        │ ACCESS_MODIFIER          │ PUBLIC           │
-   └─────────────┴─────────────┴───────────────┴──────────────────────────┴──────────────────┘
+   ┌─────────────┬─────────────┬───────────────┬──────────────────────────┬────────────────┐
+   │ object_kind │ object_name │ parent_entity │ property                 │ property_value │
+   ├─────────────┼─────────────┼───────────────┼──────────────────────────┼────────────────┤
+   │ TABLE       │ orders      │               │ BASE_TABLE_DATABASE_NAME │ memory         │
+   │ TABLE       │ orders      │               │ BASE_TABLE_SCHEMA_NAME   │ main           │
+   │ TABLE       │ orders      │               │ BASE_TABLE_NAME          │ orders         │
+   │ TABLE       │ orders      │               │ PRIMARY_KEY              │ ["id"]         │
+   │ DIMENSION   │ region      │ orders        │ TABLE                    │ orders         │
+   │ DIMENSION   │ region      │ orders        │ EXPRESSION               │ o.region       │
+   │ DIMENSION   │ region      │ orders        │ DATA_TYPE                │ VARCHAR        │
+   │ METRIC      │ total       │ orders        │ TABLE                    │ orders         │
+   │ METRIC      │ total       │ orders        │ EXPRESSION               │ SUM(o.amount)  │
+   │ METRIC      │ total       │ orders        │ DATA_TYPE                │ DECIMAL(38,2)  │
+   │ METRIC      │ total       │ orders        │ ACCESS_MODIFIER          │ PUBLIC         │
+   └─────────────┴─────────────┴───────────────┴──────────────────────────┴────────────────┘
 
 **View with metadata annotations:**
 
@@ -315,12 +315,12 @@ Examples
    │ TABLE       │ orders      │               │ COMMENT                  │ Order data        │
    │ DIMENSION   │ region      │ orders        │ TABLE                    │ orders            │
    │ DIMENSION   │ region      │ orders        │ EXPRESSION               │ o.region          │
-   │ DIMENSION   │ region      │ orders        │ DATA_TYPE                │                   │
+   │ DIMENSION   │ region      │ orders        │ DATA_TYPE                │ VARCHAR           │
    │ DIMENSION   │ region      │ orders        │ COMMENT                  │ Sales region      │
    │ DIMENSION   │ region      │ orders        │ SYNONYMS                 │ ["territory"]     │
    │ METRIC      │ revenue     │ orders        │ TABLE                    │ orders            │
    │ METRIC      │ revenue     │ orders        │ EXPRESSION               │ SUM(o.amount)     │
-   │ METRIC      │ revenue     │ orders        │ DATA_TYPE                │                   │
+   │ METRIC      │ revenue     │ orders        │ DATA_TYPE                │ DECIMAL(38,2)     │
    │ METRIC      │ revenue     │ orders        │ COMMENT                  │ Total revenue     │
    │ METRIC      │ revenue     │ orders        │ ACCESS_MODIFIER          │ PUBLIC            │
    └─────────────┴─────────────┴───────────────┴──────────────────────────┴───────────────────┘
@@ -363,14 +363,14 @@ The first row is the view-level comment, so its ``object_kind`` and ``object_nam
    │ TABLE           │ orders      │               │ PRIMARY_KEY              │ ["id"]                    │
    │ DIMENSION       │ region      │ orders        │ TABLE                    │ orders                    │
    │ DIMENSION       │ region      │ orders        │ EXPRESSION               │ o.region                  │
-   │ DIMENSION       │ region      │ orders        │ DATA_TYPE                │                           │
+   │ DIMENSION       │ region      │ orders        │ DATA_TYPE                │ VARCHAR                   │
    │ METRIC          │ revenue     │ orders        │ TABLE                    │ orders                    │
    │ METRIC          │ revenue     │ orders        │ EXPRESSION               │ SUM(o.amount)             │
-   │ METRIC          │ revenue     │ orders        │ DATA_TYPE                │                           │
+   │ METRIC          │ revenue     │ orders        │ DATA_TYPE                │ DECIMAL(38,2)             │
    │ METRIC          │ revenue     │ orders        │ ACCESS_MODIFIER          │ PUBLIC                    │
    │ METRIC          │ order_count │ orders        │ TABLE                    │ orders                    │
    │ METRIC          │ order_count │ orders        │ EXPRESSION               │ COUNT(*)                  │
-   │ METRIC          │ order_count │ orders        │ DATA_TYPE                │                           │
+   │ METRIC          │ order_count │ orders        │ DATA_TYPE                │ BIGINT                    │
    │ METRIC          │ order_count │ orders        │ ACCESS_MODIFIER          │ PUBLIC                    │
    │ MATERIALIZATION │ region_agg  │               │ TABLE                    │ revenue_by_region         │
    │ MATERIALIZATION │ region_agg  │               │ DIMENSIONS               │ ["region"]                │

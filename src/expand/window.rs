@@ -38,6 +38,42 @@ fn window_dim_column(def: &SemanticViewDefinition, reference: &str) -> String {
         .map_or_else(|| quote_ident(reference), |d| quote_stored_ident(&d.name))
 }
 
+/// The dimensions a window metric cannot be queried without: every
+/// `PARTITION BY EXCLUDING`, `PARTITION BY` and `ORDER BY` reference in its
+/// spec, which the query-time guard in [`expand_window_metrics`] insists are
+/// queried alongside it (`WindowMetricRequiredDimension`).
+///
+/// Each reference is resolved (bare, dotted or quoted) to its declared
+/// dimension's stored name and deduplicated by identity, so the result is a
+/// valid `dimensions` request on its own — the read-side member-type probe
+/// (TECH-DEBT #51) uses it to type a window metric, which has no shape it can
+/// be queried in alone. A reference that resolves to no declared dimension is
+/// passed through raw so that expansion reports it. Empty for a non-window
+/// metric.
+pub(crate) fn window_required_dimensions(
+    def: &SemanticViewDefinition,
+    met: &Metric,
+) -> Vec<String> {
+    let Some(ws) = met.window_spec.as_ref() else {
+        return Vec::new();
+    };
+    let refs = ws
+        .excluding_dims
+        .iter()
+        .chain(ws.partition_dims.iter())
+        .chain(ws.order_by.iter().map(|ob| &ob.expr));
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for r in refs {
+        let name =
+            super::resolution::find_dimension(def, r).map_or_else(|| r.clone(), |d| d.name.clone());
+        if seen.insert(crate::ident::normalize_ident_part(&name)) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 /// Generate CTE-based expansion SQL for queries containing window function metrics.
 ///
 /// Called from `expand()` when all resolved metrics are window metrics.

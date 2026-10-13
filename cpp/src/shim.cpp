@@ -27,9 +27,14 @@
 
 #include "parser_extension_compat.hpp"
 #include "shim.hpp"
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <system_error>
+#include <thread>
 
 using namespace duckdb;
 
@@ -1677,6 +1682,107 @@ static void sv_emit_varchar_bool_rows(
     state.next_row += count;
 }
 
+// ---------------------------------------------------------------------------
+// Cancellation of the bind dispatchers (PR #248 review, TECH-DEBT #51)
+// ---------------------------------------------------------------------------
+//
+// Every read-side bind below runs its Rust dispatcher on a fresh
+// `Connection(*context.db)`, which carries its OWN `ClientContext` and
+// therefore its own interrupt flag. `duckdb_interrupt()` (ADBC's cancel, the
+// CLI's Ctrl-C, framework timeouts) sets the flag on the CALLER's context only.
+// Since SHOW / DESCRIBE started probing every member's type at bind time
+// (one `LIMIT 0` statement per member kind per view, with per-member
+// fallbacks), a cancelled cross-view SHOW kept probing view after view, and a
+// probe whose source binds slowly ran to completion — the INTERRUPT surfaced
+// only afterwards. `sv_query_interruptible` solves the same problem for
+// `semantic_view()` execution by polling between executor tasks; a bind has no
+// such task loop (a `LIMIT 0` probe is planned to an empty result — its cost is
+// all bind and optimisation), so the flag is carried across differently:
+//
+//   1. `sv_bind_caller_interrupted()` exposes the caller's flag to Rust, which
+//      consults it before every probe and stops typing (`member_types`), so a
+//      cross-view listing ends at the next probe.
+//   2. A watcher thread forwards the caller's flag to the probe connection for
+//      as long as the dispatcher runs. It re-forwards on every poll because each
+//      statement on `probe` clears its own flag when it starts. The engine polls
+//      that flag inside the work a slow probe actually does — glob expansion
+//      (`LazyMultiFileList`), between optimiser passes, in the executor — so a
+//      probe already running stops too, and its INTERRUPT error is classified as
+//      a cancellation on the Rust side rather than as an untypable member.
+//   3. Once the dispatcher returns, a cancelled caller wins: a bare
+//      `InterruptException` is thrown, never the `"<fn> failed: ..."` wrapper,
+//      so the error is an INTERRUPT with the "Interrupted!" message (see
+//      `sv_query_interruptible` for why that matters to ADBC). Thrown from a
+//      bind, the binder appends the call's query location, exactly as it does
+//      when one of DuckDB's own table functions (`read_csv` over a glob) is
+//      interrupted while binding.
+//
+// The scope is per bind call and per thread; it saves and restores any outer
+// scope so a bind nested inside a probe (a source that is itself a semantic
+// view function) keeps its own caller. Cost: one short-lived thread per bind.
+// If the thread cannot be started, (1) and (3) still hold.
+static thread_local ClientContext *sv_bind_caller = nullptr;
+
+extern "C" bool sv_bind_caller_interrupted() {
+    return sv_bind_caller != nullptr &&
+           sv_bind_caller->interrupted.load(std::memory_order_relaxed);
+}
+
+class SvBindCancellationScope {
+public:
+    SvBindCancellationScope(ClientContext &outer, Connection &probe)
+        : outer_(outer), probe_(probe), prev_(sv_bind_caller) {
+        sv_bind_caller = &outer_;
+        try {
+            watcher_ = std::thread([this] { Watch(); });
+        } catch (const std::system_error &) {
+            // No watcher: a running probe is not interrupted, but the Rust
+            // side still stops before the next one and the throw below holds.
+        }
+    }
+
+    ~SvBindCancellationScope() {
+        if (watcher_.joinable()) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stop_ = true;
+            }
+            wake_.notify_one();
+            watcher_.join();
+        }
+        sv_bind_caller = prev_;
+    }
+
+    SvBindCancellationScope(const SvBindCancellationScope &) = delete;
+    SvBindCancellationScope &operator=(const SvBindCancellationScope &) = delete;
+
+    // A cancelled caller is authoritative however the dispatcher ended.
+    void ThrowIfCancelled() const {
+        if (outer_.interrupted.load(std::memory_order_relaxed)) {
+            throw InterruptException();
+        }
+    }
+
+private:
+    void Watch() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!stop_) {
+            if (outer_.interrupted.load(std::memory_order_relaxed)) {
+                probe_.Interrupt();
+            }
+            wake_.wait_for(lock, std::chrono::milliseconds(10));
+        }
+    }
+
+    ClientContext &outer_;
+    Connection &probe_;
+    ClientContext *prev_;
+    std::thread watcher_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    bool stop_ = false;
+};
+
 // Common idiom for the bind callback: open Connection, run Rust dispatcher
 // for the zero-arg case, parse payload into bd. Used by all 5 zero-arg
 // migrated TFs (Task 2 / Wave 1) and reused by Task 3 / Wave 2 with extra
@@ -1693,6 +1799,7 @@ static void sv_run_varchar_bind(ClientContext &context,
                                 DispatcherFn &&dispatcher) {
     bd.expected_cols = expected_cols;
     Connection probe(*context.db);
+    SvBindCancellationScope cancellation(context, probe);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
     SvOwnedBuffer payload;
     char error_buf[1024];
@@ -1700,6 +1807,7 @@ static void sv_run_varchar_bind(ClientContext &context,
     uint8_t rc = dispatcher(borrowed,
                             &payload.ptr, &payload.len,
                             error_buf, sizeof(error_buf));
+    cancellation.ThrowIfCancelled();
     if (rc != 0) {
         throw BinderException(std::string(fn_name) + " failed: " + error_buf);
     }
@@ -1749,6 +1857,7 @@ static void sv_run_varchar_bind_with_name(ClientContext &context,
     std::string name = input.inputs[0].GetValue<std::string>();
     std::vector<uint8_t> sp = sv_search_path_payload(input);
     Connection probe(*context.db);
+    SvBindCancellationScope cancellation(context, probe);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
     SvOwnedBuffer payload;
     char error_buf[1024];
@@ -1758,6 +1867,7 @@ static void sv_run_varchar_bind_with_name(ClientContext &context,
                             sp.empty() ? nullptr : sp.data(), sp.size(),
                             &payload.ptr, &payload.len,
                             error_buf, sizeof(error_buf));
+    cancellation.ThrowIfCancelled();
     if (rc != 0) {
         throw BinderException(std::string(fn_name) + " failed: " + error_buf);
     }
@@ -1787,6 +1897,7 @@ static void sv_run_varchar_bool_bind_with_two_names(
     std::string name2 = input.inputs[1].GetValue<std::string>();
     std::vector<uint8_t> sp = sv_search_path_payload(input);
     Connection probe(*context.db);
+    SvBindCancellationScope cancellation(context, probe);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
     SvOwnedBuffer payload;
     char error_buf[1024];
@@ -1797,6 +1908,7 @@ static void sv_run_varchar_bool_bind_with_two_names(
                             sp.empty() ? nullptr : sp.data(), sp.size(),
                             &payload.ptr, &payload.len,
                             error_buf, sizeof(error_buf));
+    cancellation.ThrowIfCancelled();
     if (rc != 0) {
         throw BinderException(std::string(fn_name) + " failed: " + error_buf);
     }
@@ -1811,6 +1923,7 @@ static void sv_run_varchar_bool_bind(ClientContext &context,
                                      DispatcherFn &&dispatcher) {
     bd.expected_varchar_cols = expected_varchar_cols;
     Connection probe(*context.db);
+    SvBindCancellationScope cancellation(context, probe);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
     SvOwnedBuffer payload;
     char error_buf[1024];
@@ -1818,6 +1931,7 @@ static void sv_run_varchar_bool_bind(ClientContext &context,
     uint8_t rc = dispatcher(borrowed,
                             &payload.ptr, &payload.len,
                             error_buf, sizeof(error_buf));
+    cancellation.ThrowIfCancelled();
     if (rc != 0) {
         throw BinderException(std::string(fn_name) + " failed: " + error_buf);
     }

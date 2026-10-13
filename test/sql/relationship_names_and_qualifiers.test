@@ -1,0 +1,389 @@
+# CREATE-time identity checks for relationship names and member qualifiers.
+#
+# TECH-DEBT #79: relationship names are one namespace per view (Snowflake),
+# compared by DuckDB's identifier rule (`r`, `R` and `"r"` are one name). Two
+# relationships sharing a name used to be accepted unless they were a
+# role-playing pair to one table, and every lookup by name (`USING (r)`, the
+# join resolver, the role-playing fence) silently took the first.
+#
+# TECH-DEBT #78: a single-table view skipped relationship-graph validation, so
+# a member qualified by an undeclared alias (`x.foo` in a view whose only table
+# is `o`) was accepted. A multi-table view rejects it with
+# `unknown source table 'x'`; a single-table view now does too.
+#
+# Both checks are CREATE-only: a stored row that already has either shape is
+# not re-validated on load and keeps answering queries (last section).
+#
+# PR #249 review: relationship names keep their identifier parts (`x.y` and
+# `"x.y"` are two names), and a stored pair accepted before the uniqueness
+# check keeps resolving `USING` by spelling first (both sections below).
+#
+# `graph::relationship::tests` cover the checks directly.
+
+require semantic_views
+
+statement ok
+CREATE TABLE rn_flights (id INTEGER, dep_code VARCHAR, arr_code VARCHAR, carrier_code VARCHAR, fare INTEGER);
+
+statement ok
+CREATE TABLE rn_airports (code VARCHAR, city VARCHAR);
+
+statement ok
+CREATE TABLE rn_carriers (code VARCHAR, name VARCHAR);
+
+statement ok
+INSERT INTO rn_flights VALUES (1, 'SFO', 'DEN', 'UA', 100), (2, 'DEN', 'SFO', 'UA', 150), (3, 'SFO', 'JFK', 'B6', 300);
+
+statement ok
+INSERT INTO rn_airports VALUES ('SFO', 'San Francisco'), ('DEN', 'Denver'), ('JFK', 'New York');
+
+statement ok
+INSERT INTO rn_carriers VALUES ('UA', 'United'), ('B6', 'JetBlue');
+
+# ============================================================
+# TECH-DEBT #79: duplicate relationship names
+# ============================================================
+
+# Same name, DIFFERENT targets: no diamond, so nothing compared the names.
+statement error
+CREATE SEMANTIC VIEW rn_dup_targets AS
+  TABLES (
+    f AS rn_flights PRIMARY KEY (id),
+    a AS rn_airports PRIMARY KEY (code),
+    c AS rn_carriers PRIMARY KEY (code)
+  )
+  RELATIONSHIPS (
+    r AS f(dep_code) REFERENCES a,
+    r AS f(carrier_code) REFERENCES c
+  )
+  DIMENSIONS (a.city AS a.city, c.name AS c.name)
+  METRICS (f.flights AS COUNT(*));
+----
+duplicate relationship name 'r'
+
+# Names differing only in case and quoting are one name under DuckDB's rule.
+statement error
+CREATE SEMANTIC VIEW rn_dup_case AS
+  TABLES (
+    f AS rn_flights PRIMARY KEY (id),
+    a AS rn_airports PRIMARY KEY (code),
+    c AS rn_carriers PRIMARY KEY (code)
+  )
+  RELATIONSHIPS (
+    route AS f(dep_code) REFERENCES a,
+    "ROUTE" AS f(carrier_code) REFERENCES c
+  )
+  DIMENSIONS (a.city AS a.city, c.name AS c.name)
+  METRICS (f.flights AS COUNT(*));
+----
+duplicate relationship name 'route'
+
+# A duplicated role-playing pair to ONE table gets the duplicate-name message,
+# not the former "diamond: two paths to 'a' via 'f' and 'f'".
+statement error
+CREATE SEMANTIC VIEW rn_dup_role AS
+  TABLES (
+    f AS rn_flights PRIMARY KEY (id),
+    a AS rn_airports PRIMARY KEY (code)
+  )
+  RELATIONSHIPS (
+    dep AS f(dep_code) REFERENCES a,
+    DEP AS f(arr_code) REFERENCES a
+  )
+  DIMENSIONS (a.city AS a.city)
+  METRICS (f.flights USING (dep) AS COUNT(*));
+----
+duplicate relationship name 'dep'
+
+# The same check applies to FROM YAML.
+statement error
+CREATE SEMANTIC VIEW rn_dup_yaml FROM YAML $$
+tables:
+  - alias: f
+    table: rn_flights
+    pk_columns: [id]
+  - alias: a
+    table: rn_airports
+    pk_columns: [code]
+  - alias: c
+    table: rn_carriers
+    pk_columns: [code]
+joins:
+  - table: a
+    from_alias: f
+    fk_columns: [dep_code]
+    name: r
+  - table: c
+    from_alias: f
+    fk_columns: [carrier_code]
+    name: '"R"'
+dimensions:
+  - name: city
+    expr: a.city
+    source_table: a
+metrics:
+  - name: flights
+    expr: COUNT(*)
+    source_table: f
+$$
+----
+duplicate relationship name 'r'
+
+# Control: distinct names (one quoted, with a space) are accepted and resolve.
+statement ok
+CREATE SEMANTIC VIEW rn_distinct AS
+  TABLES (
+    f AS rn_flights PRIMARY KEY (id),
+    a AS rn_airports PRIMARY KEY (code),
+    c AS rn_carriers PRIMARY KEY (code)
+  )
+  RELATIONSHIPS (
+    dep AS f(dep_code) REFERENCES a,
+    "Dep Carrier" AS f(carrier_code) REFERENCES c
+  )
+  DIMENSIONS (a.city AS a.city, c.name AS c.name)
+  METRICS (f.flights AS COUNT(*), f.fares AS SUM(f.fare));
+
+query TII rowsort
+SELECT * FROM semantic_view('rn_distinct', dimensions := ['city'], metrics := ['flights', 'fares']);
+----
+Denver	1	150
+San Francisco	2	400
+
+# `"x.y"` (one identifier containing a dot) and `x.y` (two parts) are
+# different names (PR #249 review): CREATE accepts both, to different tables,
+# and `USING ("x"."y")` names the two-part one (which edge it binds is pinned
+# by `using_a_two_part_relationship_name_does_not_bind_a_dotted_one_part_name`;
+# a dimension on `r` is not co-queried with `arrivals` here because `USING` on
+# a table reached by ONE relationship fails to bind such a dimension, a
+# separate pre-existing defect).
+statement ok
+CREATE SEMANTIC VIEW rn_dotted AS
+  TABLES (
+    f AS rn_flights PRIMARY KEY (id),
+    d AS rn_airports PRIMARY KEY (code),
+    r AS rn_airports PRIMARY KEY (code)
+  )
+  RELATIONSHIPS (
+    "x.y" AS f(dep_code) REFERENCES d,
+    x.y AS f(arr_code) REFERENCES r
+  )
+  DIMENSIONS (d.dep_city AS d.city, r.arr_city AS r.city)
+  METRICS (f.flights AS COUNT(*), f.arrivals USING ("x"."y") AS COUNT(*));
+
+query II
+SELECT * FROM semantic_view('rn_dotted', metrics := ['flights', 'arrivals']);
+----
+3	3
+
+query TI rowsort
+SELECT * FROM semantic_view('rn_dotted', dimensions := ['arr_city'], metrics := ['flights']);
+----
+Denver	1
+New York	1
+San Francisco	1
+
+query TI rowsort
+SELECT * FROM semantic_view('rn_dotted', dimensions := ['dep_city'], metrics := ['flights']);
+----
+Denver	1
+San Francisco	2
+
+# The same two names as two roles of ONE table would share the role alias
+# `a__x.y`, so that pair is rejected.
+statement error
+CREATE SEMANTIC VIEW rn_dotted_role AS
+  TABLES (
+    f AS rn_flights PRIMARY KEY (id),
+    a AS rn_airports PRIMARY KEY (code)
+  )
+  RELATIONSHIPS (
+    "x.y" AS f(dep_code) REFERENCES a,
+    x.y AS f(arr_code) REFERENCES a
+  )
+  DIMENSIONS (a.city AS a.city)
+  METRICS (f.flights USING (x.y) AS COUNT(*));
+----
+would both be joined as 'a__x.y'
+
+# ============================================================
+# TECH-DEBT #78: single-table member qualified by an undeclared alias
+# ============================================================
+
+# The dimension's expression references no column, so nothing else noticed `x`.
+statement error
+CREATE SEMANTIC VIEW rn_single_bad_dim AS
+  TABLES (f AS rn_flights PRIMARY KEY (id))
+  DIMENSIONS (x.one AS 1)
+  METRICS (f.flights AS COUNT(*));
+----
+unknown source table 'x'; did you mean 'f'?
+
+statement error
+CREATE SEMANTIC VIEW rn_single_bad_metric AS
+  TABLES (f AS rn_flights PRIMARY KEY (id))
+  DIMENSIONS (f.dep_code AS f.dep_code)
+  METRICS (x.flights AS COUNT(*));
+----
+unknown source table 'x'; did you mean 'f'?
+
+statement error
+CREATE SEMANTIC VIEW rn_single_bad_yaml FROM YAML $$
+tables:
+  - alias: f
+    table: rn_flights
+    pk_columns: [id]
+dimensions:
+  - name: one
+    expr: '1'
+    source_table: x
+metrics:
+  - name: flights
+    expr: COUNT(*)
+    source_table: f
+$$
+----
+unknown source table 'x'; did you mean 'f'?
+
+# Control: the declared alias in any case or quoting is still accepted, and so
+# is an unqualified (derived) metric.
+statement ok
+CREATE SEMANTIC VIEW rn_single_ok AS
+  TABLES (f AS rn_flights PRIMARY KEY (id))
+  DIMENSIONS (F.dep_code AS f.dep_code, "F".carrier AS f.carrier_code)
+  METRICS (f.flights AS COUNT(*), f.fares AS SUM(f.fare), avg_fare AS fares / flights);
+
+query TII rowsort
+SELECT dep_code, flights, fares FROM semantic_view('rn_single_ok', dimensions := ['dep_code'], metrics := ['flights', 'fares']);
+----
+DEN	1	150
+SFO	2	400
+
+statement ok
+CREATE SEMANTIC VIEW rn_single_ok_yaml FROM YAML $$
+tables:
+  - alias: f
+    table: rn_flights
+    pk_columns: [id]
+dimensions:
+  - name: carrier
+    expr: f.carrier_code
+    source_table: F
+metrics:
+  - name: flights
+    expr: COUNT(*)
+    source_table: f
+$$
+
+query TI rowsort
+SELECT * FROM semantic_view('rn_single_ok_yaml', dimensions := ['carrier'], metrics := ['flights']);
+----
+B6	1
+UA	2
+
+# TECH-DEBT #80 (documented limitation): a QUOTED qualifier naming a declared
+# alias is accepted in a single-table view but rejected in a view with
+# several tables, for a dimension and for a metric. These pin the current
+# behaviour the reference docs describe; finishing #80 flips them to
+# `statement ok`.
+statement error
+CREATE SEMANTIC VIEW rn_quoted_qualifier_dim AS
+  TABLES (
+    f AS rn_flights PRIMARY KEY (id),
+    a AS rn_airports PRIMARY KEY (code)
+  )
+  RELATIONSHIPS (dep AS f(dep_code) REFERENCES a)
+  DIMENSIONS ("A".city AS a.city)
+  METRICS (f.flights AS COUNT(*));
+----
+unknown source table '"A"'
+
+statement error
+CREATE SEMANTIC VIEW rn_quoted_qualifier_metric AS
+  TABLES (
+    f AS rn_flights PRIMARY KEY (id),
+    a AS rn_airports PRIMARY KEY (code)
+  )
+  RELATIONSHIPS (dep AS f(dep_code) REFERENCES a)
+  DIMENSIONS (a.city AS a.city)
+  METRICS ("F".flights AS COUNT(*));
+----
+unknown source table '"F"'
+
+statement ok
+CREATE SEMANTIC VIEW rn_quoted_qualifier_single AS
+  TABLES (f AS rn_flights PRIMARY KEY (id))
+  DIMENSIONS ("F".dep_code AS f.dep_code)
+  METRICS ("F".flights AS COUNT(*));
+
+# ============================================================
+# Stored rows are not re-validated (CREATE-only checks)
+# ============================================================
+
+# A duplicate relationship name already stored (injected, bypassing CREATE):
+# still listed, and its queries still answer; `USING (r)` reads take the first.
+statement ok
+INSERT INTO semantic_layer._definitions (schema_name, name, definition) VALUES (
+  'main',
+  'rn_stored_dup',
+  '{"tables":[{"alias":"f","table":"rn_flights","pk_columns":["id"]},{"alias":"a","table":"rn_airports","pk_columns":["code"]},{"alias":"c","table":"rn_carriers","pk_columns":["code"]}],"dimensions":[{"name":"city","expr":"a.city","source_table":"a"},{"name":"carrier","expr":"c.name","source_table":"c"}],"metrics":[{"name":"flights","expr":"COUNT(*)","source_table":"f"}],"joins":[{"table":"a","from_alias":"f","fk_columns":["dep_code"],"ref_columns":["code"],"name":"r","cardinality":"ManyToOne"},{"table":"c","from_alias":"f","fk_columns":["carrier_code"],"ref_columns":["code"],"name":"r","cardinality":"ManyToOne"}],"schema_version":1}'
+)
+
+query T
+SELECT name FROM list_semantic_views() WHERE name = 'rn_stored_dup';
+----
+rn_stored_dup
+
+query TI rowsort
+SELECT * FROM semantic_view('rn_stored_dup', dimensions := ['carrier'], metrics := ['flights']);
+----
+JetBlue	1
+United	2
+
+# A single-table member with an undeclared qualifier already stored.
+statement ok
+INSERT INTO semantic_layer._definitions (schema_name, name, definition) VALUES (
+  'main',
+  'rn_stored_single',
+  '{"tables":[{"alias":"f","table":"rn_flights","pk_columns":["id"]}],"dimensions":[{"name":"one","expr":"1","source_table":"x"},{"name":"dep_code","expr":"f.dep_code","source_table":"f"}],"metrics":[{"name":"flights","expr":"COUNT(*)","source_table":"f"}],"schema_version":1}'
+)
+
+query T
+SELECT name FROM list_semantic_views() WHERE name = 'rn_stored_single';
+----
+rn_stored_single
+
+query TI rowsort
+SELECT * FROM semantic_view('rn_stored_single', dimensions := ['dep_code'], metrics := ['flights']);
+----
+DEN	1
+SFO	2
+
+query II
+SELECT * FROM semantic_view('rn_stored_single', dimensions := ['one'], metrics := ['flights']);
+----
+1	3
+
+# A role-playing pair whose names differ only by quoting (`dep` departure,
+# `"dep"` arrival), stored before CREATE rejected it (PR #249 review). Every
+# lookup used to compare spellings, so `USING ("dep")` meant the quoted
+# (arrival) edge; it must keep meaning it, not the first identifier match.
+statement ok
+INSERT INTO semantic_layer._definitions (schema_name, name, definition) VALUES (
+  'main',
+  'rn_stored_quoted_pair',
+  '{"tables":[{"alias":"f","table":"rn_flights","pk_columns":["id"]},{"alias":"a","table":"rn_airports","pk_columns":["code"]}],"dimensions":[{"name":"city","expr":"a.city","source_table":"a"}],"metrics":[{"name":"departures","expr":"COUNT(*)","source_table":"f","using_relationships":["dep"]},{"name":"arrivals","expr":"COUNT(*)","source_table":"f","using_relationships":["\"dep\""]}],"joins":[{"table":"a","from_alias":"f","fk_columns":["dep_code"],"ref_columns":["code"],"name":"dep","cardinality":"ManyToOne"},{"table":"a","from_alias":"f","fk_columns":["arr_code"],"ref_columns":["code"],"name":"\"dep\"","cardinality":"ManyToOne"}],"schema_version":1}'
+)
+
+query TI rowsort
+SELECT * FROM semantic_view('rn_stored_quoted_pair', dimensions := ['city'], metrics := ['arrivals']);
+----
+Denver	1
+New York	1
+San Francisco	1
+
+query TI rowsort
+SELECT * FROM semantic_view('rn_stored_quoted_pair', dimensions := ['city'], metrics := ['departures']);
+----
+Denver	1
+San Francisco	2

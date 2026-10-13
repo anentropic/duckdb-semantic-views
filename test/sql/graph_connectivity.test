@@ -78,7 +78,79 @@ CREATE SEMANTIC VIEW gc_two_components AS
 ----
 table 'p' is not reachable from the base table 'o'
 
-# Neither rejected view was stored.
+# Case 3: several tables and NO relationships at all. `validate_graph` used to
+# skip every check when no relationship carried FK columns (a "legacy" path),
+# so this was accepted; a metric on the base table worked, but every member on
+# `c` emitted `FROM "gc_orders" AS "o" … c.region` and failed at bind time with
+# `Referenced table "c" not found`. Rejected now with #72's own error.
+statement error
+CREATE SEMANTIC VIEW gc_no_relationships AS
+  TABLES (
+    o AS gc_orders PRIMARY KEY (id),
+    c AS gc_customers PRIMARY KEY (id)
+  )
+  DIMENSIONS (
+    c.region AS c.region
+  )
+  METRICS (
+    o.total AS SUM(o.amount)
+  );
+----
+base table 'o' (the first table in TABLES) is not connected by any relationship to the other tables ('c')
+
+# Case 4: the same shape through YAML import, which shares the CREATE-time
+# validation.
+statement error
+CREATE SEMANTIC VIEW gc_no_relationships_yaml FROM YAML $$
+tables:
+  - alias: o
+    table: gc_orders
+    pk_columns: [id]
+  - alias: c
+    table: gc_customers
+    pk_columns: [id]
+dimensions:
+  - name: region
+    expr: c.region
+    source_table: c
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+$$
+----
+base table 'o' (the first table in TABLES) is not connected by any relationship to the other tables ('c')
+
+# Case 5: a YAML relationship with no FK columns (the DDL grammar cannot express
+# one). It switched graph validation off for the whole view, and every query —
+# even of a base-table metric — then failed the fan-trap fence with a
+# misleading "legacy pre-Phase-24 definition format" error.
+statement error
+CREATE SEMANTIC VIEW gc_fkless_yaml FROM YAML $$
+tables:
+  - alias: o
+    table: gc_orders
+    pk_columns: [id]
+  - alias: c
+    table: gc_customers
+    pk_columns: [id]
+joins:
+  - name: o_to_c
+    from_alias: o
+    table: c
+dimensions:
+  - name: region
+    expr: c.region
+    source_table: c
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+$$
+----
+relationship 'o_to_c' from 'o' to 'c' declares no foreign-key columns
+
+# None of the rejected views was stored.
 query I
 SELECT count(*) FROM list_semantic_views() WHERE name LIKE 'gc_%';
 ----
@@ -108,3 +180,57 @@ SELECT * FROM semantic_view('gc_connected', dimensions := ['region'], metrics :=
 ----
 east	12
 west	100
+
+# Control: a single-table view has no graph to connect and is accepted exactly
+# as before, through DDL and YAML alike.
+statement ok
+CREATE SEMANTIC VIEW gc_single AS
+  TABLES (o AS gc_orders PRIMARY KEY (id))
+  METRICS (o.total AS SUM(o.amount));
+
+query I
+SELECT * FROM semantic_view('gc_single', metrics := ['total']);
+----
+112
+
+statement ok
+CREATE SEMANTIC VIEW gc_single_yaml FROM YAML $$
+tables:
+  - alias: o
+    table: gc_orders
+    pk_columns: [id]
+dimensions:
+  - name: order_id
+    expr: o.id
+    source_table: o
+metrics:
+  - name: total
+    expr: SUM(o.amount)
+    source_table: o
+$$
+
+query I
+SELECT * FROM semantic_view('gc_single_yaml', metrics := ['total']);
+----
+112
+
+# A disconnected multi-table definition ALREADY STORED (written before this
+# check, injected here bypassing the parser) is not re-validated on read, so it
+# does not brick the catalog: it is still listed, and the queries that worked
+# before still work. Only CREATE rejects the shape.
+statement ok
+INSERT INTO semantic_layer._definitions (schema_name, name, definition) VALUES (
+  'main',
+  'gc_stored_disconnected',
+  '{"tables":[{"alias":"o","table":"gc_orders","pk_columns":["id"]},{"alias":"c","table":"gc_customers","pk_columns":["id"]}],"dimensions":[{"name":"region","expr":"c.region","source_table":"c"}],"metrics":[{"name":"total","expr":"SUM(o.amount)","source_table":"o"}],"schema_version":1}'
+)
+
+query T
+SELECT name FROM list_semantic_views() WHERE name = 'gc_stored_disconnected';
+----
+gc_stored_disconnected
+
+query I
+SELECT * FROM semantic_view('gc_stored_disconnected', metrics := ['total']);
+----
+112

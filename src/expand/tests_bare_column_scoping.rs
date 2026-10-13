@@ -1,5 +1,5 @@
 //! Bare (unqualified) column references inside member expressions, on the
-//! home-anchored path and the base-anchored path (TECH-DEBT #82).
+//! home-anchored path and the base-anchored path (TECH-DEBT #83).
 //!
 //! Snowflake scopes a member expression to its own logical table: a bare
 //! column means "this table's column", and a column of another table is a
@@ -22,7 +22,7 @@
 //!   query shape.
 //!
 //! These tests pin today's behaviour so a change to either shows up red; the
-//! `known_gap_*` ones pin a WRONG answer on purpose and flip when #82 is fixed.
+//! `known_gap_*` ones pin a WRONG answer on purpose and flip when #83 is fixed.
 //! The documented workaround is to qualify every column
 //! (`docs/reference/create-semantic-view.rst`, "Column qualification in
 //! expressions").
@@ -56,7 +56,7 @@ fn many_to_one(name: &str, from: &str, to: &str, key: &str) -> Join {
 /// customers `c` <- orders `o` <- line items `li`, base `c`. `o_id` is a column
 /// of both `o` and `li`; `amount` only of `o`. Every member expression is BARE.
 /// `region_u` has no source table, which keeps a query on the base-anchored
-/// path (TECH-DEBT #81), so each shape is exercised on both paths.
+/// path (TECH-DEBT #82), so each shape is exercised on both paths.
 fn bare_def() -> SemanticViewDefinition {
     SemanticViewDefinition {
         tables: vec![table("c", "c_id"), table("o", "o_id"), table("li", "li_id")],
@@ -164,7 +164,7 @@ fn dimension_with_a_colliding_bare_column_is_ambiguous_in_a_multi_grain_plan() {
     assert_ambiguous(outcome(&["order_id"], &["sum_o_oid", "total_qty"], &[]));
 }
 
-/// Fact (row-level path, base-anchored by design: TECH-DEBT #81).
+/// Fact (row-level path, base-anchored by design: TECH-DEBT #82).
 #[test]
 fn fact_with_a_colliding_bare_column_is_ambiguous() {
     assert_ambiguous(outcome(&["region"], &[], &["li_order"]));
@@ -200,11 +200,11 @@ fn metric_without_a_collision_binds_on_both_paths() {
 
 // --- Cross-table bare reference: accepted at CREATE, bound by accident. -----
 
-/// KNOWN GAP (TECH-DEBT #82): `li.li_amount AS SUM(amount)` names a column of
+/// KNOWN GAP (TECH-DEBT #83): `li.li_amount AS SUM(amount)` names a column of
 /// `o`, which Snowflake rejects at CREATE. Grouped by region, `o` is joined, so
 /// it binds to `o.amount` and sums each order's amount once PER LINE ITEM
 /// (order 10 twice): EU 250 where no line-item column was ever read. Flips when
-/// #82 rejects (or qualifies) the reference.
+/// #83 rejects (or qualifies) the reference.
 #[test]
 fn known_gap_cross_table_bare_column_binds_silently_when_its_table_is_joined() {
     assert_eq!(
@@ -213,7 +213,7 @@ fn known_gap_cross_table_bare_column_binds_silently_when_its_table_is_joined() {
     );
 }
 
-/// KNOWN GAP (TECH-DEBT #82): the same metric with no dimension scans `li`
+/// KNOWN GAP (TECH-DEBT #83): the same metric with no dimension scans `li`
 /// alone, so `amount` does not bind at all. Before #71 this returned the same
 /// silent 250 through the base-anchored join; it is now a loud error, which is
 /// the side of the gap Snowflake is on (it rejects the definition).

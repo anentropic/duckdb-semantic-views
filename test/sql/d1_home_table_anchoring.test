@@ -30,7 +30,7 @@
 # Snowflake resolves a bare column against the member's own table, while this
 # extension splices the expression into a FROM that may also join a table with
 # a same-named column (`o_id` is on both `o` and `li`), which DuckDB reports as
-# ambiguous (TECH-DEBT #82, pinned by bare_column_scoping.test). The semantics
+# ambiguous (TECH-DEBT #83, pinned by bare_column_scoping.test). The semantics
 # under test are unaffected.
 #
 # Each red query was also confirmed red on its own (one query per scratch file)

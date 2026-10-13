@@ -254,8 +254,9 @@ Cardinality is used for :ref:`fan trap detection <howto-fan-traps>`.
 - Cycles are rejected: ``cycle detected in relationships: a -> b -> a``.
 - Several named relationships from the **same** source table to the same target are allowed. This is the role-playing pattern (``dep_airport`` and ``arr_airport`` from ``flights`` to ``airports``); pick the path per metric with ``USING``.
 - One target reached from two **different** source tables is a diamond, and is rejected whatever the relationships are named: ``diamond: 's' is reachable from multiple tables ('a', 'b'); the join path is ambiguous.`` To model it, declare the shared table twice under two aliases, one per path, so each is joined once.
+- Relationship names must be unique within the view, whichever tables the relationships connect. Names are compared the way DuckDB compares identifiers (case-insensitively, quoted or not), so ``route`` and ``"ROUTE"`` are the same name: ``duplicate relationship name 'route'``. A role-playing pair that repeats a name gets this error too.
 - Self-references (``from_alias`` equals ``to_alias``) are rejected.
-- Orphan tables (declared in ``TABLES`` but not connected by any relationship) are rejected once the view declares at least one relationship. A view with several tables and no ``RELATIONSHIPS`` clause is not checked this way; a query that needs one of the unconnected tables then fails when it is bound.
+- Every table must be reachable from the base table (the first table in ``TABLES``) through some chain of relationships, in either direction. An orphan table (declared in ``TABLES`` but not connected by any relationship), a base table with no relationship, two separate groups of related tables, and several tables with no ``RELATIONSHIPS`` clause at all are all rejected, naming the table that cannot be reached. A single-table view needs no relationships.
 
 
 .. _ref-create-facts:
@@ -295,7 +296,7 @@ Facts can reference other facts by name. The extension resolves dependencies in 
 
 **Reported data type:**
 
-As with dimensions and metrics, ``CREATE`` records no output type for a fact. The ``data_type`` column reported by :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is empty for every view created since v0.10.0, and populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+As with dimensions and metrics, ``CREATE`` records no output type for a fact. The ``data_type`` column reported by :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is worked out when that command runs: it is the type of the fact's expression over the current source columns. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 
 .. _ref-create-dimensions:
@@ -330,17 +331,22 @@ Declares named grouping expressions available for queries.
 
 - Dimension names must be unique within the view (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). For example, ``region`` and ``Region`` cannot both appear in the same ``DIMENSIONS`` clause. See :ref:`ref-err-name-uniqueness`.
 - A dimension name cannot collide with any metric name (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). See :ref:`ref-err-name-uniqueness`.
+- The table alias that qualifies the dimension name must be declared in ``TABLES``, in any case (``o`` or ``O`` for alias ``o``). This applies to a single-table view too: ``x.foo`` in a view whose only table is ``o`` is rejected with ``unknown source table 'x'; did you mean 'o'?``. Metrics follow the same rule.
+
+  .. note::
+
+     A *quoted* qualifier (``"O".region`` for alias ``o``) is currently accepted only in a single-table view. In a view with several tables, ``CREATE`` rejects it with ``unknown source table '"O"'`` even though DuckDB treats ``"O"`` as the same identifier as ``o``; facts reject it in every view. Write the qualifier unquoted. This is a known limitation.
 
 **Reported data type:**
 
-``CREATE`` does not record an output type for a dimension, and no surface can declare one: the DDL grammar above has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`ref-get-ddl` could not carry it (a restored view silently lost the cast). The ``data_type`` column reported by :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is therefore empty for every view created since v0.10.0, and populated only for views stored before that release.
+``CREATE`` does not record an output type for a dimension, and no surface can declare one: the DDL grammar above has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`ref-get-ddl` could not carry it (a restored view silently lost the cast). To force a type, write the cast into the expression (``CAST(o.code AS VARCHAR)``).
 
-Query results are still fully typed -- :ref:`semantic_view() <ref-semantic-view-function>` infers each output column when the query is bound. Only the catalog metadata is silent about types. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+The ``data_type`` column reported by :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-semantic-dimensions>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is worked out when that command runs, the same way :ref:`semantic_view() <ref-semantic-view-function>` types its output columns when a query is bound. It therefore always matches the type a query returns, and follows a source column whose type changes after ``CREATE``. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 .. versionchanged:: 0.10.0
 
-   The define-time inference pass was removed. Views created before this
-   change keep whatever ``data_type`` they were stored with.
+   The define-time inference pass was removed. ``data_type`` was empty for
+   new views until it became a read-time probe (see the release notes).
 
 
 .. _ref-create-metrics:
@@ -455,7 +461,7 @@ See :ref:`howto-window-metrics` for details on both modes.
 - A metric name cannot collide with any dimension name (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). See :ref:`ref-err-name-uniqueness`.
 - Derived metrics must not contain aggregate functions.
 - Circular derived metric references are rejected.
-- ``USING`` relationship names must match declared relationships.
+- ``USING`` relationship names must match declared relationships. Names match the way DuckDB matches identifiers: case-insensitively, whether or not they are quoted, so ``USING (dep_airport)`` names a relationship declared as ``"Dep_Airport"``. Two relationships whose names differ only in case or quoting (``dep`` and ``"dep"``) are the same name. A name keeps its parts, though: the quoted ``"x.y"`` is one identifier containing a dot, so it is a different name from the two-part ``x.y`` (which ``"x"."y"`` also spells).
 - ``NON ADDITIVE BY`` dimension names must match declared dimensions.
 - Window metric inner metric name must match a declared metric.
 - Window metric ``EXCLUDING`` dimension names must match declared dimensions.
@@ -466,7 +472,7 @@ See :ref:`howto-window-metrics` for details on both modes.
 
 **Reported data type:**
 
-As with dimensions, ``CREATE`` does not record an output type for a metric. The ``data_type`` column reported by :ref:`SHOW SEMANTIC METRICS <ref-show-semantic-metrics>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is empty for every view created since v0.10.0, and populated only for views stored before that release. The metric's result column is typed when the query is bound, not when the view is defined. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+As with dimensions, ``CREATE`` does not record an output type for a metric. The ``data_type`` column reported by :ref:`SHOW SEMANTIC METRICS <ref-show-semantic-metrics>` and :ref:`DESCRIBE SEMANTIC VIEW <ref-describe-semantic-view>` is worked out when that command runs and is the type of the aggregate, not of its input: ``COUNT`` is ``BIGINT``, ``AVG`` is ``DOUBLE``, and ``SUM`` of an integer column is ``BIGINT`` -- the type :ref:`semantic_view() <ref-semantic-view-function>` returns it as. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 
 .. _ref-create-materializations:

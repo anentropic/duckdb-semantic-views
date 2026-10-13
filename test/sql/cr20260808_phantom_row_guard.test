@@ -22,7 +22,7 @@
 # no row (EXP-25 / EXP-26 below), or a NULL child value when a parent-grain
 # metric brings its row in. The guard (`facts::guard_aggregate_args`) still runs
 # and is still load-bearing on the paths that stay base-anchored (TECH-DEBT
-# #81); those are pinned by the unit tests, since this DDL shape no longer
+# #82); those are pinned by the unit tests, since this DDL shape no longer
 # reaches them. The FACTS and dimensions-only paths (EXP-28 / EXP-29) are
 # unchanged and still filter the phantom row.
 

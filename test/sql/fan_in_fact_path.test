@@ -86,8 +86,8 @@ CREATE SEMANTIC VIEW fi_sv AS
 query TTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN fi_sv FOR METRIC total_ship_cost
 ----
-fi_customers	customer_country	(empty)	false
-fi_shipments	carrier	(empty)	false
+fi_customers	customer_country	VARCHAR	false
+fi_shipments	carrier	VARCHAR	false
 
 # ============================================================
 # Test 2: the mirror case -- a metric on the sibling branch reaches `c` too,
@@ -97,8 +97,8 @@ fi_shipments	carrier	(empty)	false
 query TTTT rowsort
 SHOW SEMANTIC DIMENSIONS IN fi_sv FOR METRIC line_total
 ----
-fi_customers	customer_country	(empty)	false
-fi_line_items	item_qty	(empty)	false
+fi_customers	customer_country	VARCHAR	false
+fi_line_items	item_qty	INTEGER	false
 
 # ============================================================
 # Test 3: a fact on the base table with a dimension across the fan-in

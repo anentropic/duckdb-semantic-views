@@ -202,6 +202,26 @@ Graph validation errors
 
    orphan table '<alias>' is not connected by any relationship; did you mean '<suggestion>'?
 
+   base table '<alias>' (the first table in TABLES) is not connected by any
+   relationship to the other tables ('<alias>', ...); declare a relationship that
+   reaches it, or list a connected table first
+
+   table '<alias>' is not reachable from the base table '<alias>' (the first table
+   in TABLES) through any chain of relationships; unreachable: '<alias>', ...
+
+   relationship '<name>' from '<alias>' to '<alias>' declares no foreign-key columns;
+   the form is 'rel_name AS from_alias(fk_cols) REFERENCES to_alias'
+
+   duplicate relationship name '<name>': '<name>' (<from> -> <to>) and '<other>'
+   (<from> -> <to>) name the same relationship; relationship names must be unique
+   within a semantic view (compared case-insensitively, quoted or not)
+
+   relationships '<name>' and '<other>' to '<alias>' would both be joined as
+   '<alias>__<name>'; role-playing relationships to one table need names that differ
+   once quotes are removed and case is folded
+
+   unknown source table '<alias>'; did you mean '<suggestion>'?
+
 **Cause:** The relationship graph violates tree structure requirements.
 
 **Fix:**
@@ -210,6 +230,11 @@ Graph validation errors
 - **Cycle:** Follow the chain in the error message to find the circular dependency and remove it.
 - **Diamond:** One target table is reached from two different source tables. Naming the relationships does not help; declare the shared table a second time under another alias (for example ``s_a AS stores`` and ``s_b AS stores``) so each path has its own copy. Several relationships from the *same* source table to one target are allowed; that is the role-playing pattern (see :ref:`howto-role-playing`).
 - **Orphan:** Add a relationship that connects the table, or remove it from ``TABLES``.
+- **Not connected / not reachable:** Every table must be reachable from the first table in ``TABLES``. Add the missing relationship, or remove the table. A view that lists several tables but no ``RELATIONSHIPS`` at all gets the base-table form of this error.
+- **No foreign-key columns:** A YAML ``joins`` entry needs ``fk_columns`` (the DDL form always has them).
+- **Duplicate relationship name:** Two relationships share a name. Names are compared the way DuckDB compares identifiers, so ``route``, ``ROUTE`` and ``"route"`` are one name, whichever tables the relationships connect. Rename one of them. Before this check, ``USING`` silently used the first relationship with the name. Views stored before the check keep loading and keep that behaviour. A quoted name containing a dot (``"x.y"``) is one identifier, a different name from the two-part ``x.y``.
+- **Role-playing names sharing an alias:** Two relationships from one table to the same target are joined under ``<target>__<name>``, with the name's quotes removed and its case folded. ``x.y`` and ``"x.y"`` are different names but would get the same alias. Rename one of them.
+- **Unknown source table:** A dimension or metric is qualified by a table alias that ``TABLES`` does not declare, such as ``x.foo`` when the only table is ``o``. This applies to single-table views too. Qualify the member with a declared alias, in any case. Write the alias unquoted: a quoted qualifier such as ``"O"`` for alias ``o`` is accepted only in a single-table view, and a view with several tables rejects it with this error (a known limitation; DuckDB itself treats ``"O"`` and ``o`` as the same identifier).
 
 
 Key missing on a relationship target

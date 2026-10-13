@@ -16,14 +16,10 @@ use crate::model::SemanticViewDefinition;
 ///
 /// Returns `Ok(())` if all references are valid, `Err` with descriptive message otherwise.
 pub fn validate_using_relationships(def: &SemanticViewDefinition) -> Result<(), ParseError> {
-    // Collect all named relationships for lookup
-    let named_rels: Vec<(&crate::model::Join, String)> = def
-        .joins
-        .iter()
-        .filter_map(|j| j.name.as_ref().map(|n| (j, n.to_ascii_lowercase())))
-        .collect();
-
-    let available_names: Vec<String> = named_rels.iter().map(|(_, n)| n.clone()).collect();
+    // Names resolve with `graph::find_relationship` (spelling first, then
+    // DuckDB's identifier rule), the lookup the join resolver, the role-playing
+    // fences, the fact rewrite and the per-grain path share.
+    let available_names: Vec<&str> = def.joins.iter().filter_map(|j| j.name.as_deref()).collect();
 
     for metric in &def.metrics {
         if metric.using_relationships.is_empty() {
@@ -41,10 +37,8 @@ pub fn validate_using_relationships(def: &SemanticViewDefinition) -> Result<(), 
         let metric_source = metric.source_table.as_ref().unwrap().to_ascii_lowercase();
 
         for rel_name in &metric.using_relationships {
-            let rel_lower = rel_name.to_ascii_lowercase();
-
             // Check 2: relationship must exist
-            let found = named_rels.iter().find(|(_, n)| *n == rel_lower);
+            let found = super::find_relationship(&def.joins, rel_name);
 
             match found {
                 None => {
@@ -55,7 +49,7 @@ pub fn validate_using_relationships(def: &SemanticViewDefinition) -> Result<(), 
                         available_names.join(", ")
                     )));
                 }
-                Some((join, _)) => {
+                Some(join) => {
                     // Check 3: relationship must originate from metric's source_table
                     let from_lower = join.from_alias.to_ascii_lowercase();
                     if from_lower != metric_source {
@@ -152,5 +146,142 @@ mod tests {
             err.contains("derived metric") && err.contains("USING"),
             "Expected USING on derived metric error, got: {err}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Relationship names follow DuckDB identifier rules (CLAUDE.md;
+    // `ident::ident_matches`, TECH-DEBT #28): quoting never changes which
+    // relationship a name denotes, and case folds for ASCII letters only.
+    // -------------------------------------------------------------------
+
+    /// A relationship declared QUOTED (`"Dep_Airport"`, stored with its
+    /// quotes) is named by the bare `dep_airport` — DuckDB matches a quoted
+    /// identifier case-insensitively, exactly as it does a bare one. An
+    /// ASCII-lowercase comparison kept the quote characters and rejected it as
+    /// an unknown relationship.
+    #[test]
+    fn using_names_a_quoted_relationship_by_its_bare_spelling() {
+        let def = make_def_with_named_joins(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![
+                (Some("\"Dep_Airport\""), "f", "a", vec!["dep_id"]),
+                (Some("arr_airport"), "f", "a", vec!["arr_id"]),
+            ],
+            vec![("departure_count", Some("f"), vec!["dep_airport"])],
+        );
+        assert!(
+            validate_using_relationships(&def).is_ok(),
+            "{:?}",
+            validate_using_relationships(&def).err().map(|e| e.message)
+        );
+    }
+
+    /// The converse: a bare declaration named by a quoted, differently-cased
+    /// `USING` entry.
+    #[test]
+    fn using_names_a_bare_relationship_by_a_quoted_spelling() {
+        let def = make_def_with_named_joins(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![
+                (Some("dep_airport"), "f", "a", vec!["dep_id"]),
+                (Some("arr_airport"), "f", "a", vec!["arr_id"]),
+            ],
+            vec![("departure_count", Some("f"), vec!["\"DEP_AIRPORT\""])],
+        );
+        assert!(
+            validate_using_relationships(&def).is_ok(),
+            "{:?}",
+            validate_using_relationships(&def).err().map(|e| e.message)
+        );
+    }
+
+    /// Control, pinning DuckDB parity rather than a fix: DuckDB folds case for
+    /// ASCII letters only (`CREATE TABLE "ÉTAPE"` is not found as `étape`,
+    /// checked against DuckDB 1.5.6), so neither does relationship matching.
+    #[test]
+    fn using_does_not_fold_non_ascii_case() {
+        let def = make_def_with_named_joins(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![(Some("ÉTAPE"), "f", "a", vec!["dep_id"])],
+            vec![("departure_count", Some("f"), vec!["étape"])],
+        );
+        let err = validate_using_relationships(&def).unwrap_err().message;
+        assert!(err.contains("unknown relationship 'étape'"), "{err}");
+        // ...while the ASCII letters of the same name still fold.
+        let def = make_def_with_named_joins(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![(Some("ÉTAPE"), "f", "a", vec!["dep_id"])],
+            vec![("departure_count", Some("f"), vec!["Étape"])],
+        );
+        assert!(validate_using_relationships(&def).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // PR #249 review: legacy stored names and dot-qualified names.
+    // -------------------------------------------------------------------
+
+    /// A stored pair named `dep` and `"dep"` (accepted before #249) is resolved
+    /// by spelling first: `USING ("dep")` names the quoted relationship, which
+    /// originates from the metric's table. Taking the first identifier match
+    /// picked `dep` (from `c`) and rejected the metric.
+    #[test]
+    fn using_prefers_the_relationship_spelled_as_written() {
+        let def = make_def_with_named_joins(
+            vec![
+                ("f", "flights", vec!["id"]),
+                ("c", "carriers", vec!["id"]),
+                ("a", "airports", vec!["id"]),
+            ],
+            vec![
+                (Some("dep"), "c", "a", vec!["hub_id"]),
+                (Some("\"dep\""), "f", "a", vec!["dep_id"]),
+                (Some("f_to_c"), "f", "c", vec!["carrier_id"]),
+            ],
+            vec![("departure_count", Some("f"), vec!["\"dep\""])],
+        );
+        assert!(
+            validate_using_relationships(&def).is_ok(),
+            "{:?}",
+            validate_using_relationships(&def).err().map(|e| e.message)
+        );
+    }
+
+    /// `"x.y"` is one identifier containing a dot; `x.y` and `"x"."y"` are the
+    /// two-part identifier. `USING ("x"."y")` names `x.y` (from `f`), not the
+    /// first-declared `"x.y"` (from `c`), although both join to the string
+    /// `x.y` once normalized.
+    #[test]
+    fn using_keeps_identifier_part_boundaries() {
+        let def = make_def_with_named_joins(
+            vec![
+                ("f", "flights", vec!["id"]),
+                ("c", "carriers", vec!["id"]),
+                ("a", "airports", vec!["id"]),
+            ],
+            vec![
+                (Some("\"x.y\""), "c", "a", vec!["hub_id"]),
+                (Some("x.y"), "f", "a", vec!["dep_id"]),
+                (Some("f_to_c"), "f", "c", vec!["carrier_id"]),
+            ],
+            vec![("departure_count", Some("f"), vec!["\"x\".\"y\""])],
+        );
+        assert!(
+            validate_using_relationships(&def).is_ok(),
+            "{:?}",
+            validate_using_relationships(&def).err().map(|e| e.message)
+        );
+    }
+
+    /// A one-part `"x.y"` does not name the two-part `x.y`: DuckDB resolves
+    /// them as different identifiers, so the `USING` names no relationship.
+    #[test]
+    fn using_a_dotted_one_part_name_does_not_name_a_two_part_relationship() {
+        let def = make_def_with_named_joins(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![(Some("x.y"), "f", "a", vec!["dep_id"])],
+            vec![("departure_count", Some("f"), vec!["\"x.y\""])],
+        );
+        let err = validate_using_relationships(&def).unwrap_err().message;
+        assert!(err.contains("unknown relationship '\"x.y\"'"), "{err}");
     }
 }

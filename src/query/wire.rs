@@ -180,6 +180,80 @@ pub fn type_id_to_cast_sql(type_id: u32) -> Option<&'static str> {
     }
 }
 
+/// The type name `semantic_view()` declares for an output column whose probed
+/// C-API type id is `type_id`, spelled as `DuckDB` prints it (what `typeof()`
+/// returns for that column), or `None` for DECIMAL and LIST.
+///
+/// This mirrors `sv_logical_type_from_c_type_id` in `cpp/src/shim.cpp`, the map
+/// the C++ bind uses to declare `semantic_view()`'s output schema: HUGEINT /
+/// UHUGEINT are declared BIGINT / UBIGINT, ENUM / STRUCT / MAP and any id the
+/// map does not know are declared VARCHAR. DECIMAL and LIST are declared from a
+/// logical-type probe instead (width/scale, child type), so their name cannot
+/// come from the id alone — the caller reads it from the probed type.
+///
+/// It exists for the read-side member-type probe (TECH-DEBT #51): SHOW /
+/// DESCRIBE report the type `semantic_view()` returns, not the raw type of the
+/// expanded SQL, so a member's `data_type` always equals `typeof()` of its
+/// column. A change to the C++ map must be mirrored here;
+/// `member_types::tests::declared_type_names_match_typeof` and
+/// `test/sql/member_data_type.test` pin the agreement.
+#[must_use]
+#[allow(clippy::match_same_arms)]
+pub fn declared_type_name(type_id: u32) -> Option<&'static str> {
+    use ffi::{
+        DUCKDB_TYPE_DUCKDB_TYPE_BIGINT as BIGINT, DUCKDB_TYPE_DUCKDB_TYPE_BIT as BIT,
+        DUCKDB_TYPE_DUCKDB_TYPE_BLOB as BLOB, DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN as BOOLEAN,
+        DUCKDB_TYPE_DUCKDB_TYPE_DATE as DATE, DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL as DECIMAL,
+        DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE as DOUBLE, DUCKDB_TYPE_DUCKDB_TYPE_FLOAT as FLOAT,
+        DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT as HUGEINT, DUCKDB_TYPE_DUCKDB_TYPE_INTEGER as INTEGER,
+        DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL as INTERVAL, DUCKDB_TYPE_DUCKDB_TYPE_LIST as LIST,
+        DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT as SMALLINT, DUCKDB_TYPE_DUCKDB_TYPE_TIME as TIME,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP as TIMESTAMP,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS as TIMESTAMP_MS,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS as TIMESTAMP_NS,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S as TIMESTAMP_S,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ as TIMESTAMP_TZ,
+        DUCKDB_TYPE_DUCKDB_TYPE_TIME_TZ as TIME_TZ, DUCKDB_TYPE_DUCKDB_TYPE_TINYINT as TINYINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT as UBIGINT, DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT as UHUGEINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER as UINTEGER,
+        DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT as USMALLINT,
+        DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT as UTINYINT, DUCKDB_TYPE_DUCKDB_TYPE_UUID as UUID,
+        DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR as VARCHAR,
+    };
+
+    match type_id {
+        BOOLEAN => Some("BOOLEAN"),
+        TINYINT => Some("TINYINT"),
+        SMALLINT => Some("SMALLINT"),
+        INTEGER => Some("INTEGER"),
+        BIGINT | HUGEINT => Some("BIGINT"),
+        UTINYINT => Some("UTINYINT"),
+        USMALLINT => Some("USMALLINT"),
+        UINTEGER => Some("UINTEGER"),
+        UBIGINT | UHUGEINT => Some("UBIGINT"),
+        FLOAT => Some("FLOAT"),
+        DOUBLE => Some("DOUBLE"),
+        TIMESTAMP => Some("TIMESTAMP"),
+        DATE => Some("DATE"),
+        TIME => Some("TIME"),
+        INTERVAL => Some("INTERVAL"),
+        VARCHAR => Some("VARCHAR"),
+        BLOB => Some("BLOB"),
+        TIMESTAMP_S => Some("TIMESTAMP_S"),
+        TIMESTAMP_MS => Some("TIMESTAMP_MS"),
+        TIMESTAMP_NS => Some("TIMESTAMP_NS"),
+        TIMESTAMP_TZ => Some("TIMESTAMP WITH TIME ZONE"),
+        TIME_TZ => Some("TIME WITH TIME ZONE"),
+        UUID => Some("UUID"),
+        BIT => Some("BIT"),
+        // Declared from the probed logical type (width/scale, child type).
+        DECIMAL | LIST => None,
+        // ENUM, STRUCT, MAP, INVALID and every id the C++ map does not list
+        // (ARRAY, UNION, ...) are declared VARCHAR.
+        _ => Some("VARCHAR"),
+    }
+}
+
 /// Build the SQL used at execution time, wrapping the expanded SQL with explicit
 /// type casts for EVERY output column.
 ///

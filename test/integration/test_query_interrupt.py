@@ -40,6 +40,16 @@ least TARGET_BASELINE_S. Cost is scaled through the *expression* rather than the
 row count so the fact table stays small and the grouped result stays 256 rows —
 what is being timed is the inner aggregate, not result materialisation.
 
+The same holds for the metadata commands. Since TECH-DEBT #51, SHOW SEMANTIC
+DIMENSIONS / METRICS / FACTS, SHOW COLUMNS, SHOW SEMANTIC DIMENSIONS FOR METRIC
+and DESCRIBE SEMANTIC VIEW probe each view's member types at bind time, on the
+bind's own `Connection(*context.db)`. Pre-fix, a cancel neither reached a probe
+already running nor stopped the remaining ones, so a cross-view SHOW typed
+every view and only then reported INTERRUPT. The second half of this file
+asserts the same two properties for those binds, against a source whose BIND
+is slow: a `read_csv` over a list of globs, each of which scans the directory
+(and polls the probe connection's interrupt flag) when expanded.
+
 Usage:
     uv run test/integration/test_query_interrupt.py
 
@@ -214,6 +224,138 @@ def check(label, passed, detail):
     return passed
 
 
+# ---------------------------------------------------------------------------
+# Metadata binds (SHOW / DESCRIBE member-type probes, TECH-DEBT #51)
+# ---------------------------------------------------------------------------
+
+# Calibration for the slow-bind source: double the glob count until one
+# single-probe SHOW costs at least TARGET_BASELINE_S.
+START_GLOBS = 250
+MAX_GLOBS = 8000
+
+
+def build_slow_source(con, view, csv_dir, n):
+    """A view whose every bind expands `n` globs, one directory scan each."""
+    globs = ", ".join(f"'{csv_dir}/f{i}.cs?'" for i in range(n))
+    con.execute(
+        f"CREATE OR REPLACE VIEW {view} AS "
+        f"SELECT * FROM read_csv([{globs}], union_by_name = true)"
+    )
+
+
+def write_csvs(csv_dir, n):
+    for i in range(n):
+        path = csv_dir / f"f{i}.csv"
+        if not path.exists():
+            path.write_text("id,x\n1,2\n")
+
+
+def create_probe_view(con, name, source):
+    con.execute(f"DROP SEMANTIC VIEW IF EXISTS {name}")
+    con.execute(
+        f"""
+        CREATE SEMANTIC VIEW {name} AS
+          TABLES (s AS {source} PRIMARY KEY (id))
+          DIMENSIONS (s.x AS s.x)
+          METRICS (s.total AS sum(s.x))
+        """
+    )
+
+
+def run_metadata_probe_tests(con) -> bool:
+    import shutil
+    import tempfile
+
+    csv_dir = Path(tempfile.mkdtemp(prefix="sv_interrupt_"))
+    try:
+        return _run_metadata_probe_tests(con, csv_dir)
+    finally:
+        shutil.rmtree(csv_dir, ignore_errors=True)
+
+
+def _run_metadata_probe_tests(con, csv_dir) -> bool:
+    ok = True
+
+    print("\nCalibrating the slow-bind source for the metadata probes...")
+    n = START_GLOBS
+    one_sql = "SHOW SEMANTIC DIMENSIONS IN mp_one"
+    while True:
+        write_csvs(csv_dir, n)
+        build_slow_source(con, "mp_src", csv_dir, n)
+        create_probe_view(con, "mp_one", "mp_src")
+        baseline = time_query(con, one_sql)
+        print(f"  calibration: {n:>5} globs -> one-probe SHOW baseline {baseline:.2f}s")
+        if baseline >= TARGET_BASELINE_S or n >= MAX_GLOBS:
+            break
+        n *= 2
+
+    # One statement per bind helper the probes run under: the single-name SHOW,
+    # DESCRIBE, and the two-name DIMENSIONS FOR METRIC (a separate C++ helper).
+    single = [
+        ("SHOW SEMANTIC DIMENSIONS IN <view>", one_sql),
+        ("DESCRIBE SEMANTIC VIEW <view>", "DESCRIBE SEMANTIC VIEW mp_one"),
+        (
+            "SHOW SEMANTIC DIMENSIONS IN <view> FOR METRIC",
+            "SHOW SEMANTIC DIMENSIONS IN mp_one FOR METRIC total",
+        ),
+    ]
+    for label, sql in single:
+        ok &= check_interrupted_statement(con, label, sql)
+
+    # Cross-view: many views, each probe a fraction of the whole. The fix must
+    # stop between views, not type all of them first.
+    con.execute("DROP SEMANTIC VIEW mp_one")
+    per_probe_target = 0.15
+    # Each glob scans the whole directory (n files), so cost is linear in it.
+    small = max(10, int(n * per_probe_target / max(baseline, 0.01)))
+    build_slow_source(con, "mp_small", csv_dir, small)
+    create_probe_view(con, "mp_v0", "mp_small")
+    per_view = time_query(con, "SHOW SEMANTIC METRICS IN mp_v0")
+    views = min(200, max(8, int(2 * TARGET_BASELINE_S / max(per_view, 0.005)) + 1))
+    for i in range(1, views):
+        create_probe_view(con, f"mp_v{i}", "mp_small")
+    print(f"  cross-view: {views} views over {small} globs, ~{per_view:.2f}s per view")
+    ok &= check_interrupted_statement(con, "cross-view SHOW SEMANTIC METRICS", "SHOW SEMANTIC METRICS")
+
+    for i in range(views):
+        con.execute(f"DROP SEMANTIC VIEW mp_v{i}")
+    return ok
+
+
+def check_interrupted_statement(con, label, sql) -> bool:
+    """Time `sql` uninterrupted, then assert an interrupt stops it early and bare."""
+    baseline = time_query(con, sql)
+    limit = max(FIRE_AT_S + MIN_ABORT_SLACK_S, ABORT_FRACTION * baseline)
+    print(f"\n{label}: cancellation must stop the member-type probes")
+    ok = check(
+        "the abort limit still discriminates a regressed build",
+        limit <= VACUITY_MARGIN * baseline,
+        f"limit {limit:.2f}s <= {VACUITY_MARGIN:.0%} of baseline {baseline:.2f}s",
+    )
+    elapsed, err = run_interrupted(con, sql)
+    message = "" if err is None else str(err)
+    ok &= check(
+        "the statement raises rather than completing",
+        err is not None,
+        f"error={type(err).__name__ if err else 'None'} after {elapsed:.2f}s",
+    )
+    ok &= check(
+        "the statement stops early instead of probing to completion",
+        err is not None and elapsed < limit,
+        f"stopped after {elapsed:.2f}s (baseline {baseline:.2f}s, limit {limit:.2f}s)",
+    )
+    # Bare means an INTERRUPT carrying "Interrupted!", not wrapped in the
+    # "<function> failed: ..." BinderException every other bind failure gets.
+    # Raised from a bind, it carries the call's query location, as DuckDB's own
+    # table functions' bind-time interrupts do.
+    ok &= check(
+        "the error is a bare interrupt",
+        message.startswith("INTERRUPT Error: Interrupted!") and "failed:" not in message,
+        f"message={message!r}",
+    )
+    return ok
+
+
 def run_tests() -> int:
     ext_path = get_extension_path()
     if not ext_path.exists():
@@ -328,6 +470,8 @@ def run_tests() -> int:
         "SQL execution failed" not in message,
         f"message={message!r}",
     )
+
+    ok &= run_metadata_probe_tests(con)
 
     print("\nThe connection is still usable after the cancelled query")
     ok &= check(

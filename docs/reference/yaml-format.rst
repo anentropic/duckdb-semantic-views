@@ -304,7 +304,7 @@ Each entry in the ``dimensions`` list declares a named grouping expression.
      - string
      - No
      - null
-     - Table alias this dimension comes from. Used for join dependency resolution.
+     - Table alias this dimension comes from. Used for join dependency resolution. Must be an alias declared in ``tables`` (any case), also in a single-table view. Write it unquoted: a quoted alias such as ``'"O"'`` is accepted only in a single-table view (a known limitation).
    * - ``output_type``
      - string
      - No
@@ -379,7 +379,7 @@ Each entry in the ``metrics`` list declares a named aggregation, derived metric,
      - string
      - No
      - null
-     - Table alias. Present for base metrics, absent for derived metrics.
+     - Table alias. Present for base metrics, absent for derived metrics. Must be an alias declared in ``tables`` (any case), also in a single-table view. Write it unquoted: a quoted alias such as ``'"O"'`` is accepted only in a single-table view (a known limitation).
    * - ``output_type``
      - string
      - No
@@ -514,7 +514,7 @@ Each entry in the ``facts`` list declares a named row-level expression. Facts ca
      - null
      - **No longer accepted.** Write the cast into the expression instead
        (see the dimension table above). :ref:`SHOW SEMANTIC FACTS <ref-show-semantic-facts>`
-       reports an empty ``data_type`` for every newly created view as a result.
+       reports the expression's actual type without it.
    * - ``comment``
      - string
      - No
@@ -573,14 +573,14 @@ Each entry in the ``joins`` list declares a FK/PK relationship between tables. T
      - Target table alias (the table being joined to).
    * - ``from_alias``
      - string
-     - No
-     - ``""``
+     - Yes
+     -
      - Source table alias containing the FK columns.
    * - ``fk_columns``
      - list of string
-     - No
-     - ``[]``
-     - FK column names on the source table.
+     - Yes
+     -
+     - FK column names on the source table. At least one is required; ``CREATE`` rejects a relationship without any.
    * - ``ref_columns``
      - list of string
      - No
@@ -588,9 +588,9 @@ Each entry in the ``joins`` list declares a FK/PK relationship between tables. T
      - Referenced columns on the target table. Defaults to the target's primary key if omitted.
    * - ``name``
      - string
-     - No
-     - null
-     - Relationship name. Required for role-playing dimensions (``using_relationships``).
+     - Yes
+     -
+     - Relationship name, referenced by ``using_relationships`` for role-playing dimensions. Must be unique among the view's relationships, compared the way DuckDB compares identifiers (``r``, ``R`` and ``"r"`` are one name).
    * - ``cardinality``
      - string
      - No

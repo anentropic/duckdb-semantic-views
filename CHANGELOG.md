@@ -26,6 +26,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Snowflake rejects) may now fail with a "not found" error in queries where that table is
   no longer joined; qualify the column or define a fact on the other table.
   See *Metric grain* in the docs for the full rules.
+- **`CREATE SEMANTIC VIEW` rejects two relationships with the same name.** Relationship
+  names are one namespace per view, compared the way DuckDB compares identifiers, so `r`,
+  `R` and `"r"` are the same name. Two relationships sharing a name used to be accepted
+  unless both pointed at the same table, and `USING (r)` then silently meant whichever
+  was declared first. `CREATE` (and `CREATE … FROM YAML`) now fails with
+  `duplicate relationship name '<name>'`, naming both relationships. A role-playing pair
+  that repeats a name reports this error instead of the former "diamond" error. A name
+  keeps its parts: the quoted `"x.y"` is one identifier and a different name from the
+  two-part `x.y` (also spelled `"x"."y"`), and `USING` matches it the same way. Two
+  role-playing relationships to one table whose names differ only that way are rejected,
+  because both would be joined under the same alias. Views already stored keep loading,
+  and a `USING` in them keeps naming the relationship it named before, including in a
+  view that holds two relationships whose names differ only in quoting.
+- **`CREATE SEMANTIC VIEW` rejects a single-table member qualified by an undeclared
+  table alias.** In a view whose only table is `o`, a dimension or metric named
+  `x.foo` was accepted. It now fails with `unknown source table 'x'; did you mean 'o'?`,
+  the error a multi-table view already gave. An unqualified member, or one qualified by
+  the declared alias in any case or quoting (`o`, `O`, `"O"`), is still accepted. Views
+  already stored keep loading.
 
 ### Fixed
 
@@ -39,7 +58,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child members.
 - **Grouping a child-table metric by a child-table dimension no longer produces an extra
   `NULL` group** for parents with no children.
-
+- **`SHOW SEMANTIC DIMENSIONS` / `METRICS` / `FACTS`, `SHOW COLUMNS IN SEMANTIC VIEW`,
+  `SHOW SEMANTIC DIMENSIONS FOR METRIC` and `DESCRIBE SEMANTIC VIEW` report each member's
+  data type again.** The `data_type` column (and the `DATA_TYPE` rows of `DESCRIBE`) has been
+  empty for every view created since v0.10.0. It now reports the type the member's column
+  has in a `semantic_view()` query, in DuckDB's spelling: an aggregate's own type rather than
+  its input's (`COUNT` is `BIGINT`, `AVG` is `DOUBLE`, `SUM` of an integer column is `BIGINT`,
+  as the query returns it), for dimensions, facts, derived, window, semi-additive, PRIVATE
+  and role-played members alike. The type is worked out when the command runs, so it follows a source column
+  whose type changes after `CREATE`. A member whose source table or column no longer exists
+  reports an empty `data_type` instead of making the whole command fail. The cross-view forms
+  (`SHOW SEMANTIC METRICS` without `IN`) take about a millisecond or two longer per view.
+  Cancelling one of these commands (Ctrl-C, `interrupt()`, an ADBC cancel) stops the type
+  lookup promptly with an `INTERRUPT` error, rather than once every view has been typed.
+- **`SHOW SEMANTIC DIMENSIONS FOR METRIC` marks a window metric's dimensions `required` however
+  they are spelled.** A dimension named in the window's `ORDER BY` or `PARTITION BY [EXCLUDING]`
+  as `alias.name` (`ORDER BY s.placed`) or quoted in a different case (`ORDER BY "PLACED"`) was
+  reported `required = false`, although querying the metric without it fails.
 - **A `USING` metric can aggregate a fact on the role-playing table.** A metric such as
   `f.dep_elev USING (dep_airport) AS SUM(a.elev)`, where `elev` is a fact on the
   role-played `airports` table, used to fail with `Referenced table "a" not found`. It now
@@ -68,9 +103,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a quoted identifier (`"Dep Airport"`, or a name with an embedded `""`) used to make
   every query that went through it fail with a parser error.
 - **A table not connected to the base table is rejected at `CREATE`.** If the first table in
-  `TABLES` had no relationship, or the relationships formed two separate groups, the view
-  was accepted and every query failed with a binder error. `CREATE SEMANTIC VIEW` now
-  rejects the definition and names the unreachable table.
+  `TABLES` had no relationship, the relationships formed two separate groups, or the view
+  listed several tables with no `RELATIONSHIPS` at all, the view was accepted and every
+  query that needed an unconnected table failed with a binder error. `CREATE SEMANTIC VIEW`
+  (and `CREATE … FROM YAML`) now rejects the definition and names the unreachable table.
+  Views already stored keep loading. When several tables are unconnected, the error now
+  names the same one every time.
+- **A YAML relationship without `fk_columns` is rejected at `CREATE`.** It used to be
+  accepted, and every query on the view then failed with a misleading "legacy
+  definition format" error.
+- **Relationship names match the way DuckDB matches identifiers.** A relationship declared
+  quoted (`"Dep_Airport"`) is now named by `USING (dep_airport)`, and the converse; both
+  used to be rejected as an unknown relationship. Two role-playing relationships named
+  `dep` and `"dep"` are now rejected as a duplicate name, as `dep` and `DEP` already were.
 
 ## [0.13.0] - 2026-09-30
 

@@ -21,7 +21,7 @@
 //! both for every metric these tests declare.
 //!
 //! The guard is still load-bearing on the shapes that keep the base-anchored
-//! path for a child metric (TECH-DEBT #81). The values below are measured on
+//! path for a child metric (TECH-DEBT #82). The values below are measured on
 //! one of them — a request grouped by `region_u`, the same `o.region` declared
 //! WITHOUT a source table, which only YAML / legacy JSON can produce and which
 //! is never re-anchored because its binding would move with the FROM. So the

@@ -99,7 +99,7 @@ East	2
 West	1
 
 # The CountStarRequiresPrimaryKey error is still live on the paths that stay
-# base-anchored (TECH-DEBT #81). None of them is reachable from this DDL shape
+# base-anchored (TECH-DEBT #82). None of them is reachable from this DDL shape
 # -- the remaining one for a plain metric, an unqualified dimension, exists only
 # in legacy stored JSON, since both DDL and YAML now require every dimension to
 # name its table -- so that error is pinned by the unit tests

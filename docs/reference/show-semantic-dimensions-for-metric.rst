@@ -90,7 +90,7 @@ Returns one row per reachable dimension with 4 columns:
      - The dimension name.
    * - ``data_type``
      - VARCHAR
-     - The **declared** output type. Empty for every view created since v0.10.0 -- no surface can declare a type and nothing infers one. Populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+     - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``required``
      - BOOLEAN
      - ``TRUE`` if the dimension is referenced in a window metric's ``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY`` clause (meaning it must be included in the query for that metric). ``FALSE`` for all other dimensions and for non-window metrics.
@@ -143,13 +143,13 @@ Examples
    ┌────────────┬─────────┬───────────┬──────────┐
    │ table_name │ name    │ data_type │ required │
    ├────────────┼─────────┼───────────┼──────────┤
-   │ sales      │ product │           │ false    │
-   │ sales      │ region  │           │ false    │
+   │ sales      │ product │ VARCHAR   │ false    │
+   │ sales      │ region  │ VARCHAR   │ false    │
    └────────────┴─────────┴───────────┴──────────┘
 
 With a single table, there are no joins, so every dimension is safe for every metric.
 
-``data_type`` is empty here, and in every example below, because no surface can declare a member's output type: the SQL DDL has no clause for it, and the YAML ``output_type`` field was withdrawn because :ref:`GET_DDL <ref-get-ddl>` could not carry it (a restored view silently lost the cast). Nothing infers one either -- v0.10.0 removed the define-time inference pass -- so the column is populated only for views stored before that release. See :ref:`Reported Data Types <explanation-sf-data-types>`.
+The example tables use ``VARCHAR`` text columns, ``DATE`` dates, ``INTEGER`` quantities and ``DECIMAL(10,2)`` amounts and prices. ``data_type`` is each member's type as a query returns it -- an aggregate's own type, not its input's: ``COUNT`` is ``BIGINT``, ``SUM`` of a ``DECIMAL(10,2)`` is ``DECIMAL(38,2)``, and a ratio of two metrics is ``DOUBLE``. See :ref:`Reported Data Types <explanation-sf-data-types>`.
 
 **Multi-table view with fan trap filtering:**
 
@@ -188,8 +188,8 @@ For ``order_total`` (source table: ``orders``), the path to ``customers`` is man
    ┌────────────┬──────────────────┬───────────┬──────────┐
    │ table_name │ name             │ data_type │ required │
    ├────────────┼──────────────────┼───────────┼──────────┤
-   │ customers  │ customer_country │           │ false    │
-   │ customers  │ customer_name    │           │ false    │
+   │ customers  │ customer_country │ VARCHAR   │ false    │
+   │ customers  │ customer_name    │ VARCHAR   │ false    │
    └────────────┴──────────────────┴───────────┴──────────┘
 
 For ``line_item_sum`` (source table: ``line_items``), the path from ``line_items`` to ``orders`` to ``customers`` is all many-to-one (safe), and ``item_qty`` is on the same table. All three dimensions are included:
@@ -203,9 +203,9 @@ For ``line_item_sum`` (source table: ``line_items``), the path from ``line_items
    ┌────────────┬──────────────────┬───────────┬──────────┐
    │ table_name │ name             │ data_type │ required │
    ├────────────┼──────────────────┼───────────┼──────────┤
-   │ customers  │ customer_country │           │ false    │
-   │ customers  │ customer_name    │           │ false    │
-   │ line_items │ item_qty         │           │ false    │
+   │ customers  │ customer_country │ VARCHAR   │ false    │
+   │ customers  │ customer_name    │ VARCHAR   │ false    │
+   │ line_items │ item_qty         │ INTEGER   │ false    │
    └────────────┴──────────────────┴───────────┴──────────┘
 
 **Window metric with required dimensions:**
@@ -237,9 +237,9 @@ When querying dimensions for a window function metric, the ``required`` column i
    ┌────────────┬────────┬───────────┬──────────┐
    │ table_name │ name   │ data_type │ required │
    ├────────────┼────────┼───────────┼──────────┤
-   │ orders     │ month  │           │ true     │
-   │ orders     │ region │           │ true     │
-   │ orders     │ status │           │ false    │
+   │ orders     │ month  │ DATE      │ true     │
+   │ orders     │ region │ VARCHAR   │ true     │
+   │ orders     │ status │ VARCHAR   │ false    │
    └────────────┴────────┴───────────┴──────────┘
 
 In this example, ``region`` is required because it appears in ``EXCLUDING`` (it defines the partition boundary), and ``month`` is required because it appears in ``ORDER BY`` (it defines the window ordering). The ``status`` dimension is optional -- it can be included in the query but is not referenced by the window specification.
@@ -283,7 +283,7 @@ After fan trap filtering, narrow results further by name pattern. ``LIKE`` is ca
    ┌────────────┬────────┬───────────┬──────────┐
    │ table_name │ name   │ data_type │ required │
    ├────────────┼────────┼───────────┼──────────┤
-   │ customers  │ region │           │ false    │
+   │ customers  │ region │ VARCHAR   │ false    │
    └────────────┴────────┴───────────┴──────────┘
 
 ``STARTS WITH`` is case-sensitive:
@@ -297,7 +297,7 @@ After fan trap filtering, narrow results further by name pattern. ``LIKE`` is ca
    ┌────────────┬───────────────┬───────────┬──────────┐
    │ table_name │ name          │ data_type │ required │
    ├────────────┼───────────────┼───────────┼──────────┤
-   │ customers  │ customer_name │           │ false    │
+   │ customers  │ customer_name │ VARCHAR   │ false    │
    └────────────┴───────────────┴───────────┴──────────┘
 
 ``LIMIT`` applies after the rows are sorted by dimension name:
@@ -311,9 +311,9 @@ After fan trap filtering, narrow results further by name pattern. ``LIKE`` is ca
    ┌────────────┬───────────────┬───────────┬──────────┐
    │ table_name │ name          │ data_type │ required │
    ├────────────┼───────────────┼───────────┼──────────┤
-   │ customers  │ customer_name │           │ false    │
-   │ orders     │ order_date    │           │ false    │
-   │ customers  │ region        │           │ false    │
+   │ customers  │ customer_name │ VARCHAR   │ false    │
+   │ orders     │ order_date    │ DATE      │ false    │
+   │ customers  │ region        │ VARCHAR   │ false    │
    └────────────┴───────────────┴───────────┴──────────┘
 
 **Derived metrics inherit source tables:**
@@ -343,7 +343,7 @@ After fan trap filtering, narrow results further by name pattern. ``LIKE`` is ca
    ┌────────────┬───────────────┬───────────┬──────────┐
    │ table_name │ name          │ data_type │ required │
    ├────────────┼───────────────┼───────────┼──────────┤
-   │ customers  │ customer_name │           │ false    │
+   │ customers  │ customer_name │ VARCHAR   │ false    │
    └────────────┴───────────────┴───────────┴──────────┘
 
 The derived metric ``double_total`` depends on ``order_total`` (source: ``orders``). The extension traces this dependency and applies the same reachability rules as if querying ``order_total`` directly.

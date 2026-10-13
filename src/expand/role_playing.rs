@@ -330,17 +330,21 @@ pub(super) fn check_member_fact_role_playing_path(
             // the metric's USING names exactly one relationship to it — the
             // same name match the join resolver uses to emit the scoped join.
             if fact_table == rp {
-                let mut roles: Vec<String> = Vec::new();
+                // Distinct by the EDGE each spelling names
+                // (`graph::RelNameMatch`), so `dep`, `DEP` and `"dep"` are one
+                // role of a view that declares one of them, and two roles of a
+                // view stored before #249 that declares `dep` AND `"dep"`.
+                let mut roles: Vec<&crate::model::Join> = Vec::new();
                 for rel in &base.using_relationships {
-                    let rel_lower = rel.to_ascii_lowercase();
-                    let targets_rp = def.joins.iter().any(|j| {
-                        j.name
-                            .as_ref()
-                            .is_some_and(|n| n.to_ascii_lowercase() == rel_lower)
-                            && j.table.to_ascii_lowercase() == rp
-                    });
-                    if targets_rp && !roles.contains(&rel_lower) {
-                        roles.push(rel_lower);
+                    let m = crate::graph::RelNameMatch::new(&def.joins, rel);
+                    let edge = def
+                        .joins
+                        .iter()
+                        .find(|j| m.matches_join(j) && j.table.to_ascii_lowercase() == rp);
+                    if let Some(edge) = edge {
+                        if !roles.iter().any(|r| std::ptr::eq(*r, edge)) {
+                            roles.push(edge);
+                        }
                     }
                 }
                 if roles.len() == 1 {
@@ -399,42 +403,42 @@ pub(super) fn find_using_context(
 
     // Multiple relationships -> role-playing table. Look for USING context.
     // Collect all USING relationships from co-queried metrics that target this table.
-    let mut using_rels_for_table: Vec<String> = Vec::new();
+    // (edge, spelling as written): deduplicated by the EDGE the spelling names
+    // (`graph::RelNameMatch`), and the alias built from the written spelling —
+    // `scoped_join_alias` normalizes it. By edge, so `dep` and `"dep"` are one
+    // role of a view declaring one of them, and two roles of a view stored
+    // before #249 that declares both (which was ambiguous then too).
+    let mut using_rels_for_table: Vec<(&crate::model::Join, String)> = Vec::new();
+    let mut note_using = |using_rel: &str| {
+        let m = crate::graph::RelNameMatch::new(&def.joins, using_rel);
+        let edge = def
+            .joins
+            .iter()
+            .find(|j| m.matches_join(j) && j.table.to_ascii_lowercase() == dim_table_lower);
+        if let Some(edge) = edge {
+            if !using_rels_for_table
+                .iter()
+                .any(|(e, _)| std::ptr::eq(*e, edge))
+            {
+                using_rels_for_table.push((edge, using_rel.to_string()));
+            }
+        }
+    };
     for met in resolved_mets {
         for using_rel in &met.using_relationships {
-            // Check if this USING relationship targets our dimension's table
-            let using_rel_lower = using_rel.to_ascii_lowercase();
-            let targets_our_table = def.joins.iter().any(|j| {
-                j.name
-                    .as_ref()
-                    .is_some_and(|n| n.to_ascii_lowercase() == using_rel_lower)
-                    && j.table.to_ascii_lowercase() == dim_table_lower
-            });
-            if targets_our_table && !using_rels_for_table.contains(&using_rel_lower) {
-                using_rels_for_table.push(using_rel_lower);
-            }
+            note_using(using_rel);
         }
         // Also check derived metrics: walk their transitive dependencies
         if met.source_table.is_none() {
-            let transitive_using = collect_derived_metric_using(met, &def.metrics);
-            for using_rel in transitive_using {
-                let using_rel_lower = using_rel.to_ascii_lowercase();
-                let targets_our_table = def.joins.iter().any(|j| {
-                    j.name
-                        .as_ref()
-                        .is_some_and(|n| n.to_ascii_lowercase() == using_rel_lower)
-                        && j.table.to_ascii_lowercase() == dim_table_lower
-                });
-                if targets_our_table && !using_rels_for_table.contains(&using_rel_lower) {
-                    using_rels_for_table.push(using_rel_lower);
-                }
+            for using_rel in collect_derived_metric_using(met, &def.metrics) {
+                note_using(&using_rel);
             }
         }
     }
 
     if using_rels_for_table.len() == 1 {
         // Exactly one USING path disambiguates -> return scoped alias
-        let scoped = scoped_join_alias(&dim_table_lower, &using_rels_for_table[0]);
+        let scoped = scoped_join_alias(&dim_table_lower, &using_rels_for_table[0].1);
         Ok(Some(scoped))
     } else if using_rels_for_table.is_empty() && !is_role_playing_target(def, &dim_table_lower) {
         // Multiple inbound relationships but each from a DIFFERENT source
