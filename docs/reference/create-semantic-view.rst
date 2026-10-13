@@ -254,6 +254,7 @@ Cardinality is used for :ref:`fan trap detection <howto-fan-traps>`.
 - Cycles are rejected: ``cycle detected in relationships: a -> b -> a``.
 - Several named relationships from the **same** source table to the same target are allowed. This is the role-playing pattern (``dep_airport`` and ``arr_airport`` from ``flights`` to ``airports``); pick the path per metric with ``USING``.
 - One target reached from two **different** source tables is a diamond, and is rejected whatever the relationships are named: ``diamond: 's' is reachable from multiple tables ('a', 'b'); the join path is ambiguous.`` To model it, declare the shared table twice under two aliases, one per path, so each is joined once.
+- Relationship names must be unique within the view, whichever tables the relationships connect. Names are compared the way DuckDB compares identifiers (case-insensitively, quoted or not), so ``route`` and ``"ROUTE"`` are the same name: ``duplicate relationship name 'route'``. A role-playing pair that repeats a name gets this error too.
 - Self-references (``from_alias`` equals ``to_alias``) are rejected.
 - Every table must be reachable from the base table (the first table in ``TABLES``) through some chain of relationships, in either direction. An orphan table (declared in ``TABLES`` but not connected by any relationship), a base table with no relationship, two separate groups of related tables, and several tables with no ``RELATIONSHIPS`` clause at all are all rejected, naming the table that cannot be reached. A single-table view needs no relationships.
 
@@ -330,6 +331,7 @@ Declares named grouping expressions available for queries.
 
 - Dimension names must be unique within the view (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). For example, ``region`` and ``Region`` cannot both appear in the same ``DIMENSIONS`` clause. See :ref:`ref-err-name-uniqueness`.
 - A dimension name cannot collide with any metric name (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). See :ref:`ref-err-name-uniqueness`.
+- The table alias that qualifies the dimension name must be declared in ``TABLES``, in any case or quoting (``o``, ``O`` or ``"O"`` for alias ``o``). This applies to a single-table view too: ``x.foo`` in a view whose only table is ``o`` is rejected with ``unknown source table 'x'; did you mean 'o'?``. Metrics follow the same rule.
 
 **Reported data type:**
 

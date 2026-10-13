@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`CREATE SEMANTIC VIEW` rejects two relationships with the same name.** Relationship
+  names are one namespace per view, compared the way DuckDB compares identifiers, so `r`,
+  `R` and `"r"` are the same name. Two relationships sharing a name used to be accepted
+  unless both pointed at the same table, and `USING (r)` then silently meant whichever
+  was declared first. `CREATE` (and `CREATE … FROM YAML`) now fails with
+  `duplicate relationship name '<name>'`, naming both relationships. A role-playing pair
+  that repeats a name reports this error instead of the former "diamond" error. Views
+  already stored keep loading.
+- **`CREATE SEMANTIC VIEW` rejects a single-table member qualified by an undeclared
+  table alias.** In a view whose only table is `o`, a dimension or metric named
+  `x.foo` was accepted. It now fails with `unknown source table 'x'; did you mean 'o'?`,
+  the error a multi-table view already gave. An unqualified member, or one qualified by
+  the declared alias in any case or quoting (`o`, `O`, `"O"`), is still accepted. Views
+  already stored keep loading.
+
 ### Fixed
 
 - **A `USING` metric can aggregate a fact on the role-playing table.** A metric such as

@@ -212,6 +212,12 @@ Graph validation errors
    relationship '<name>' from '<alias>' to '<alias>' declares no foreign-key columns;
    the form is 'rel_name AS from_alias(fk_cols) REFERENCES to_alias'
 
+   duplicate relationship name '<name>': '<name>' (<from> -> <to>) and '<other>'
+   (<from> -> <to>) name the same relationship; relationship names must be unique
+   within a semantic view (compared case-insensitively, quoted or not)
+
+   unknown source table '<alias>'; did you mean '<suggestion>'?
+
 **Cause:** The relationship graph violates tree structure requirements.
 
 **Fix:**
@@ -222,6 +228,8 @@ Graph validation errors
 - **Orphan:** Add a relationship that connects the table, or remove it from ``TABLES``.
 - **Not connected / not reachable:** Every table must be reachable from the first table in ``TABLES``. Add the missing relationship, or remove the table. A view that lists several tables but no ``RELATIONSHIPS`` at all gets the base-table form of this error.
 - **No foreign-key columns:** A YAML ``joins`` entry needs ``fk_columns`` (the DDL form always has them).
+- **Duplicate relationship name:** Two relationships share a name. Names are compared the way DuckDB compares identifiers, so ``route``, ``ROUTE`` and ``"route"`` are one name, whichever tables the relationships connect. Rename one of them. Before this check, ``USING`` silently used the first relationship with the name. Views stored before the check keep loading and keep that behaviour.
+- **Unknown source table:** A dimension or metric is qualified by a table alias that ``TABLES`` does not declare, such as ``x.foo`` when the only table is ``o``. This applies to single-table views too. Qualify the member with a declared alias, in any case or quoting.
 
 
 Key missing on a relationship target

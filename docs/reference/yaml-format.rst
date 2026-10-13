@@ -304,7 +304,7 @@ Each entry in the ``dimensions`` list declares a named grouping expression.
      - string
      - No
      - null
-     - Table alias this dimension comes from. Used for join dependency resolution.
+     - Table alias this dimension comes from. Used for join dependency resolution. Must be an alias declared in ``tables`` (any case or quoting), also in a single-table view.
    * - ``output_type``
      - string
      - No
@@ -379,7 +379,7 @@ Each entry in the ``metrics`` list declares a named aggregation, derived metric,
      - string
      - No
      - null
-     - Table alias. Present for base metrics, absent for derived metrics.
+     - Table alias. Present for base metrics, absent for derived metrics. Must be an alias declared in ``tables`` (any case or quoting), also in a single-table view.
    * - ``output_type``
      - string
      - No
@@ -590,7 +590,7 @@ Each entry in the ``joins`` list declares a FK/PK relationship between tables. T
      - string
      - Yes
      -
-     - Relationship name, referenced by ``using_relationships`` for role-playing dimensions.
+     - Relationship name, referenced by ``using_relationships`` for role-playing dimensions. Must be unique among the view's relationships, compared the way DuckDB compares identifiers (``r``, ``R`` and ``"r"`` are one name).
    * - ``cardinality``
      - string
      - No
