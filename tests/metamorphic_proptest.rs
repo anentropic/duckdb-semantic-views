@@ -383,12 +383,40 @@ struct Names {
     rels: Vec<String>,
     /// The style each name was drawn with — the anti-vacuity guards read this.
     styles: Vec<Style>,
-    /// When set, every role-naming metric spells its relationship TWICE in
-    /// `USING`, the second time case-flipped (`USING (r_dep, R_DEP)`). Both
-    /// spellings name one relationship — validation folds case — so the
-    /// numbers must not move (PR #247 review: the fact rewrite counted
-    /// spellings, not relationships, and left the fact on the unjoined alias).
-    dup_using: bool,
+    /// How every role-naming metric spells its relationship in `USING` — as
+    /// declared, or as another spelling of the same identifier (see
+    /// [`UsingSpelling`]). Every spelling names one relationship, so the
+    /// numbers must not move.
+    using_spelling: UsingSpelling,
+}
+
+/// The `USING` spellings of one relationship. All of them denote the same
+/// identifier under DuckDB's rule (quotes stripped, ASCII case folded), so
+/// each must bind the same role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsingSpelling {
+    /// `USING (r_dep)`, exactly as declared.
+    AsDeclared,
+    /// `USING (r_dep, R_DEP)` — PR #247 review: the fact rewrite counted
+    /// spellings, not relationships, and left the fact on the unjoined alias.
+    TwiceCaseFlipped,
+    /// `USING (r_dep, "R_DEP")` — the second spelling also differs in QUOTING.
+    TwiceRequoted,
+    /// `USING ("R_DEP")` against a bare `r_dep` declaration, the ONLY spelling.
+    /// Every site that found the relationship by ASCII-lowercase spelling
+    /// (join resolver, role-playing fence, fact rewrite, per-grain path) missed
+    /// it, because the quote characters stayed part of the compared text.
+    Requoted,
+}
+
+impl UsingSpelling {
+    fn is_respelled(self) -> bool {
+        self != UsingSpelling::AsDeclared
+    }
+
+    fn requotes(self) -> bool {
+        matches!(self, UsingSpelling::TwiceRequoted | UsingSpelling::Requoted)
+    }
 }
 
 impl Names {
@@ -408,9 +436,15 @@ fn arb_names() -> impl Strategy<Value = Names> {
         // from all five styles. r_dep / r_arr were held to bare/upper while
         // MM-2 (TECH-DEBT #70) made a quoted role name emit unparseable SQL.
         (arb_style(), arb_style(), arb_style(), arb_style()),
-        any::<bool>(),
+        (any::<bool>(), any::<bool>()),
     )
-        .prop_map(|(t, d, m, dv, f, (rl, rd, ra, rc), dup_using)| {
+        .prop_map(|(t, d, m, dv, f, (rl, rd, ra, rc), (twice, requote))| {
+            let using_spelling = match (twice, requote) {
+                (false, false) => UsingSpelling::AsDeclared,
+                (true, false) => UsingSpelling::TwiceCaseFlipped,
+                (true, true) => UsingSpelling::TwiceRequoted,
+                (false, true) => UsingSpelling::Requoted,
+            };
             let rel_styles = vec![rl, rd, ra, rc];
             let mut styles = Vec::new();
             styles.extend(&t);
@@ -451,7 +485,7 @@ fn arb_names() -> impl Strategy<Value = Names> {
                     .map(|(s, stem)| s.apply(stem))
                     .collect(),
                 styles,
-                dup_using,
+                using_spelling,
             }
         })
 }
@@ -467,12 +501,24 @@ fn case_flipped(rel: &str) -> String {
     }
 }
 
-/// The `USING` list a role-naming metric declares for relationship `rel`.
-fn using_list(rel: &str, dup_using: bool) -> Vec<String> {
-    if dup_using {
-        vec![rel.to_string(), case_flipped(rel)]
+/// [`case_flipped`], and additionally wrapped in double quotes when `rel` is
+/// declared unquoted: `r_dep` -> `"R_DEP"`. (A quoted declaration keeps its
+/// quotes — `"r_dep x"` has no unquoted spelling — and is only case-flipped.)
+fn requoted(rel: &str) -> String {
+    if rel.starts_with('"') {
+        case_flipped(rel)
     } else {
-        vec![rel.to_string()]
+        format!("\"{}\"", case_flipped(rel))
+    }
+}
+
+/// The `USING` list a role-naming metric declares for relationship `rel`.
+fn using_list(rel: &str, spelling: UsingSpelling) -> Vec<String> {
+    match spelling {
+        UsingSpelling::AsDeclared => vec![rel.to_string()],
+        UsingSpelling::TwiceCaseFlipped => vec![rel.to_string(), case_flipped(rel)],
+        UsingSpelling::TwiceRequoted => vec![rel.to_string(), requoted(rel)],
+        UsingSpelling::Requoted => vec![requoted(rel)],
     }
 }
 
@@ -872,8 +918,8 @@ fn build_def(names: &Names, chain: Option<&Chain>) -> SemanticViewDefinition {
                 .to_string(),
             ),
             using_relationships: match bm.role {
-                Some(Role::Dep) => using_list(&names.rels[1], names.dup_using),
-                Some(Role::Arr) => using_list(&names.rels[2], names.dup_using),
+                Some(Role::Dep) => using_list(&names.rels[1], names.using_spelling),
+                Some(Role::Arr) => using_list(&names.rels[2], names.using_spelling),
                 None => vec![],
             },
             ..Default::default()
@@ -2098,7 +2144,7 @@ fn generator_varies_the_using_spellings() {
     let cases = sample(&arb_algebra_case(), 256);
     let dup = cases
         .iter()
-        .filter(|c| c.role.is_some() && c.names.dup_using)
+        .filter(|c| c.role.is_some() && c.names.using_spelling.is_respelled())
         .count();
     assert!(
         dup >= 16,
@@ -2107,11 +2153,44 @@ fn generator_varies_the_using_spellings() {
     let rollups = sample(&arb_rollup_case(), 256);
     let r_dup = rollups
         .iter()
-        .filter(|c| c.names.dup_using && c.metrics.iter().any(|&i| BASE_METRICS[i].role.is_some()))
+        .filter(|c| {
+            c.names.using_spelling.is_respelled()
+                && c.metrics.iter().any(|&i| BASE_METRICS[i].role.is_some())
+        })
         .count();
     assert!(
         r_dup >= 16,
         "only {r_dup}/256 roll-up cases queried a role metric with USING spelled twice"
+    );
+}
+
+/// The quoting half of the spelling axis: a `USING` entry that differs from
+/// an UNQUOTED declaration in quoting (`r_dep` named as `"R_DEP"`) must be
+/// drawn on role-naming cases, alone and alongside the declared spelling. That
+/// is the only cell where ASCII-lowercase relationship matching and DuckDB's
+/// identifier rule disagree on an ASCII name (TECH-DEBT #28 relationship-name
+/// sites).
+#[test]
+fn generator_requotes_an_unquoted_role_name() {
+    let cases = sample(&arb_algebra_case(), 256);
+    let requoted = |only: bool| {
+        cases
+            .iter()
+            .filter(|c| {
+                let rel = match c.role {
+                    Some(Role::Dep) => &c.names.rels[1],
+                    Some(Role::Arr) => &c.names.rels[2],
+                    None => return false,
+                };
+                let sp = c.names.using_spelling;
+                !rel.starts_with('"') && sp.requotes() && (sp == UsingSpelling::Requoted) == only
+            })
+            .count()
+    };
+    let (alone, paired) = (requoted(true), requoted(false));
+    assert!(
+        alone >= 4 && paired >= 4,
+        "requoted an unquoted role name in only {alone} (alone) / {paired} (paired) of 256 algebra cases"
     );
 }
 
@@ -2122,7 +2201,14 @@ fn generator_varies_the_using_spellings() {
 /// role-playing fence), and a plain role-scoped metric.
 #[test]
 fn generator_reaches_the_declaration_order_cells() {
-    let cases = sample(&arb_order_case(), 256);
+    // 512 samples, not 256: adding the `USING` quoting axis reshuffled the
+    // deterministic sample, and the window-over-a-USING-metric cell — whose
+    // long-run rate is about 5% before and after that change (measured over
+    // 1024 samples: 55 vs 50 accepted, same ~23% acceptance) — fell to 13/256
+    // under a bar of 16. The old bar sat above the cell's own rate and held
+    // only by the luck of one sample. The other three cells keep their old
+    // rate (doubled count).
+    let cases = sample(&arb_order_case(), 512);
     let accepted = |c: &OrderCase| {
         let metrics: Vec<String> = match c.window {
             Some(_) => vec![WIN.to_string()],
@@ -2137,8 +2223,8 @@ fn generator_reaches_the_declaration_order_cells() {
         .filter(|c| c.window.is_some_and(is_role_metric) && accepted(c))
         .count();
     assert!(
-        win_role >= 16,
-        "only {win_role}/256 accepted cases put a window over a USING metric"
+        win_role >= 20,
+        "only {win_role}/512 accepted cases put a window over a USING metric"
     );
     let win_role_fact = cases
         .iter()
@@ -2149,8 +2235,8 @@ fn generator_reaches_the_declaration_order_cells() {
         })
         .count();
     assert!(
-        win_role_fact >= 4,
-        "only {win_role_fact}/256 accepted cases put a window over a USING metric \
+        win_role_fact >= 8,
+        "only {win_role_fact}/512 accepted cases put a window over a USING metric \
          over the role-played fact"
     );
     let on_ap =
@@ -2164,8 +2250,8 @@ fn generator_reaches_the_declaration_order_cells() {
         })
         .count();
     assert!(
-        ap_one_to_one >= 16,
-        "only {ap_one_to_one}/256 cases queried a metric on the role-played table \
+        ap_one_to_one >= 32,
+        "only {ap_one_to_one}/512 cases queried a metric on the role-played table \
          under OneToOne"
     );
     let plain_role = cases
@@ -2175,8 +2261,8 @@ fn generator_reaches_the_declaration_order_cells() {
         })
         .count();
     assert!(
-        plain_role >= 16,
-        "only {plain_role}/256 accepted cases queried a role-scoped metric directly"
+        plain_role >= 32,
+        "only {plain_role}/512 accepted cases queried a role-scoped metric directly"
     );
 }
 
@@ -2320,7 +2406,7 @@ fn fixed_names() -> Names {
         facts: FACT_STEMS.iter().map(ToString::to_string).collect(),
         rels: REL_STEMS.iter().map(ToString::to_string).collect(),
         styles,
-        dup_using: false,
+        using_spelling: UsingSpelling::AsDeclared,
     }
 }
 

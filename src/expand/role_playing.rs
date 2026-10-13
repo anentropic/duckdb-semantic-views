@@ -332,15 +332,17 @@ pub(super) fn check_member_fact_role_playing_path(
             if fact_table == rp {
                 let mut roles: Vec<String> = Vec::new();
                 for rel in &base.using_relationships {
-                    let rel_lower = rel.to_ascii_lowercase();
+                    // Keyed by the normalized identifier, so `dep`, `DEP` and
+                    // `"dep"` are one role (DuckDB identifier rule).
+                    let rel_key = crate::ident::normalize_ident_part(rel);
                     let targets_rp = def.joins.iter().any(|j| {
                         j.name
                             .as_ref()
-                            .is_some_and(|n| n.to_ascii_lowercase() == rel_lower)
+                            .is_some_and(|n| crate::ident::ident_matches(n, rel))
                             && j.table.to_ascii_lowercase() == rp
                     });
-                    if targets_rp && !roles.contains(&rel_lower) {
-                        roles.push(rel_lower);
+                    if targets_rp && !roles.contains(&rel_key) {
+                        roles.push(rel_key);
                     }
                 }
                 if roles.len() == 1 {
@@ -399,34 +401,46 @@ pub(super) fn find_using_context(
 
     // Multiple relationships -> role-playing table. Look for USING context.
     // Collect all USING relationships from co-queried metrics that target this table.
-    let mut using_rels_for_table: Vec<String> = Vec::new();
+    // (normalized key, spelling as written): deduplicated by key, and the alias
+    // built from the written spelling — `scoped_join_alias` normalizes it.
+    let mut using_rels_for_table: Vec<(String, String)> = Vec::new();
     for met in resolved_mets {
         for using_rel in &met.using_relationships {
-            // Check if this USING relationship targets our dimension's table
-            let using_rel_lower = using_rel.to_ascii_lowercase();
+            // Check if this USING relationship targets our dimension's table.
+            // Keyed by the normalized identifier (DuckDB rule), which is also
+            // what `scoped_join_alias` builds the alias from.
+            let using_rel_key = crate::ident::normalize_ident_part(using_rel);
             let targets_our_table = def.joins.iter().any(|j| {
                 j.name
                     .as_ref()
-                    .is_some_and(|n| n.to_ascii_lowercase() == using_rel_lower)
+                    .is_some_and(|n| crate::ident::ident_matches(n, using_rel))
                     && j.table.to_ascii_lowercase() == dim_table_lower
             });
-            if targets_our_table && !using_rels_for_table.contains(&using_rel_lower) {
-                using_rels_for_table.push(using_rel_lower);
+            if targets_our_table
+                && !using_rels_for_table
+                    .iter()
+                    .any(|(k, _)| *k == using_rel_key)
+            {
+                using_rels_for_table.push((using_rel_key, using_rel.clone()));
             }
         }
         // Also check derived metrics: walk their transitive dependencies
         if met.source_table.is_none() {
             let transitive_using = collect_derived_metric_using(met, &def.metrics);
             for using_rel in transitive_using {
-                let using_rel_lower = using_rel.to_ascii_lowercase();
+                let using_rel_key = crate::ident::normalize_ident_part(&using_rel);
                 let targets_our_table = def.joins.iter().any(|j| {
                     j.name
                         .as_ref()
-                        .is_some_and(|n| n.to_ascii_lowercase() == using_rel_lower)
+                        .is_some_and(|n| crate::ident::ident_matches(n, &using_rel))
                         && j.table.to_ascii_lowercase() == dim_table_lower
                 });
-                if targets_our_table && !using_rels_for_table.contains(&using_rel_lower) {
-                    using_rels_for_table.push(using_rel_lower);
+                if targets_our_table
+                    && !using_rels_for_table
+                        .iter()
+                        .any(|(k, _)| *k == using_rel_key)
+                {
+                    using_rels_for_table.push((using_rel_key, using_rel));
                 }
             }
         }
@@ -434,7 +448,7 @@ pub(super) fn find_using_context(
 
     if using_rels_for_table.len() == 1 {
         // Exactly one USING path disambiguates -> return scoped alias
-        let scoped = scoped_join_alias(&dim_table_lower, &using_rels_for_table[0]);
+        let scoped = scoped_join_alias(&dim_table_lower, &using_rels_for_table[0].1);
         Ok(Some(scoped))
     } else if using_rels_for_table.is_empty() && !is_role_playing_target(def, &dim_table_lower) {
         // Multiple inbound relationships but each from a DIFFERENT source

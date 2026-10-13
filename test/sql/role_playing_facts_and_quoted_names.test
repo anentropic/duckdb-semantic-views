@@ -143,3 +143,74 @@ statement error
 SELECT * FROM semantic_view('p0a_unscoped', metrics := ['any_elev']);
 ----
 'any_elev' is ambiguous -- it references fact
+
+# ------------------------------------------------------------------
+# Relationship names follow DuckDB identifier rules: quoting never changes which
+# relationship a name denotes. Every site matched names by ASCII-lowercased
+# spelling, quotes included, so a relationship declared `"Dep_Airport"` was an
+# "unknown relationship" to `USING (dep_airport)` at CREATE, and two roles named
+# `dep` and `"dep"` were accepted as two names.
+# ------------------------------------------------------------------
+
+# Declared quoted, named bare in USING (and the converse on the other role).
+statement ok
+CREATE SEMANTIC VIEW p0a_mixed_quoting AS
+  TABLES (
+    f AS p0a_flights PRIMARY KEY (flight_id),
+    a AS p0a_airports PRIMARY KEY (airport_code)
+  )
+  RELATIONSHIPS (
+    "Dep_Airport" AS f(departure_code) REFERENCES a,
+    arr_airport AS f(arrival_code) REFERENCES a
+  )
+  FACTS (
+    a.elev AS a.elevation
+  )
+  DIMENSIONS (
+    a.city AS a.city
+  )
+  METRICS (
+    f.departures USING (dep_airport) AS COUNT(*),
+    f.arrivals USING ("ARR_AIRPORT") AS COUNT(*),
+    f.dep_elev USING (DEP_AIRPORT) AS SUM(a.elev)
+  );
+
+# Each spelling binds its own role: the numbers differ between the two roles.
+query TI rowsort
+SELECT * FROM semantic_view('p0a_mixed_quoting', dimensions := ['city'], metrics := ['departures']);
+----
+Denver	1
+San Francisco	2
+
+query TI rowsort
+SELECT * FROM semantic_view('p0a_mixed_quoting', dimensions := ['city'], metrics := ['arrivals']);
+----
+Denver	2
+San Francisco	1
+
+# The role-played fact moves onto the departure role's alias: 13 + 13 + 5434.
+query I
+SELECT * FROM semantic_view('p0a_mixed_quoting', metrics := ['dep_elev']);
+----
+5460
+
+# `dep` and `"dep"` are ONE name, so two relationships to the same table named
+# that way are a diamond, exactly like `dep` / `DEP`.
+statement error
+CREATE SEMANTIC VIEW p0a_quoting_duplicate AS
+  TABLES (
+    f AS p0a_flights PRIMARY KEY (flight_id),
+    a AS p0a_airports PRIMARY KEY (airport_code)
+  )
+  RELATIONSHIPS (
+    dep AS f(departure_code) REFERENCES a,
+    "dep" AS f(arrival_code) REFERENCES a
+  )
+  DIMENSIONS (
+    a.city AS a.city
+  )
+  METRICS (
+    f.departures USING (dep) AS COUNT(*)
+  );
+----
+diamond

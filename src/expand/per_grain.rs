@@ -528,8 +528,11 @@ fn rebuild_expr(
 ///
 /// [`role_playing_on_path`]: super::role_playing::role_playing_on_path
 /// The role each role-played table plays in **this** query: lowercased table
-/// alias -> the lowercased relationship name a co-queried metric's `USING`
-/// named for it.
+/// alias -> the relationship a co-queried metric's `USING`
+/// named for it, as DECLARED (its stored spelling, quotes and all). Compare a
+/// value with `ident::ident_matches`, never `==`: a `USING` entry may spell the
+/// same identifier differently (`dep` / `"Dep"`). `scoped_join_alias`
+/// normalizes it, so every spelling yields the same alias.
 ///
 /// [`find_using_context`] is the base-anchored path's answer to the same
 /// question, and reusing it is what keeps the two paths agreeing on which role a
@@ -559,10 +562,10 @@ fn scoped_roles(
             super::role_playing::find_using_context("", def, dim, resolved_mets)
         {
             if let Some(rel) = def.joins.iter().find_map(|j| {
-                let name = j.name.as_ref()?.to_ascii_lowercase();
+                let name = j.name.as_ref()?;
                 (j.table.to_ascii_lowercase() == table
-                    && super::join_resolver::scoped_join_alias(&table, &name) == scoped)
-                    .then_some(name)
+                    && super::join_resolver::scoped_join_alias(&table, name) == scoped)
+                    .then(|| name.clone())
             }) {
                 roles.insert(table, rel);
             }
@@ -910,12 +913,13 @@ fn is_eligible(
     let roles = scoped_roles(def, resolved_dims, resolved_mets);
     let using_is_threaded = |m: &Metric| {
         m.using_relationships.iter().all(|rel| {
-            let rel = rel.to_ascii_lowercase();
             def.joins.iter().any(|j| {
                 j.name
                     .as_ref()
-                    .is_some_and(|n| n.to_ascii_lowercase() == rel)
-                    && roles.get(&j.table.to_ascii_lowercase()) == Some(&rel)
+                    .is_some_and(|n| crate::ident::ident_matches(n, rel))
+                    && roles
+                        .get(&j.table.to_ascii_lowercase())
+                        .is_some_and(|role| crate::ident::ident_matches(role, rel))
             })
         })
     };
@@ -1347,7 +1351,7 @@ pub(super) fn anchor_joins<'a>(
                 if let Some(join) = def.joins.iter().find(|j| {
                     j.name
                         .as_ref()
-                        .is_some_and(|n| n.to_ascii_lowercase() == *rel)
+                        .is_some_and(|n| crate::ident::ident_matches(n, rel))
                 }) {
                     joins.push(ResolvedJoin {
                         emit_alias: scoped,

@@ -1308,6 +1308,33 @@ fn using_naming_a_non_role_played_relationship_still_declines() {
     );
 }
 
+/// The GRAIN-10 shape with the `dep` relationship declared QUOTED (`"Dep"`,
+/// stored with its quotes) while `USING` names it bare. One identifier to
+/// DuckDB, so the per-grain path must thread the same role: `scoped_roles`,
+/// the `using_is_threaded` gate and the grain-CTE join emission all matched
+/// relationship names by ASCII-lowercase spelling and so found no role.
+#[test]
+fn using_scopes_a_quoted_relationship_role_in_every_grain_cte() {
+    let mut def = flights_using_fixture();
+    def.joins[0].name = Some("\"Dep\"".to_string());
+    let sql = expand(
+        "flights_sv",
+        &def,
+        &req(&["dep_city"], &["flight_count", "leg_count"]),
+    )
+    .expect("USING names the quoted role, so the grain CTEs can join it");
+    assert_eq!(
+        sql.matches(r#"AS "a__dep""#).count(),
+        2,
+        "each grain CTE joins the scoped role exactly once, got:\n{sql}"
+    );
+    assert!(sql.contains("a__dep.city"), "{sql}");
+    assert!(
+        !sql.contains("arr_code"),
+        "the arrival role was not named by USING and must not be joined:\n{sql}"
+    );
+}
+
 /// root `f` (flights) --carrier_id--> `c` (carriers) --dep/arr--> `a` (airports).
 ///
 /// `c` is a PARENT of the base table, so a metric on it needs per-grain

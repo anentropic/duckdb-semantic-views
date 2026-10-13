@@ -132,11 +132,12 @@ impl RelationshipGraph {
                     !joins_to_node.is_empty() && joins_to_node.iter().all(|j| j.name.is_some());
 
                 if all_named {
-                    // Check all names are unique (case-insensitive)
+                    // Check all names are unique under DuckDB's identifier
+                    // rule: `dep`, `DEP` and `"dep"` are one name.
                     let mut seen_names = HashSet::new();
                     let all_unique = joins_to_node.iter().all(|j| {
-                        let name_lower = j.name.as_ref().unwrap().to_ascii_lowercase();
-                        seen_names.insert(name_lower)
+                        seen_names
+                            .insert(crate::ident::normalize_ident_part(j.name.as_ref().unwrap()))
                     });
                     if all_unique {
                         continue; // Role-playing: allow this diamond
@@ -906,6 +907,37 @@ mod tests {
         let order1 = validate_graph(&def1).unwrap().toposort().unwrap();
         let order2 = validate_graph(&def2).unwrap().toposort().unwrap();
         assert_eq!(order1, order2, "topological sort must be deterministic");
+    }
+
+    /// Two role-playing relationships whose names differ only in QUOTING
+    /// (`dep` and `"dep"`) are one identifier under DuckDB's rules, so they are
+    /// the same name used twice — rejected exactly like `dep` / `DEP`. An
+    /// ASCII-lowercase comparison kept the quotes, accepted the pair as two
+    /// roles, and both then mapped to the one scoped alias `a__dep`.
+    #[test]
+    fn role_playing_names_differing_only_in_quoting_are_one_name() {
+        let mut def = make_def(
+            vec![("f", "flights", vec!["id"]), ("a", "airports", vec!["id"])],
+            vec![("f", "a", vec!["dep_id"]), ("f", "a", vec!["arr_id"])],
+            vec![],
+            vec![],
+        );
+        def.joins[0].name = Some("dep".to_string());
+        def.joins[1].name = Some("\"dep\"".to_string());
+        let err = validate_graph(&def)
+            .expect_err("`dep` and `\"dep\"` name the same relationship")
+            .message;
+        assert!(
+            err.contains("diamond"),
+            "expected a diamond error, got: {err}"
+        );
+        // Control: genuinely distinct names (one of them quoted) still pass.
+        def.joins[1].name = Some("\"Arr\"".to_string());
+        assert!(
+            validate_graph(&def).is_ok(),
+            "{:?}",
+            validate_graph(&def).err().map(|e| e.message)
+        );
     }
 
     // -----------------------------------------------------------------------

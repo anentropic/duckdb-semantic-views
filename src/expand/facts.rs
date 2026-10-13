@@ -1083,17 +1083,16 @@ fn rewrite_using_scoped_refs(expr: &str, met: &crate::model::Metric, joins: &[Jo
     let own = met.source_table.as_deref().map(normalize_ident_part);
     // target table -> the distinct relationships (join edges) of this metric
     // that reach it. Distinct by the EDGE a spelling resolves to, not by the
-    // spelling: `USING (dep_airport, DEP_AIRPORT)` names one relationship —
-    // validation, the role-playing fence and the join resolver all fold case
-    // to find it — so it is one role, and must be rewritten as one (PR #247
+    // spelling: `USING (dep_airport, "DEP_AIRPORT")` names one relationship —
+    // validation, the role-playing fence and the join resolver all match it
+    // with `ident_matches` (DuckDB identifier rule) — so it is one role, and must be rewritten as one (PR #247
     // review). Counting spellings left the fact on the never-joined bare alias.
     let mut by_target: Vec<(String, Vec<(&str, &Join)>)> = Vec::new();
     for rel in &met.using_relationships {
-        let rel_lower = rel.to_ascii_lowercase();
         let Some(join) = joins.iter().find(|j| {
             j.name
                 .as_ref()
-                .is_some_and(|n| n.to_ascii_lowercase() == rel_lower)
+                .is_some_and(|n| crate::ident::ident_matches(n, rel))
         }) else {
             continue;
         };
