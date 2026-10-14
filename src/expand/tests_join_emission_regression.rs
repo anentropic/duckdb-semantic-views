@@ -408,8 +408,8 @@ fn queried_cross_table_fact_pulls_its_join() {
 }
 
 /// Copilot review of #200: a DERIVED metric whose base component references a
-/// cross-table fact, on the PER-GRAIN path. `group_fact_tables` scans each
-/// group's `metric_names`, and a derived metric's own expression names METRICS,
+/// cross-table fact, on the PER-GRAIN path. `per_grain::anchor_needs` scans
+/// each group's metrics, and a derived metric's own expression names METRICS,
 /// not facts -- the fact references live in the base metrics inlined into it.
 /// Scanning only the derived expression reintroduced PAR-6 inside the grain
 /// CTE: `(SUM(o.amount - (p.markup))) * 2` rendered over a FROM clause with no

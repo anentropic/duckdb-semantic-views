@@ -567,3 +567,63 @@ fn test_child_min_of_a_constant_is_guarded_by_the_pk() {
         "MIN over a constant needs the existence guard: {sql}"
     );
 }
+
+/// Reviewbot, #250: the SG-8 exemption for a CHILD-anchored `__sv_snapshot`.
+/// `line_items` declares no PRIMARY KEY, so on the base-anchored path its
+/// `COUNT(1)` cannot be PK-guarded (EXP-21) and the query errors. Co-queried with a
+/// `NON ADDITIVE BY` metric on the same table, the snapshot CTE anchors at
+/// `li` itself (TECH-DEBT #71): there is no NULL-extended row to exclude, so
+/// the query is answered, and `COUNT(1)` counts every child row. (`COUNT(*)`
+/// itself is rejected by the snapshot decomposition, SG-5, on either path.)
+#[test]
+fn test_child_count_star_without_pk_is_answered_from_a_child_anchored_snapshot() {
+    let def = orders_view()
+        .clear_dimensions()
+        .clear_metrics()
+        .with_table("li", "line_items", &[]) // no PK declared
+        .with_dimension("report_date", "li.report_date", Some("li"))
+        .with_metric("balance", "SUM(li.balance)", Some("li"))
+        .with_metric("txn_count", "COUNT(1)", Some("li"))
+        .with_pkfk_join("li_orders", "li", "orders", &["order_id"], &["id"])
+        .with_non_additive_by(
+            "balance",
+            &[(
+                "report_date",
+                crate::model::SortOrder::Desc,
+                crate::model::NullsOrder::First,
+            )],
+        );
+    let req = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![],
+        metrics: vec![MetricName::new("balance"), MetricName::new("txn_count")],
+    };
+    let sql = expand("orders", &def, &req)
+        .expect("a child-anchored snapshot has no NULL-extended row, so needs no PK");
+    assert!(
+        sql.contains("__sv_snapshot") && sql.contains("FROM \"line_items\" AS \"li\""),
+        "the snapshot CTE must be anchored at the child: {sql}"
+    );
+    assert!(
+        !sql.contains("FROM \"orders\""),
+        "nothing may be base-anchored, or COUNT(1) would see the phantom row: {sql}"
+    );
+
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+    conn.execute_batch(
+        "CREATE TABLE orders (id INT, region VARCHAR); \
+         CREATE TABLE line_items (order_id INT, report_date DATE, balance INT); \
+         INSERT INTO orders VALUES (1, 'EU'), (2, 'US'); \
+         INSERT INTO line_items VALUES (1, DATE '2024-01-01', 10), \
+             (1, DATE '2024-01-02', 20), (NULL, DATE '2024-01-02', 5);",
+    )
+    .expect("load the fixture");
+    let got: (i64, i64) = conn
+        .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap_or_else(|e| panic!("query failed: {e}\n{sql}"));
+    // `NON ADDITIVE BY (report_date DESC)` keeps the rows that sort last,
+    // 2024-01-01: 10. Three child rows, the orphan included; the childless
+    // order 2 contributes no phantom row (base-anchored, it would be 4).
+    assert_eq!(got, (10, 3));
+}

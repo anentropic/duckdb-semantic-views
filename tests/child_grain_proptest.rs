@@ -67,8 +67,8 @@
 use proptest::prelude::*;
 use semantic_views::expand::{expand, DimensionName, FactName, MetricName, QueryRequest};
 use semantic_views::model::{
-    AccessModifier, Cardinality, Dimension, Fact, Join, Metric, SemanticViewDefinition, TableRef,
-    WindowSpec,
+    AccessModifier, Cardinality, Dimension, Fact, Join, Metric, NonAdditiveDim, NullsOrder,
+    SemanticViewDefinition, SortOrder, TableRef, WindowSpec,
 };
 
 /// Base rows `o` have ids `0..n_o`; child rows `li` carry a foreign key into
@@ -103,12 +103,33 @@ const D_LAMT: usize = 1;
 /// metric's home table, and has to join `o` for the inlined parent fact even
 /// when no queried dimension reaches `o` (reviewbot on #250: it did not, and
 /// the query failed with a Binder Error).
-const METS: [&str; 13] = [
-    "n_star", "n_one", "s_one", "n_str", "n_paren", "n_dist", "n_expr", "mn_one", "s_coal",
-    "s_parent", "s_amt", "mx_amt", "w_parent",
+///
+/// `snap_parent` is `SUM(orate) NON ADDITIVE BY (lamt)`: a semi-additive
+/// metric on the child reaching a parent fact. Its `__sv_snapshot` CTE is
+/// re-anchored at `li` (TECH-DEBT #71), so the orphans — whose `lamt` may be
+/// NULL — are ranked with the rest (reviewbot on #250: the child-anchored
+/// snapshot had no randomized oracle).
+const METS: [&str; 14] = [
+    "n_star",
+    "n_one",
+    "s_one",
+    "n_str",
+    "n_paren",
+    "n_dist",
+    "n_expr",
+    "mn_one",
+    "s_coal",
+    "s_parent",
+    "s_amt",
+    "mx_amt",
+    "w_parent",
+    "snap_parent",
 ];
 /// Index of `w_parent` in [`METS`]: requested alone, never in a mask.
 const M_WINDOW: usize = 12;
+/// Index of `snap_parent` in [`METS`]: requested alone, never in a mask (a
+/// snapshot co-query rejects the `COUNT(*)` family, SG-5).
+const M_SNAP: usize = 13;
 /// The only requestable fact: a row-level child value. A fact query is at the
 /// grain of its facts, so a childless parent has no row in it (EXP-28).
 const FACTS: [&str; 1] = ["f_amt"];
@@ -294,9 +315,11 @@ fn arb_case() -> impl Strategy<Value = Case> {
         // 1 in 5 metric requests is the window metric. It cannot share a
         // request with a plain aggregate, so it is drawn on its own.
         prop::bool::weighted(0.2),
+        // About 1 in 6 is the semi-additive metric, also drawn on its own.
+        prop::bool::weighted(0.2),
     )
         .prop_map(
-            |(inst, dim_mask, met_mask, want_facts, where_pred, want_window)| {
+            |(inst, dim_mask, met_mask, want_facts, where_pred, want_window, want_snap)| {
                 let mut sel_dims: Vec<usize> = dim_mask
                     .iter()
                     .enumerate()
@@ -312,10 +335,12 @@ fn arb_case() -> impl Strategy<Value = Case> {
                 let mut sel_metrics: Vec<usize> = met_mask
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, &b)| (b && i != M_WINDOW).then_some(i))
+                    .filter_map(|(i, &b)| (b && i != M_WINDOW && i != M_SNAP).then_some(i))
                     .collect();
                 if want_window {
                     sel_metrics = vec![M_WINDOW];
+                } else if want_snap {
+                    sel_metrics = vec![M_SNAP];
                 }
                 // A request with no metrics and no facts is a different code path
                 // (dims-only DISTINCT); this harness is about the aggregates and
@@ -415,6 +440,14 @@ fn build_def() -> SemanticViewDefinition {
                 frame_clause: None,
             }),
             ..base_metric("w_parent", "SUM(s_parent) OVER ()", Some("li"))
+        },
+        Metric {
+            non_additive_by: vec![NonAdditiveDim {
+                dimension: "lamt".to_string(),
+                order: SortOrder::Asc,
+                nulls: NullsOrder::Last,
+            }],
+            ..base_metric("snap_parent", "SUM(orate)", Some("li"))
         },
     ];
     let facts = vec![
@@ -523,6 +556,15 @@ fn metrics_oracle_sql(case: &Case, sel_metrics: &[usize]) -> String {
             // A window partitioned by every queried dimension holds one group,
             // so it reads back that group's own `s_parent`.
             "w_parent" => "sum(x.p_rate)",
+            // NON ADDITIVE BY (lamt) — ASC / NULLS LAST — keeps the LAST
+            // value of that sort in each group: the rows at the group's
+            // MAX(lamt), or every row when the group's `lamt` is all NULL
+            // (`x.snap_at` is then NULL, and NULL IS NOT DISTINCT FROM NULL).
+            // Queried, `lamt` is a group key and the metric is plain.
+            "snap_parent" if case.sel_dims.contains(&D_LAMT) => "sum(x.p_rate)",
+            "snap_parent" => {
+                "sum(CASE WHEN x.amount IS NOT DISTINCT FROM x.snap_at THEN x.p_rate END)"
+            }
             other => unreachable!("unexpected metric {other}"),
         }
     };
@@ -550,6 +592,16 @@ fn metrics_oracle_sql(case: &Case, sel_metrics: &[usize]) -> String {
                 (SELECT op.rate FROM o op WHERE op.id = li.order_id) AS p_rate \
          FROM li{where_sql}"
     );
+    // The snapshot value per group, over the FILTERED rows: the predicate is
+    // applied before the snapshot is picked. Partitioned by the queried
+    // dimensions by name, so nothing here reuses the expansion's RANK shape.
+    let partition: Vec<String> = case.sel_dims.iter().map(|&i| DIMS[i].to_string()).collect();
+    let over = if partition.is_empty() {
+        "OVER ()".to_string()
+    } else {
+        format!("OVER (PARTITION BY {})", partition.join(", "))
+    };
+    let rows = format!("SELECT r.*, max(r.amount) {over} AS snap_at FROM ({rows}) r");
     if case.sel_dims.is_empty() {
         format!("SELECT {select_items} FROM ({rows}) x")
     } else {
