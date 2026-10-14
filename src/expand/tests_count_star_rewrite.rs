@@ -575,6 +575,10 @@ fn test_child_min_of_a_constant_is_guarded_by_the_pk() {
 /// `li` itself (TECH-DEBT #71): there is no NULL-extended row to exclude, so
 /// the query is answered, and `COUNT(1)` counts every child row. (`COUNT(*)`
 /// itself is rejected by the snapshot decomposition, SG-5, on either path.)
+///
+/// Executes the SQL in-memory, so gated off the `extension` feature like the
+/// other number-pinning tests; the default-features run covers it.
+#[cfg(not(feature = "extension"))]
 #[test]
 fn test_child_count_star_without_pk_is_answered_from_a_child_anchored_snapshot() {
     let def = orders_view()
