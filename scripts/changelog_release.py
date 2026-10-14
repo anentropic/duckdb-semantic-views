@@ -74,7 +74,7 @@ def main():
     m = re.match(r"(\[Unreleased\]:\s*)(\S+?)/compare/\S+\.\.\.HEAD\s*$", lines[ur_idx])
     if not m:
         sys.exit(f"unexpected [Unreleased] link format: {lines[ur_idx]!r}")
-    base = m.group(2)  # e.g. https://github.com/anentropic/duckdb-semantic-views
+    base = m.group(2)  # e.g. https://github.com/s-layer/duckdb-semantic-views
     lines[ur_idx] = f"[Unreleased]: {base}/compare/v{version}...HEAD"
     lines.insert(
         ur_idx + 1,
