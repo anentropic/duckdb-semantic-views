@@ -139,12 +139,16 @@ pub unsafe extern "C" fn sv_parser_override_rust(
             return 2; // not ours — defer
         };
 
+        let outcome = rewrite_to_native_sql(query);
         // Remember a multi-statement string so that parse_function can name
         // the real cause (TECH-DEBT #85). Noted on every call, rewritten or
         // not: a string whose read call gets the search path injected (rc=0)
-        // still fails when the plain re-parse below meets its DDL.
-        note_override_query(query);
-        match rewrite_to_native_sql(query) {
+        // still fails when the plain re-parse below meets its DDL. A DDL
+        // rewrite, though, took the whole string as ONE statement, whatever
+        // `;` it holds in a literal or comment -- nothing to remember.
+        let one_ddl_statement = matches!(outcome, Ok(Some(_))) && detect_ddl_kind(query).is_some();
+        note_override_query(if one_ddl_statement { "" } else { query });
+        match outcome {
             Ok(Some(sql)) => {
                 publish_owned_sql(sql, sql_out_ptr, sql_out_len);
                 0 // success — native SQL handed to caller
@@ -224,13 +228,15 @@ const MULTI_STATEMENT_MSG: &str = "semantic_views: semantic-view DDL must be sen
 // the same thread, within the same call -- `parse_function` on each statement
 // the default parser could not handle, so this is how `parse_function` learns
 // that the override DID run on the string the statement came from. The
-// override overwrites the record on every query it sees, and `parse_function`
-// consumes it, so a record cannot outlive the query it came from into a later
-// one -- in particular not into a query on a connection whose override is off
-// (the record is per thread, not per connection). The one survivor is a
-// multi-statement string mentioning SEMANTIC that raised no parse_function
-// call; it is only matched by a later statement identical to one of its own
-// statements, which that string would have reported itself.
+// override overwrites the record on every query it sees, and every
+// `parse_function` call consumes it, so a record cannot outlive the query it
+// came from into a later one -- in particular not into a query on a
+// connection whose override is off (the record is per thread, not per
+// connection). A string the override rewrote as one DDL statement is not
+// recorded at all, even when a literal or comment in it holds a `;`. The one
+// survivor is a multi-statement string mentioning SEMANTIC that parsed
+// without any parse_function call, which means it held no semantic-view DDL
+// as its own statement, so no later DDL statement can match it.
 #[cfg(any(feature = "extension", test))]
 thread_local! {
     static OVERRIDE_MULTI_STATEMENT: std::cell::RefCell<String> =
@@ -269,16 +275,20 @@ pub(crate) fn note_override_query(query: &str) {
     });
 }
 
-/// Whether `statement` (as handed to `parse_function`) is one whole statement
-/// of the multi-statement string the override last saw on this thread.
-/// Consumes the record.
+/// Take the record (see `OVERRIDE_MULTI_STATEMENT`), leaving it empty.
 #[cfg(any(feature = "extension", test))]
-fn part_of_multi_statement_query(statement: &str) -> bool {
+fn take_override_query() -> String {
+    OVERRIDE_MULTI_STATEMENT.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
+/// Whether `statement` (as handed to `parse_function`) is one whole statement
+/// of `recorded`, the multi-statement string the override last saw.
+#[cfg(any(feature = "extension", test))]
+fn part_of_multi_statement_query(recorded: &str, statement: &str) -> bool {
     let statement = statement.trim().trim_end_matches(';').trim_end();
     if statement.is_empty() {
         return false;
     }
-    let recorded = OVERRIDE_MULTI_STATEMENT.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
     recorded.match_indices(statement).any(|(at, _)| {
         let before = recorded[..at].trim_end();
         let after = recorded[at + statement.len()..].trim_start();
@@ -342,6 +352,11 @@ pub unsafe extern "C" fn sv_parse_function_rust(
     position_out: *mut u32,
 ) -> u8 {
     parse_function_panic_guard(error_out, error_out_len, position_out, || {
+        // Consumed by every call, whatever it returns: any parse_function
+        // call ends the query it came from, so the record must not outlive
+        // it into a later query (TECH-DEBT #85).
+        let multi_statement_query = take_override_query();
+
         // Initialise position_out to UINT32_MAX (no-position sentinel).
         if !position_out.is_null() {
             *position_out = u32::MAX;
@@ -393,7 +408,7 @@ pub unsafe extern "C" fn sv_parse_function_rust(
                 // `allow_parser_override_extension` to DEFAULT (TECH-DEBT 21).
                 // Position 0 puts the caret on the `C` of CREATE / `D` of
                 // DROP / etc.
-                let msg = if part_of_multi_statement_query(query) {
+                let msg = if part_of_multi_statement_query(&multi_statement_query, query) {
                     MULTI_STATEMENT_MSG
                 } else {
                     OVERRIDE_INACTIVE_MSG
@@ -616,6 +631,19 @@ mod tests {
         note_override_query(&format!("SELECT 1; {DDL}"));
         let (_, msg) = call_parse_function(DDL);
         assert!(msg.contains("one statement per call"), "got: {msg}");
+        let (_, msg) = call_parse_function(DDL);
+        assert!(msg.contains("parser_override is not active"), "got: {msg}");
+    }
+
+    /// Any `parse_function` call consumes the record, not only the one that
+    /// reports on it: an earlier statement of the same string that is not
+    /// ours (`SELEC 1` here) ends the query, and must not leave the record
+    /// for a later query's DDL.
+    #[test]
+    fn record_is_consumed_by_a_statement_that_is_not_ours() {
+        note_override_query(&format!("SELEC 1; {DDL}"));
+        let (rc, _) = call_parse_function("SELEC 1");
+        assert_eq!(rc, 2, "a typo far from every DDL prefix is not ours");
         let (_, msg) = call_parse_function(DDL);
         assert!(msg.contains("parser_override is not active"), "got: {msg}");
     }

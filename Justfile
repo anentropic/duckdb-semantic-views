@@ -311,7 +311,7 @@ test-examples *examples: build
 # the run, which the bare runner reports as success. Uses the configure/venv
 # runner, so it needs `make configure` (done by `build`).
 # Check that the sqllogictest wrapper fails runs that silently skip
-test-sqllogictest-guards: build
+test-sqllogictest-guards: build _ensure-test-deps
     make patch-runner
     configure/venv/bin/python test/integration/test_sqllogictest_guards.py
 

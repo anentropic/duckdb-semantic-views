@@ -30,6 +30,11 @@ Each scenario runs on a fresh in-memory database and reports independently:
                                then the same DDL alone on another database
                                whose override is off: the second must get the
                                "not active" message, not the first one's.
+  control_stale_after_success  the same, but the first database's string was
+                               ONE statement that merely holds a `;` (a
+                               trailing comment) and succeeded.
+  control_stale_after_typo     the same, but the first database's string
+                               failed on a typo before reaching its DDL.
 
 Run: uv run test/integration/test_multi_statement_ddl_error.py (or
 `just test-multi-statement-error`).
@@ -151,6 +156,31 @@ def scenario_control_stale_other_database():
     assert NEW_HINT not in msg, f"must not reuse another database's error; got: {msg}"
 
 
+def check_not_blamed_after(first_sql, expect_first_error):
+    off, on = connect(), connect()
+    try:
+        for con in (off, on):
+            con.execute("CREATE TABLE orders (id INTEGER, region VARCHAR, amount DOUBLE)")
+        off.execute("SET allow_parser_override_extension = 'DEFAULT'")
+        first = error_of(on, first_sql)
+        msg = error_of(off, DDL)
+    finally:
+        off.close()
+        on.close()
+    assert (first is not None) == expect_first_error, f"setup: unexpected first result: {first}"
+    assert msg is not None, "DDL with the override switched off must fail"
+    assert OLD_HINT in msg, f"override-off database must keep its message; got: {msg}"
+    assert NEW_HINT not in msg, f"must not reuse another query's record; got: {msg}"
+
+
+def scenario_control_stale_after_success():
+    check_not_blamed_after(DDL + "; -- created", expect_first_error=False)
+
+
+def scenario_control_stale_after_typo():
+    check_not_blamed_after("SELEC 1; " + DDL, expect_first_error=True)
+
+
 SCENARIOS = [
     scenario_ddl_after_other_statements,
     scenario_ddl_before_other_statement,
@@ -158,6 +188,8 @@ SCENARIOS = [
     scenario_control_override_disabled,
     scenario_control_single_statement,
     scenario_control_stale_other_database,
+    scenario_control_stale_after_success,
+    scenario_control_stale_after_typo,
 ]
 
 
