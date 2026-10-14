@@ -39,7 +39,7 @@ You do **not** need to install DuckDB separately. The build system downloads the
 From zero to a working extension in five commands:
 
 ```bash
-git clone --recurse-submodules https://github.com/anentropic/duckdb-semantic-views.git
+git clone --recurse-submodules https://github.com/s-layer/duckdb-semantic-views.git
 cd duckdb-semantic-views
 just setup          # installs dev tools (cargo-nextest, cargo-deny, cargo-llvm-cov), downloads DuckDB test binary
 just build          # builds the debug extension (.duckdb_extension file)
@@ -528,7 +528,7 @@ The version monitor workflow needs a fine-grained Personal Access Token (PAT) st
 2. Click "Generate new token"
 3. Set a descriptive name (e.g., `duckdb-semantic-views version monitor`)
 4. Set expiration (recommend 1 year — add a calendar reminder to rotate)
-5. Under **Repository access**, select "Only select repositories" and choose `anentropic/duckdb-semantic-views`
+5. Under **Repository access**, select "Only select repositories" and choose `s-layer/duckdb-semantic-views`
 6. Under **Permissions**, grant:
    - **Contents:** Read and write
    - **Pull requests:** Read and write
@@ -695,10 +695,10 @@ You can also download artifacts via the `gh` CLI:
 
 ```bash
 # List artifacts from a specific run
-gh run view <run-id> --repo anentropic/duckdb-semantic-views
+gh run view <run-id> --repo s-layer/duckdb-semantic-views
 
 # Download the crash artifact
-gh run download <run-id> --repo anentropic/duckdb-semantic-views --name crash-fuzz_json_parse-<sha>
+gh run download <run-id> --repo s-layer/duckdb-semantic-views --name crash-fuzz_json_parse-<sha>
 ```
 
 ## Publishing to Community Extension Registry
@@ -767,7 +767,7 @@ This will:
 To publish builds for DuckDB 1.4.x (Andium LTS), add the `andium` field to `description.yml`:
 ```yaml
 repo:
-  github: anentropic/duckdb-semantic-views
+  github: s-layer/duckdb-semantic-views
   ref: <main-branch-sha>
   andium: <duckdb-1.4.x-branch-sha>
 ```

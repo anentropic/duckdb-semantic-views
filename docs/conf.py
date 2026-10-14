@@ -38,7 +38,7 @@ html_theme = "shibuya"
 html_theme_options = {
     "accent_color": "orange",
     "color_mode": "auto",
-    "github_url": "https://github.com/anentropic/duckdb-semantic-views",
+    "github_url": "https://github.com/s-layer/duckdb-semantic-views",
     "toctree_maxdepth": 3,
     "toctree_titles_only": True,
     "nav_links": [

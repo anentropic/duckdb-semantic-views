@@ -811,7 +811,7 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Resolution:** both targets are back on the single-process `TEST_RUNNER_FILE_LIST_*` path; the probe target and the `probe-isolation-workaround` / `probe-isolation-prebuilt` recipes are deleted, since with the loop gone `test-sql` *is* the single-process run and the probe would be tautological.
 - **Evidence, on every platform that executes the suite:**
   - Linux debug, 3 consecutive local runs — exit 0, `111/111` SUCCESS, ~33 s (against ~39 s for the loop). Run three times because an intermittent segfault would be worse than a reliable one, and one green run cannot distinguish them.
-  - `windows_amd64` release — BuildAll run [31316526280](https://github.com/anentropic/duckdb-semantic-views/actions/runs/31316526280): 111 progress markers, all `[n/111]` (one process), `111 test files passed (single process)`, no skip and no crash. **28 s, down from 53 s.**
+  - `windows_amd64` release — BuildAll run [31316526280](https://github.com/s-layer/duckdb-semantic-views/actions/runs/31316526280): 111 progress markers, all `[n/111]` (one process), `111 test files passed (single process)`, no skip and no crash. **28 s, down from 53 s.**
   - `osx_arm64` release — same run, same markers and end line. **13 s, down from 29 s.**
   - The remaining three platforms (`linux_amd64`, `linux_arm64`, `osx_amd64`) never execute the suite at all — see the CI Workflows section of MAINTAINER.md — so there is no platform left where the loop could still be needed.
 - **If the crash returns:** the loop and the probe are both in git history at commit `4e932d0`'s parent. Restore them together rather than papering over an intermittent segfault; a flaky crash would need the probe more, not less.
