@@ -614,129 +614,165 @@ proptest! {
 
     #[test]
     fn multi_hop_fence_and_aggregation(case in arb_case()) {
-        let def = build_def();
-        let req = QueryRequest {
-            where_clause: case.where_pred.as_ref().map(Pred::to_member_sql),
-            dimensions: case
-                .sel_dims
-                .iter()
-                .map(|&i| DimensionName::new(DIMS[i]))
-                .collect(),
-            metrics: case
-                .sel_metrics
-                .iter()
-                .map(|&i| MetricName::new(METS[i]))
-                .collect(),
-            // PIN: FACTS is a row-level shape with no per-grain meaning; this harness oracles the three-table per-grain chain. TECH-DEBT #66
-            facts: vec![],
-        };
+        check_case(&case)?;
+    }
+}
 
-        // A dimension BELOW some selected metric's grain is the one shape that
-        // must stay rejected: those parent rows genuinely fan across the
-        // descendant's values, at one hop or two.
-        let dimension_below_a_metric_grain = case.sel_metrics.iter().any(|&m| {
-            case.sel_dims
-                .iter()
-                .any(|&d| level(dim_table(DIMS[d])) < level(metric_table(METS[m])))
-        });
-        let result = expand("multihop", &def, &req);
+/// The setting that sidesteps the DuckDB bug behind TECH-DEBT #84.
+const DUCKDB_BIND_BUG_WORKAROUND: &str = "SET disabled_optimizers = 'compressed_materialization'";
 
-        if dimension_below_a_metric_grain {
-            match result {
-                Err(e) => {
-                    let msg = e.to_string();
-                    prop_assert!(
-                        msg.contains("fan trap"),
-                        "dimension below a metric's grain rejected, but not as a fan trap: {msg}"
-                    );
-                }
-                Ok(sql) => prop_assert!(
-                    false,
-                    "a dimension below a metric's grain must be rejected, got SQL:\n{sql}"
-                ),
-            }
-            return Ok(());
-        }
+/// Whether `msg` is the DuckDB internal error of TECH-DEBT #84.
+fn is_duckdb_group_by_bind_bug(msg: &str) -> bool {
+    msg.contains("INTERNAL Error: Failed to bind column reference")
+}
 
-        // PBT-6: a `where_clause` member BELOW some selected metric's grain is
-        // the same hazard through a different door. Filtering on `t` while
-        // aggregating `sum(u.uw)` means joining `t` into the u-grain CTE, and
-        // that join fans `u` — one copy per matching child row — so the sum
-        // would be inflated. There is no correct number to return, so the
-        // fence must reject it exactly as it rejects a dimension below the
-        // grain. Checked after the dimension rule, which takes precedence.
-        let mut pred_tables: Vec<&'static str> = Vec::new();
-        if let Some(p) = case.where_pred.as_ref() {
-            p.tables(&mut pred_tables);
-        }
-        let where_member_below_a_metric_grain = case.sel_metrics.iter().any(|&m| {
-            pred_tables
-                .iter()
-                .any(|&pt| level(pt) < level(metric_table(METS[m])))
-        });
-
-        if where_member_below_a_metric_grain {
-            match result {
-                Err(e) => {
-                    let msg = e.to_string();
-                    prop_assert!(
-                        msg.contains("fan trap"),
-                        "where_clause member below a metric's grain rejected, but not \
-                         as a fan trap: {msg}"
-                    );
-                }
-                Ok(sql) => prop_assert!(
-                    false,
-                    "a where_clause member below a metric's grain must be rejected \
-                     -- joining it in fans that metric. Got SQL:\n{sql}"
-                ),
-            }
-            return Ok(());
-        }
-
-        // Accepted-query branch: must expand and match the independent oracle.
-        let expanded = match result {
-            Ok(sql) => sql,
-            Err(e) => {
-                prop_assert!(false, "safe multi-hop query unexpectedly rejected: {e}");
-                unreachable!()
-            }
-        };
-        let oracle = oracle_sql(&case);
-
-        // Canonical projection (output columns sorted by name) so a column-order
-        // difference between the two formulations is not a false diff.
-        let mut proj_cols: Vec<String> = case
+/// The property, for one case: a dimension or `where_clause` member below a
+/// selected metric's grain is rejected as a fan trap; every other query expands
+/// and matches the independent per-grain oracle. Shared by the proptest and the
+/// pinned cases below so a pinned case runs exactly the property's checks.
+fn check_case(case: &Case) -> Result<(), TestCaseError> {
+    let def = build_def();
+    let req = QueryRequest {
+        where_clause: case.where_pred.as_ref().map(Pred::to_member_sql),
+        dimensions: case
             .sel_dims
             .iter()
-            .map(|&i| DIMS[i].to_string())
-            .chain(case.sel_metrics.iter().map(|&i| METS[i].to_string()))
-            .collect();
-        proj_cols.sort();
-        let proj = proj_cols.join(", ");
+            .map(|&i| DimensionName::new(DIMS[i]))
+            .collect(),
+        metrics: case
+            .sel_metrics
+            .iter()
+            .map(|&i| MetricName::new(METS[i]))
+            .collect(),
+        // PIN: FACTS is a row-level shape with no per-grain meaning; this harness oracles the three-table per-grain chain. TECH-DEBT #66
+        facts: vec![],
+    };
 
-        let cmp = format!(
-            "SELECT \
-               (SELECT count(*) FROM (SELECT {proj} FROM ({expanded}) qa \
-                                      EXCEPT ALL \
-                                      SELECT {proj} FROM ({oracle}) qb) e1) \
-             + (SELECT count(*) FROM (SELECT {proj} FROM ({oracle}) qc \
-                                      EXCEPT ALL \
-                                      SELECT {proj} FROM ({expanded}) qd) e2) AS diff"
-        );
+    // A dimension BELOW some selected metric's grain is the one shape that
+    // must stay rejected: those parent rows genuinely fan across the
+    // descendant's values, at one hop or two.
+    let dimension_below_a_metric_grain = case.sel_metrics.iter().any(|&m| {
+        case.sel_dims
+            .iter()
+            .any(|&d| level(dim_table(DIMS[d])) < level(metric_table(METS[m])))
+    });
+    let result = expand("multihop", &def, &req);
 
-        let conn = make_db(&case.inst);
-        let diff: i64 = conn.query_row(&cmp, [], |r| r.get(0)).unwrap_or_else(|e| {
-            panic!("differential comparison query failed: {e}\n--- expanded:\n{expanded}\n--- oracle:\n{oracle}")
-        });
-
-        prop_assert_eq!(
-            diff, 0,
-            "multi-hop expansion disagrees with hand-written chained LEFT JOIN aggregation \
-             (symmetric multiset diff = {}); dims={:?} metrics={:?}\n--- expanded:\n{}\n--- oracle:\n{}",
-            diff, case.sel_dims, case.sel_metrics, expanded, oracle
-        );
+    if dimension_below_a_metric_grain {
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                prop_assert!(
+                    msg.contains("fan trap"),
+                    "dimension below a metric's grain rejected, but not as a fan trap: {msg}"
+                );
+            }
+            Ok(sql) => prop_assert!(
+                false,
+                "a dimension below a metric's grain must be rejected, got SQL:\n{sql}"
+            ),
+        }
+        return Ok(());
     }
+
+    // PBT-6: a `where_clause` member BELOW some selected metric's grain is
+    // the same hazard through a different door. Filtering on `t` while
+    // aggregating `sum(u.uw)` means joining `t` into the u-grain CTE, and
+    // that join fans `u` — one copy per matching child row — so the sum
+    // would be inflated. There is no correct number to return, so the
+    // fence must reject it exactly as it rejects a dimension below the
+    // grain. Checked after the dimension rule, which takes precedence.
+    let mut pred_tables: Vec<&'static str> = Vec::new();
+    if let Some(p) = case.where_pred.as_ref() {
+        p.tables(&mut pred_tables);
+    }
+    let where_member_below_a_metric_grain = case.sel_metrics.iter().any(|&m| {
+        pred_tables
+            .iter()
+            .any(|&pt| level(pt) < level(metric_table(METS[m])))
+    });
+
+    if where_member_below_a_metric_grain {
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                prop_assert!(
+                    msg.contains("fan trap"),
+                    "where_clause member below a metric's grain rejected, but not \
+                     as a fan trap: {msg}"
+                );
+            }
+            Ok(sql) => prop_assert!(
+                false,
+                "a where_clause member below a metric's grain must be rejected \
+                 -- joining it in fans that metric. Got SQL:\n{sql}"
+            ),
+        }
+        return Ok(());
+    }
+
+    // Accepted-query branch: must expand and match the independent oracle.
+    let expanded = match result {
+        Ok(sql) => sql,
+        Err(e) => {
+            prop_assert!(false, "safe multi-hop query unexpectedly rejected: {e}");
+            unreachable!()
+        }
+    };
+    let oracle = oracle_sql(case);
+
+    // Canonical projection (output columns sorted by name) so a column-order
+    // difference between the two formulations is not a false diff.
+    let mut proj_cols: Vec<String> = case
+        .sel_dims
+        .iter()
+        .map(|&i| DIMS[i].to_string())
+        .chain(case.sel_metrics.iter().map(|&i| METS[i].to_string()))
+        .collect();
+    proj_cols.sort();
+    let proj = proj_cols.join(", ");
+
+    let cmp = format!(
+        "SELECT \
+           (SELECT count(*) FROM (SELECT {proj} FROM ({expanded}) qa \
+                                  EXCEPT ALL \
+                                  SELECT {proj} FROM ({oracle}) qb) e1) \
+         + (SELECT count(*) FROM (SELECT {proj} FROM ({oracle}) qc \
+                                  EXCEPT ALL \
+                                  SELECT {proj} FROM ({expanded}) qd) e2) AS diff"
+    );
+
+    let conn = make_db(&case.inst);
+    let diff: i64 = match conn.query_row(&cmp, [], |r| r.get(0)) {
+        Ok(diff) => diff,
+        // TECH-DEBT #84: DuckDB 1.4/1.5 raise this internal error while
+        // optimizing a GROUP BY over the chained join under some OR-of-ANDs
+        // filters, for the expansion and the oracle alike. It is an engine
+        // bug, not a planner or oracle answer, so the comparison is re-run
+        // with the optimizer pass that trips it switched off. That pass only
+        // compresses intermediate columns, so it cannot change a result; the
+        // numbers must still agree. Any other error still fails the case, and
+        // `duckdb_group_by_bind_bug_still_present` fails once DuckDB fixes the
+        // bug, so this branch cannot outlive it.
+        Err(e) if is_duckdb_group_by_bind_bug(&e.to_string()) => {
+            conn.execute_batch(DUCKDB_BIND_BUG_WORKAROUND)
+                .expect("disable compressed_materialization");
+            conn.query_row(&cmp, [], |r| r.get(0)).unwrap_or_else(|e| {
+                panic!("differential comparison query failed with compressed_materialization off: {e}\n--- expanded:\n{expanded}\n--- oracle:\n{oracle}")
+            })
+        }
+        Err(e) => {
+            panic!("differential comparison query failed: {e}\n--- expanded:\n{expanded}\n--- oracle:\n{oracle}")
+        }
+    };
+
+    prop_assert_eq!(
+        diff, 0,
+        "multi-hop expansion disagrees with hand-written chained LEFT JOIN aggregation \
+         (symmetric multiset diff = {}); dims={:?} metrics={:?}\n--- expanded:\n{}\n--- oracle:\n{}",
+        diff, case.sel_dims, case.sel_metrics, expanded, oracle
+    );
+    Ok(())
 }
 
 /// PBT-6 guard: prove the generated cases reach both `where_clause` branches
@@ -851,4 +887,107 @@ fn generator_reaches_both_where_clause_branches() {
         "generator produced only {} distinct predicates; search space collapsed",
         distinct.len()
     );
+}
+
+/// The instance CI's run of `multi_hop_fence_and_aggregation` shrank to (PR #250,
+/// job 115465282382). Every `u` row points at `w` id 0, and the queries pinned
+/// below filter on `((ucat < 0 AND wcat < 0) OR (wcat < 1 AND ucat < 1))`.
+fn ci_or_of_ands_instance() -> Instance {
+    Instance {
+        w_rows: vec![(None, Some(-4)), (Some(2), Some(5))],
+        u_rows: vec![
+            (Some(0), Some(0), Some(1)),
+            (Some(0), None, Some(5)),
+            (Some(0), Some(2), Some(-2)),
+        ],
+        t_rows: vec![
+            (None, Some(0), Some(-2)),
+            (Some(3), Some(1), Some(-5)),
+            (Some(1), Some(1), Some(1)),
+            (Some(1), Some(0), Some(4)),
+            (Some(2), Some(0), Some(4)),
+            (Some(2), None, None),
+            (None, Some(0), Some(1)),
+            (Some(1), Some(2), Some(1)),
+            (Some(3), Some(2), Some(-3)),
+            (Some(1), Some(1), Some(1)),
+        ],
+    }
+}
+
+/// `((ucat < 0 AND wcat < 0) OR (wcat < 1 AND ucat < 1))`, both members bare.
+fn ci_or_of_ands_pred() -> Pred {
+    let cmp = |m: usize, k: i64| Box::new(Pred::Cmp(m, "<", k, false));
+    Pred::Or(
+        Box::new(Pred::And(cmp(1, 0), cmp(2, 0))),
+        Box::new(Pred::And(cmp(2, 1), cmp(1, 1))),
+    )
+}
+
+/// CI's minimal failing input: dimensions `ucat, wcat`, no metric. The
+/// expansion is right (it returns no rows, as it should); the oracle's
+/// `GROUP BY` over the chained join raised DuckDB 1.5.6's
+/// `INTERNAL Error: Failed to bind column reference "wcat"`, an engine bug.
+/// See TECH-DEBT #84.
+#[test]
+fn pinned_ci_or_of_ands_two_grains_dimensions_only() {
+    let case = Case {
+        inst: ci_or_of_ands_instance(),
+        sel_dims: vec![1, 2],
+        sel_metrics: vec![],
+        where_pred: Some(ci_or_of_ands_pred()),
+    };
+    check_case(&case).unwrap();
+}
+
+/// The same data and filter with the root-grain metric `sv`: here the
+/// EXPANSION's own `GROUP BY` hits the same DuckDB bug, so a user running this
+/// query gets the internal error too (TECH-DEBT #84). The harness must still
+/// check its number rather than fail on the engine error.
+#[test]
+fn pinned_ci_or_of_ands_two_grains_with_root_metric() {
+    let case = Case {
+        inst: ci_or_of_ands_instance(),
+        sel_dims: vec![1, 2],
+        sel_metrics: vec![0],
+        where_pred: Some(ci_or_of_ands_pred()),
+    };
+    check_case(&case).unwrap();
+}
+
+/// TECH-DEBT #84 canary: the smallest data and query found that make DuckDB
+/// raise the internal error the comparison above works around. Plain SQL, no
+/// expansion involved. When a DuckDB upgrade makes this pass, remove the
+/// workaround branch in `check_case` and resolve #84.
+#[test]
+fn duckdb_group_by_bind_bug_still_present() {
+    let conn = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
+    conn.execute_batch(
+        "CREATE TABLE w (id INTEGER, wcat INTEGER); \
+         CREATE TABLE u (id INTEGER, fk_w INTEGER, ucat INTEGER); \
+         CREATE TABLE t (fk_u INTEGER); \
+         INSERT INTO u VALUES (0, 0, 0), (2, 0, 2); \
+         INSERT INTO t VALUES (3), (1);",
+    )
+    .expect("setup");
+    let query = "SELECT count(*) FROM (SELECT u.ucat, w.wcat FROM t \
+                 JOIN u ON t.fk_u = u.id JOIN w ON u.fk_w = w.id \
+                 WHERE (u.ucat = 0 AND w.wcat = 0) OR (u.ucat = 1 AND w.wcat = 1) \
+                 GROUP BY 1, 2) g";
+    let err = conn
+        .query_row(query, [], |r| r.get::<_, i64>(0))
+        .expect_err(
+            "DuckDB no longer raises the TECH-DEBT #84 internal error: remove the \
+             workaround in check_case and resolve #84",
+        );
+    assert!(
+        is_duckdb_group_by_bind_bug(&err.to_string()),
+        "unexpected error: {err}"
+    );
+    conn.execute_batch(DUCKDB_BIND_BUG_WORKAROUND)
+        .expect("disable compressed_materialization");
+    let rows: i64 = conn
+        .query_row(query, [], |r| r.get(0))
+        .expect("the workaround setting avoids the bug");
+    assert_eq!(rows, 0);
 }

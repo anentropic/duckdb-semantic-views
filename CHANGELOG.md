@@ -11,6 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Every metric is now aggregated from its own table, so a metric on a child table can
+  return different numbers when queried on its own.** Following Snowflake, a metric such as
+  `li.total_qty AS SUM(li.qty)` on a line-items table is computed from the line items
+  themselves and then joined out to the queried dimensions, rather than from the base table
+  `LEFT JOIN`ed to its children. Two things change for a child-table metric queried by
+  itself: a child row whose foreign key is NULL is now counted, under a NULL dimension
+  value, where it used to be left out; and a parent with no children no longer gets a row
+  (it used to get `0` for a count and `NULL` otherwise). When a parent-table metric is
+  queried alongside, the childless parent's row is still there, with the child metric
+  `NULL`. `COUNT(*)` or `COUNT(1)` on a child table with no `PRIMARY KEY` is now answered
+  instead of raising an error. Dimensions-only and `facts := [...]` queries are unchanged.
+  A member expression that uses an unqualified column belonging to *another* table (which
+  Snowflake rejects) may now fail with a "not found" error in queries where that table is
+  no longer joined; qualify the column or define a fact on the other table.
+  See *Metric grain* in the docs for the full rules.
 - **`CREATE SEMANTIC VIEW` rejects two relationships with the same name.** Relationship
   names are one namespace per view, compared the way DuckDB compares identifiers, so `r`,
   `R` and `"r"` are the same name. Two relationships sharing a name used to be accepted
@@ -33,6 +48,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A metric's value no longer depends on which other metrics are queried with it.**
+  Adding a metric from another table to a query used to switch a child-table metric over to
+  per-table aggregation, so the same metric could return, for example, `12` on its own and
+  `112` next to a parent-table metric (the difference being line items with no order), or
+  `0` on its own and `NULL` co-queried for an order with no line items. Both queries now
+  return the same value. This also holds for derived, semi-additive (`NON ADDITIVE BY`) and
+  window metrics over a child-table metric, and for `where_clause` filters on parent or
+  child members.
+- **Grouping a child-table metric by a child-table dimension no longer produces an extra
+  `NULL` group** for parents with no children.
 - **`SHOW SEMANTIC DIMENSIONS` / `METRICS` / `FACTS`, `SHOW COLUMNS IN SEMANTIC VIEW`,
   `SHOW SEMANTIC DIMENSIONS FOR METRIC` and `DESCRIBE SEMANTIC VIEW` report each member's
   data type again.** The `data_type` column (and the `DATA_TYPE` rows of `DESCRIBE`) has been

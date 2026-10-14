@@ -75,15 +75,40 @@ fn sg2_two_parent_child_picks_connecting_edge() {
         metrics: vec![MetricName::new("qty")],
     };
     let sql = expand("test", &def, &req).unwrap();
+    // TECH-DEBT #71: the metric is anchored at its own table `li` and joins OUT
+    // to `o` — through the li -> o edge, not the first-declared li -> p one.
     let expected = "\
 SELECT
     o.region AS \"region\",
     sum(CASE WHEN \"li\".\"id\" IS NOT NULL THEN li.qty END) AS \"qty\"
-FROM \"orders\" AS \"o\"
-LEFT JOIN \"line_items\" AS \"li\" ON \"li\".\"order_id\" = \"o\".\"id\"
+FROM \"line_items\" AS \"li\"
+LEFT JOIN \"orders\" AS \"o\" ON \"li\".\"order_id\" = \"o\".\"id\"
 GROUP BY
     1";
-    assert_eq!(sql, expected, "must join li via li->o, not li->p");
+    assert_eq!(sql, expected, "must join o via li->o, not li->p");
+    assert!(
+        !sql.contains("\"p\"."),
+        "ON clause must not reference the never-joined p: {sql}"
+    );
+
+    // The base-anchored resolver the test was written for still emits the
+    // dimensions-only path, which is where SG-2's edge choice now lives for a
+    // query reaching `li` from the base.
+    let def = def.with_dimension("item_qty", "li.qty", Some("li"));
+    let dims_only = QueryRequest {
+        where_clause: None,
+        facts: vec![],
+        dimensions: vec![DimensionName::new("region"), DimensionName::new("item_qty")],
+        metrics: vec![],
+    };
+    let sql = expand("test", &def, &dims_only).unwrap();
+    assert!(
+        sql.contains(
+            "FROM \"orders\" AS \"o\"\nLEFT JOIN \"line_items\" AS \"li\" \
+             ON \"li\".\"order_id\" = \"o\".\"id\""
+        ),
+        "the resolver must join li via li->o: {sql}"
+    );
     assert!(
         !sql.contains("\"p\"."),
         "ON clause must not reference the never-joined p: {sql}"
@@ -115,13 +140,17 @@ fn sg10_fk_side_chain_includes_intermediate_join() {
         metrics: vec![MetricName::new("detail_qty")],
     };
     let sql = expand("test", &ld_li_o_def(), &req).unwrap();
+    // TECH-DEBT #71: anchored at the metric's own table two hops below the
+    // base, the walk OUT to the dimension still pulls in the intermediate `li`,
+    // in dependency order. (The base-anchored resolver's walk DOWN is pinned by
+    // the facts-path test below.)
     let expected = "\
 SELECT
     o.region AS \"region\",
     sum(CASE WHEN \"ld\".\"id\" IS NOT NULL THEN ld.qty END) AS \"detail_qty\"
-FROM \"orders\" AS \"o\"
-LEFT JOIN \"line_items\" AS \"li\" ON \"li\".\"order_id\" = \"o\".\"id\"
-LEFT JOIN \"line_item_details\" AS \"ld\" ON \"ld\".\"line_item_id\" = \"li\".\"id\"
+FROM \"line_item_details\" AS \"ld\"
+LEFT JOIN \"line_items\" AS \"li\" ON \"ld\".\"line_item_id\" = \"li\".\"id\"
+LEFT JOIN \"orders\" AS \"o\" ON \"li\".\"order_id\" = \"o\".\"id\"
 GROUP BY
     1";
     assert_eq!(sql, expected);
@@ -379,8 +408,8 @@ fn queried_cross_table_fact_pulls_its_join() {
 }
 
 /// Copilot review of #200: a DERIVED metric whose base component references a
-/// cross-table fact, on the PER-GRAIN path. `group_fact_tables` scans each
-/// group's `metric_names`, and a derived metric's own expression names METRICS,
+/// cross-table fact, on the PER-GRAIN path. `per_grain::anchor_needs` scans
+/// each group's metrics, and a derived metric's own expression names METRICS,
 /// not facts -- the fact references live in the base metrics inlined into it.
 /// Scanning only the derived expression reintroduced PAR-6 inside the grain
 /// CTE: `(SUM(o.amount - (p.markup))) * 2` rendered over a FROM clause with no

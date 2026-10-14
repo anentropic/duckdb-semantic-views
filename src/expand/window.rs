@@ -248,16 +248,25 @@ pub(super) fn expand_window_metrics(
     // because the window function is not grain-sensitive.
     let resolved_joins = if let Some(anchor) = grain_anchor {
         push_from_anchor(&mut sql, def, anchor, "\n    ");
+        // Off the base table, the facts the inner metrics and the dimensions
+        // inline must be joined here explicitly: `anchor_joins` walks only the
+        // tables it is handed, where `resolve_joins_pkfk` below collects them
+        // itself (reviewbot, #250 -- a child-anchored `__sv_agg` emitted
+        // `FROM li` with no join for a parent fact).
+        let needs = super::per_grain::anchor_needs(def, resolved_mets, &dims, &where_tables);
         // The window path declines every role-played query (`window_cte_anchor`
-        // is strict), so it never has a role to honour and passes none. Were
-        // that to change, `__sv_agg`'s SELECT list would need the same
-        // scoped-alias rewrite the grain CTEs do.
+        // is strict), so it never has a dimension role to honour and passes
+        // none; `needs.scoped` is empty for the same reason, since a `USING`
+        // that scopes a reached fact declines the anchor. Were that to change,
+        // `__sv_agg`'s SELECT list would need the same scoped-alias rewrite the
+        // grain CTEs do.
         super::per_grain::anchor_joins(
             def,
             anchor,
             &dims,
-            &where_tables,
+            &needs.bare,
             &std::collections::HashMap::new(),
+            &needs.scoped,
         )
     } else {
         push_from_base(&mut sql, def, "\n    ");

@@ -218,6 +218,11 @@ code overlap with the spike branch, so the two run side by side.
 - **0b, gated on D1:** TECH-DEBT #71 (HIGH), a metric's value changing with its
   co-queried metrics. See §6. It is a deliberate numbers change, so it does not
   block Phases 1 to 3. It must land before Phases 4 and 7 add emission shapes.
+  **✅ Done 2026-10-13** on branch `claude/phase0b-home-anchoring`: every metric is
+  home-table anchored, with D1 settled by the Snowflake fixture (Q1–Q6 reproduced in
+  `test/sql/d1_home_table_anchoring.test`). The shapes the per-grain planner still
+  declines, and the unchanged dimensions-only / FACTS row semantics, are TECH-DEBT
+  #82; Phases 4 and 7 should target the home-anchored emitter, not those fallbacks.
 - **0c (✅ done, branch `claude/phase0c-data-type`):** #51 member `data_type`, **read-side**: probe at `SHOW`/`DESCRIBE` bind
   time, as `query::table_function::try_infer_schema` already does for queries. It
   has no parser dependency. It also cannot be done at CREATE under the grammar,
@@ -430,7 +435,7 @@ the same fixture answers both.
 
 | # | Question | Recommendation |
 |---|---|---|
-| D1 | #71 semantics: count orphan child rows (FK NULL)? Childless parent's child-COUNT = `NULL` or `0`? | Home-table anchoring, with orphans counted. For childless parents, the two reviews disagree. The first draft said `NULL`. Fable's review says `COALESCE` the COUNT family to `0`, since BI users expect that and a left-joined star gives `0`. Leaning to `0` for COUNT and `NULL` for other aggregates. A Snowflake fixture run would settle it. |
+| D1 | #71 semantics: count orphan child rows (FK NULL)? Childless parent's child-COUNT = `NULL` or `0`? | **Settled 2026-10-13 by the Snowflake fixture:** home-table anchoring; orphans counted under a NULL dimension; a childless parent's child COUNT is `NULL` (no `COALESCE`) when a parent-grain metric brings its row in, and a child metric alone gives no row for it. Implemented in Phase 0b. (Earlier leaning, superseded: `0` for COUNT.) |
 | D2 | Drop DuckDB 1.x when Phase 2 lands? | Yes, once spike item 6 shows that duckdb-rs and community CI are ready for 2.0. 1.5 is end of life on 2026-11-01. Tag v0.13.x as the last 1.5 line (fixes only). |
 | D3 | Keep `semantic_view('v', dimensions := …)` after `SEMANTIC_VIEW(...)` ships? | Keep it one release as a documented, deprecated alias that maps onto the same IR, then remove it. `explain_semantic_view` becomes a `semantic_view_sql`-style function over any statement. |
 | D4 | Store member expressions as verbatim source text (today) or as DuckDB-normalised text? | The spike shows a transform can rebuild the expression's exact code text, spacing included, from its tokens. Only comments inside an expression are lost, and they become spaces. Recommendation: keep storing that text, and document comment loss as a known divergence with a TECH-DEBT entry and a round-trip test pinning it. That preserves `GET_DDL` fidelity. Moving to AST storage would also retire #73 and IDENT-2/3/4, but it is a separate decision. |

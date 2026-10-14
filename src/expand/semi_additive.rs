@@ -275,15 +275,24 @@ pub(super) fn build_snapshot_block(
     let resolved_joins = match anchor {
         // Re-anchored: walk out from the metric's own table. The NA-dim and
         // `where_clause` tables ride the same extra-sources channel they do on
-        // the base-anchored path, so the snapshot ORDER BY still binds.
-        // Role-playing is declined by `snapshot_cte_anchor`, hence no roles.
-        Some(a) => super::per_grain::anchor_joins(
-            def,
-            a,
-            &dims,
-            &na_dim_sources,
-            &std::collections::HashMap::new(),
-        ),
+        // the base-anchored path, so the snapshot ORDER BY still binds. So do
+        // the tables of the facts the metrics and dimensions inline, which
+        // `resolve_joins_pkfk` collects itself but `anchor_joins` does not, and
+        // the `USING`-scoped instances a metric's inlined fact was requalified
+        // to (reviewbot, #250: a per-grain snapshot group emitted `ap__dep`
+        // with no join for it). No dimension roles: `is_eligible` and
+        // `snapshot_cte_anchor` withhold the scoped-alias rescue here.
+        Some(a) => {
+            let needs = super::per_grain::anchor_needs(def, resolved_mets, &dims, &na_dim_sources);
+            super::per_grain::anchor_joins(
+                def,
+                a,
+                &dims,
+                &needs.bare,
+                &std::collections::HashMap::new(),
+                &needs.scoped,
+            )
+        }
         None => resolve_joins_pkfk(def, &dims, resolved_mets, &na_dim_sources),
     };
     push_join_clauses(&mut sql, &resolved_joins, def, "\n    LEFT JOIN ");
