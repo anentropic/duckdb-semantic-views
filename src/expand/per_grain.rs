@@ -109,68 +109,135 @@ fn metric_column(index: usize) -> String {
     format!("__sv_m{index}")
 }
 
-/// The tables a grain's metrics reach through fact references (PAR-6).
+/// What a FROM anchored anywhere but the base table must join for the fact
+/// expressions its metrics and dimensions inline to bind (PAR-6), and for the
+/// `where_clause` members' tables: the bare tables to walk out to, and the
+/// `USING`-selected relationship instances to join under their scoped aliases.
+pub(super) struct AnchorNeeds<'a> {
+    /// Tables joined under their own alias, each once, in first-reached order.
+    pub(super) bare: Vec<String>,
+    /// Relationships joined under `<table>__<rel>` (TECH-DEBT #69 / #71).
+    pub(super) scoped: Vec<&'a Join>,
+}
+
+/// Compute [`AnchorNeeds`] for `metrics` (the queried ones; every metric each
+/// reaches is walked) and `resolved_dims`, plus the `where_clause` tables.
 ///
-/// A metric's expression may name a fact declared on another logical table;
-/// `inline_facts` splices that fact's expression into the aggregate this CTE
-/// computes, so the fact's table has to be joined here exactly as it is on the
-/// base-anchored path. Resolved from the group's `metric_names` rather than
-/// from its `exprs`, which are post-inlining and no longer name the fact.
+/// The one place every anchored emitter decides bare-or-scoped — the grain
+/// CTEs, the window `__sv_agg` CTE and the semi-additive snapshot (reviewbot,
+/// #250: each had grown its own copy, and they disagreed). The decision is
+/// made per base metric and per fact table exactly as
+/// `facts::rewrite_using_scoped_refs` makes it when it requalifies that
+/// metric's inlined text: a table is scoped only when exactly one distinct
+/// relationship of that metric's `USING` targets it and it is not the metric's
+/// own table; otherwise the text still names the bare alias, so the bare table
+/// is joined. One metric's scoped instance therefore never removes the bare
+/// join another metric (or a dimension) in the same FROM still names.
 ///
 /// The planner has already established the anchor is not fanned by the paths it
 /// emits, and `check_referenced_fact_fan_traps` has already rejected a fact on
 /// a table that fans its member — so nothing joined here multiplies the anchor.
-fn group_fact_tables(
-    def: &SemanticViewDefinition,
-    group: &Group,
+pub(super) fn anchor_needs<'a>(
+    def: &'a SemanticViewDefinition,
+    metrics: &[&Metric],
     resolved_dims: &[&Dimension],
-) -> Vec<String> {
-    let mut tables: Vec<String> = Vec::new();
-    let push = |expr: &str, tables: &mut Vec<String>| {
-        for alias in super::facts::collect_referenced_fact_tables(expr, &def.facts) {
-            if !tables.contains(&alias) {
-                tables.push(alias);
-            }
+    where_tables: &[String],
+) -> AnchorNeeds<'a> {
+    let mut needs = AnchorNeeds {
+        bare: Vec::new(),
+        scoped: Vec::new(),
+    };
+    let push_bare = |t: &str, bare: &mut Vec<String>| {
+        if !bare.iter().any(|b| b.eq_ignore_ascii_case(t)) {
+            bare.push(t.to_string());
         }
     };
-    for name in &group.metric_names {
-        let Some(met) = def
-            .metrics
-            .iter()
-            .find(|m| crate::ident::normalize_ident_part(&m.name) == *name)
-        else {
-            continue;
-        };
-        push(&met.expr, &mut tables);
-        // A derived metric's own expression names METRICS, not facts -- the
-        // fact references live in the base metrics inlined into it, and the
-        // expression this CTE renders is the post-inlining one. Scanning only
-        // `met.expr` here reintroduced PAR-6 inside the grain CTE for a derived
-        // metric over a cross-table fact (Copilot, #200): the aggregate named
-        // the fact's alias and `anchor_joins` never joined it. Mirrors the walk
-        // `join_resolver` does on the base-anchored path.
-        if met.source_table.is_none() {
-            for dep in super::facts::collect_transitive_metric_names(met, &def.metrics) {
-                if let Some(base) = def
-                    .metrics
-                    .iter()
-                    .find(|m| crate::ident::normalize_ident_part(&m.name) == dep)
-                {
-                    push(&base.expr, &mut tables);
+    for t in where_tables {
+        push_bare(t, &mut needs.bare);
+    }
+    // Every metric each one reaches, not just its own expression: a derived
+    // metric's expression names METRICS and a window metric's names its inner
+    // metric, so the fact references live in the metrics inlined into them.
+    // Scanning only `met.expr` reintroduced PAR-6 inside the grain CTE for a
+    // derived metric over a cross-table fact (Copilot, #200).
+    let mut reached: Vec<&Metric> = Vec::new();
+    for met in metrics {
+        for m in metrics_reached(def, met) {
+            if !reached.iter().any(|r| std::ptr::eq(*r, m)) {
+                reached.push(m);
+            }
+        }
+    }
+    for m in reached {
+        let roles = using_roles_by_target(def, m);
+        for t in super::facts::collect_referenced_fact_tables(&m.expr, &def.facts) {
+            let key = crate::ident::normalize_ident_part(&t);
+            match roles.iter().find(|(target, _)| *target == key) {
+                Some((_, joins)) if joins.len() == 1 => {
+                    if !needs.scoped.iter().any(|j| std::ptr::eq(*j, joins[0])) {
+                        needs.scoped.push(joins[0]);
+                    }
                 }
+                _ => push_bare(&t, &mut needs.bare),
             }
         }
     }
     // TECH-DEBT #54: a grain CTE projects the queried dimension expressions as
-    // its group keys, and those are now fact-inlined too -- so a fact a
-    // dimension reaches on another table has to be joined inside this CTE, not
-    // just in the base-anchored SELECT. Copilot flagged this gap while
-    // reviewing #200; it was not yet reachable then, because dimensions were
-    // not inlined, and inlining them is what makes it real.
+    // its group keys, and those are fact-inlined too -- so a fact a dimension
+    // reaches on another table has to be joined inside this CTE (Copilot,
+    // #200). A dimension's expression is never `USING`-scoped, so always bare.
     for dim in resolved_dims {
-        push(&dim.expr, &mut tables);
+        for t in super::facts::collect_referenced_fact_tables(&dim.expr, &def.facts) {
+            push_bare(&t, &mut needs.bare);
+        }
     }
-    tables
+    needs
+}
+
+/// A base metric's `USING` relationships grouped by the (normalized) table they
+/// target, distinct by edge and skipping the metric's own table — the grouping
+/// `facts::rewrite_using_scoped_refs` rewrites by. Empty for a derived metric,
+/// whose `USING` (if any) that rewrite never applies.
+fn using_roles_by_target<'a>(
+    def: &'a SemanticViewDefinition,
+    met: &Metric,
+) -> Vec<(String, Vec<&'a Join>)> {
+    let mut by_target: Vec<(String, Vec<&'a Join>)> = Vec::new();
+    let Some(own) = met.source_table.as_deref() else {
+        return by_target;
+    };
+    let own = crate::ident::normalize_ident_part(own);
+    for rel in &met.using_relationships {
+        let Some(join) = crate::graph::find_relationship(&def.joins, rel) else {
+            continue;
+        };
+        let target = crate::ident::normalize_ident_part(&join.table);
+        if target == own {
+            continue;
+        }
+        match by_target.iter_mut().find(|(t, _)| *t == target) {
+            Some((_, joins)) => {
+                if !joins.iter().any(|j| std::ptr::eq(*j, join)) {
+                    joins.push(join);
+                }
+            }
+            None => by_target.push((target, vec![join])),
+        }
+    }
+    by_target
+}
+
+/// The metrics a grain group computes, resolved from its canonical names.
+fn group_metrics<'a>(def: &'a SemanticViewDefinition, group: &Group) -> Vec<&'a Metric> {
+    group
+        .metric_names
+        .iter()
+        .filter_map(|name| {
+            def.metrics
+                .iter()
+                .find(|m| crate::ident::normalize_ident_part(&m.name) == *name)
+        })
+        .collect()
 }
 
 /// One grain: the table its CTE is anchored at, and the aggregate columns
@@ -313,21 +380,20 @@ pub(super) fn plan(
         }
     }
 
-    // Does a base-anchored FROM actually get this wrong? Only then is rewriting
-    // it justified: an anchor that fans relative to the root (the metric is
-    // duplicated once per root row), or a pair of anchors either side of a
-    // fan-out edge (they inflate each other over the shared join).
+    // TECH-DEBT #71 (D1, settled against Snowflake): every metric is aggregated
+    // from its OWN home table, so a query needs this path whenever any grain is
+    // not the root. Only an all-root query is left to the base-anchored path —
+    // there the base table IS every metric's home, so the two agree.
+    //
+    // This used to fire only where a base-anchored FROM would INFLATE a metric
+    // (an anchor fanning relative to the root, or two anchors either side of a
+    // fan-out edge), leaving a metric on a CHILD of the base table to the
+    // base-anchored `FROM base LEFT JOIN child`. That join drops every child
+    // row whose foreign key is NULL and manufactures a row for every childless
+    // parent, so a child metric's number depended on whether a metric of
+    // another grain happened to be co-queried (MM-3).
     let anchors: Vec<&String> = partition.groups.iter().map(|g| &g.anchor).collect();
-    let needs_per_grain = anchors
-        .iter()
-        .any(|a| graph.fanning_relationship(a, &root).is_some())
-        || anchors.iter().enumerate().any(|(i, a)| {
-            anchors
-                .iter()
-                .enumerate()
-                .any(|(j, b)| i != j && graph.fanning_relationship(a, b).is_some())
-        });
-    if !needs_per_grain {
+    if anchors.iter().all(|a| **a == root) {
         return None;
     }
 
@@ -700,11 +766,10 @@ pub(super) fn snapshot_cte_anchor(
     }
     // A metric's `USING` scopes its joins on the base-anchored path; the
     // snapshot emitter does not thread that context, so decline rather than
-    // silently re-anchor onto a different relationship instance.
-    if resolved_mets
-        .iter()
-        .any(|m| !m.using_relationships.is_empty())
-    {
+    // silently re-anchor onto a different relationship instance — unless the
+    // relationship targets a table this query never reaches, where it scopes
+    // nothing (TECH-DEBT #71; the same test `is_eligible` applies).
+    if using_scopes_a_touched_table(def, resolved_dims, resolved_mets, extra_tables) {
         return None;
     }
 
@@ -730,15 +795,12 @@ pub(super) fn snapshot_cte_anchor(
     if anchor == root {
         return None; // Already correct as-is.
     }
-    // Only re-anchor where base-anchoring actually inflates — the anchor on the
-    // "one" side of the path from the root. The other direction must be left
-    // alone: for a metric on a CHILD of the base table, `FROM base LEFT JOIN
-    // child` already yields each child row once, and that LEFT JOIN keeps
-    // childless parents as NULL-extended rows. Flipping to `FROM child` would
-    // silently DROP those groups, and this single-CTE path has no FULL OUTER
-    // JOIN reassembly to restore them. Identical reasoning to
-    // [`window_cte_anchor`]; see its note for the worked example.
-    graph.fanning_relationship(&anchor, &root)?;
+    // Re-anchor in EITHER direction (TECH-DEBT #71). For a metric on a parent
+    // of the base this removes the inflation; for a metric on a CHILD it is
+    // the home-table rule itself: `FROM child` counts the child rows whose
+    // foreign key is NULL (under a NULL dimension value) and yields no group
+    // for a childless parent — exactly what the same metric gets when the
+    // per-grain planner computes it alongside a metric of another grain.
     // Everything the CTE must reference has to be reachable from the anchor, or
     // its FROM could not bind the column: the queried dimensions...
     for dim in resolved_dims {
@@ -777,10 +839,11 @@ pub(super) fn window_cte_anchor(
     {
         return None;
     }
-    if resolved_mets
-        .iter()
-        .any(|m| !m.using_relationships.is_empty())
-    {
+    // `USING` on a window metric, its inner aggregate or anything that reaches
+    // (`using_scopes_a_touched_table` walks them all): the window emitter does
+    // not thread a role into `__sv_agg`, so decline unless the relationship
+    // targets a table this query never reaches (TECH-DEBT #71).
+    if using_scopes_a_touched_table(def, resolved_dims, resolved_mets, where_tables) {
         return None;
     }
 
@@ -827,23 +890,15 @@ pub(super) fn window_cte_anchor(
     if anchor == root {
         return None; // Already correct as-is.
     }
-    // Only re-anchor in the direction where base-anchoring actually inflates —
-    // when the anchor is on the "one" side of the path from the root, so joining
-    // it to the base table replicates each of its rows once per base row.
+    // Re-anchor in EITHER direction (TECH-DEBT #71). On the "one" side of the
+    // root this removes the inflation a base-anchored join would cause. On the
+    // "many" side it is the home-table rule: `FROM child LEFT JOIN base` counts
+    // a child row whose foreign key is NULL and gives a childless parent no
+    // group, which is what the inner metric gets queried on its own (Snowflake,
+    // D1). This used to be declined because `FROM base LEFT JOIN child` kept the
+    // childless parent as a `COUNT` of 0 — the very base-anchored answer #71
+    // retires.
     //
-    // The other direction must be left alone, and not merely as an optimisation:
-    // for a metric on a CHILD of the base table, `FROM base LEFT JOIN child`
-    // already yields each child row once, and its LEFT JOIN deliberately keeps
-    // childless parents as NULL-extended rows (a `COUNT` of 0 for them). Flipping
-    // to `FROM child LEFT JOIN base` would silently DROP those groups — an order
-    // with no line items would vanish from the result rather than counting 0.
-    // Per-grain's own planner can re-anchor either way because it FULL OUTER
-    // JOINs the grain CTEs, which restores such groups; this single-CTE path has
-    // no such reassembly, so it restricts itself to the safe direction.
-    //
-    // `?` discards the relationship NAME deliberately — only its presence matters
-    // here, and `None` (no fanning edge, so no inflation to fix) declines.
-    graph.fanning_relationship(&anchor, &root)?;
     // Each queried dimension must be joinable from the anchor, or the CTE's
     // FROM could not reach the column its SELECT names.
     for dim in resolved_dims {
@@ -911,6 +966,27 @@ fn is_eligible(
     // where the base-anchored path still scopes the alias — is left on that
     // path, unchanged, rather than guessed at here.
     let roles = scoped_roles(def, resolved_dims, resolved_mets);
+    // TECH-DEBT #71: a `USING` relationship whose target table this query
+    // never reaches scopes nothing — the base-anchored path emits its scoped
+    // join, but no member names the scoped alias, so it only widens the FROM.
+    // Such a relationship is not a reason to keep a child metric off its home
+    // table. "Reaches" here is a queried dimension or a `where_clause` member:
+    // a fact the metric itself inlines from the role-played table is joined
+    // under the scoped alias its `USING` names (`anchor_needs`), so
+    // that reach is threaded.
+    let reached: Vec<&Metric> = resolved_mets
+        .iter()
+        .flat_map(|met| metrics_reached(def, met))
+        .collect();
+    if reached.iter().any(|m| m.is_window()) {
+        return false;
+    }
+    // With no `USING` anywhere, every metric is vacuously threaded: skip
+    // scanning every dimension's expression for facts (reviewbot, #250).
+    if reached.iter().all(|m| m.using_relationships.is_empty()) {
+        return true;
+    }
+    let touched = touched_tables(def, resolved_dims, resolved_mets, where_tables, false);
     // A relationship `rel` names is threaded when the role resolved for its
     // table is that same relationship, both matched by `graph::RelNameMatch`.
     // For a view stored before #249 with `dep` and `"dep"` to one table, both
@@ -921,21 +997,102 @@ fn is_eligible(
             let named = crate::graph::RelNameMatch::new(&def.joins, rel);
             def.joins.iter().any(|j| {
                 named.matches_join(j)
-                    && roles
+                    && (roles
                         .get(&j.table.to_ascii_lowercase())
                         .is_some_and(|role| named.matches(role))
+                        || !touched.contains(&j.table.to_ascii_lowercase()))
             })
         })
     };
-    resolved_mets.iter().all(|met| {
-        super::facts::collect_transitive_metric_names(met, &def.metrics)
-            .iter()
-            .filter_map(|name| {
-                def.metrics
-                    .iter()
-                    .find(|m| crate::ident::normalize_ident_part(&m.name) == *name)
-            })
-            .all(|m| !m.is_window() && using_is_threaded(m))
+    reached.into_iter().all(using_is_threaded)
+}
+
+/// `met` and every metric it reaches, transitively — a derived metric's
+/// components and a window metric's inner metric — each once, in the
+/// definition's declaration order (so emitted SQL is stable).
+///
+/// The one dependency walk the per-grain planner and the two single-CTE
+/// anchors share (reviewbot, #250: it had been copied three times, and the
+/// window-inner `USING` gap was a copy that stopped one level short).
+fn metrics_reached<'a>(def: &'a SemanticViewDefinition, met: &Metric) -> Vec<&'a Metric> {
+    let names = super::facts::collect_transitive_metric_names(met, &def.metrics);
+    def.metrics
+        .iter()
+        .filter(|m| names.contains(&crate::ident::normalize_ident_part(&m.name)))
+        .collect()
+}
+
+/// Every table (lowercased) a grain CTE for this query could have to name: the
+/// queried dimensions' tables and the facts their expressions reach, the
+/// `where_clause` members' tables, and — with `include_metric_facts` — the facts
+/// each queried metric, or a metric it depends on, inlines. A metric's own table
+/// is not included: it is the CTE's anchor, never a joined table.
+fn touched_tables(
+    def: &SemanticViewDefinition,
+    resolved_dims: &[&Dimension],
+    resolved_mets: &[&Metric],
+    where_tables: &[String],
+    include_metric_facts: bool,
+) -> HashSet<String> {
+    let mut out: HashSet<String> = where_tables
+        .iter()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    let add_facts = |expr: &str, out: &mut HashSet<String>| {
+        for alias in super::facts::collect_referenced_fact_tables(expr, &def.facts) {
+            out.insert(alias.to_ascii_lowercase());
+        }
+    };
+    for dim in resolved_dims {
+        if let Some(st) = &dim.source_table {
+            out.insert(st.to_ascii_lowercase());
+        }
+        add_facts(&dim.expr, &mut out);
+    }
+    for met in resolved_mets.iter().filter(|_| include_metric_facts) {
+        for m in metrics_reached(def, met) {
+            add_facts(&m.expr, &mut out);
+        }
+    }
+    out
+}
+
+/// Whether any queried metric's `USING` names a relationship whose target table
+/// this query reaches (see [`touched_tables`]). The single-CTE anchors cannot
+/// honour a role, so for them such a relationship declines the re-anchor; one
+/// whose target nothing reaches scopes nothing and is no obstacle.
+fn using_scopes_a_touched_table(
+    def: &SemanticViewDefinition,
+    resolved_dims: &[&Dimension],
+    resolved_mets: &[&Metric],
+    extra_tables: &[String],
+) -> bool {
+    // Every metric the query reaches, not only the queried ones: a `USING` on a
+    // derived metric's component or a window's (transitive) inner metric scopes
+    // the fact that component inlines just the same (reviewbot, #250: a window
+    // over a derived metric whose component carried the `USING` was
+    // re-anchored with no scoped join, and failed to bind `ap__dep`).
+    let mut reached: Vec<&Metric> = Vec::new();
+    for met in resolved_mets {
+        for m in metrics_reached(def, met) {
+            if !reached.iter().any(|r| std::ptr::eq(*r, m)) {
+                reached.push(m);
+            }
+        }
+    }
+    if reached.iter().all(|m| m.using_relationships.is_empty()) {
+        return false;
+    }
+    let touched = touched_tables(def, resolved_dims, resolved_mets, extra_tables, true);
+    // Resolved with the shared `graph::find_relationship` (#249), never
+    // `ident_matches`: that folds the one-part `"x.y"` and the two-part `x.y`
+    // together, which are different relationship names. A name that resolves
+    // to nothing is treated as scoping a touched table (decline, unchanged).
+    reached.iter().any(|m| {
+        m.using_relationships.iter().any(|rel| {
+            crate::graph::find_relationship(&def.joins, rel)
+                .is_none_or(|j| touched.contains(&j.table.to_ascii_lowercase()))
+        })
     })
 }
 
@@ -1021,14 +1178,16 @@ fn render_plain_group(
     }
     sql.push_str(&items.join(",\n"));
     push_from_anchor(&mut sql, def, &group.anchor, "\n    ");
+    let needs = anchor_needs(def, &group_metrics(def, group), resolved_dims, where_tables);
     push_join_clauses(
         &mut sql,
         &anchor_joins(
             def,
             &group.anchor,
             resolved_dims,
-            &[where_tables, &group_fact_tables(def, group, resolved_dims)].concat(),
+            &needs.bare,
             roles,
+            &needs.scoped,
         ),
         def,
         "\n    LEFT JOIN ",
@@ -1081,15 +1240,7 @@ fn render_snapshot_group(
     let dim_aliases: Vec<String> = (0..resolved_dims.len())
         .map(|d| quote_ident(&dim_column(d)))
         .collect();
-    let mets: Vec<&Metric> = group
-        .metric_names
-        .iter()
-        .filter_map(|name| {
-            def.metrics
-                .iter()
-                .find(|m| crate::ident::normalize_ident_part(&m.name) == *name)
-        })
-        .collect();
+    let mets = group_metrics(def, group);
 
     let block = super::semi_additive::build_snapshot_block(
         view_name,
@@ -1164,6 +1315,12 @@ fn render_single_grain(
     } else {
         GroupBy::Ordinals(resolved_dims.len())
     };
+    let needs = anchor_needs(
+        def,
+        &group_metrics(def, group),
+        resolved_dims,
+        &where_tables,
+    );
     SelectSpec {
         // Filters the anchor's rows on their way into the aggregation, the same
         // position the base-anchored path uses.
@@ -1177,12 +1334,9 @@ fn render_single_grain(
                 def,
                 &group.anchor,
                 resolved_dims,
-                &[
-                    where_tables.clone(),
-                    group_fact_tables(def, group, resolved_dims),
-                ]
-                .concat(),
+                &needs.bare,
                 roles,
+                &needs.scoped,
             ),
         },
         group_by,
@@ -1320,6 +1474,7 @@ pub(super) fn anchor_joins<'a>(
     resolved_dims: &[&Dimension],
     extra_tables: &[String],
     roles: &HashMap<String, String>,
+    scoped_facts: &[&'a Join],
 ) -> Vec<ResolvedJoin<'a>> {
     let Some(graph) = GrainGraph::build(def) else {
         return Vec::new();
@@ -1373,6 +1528,49 @@ pub(super) fn anchor_joins<'a>(
                     scoped: false,
                 });
             }
+        }
+    }
+    // TECH-DEBT #71: the role-played instances a metric's `USING` selects for a
+    // fact it inlines (see [`anchor_needs`]). Each is joined under its
+    // scoped alias straight off the relationship's own source table — the
+    // relationship NAMES the edge, so nothing is picked by declaration order —
+    // after making sure that source table is itself in scope. Two roles of one
+    // table are two joins, as on the base-anchored path.
+    for join in scoped_facts {
+        let from = join.from_alias.to_ascii_lowercase();
+        if let Some(path) = graph.path(anchor, &from) {
+            for pair in path.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                // A role-played hop here is unreachable: the #69 fence rejects
+                // a fact on a table reached only THROUGH a role-played table
+                // (no `USING` can pick that role), so a scoped fact's source
+                // table is never behind one. Skipped rather than joined bare
+                // all the same, so this can never bind declaration order.
+                if roles.contains_key(b) || !emitted.insert(b.clone()) {
+                    continue;
+                }
+                if let Some(edge) = edge_between(def, a, b) {
+                    joins.push(ResolvedJoin {
+                        emit_alias: b.clone(),
+                        bare_alias: b.clone(),
+                        join: edge,
+                        scoped: false,
+                    });
+                }
+            }
+        }
+        let table = join.table.to_ascii_lowercase();
+        let scoped = super::join_resolver::scoped_join_alias(
+            &table,
+            join.name.as_deref().unwrap_or_default(),
+        );
+        if emitted.insert(scoped.clone()) {
+            joins.push(ResolvedJoin {
+                emit_alias: scoped,
+                bare_alias: table,
+                join,
+                scoped: true,
+            });
         }
     }
     joins

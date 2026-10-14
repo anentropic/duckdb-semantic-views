@@ -62,9 +62,13 @@ East	2
 West	1
 
 # ============================================================
-# Test 3: without a PRIMARY KEY on the child table the rewrite is
-# impossible -- the query errors instead of silently over-counting.
+# Test 3: a child table with NO PRIMARY KEY.
 # (CREATE succeeds: li is the FK source, so D-06 does not require a PK.)
+#
+# Since TECH-DEBT #71 the metric is aggregated from its own home table
+# (`FROM sg8_line_items`), which has no NULL-extended rows, so COUNT(*) is
+# exact and needs no key at all. Before #71 this query errored with
+# CountStarRequiresPrimaryKey.
 # ============================================================
 
 statement ok
@@ -83,10 +87,24 @@ CREATE SEMANTIC VIEW sg8_nopk AS
     li.item_count AS COUNT(*)
   );
 
-statement error
+query I
 SELECT * FROM semantic_view('sg8_nopk', metrics := ['item_count']);
 ----
-or a constant argument (COUNT(1), SUM(1), ...) on joined table 'li'
+3
+
+query TI rowsort
+SELECT * FROM semantic_view('sg8_nopk', dimensions := ['region'], metrics := ['item_count']);
+----
+East	2
+West	1
+
+# The CountStarRequiresPrimaryKey error is still live on the paths that stay
+# base-anchored (TECH-DEBT #82). None of them is reachable from this DDL shape
+# -- the remaining one for a plain metric, an unqualified dimension, exists only
+# in legacy stored JSON, since both DDL and YAML now require every dimension to
+# name its table -- so that error is pinned by the unit tests
+# `expand::tests_count_star_rewrite::test_child_count_star_without_pk_errors`
+# and `expand::tests_phantom_row_guard::no_pk_child_min_constant_errors_loudly`.
 
 # ============================================================
 # Test 4: base-table COUNT(*) is untouched (the base table is never

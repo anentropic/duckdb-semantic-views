@@ -178,12 +178,16 @@ SELECT * FROM semantic_view('p69_pkless', metrics := ['order_count', 'item_count
 ----
 3	3
 
-# The same metric alone still goes through the base-anchored path, where
-# COUNT(*) on a PK-less joined table cannot be made safe — the guard stands.
-statement error
+# The same metric alone is aggregated from its own home table too (TECH-DEBT
+# #71). Before #71 it went through the base-anchored path and errored with
+# "PRIMARY KEY" -- answerable co-queried, refused alone. Order 12 (open) has no
+# items, so it adds nothing to `open`; there is no `status` with zero items, so
+# no row is missing here.
+query TI rowsort
 SELECT * FROM semantic_view('p69_pkless', dimensions := ['status'], metrics := ['item_count']);
 ----
-PRIMARY KEY
+closed	1
+open	2
 
 statement ok
 DROP SEMANTIC VIEW p69_pkless;

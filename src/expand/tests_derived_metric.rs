@@ -272,9 +272,11 @@ fn expand_derived_only_no_base_metrics_requested() {
         metrics: vec![MetricName::new("profit")],
     };
     let sql = expand("test", &def, &req).unwrap();
+    // TECH-DEBT #71: both components live on `li`, so the derived metric is
+    // computed from `li` and joins OUT to `o` for the dimension.
     assert!(
-        sql.contains("LEFT JOIN \"line_items\" AS \"li\""),
-        "JOIN to li must be included for derived metric referencing li-based metrics: {sql}"
+        sql.contains("FROM \"line_items\" AS \"li\"\nLEFT JOIN \"orders\" AS \"o\""),
+        "a derived metric over li-based metrics must be anchored at li: {sql}"
     );
     assert!(
         sql.contains(
@@ -305,7 +307,7 @@ fn resolve_joins_includes_transitive_deps_from_derived() {
         dimensions: vec![Dimension {
             name: "region".to_string(),
             expr: "o.region".to_string(),
-            source_table: Some("o".to_string()),
+            source_table: None,
             ..Default::default()
         }],
         metrics: vec![
@@ -333,6 +335,11 @@ fn resolve_joins_includes_transitive_deps_from_derived() {
         // test's purpose is the ORTHOGONAL mechanic that a derived metric pulls
         // its transitive dependency's join (`li`) into resolution, so the edge
         // is declared OneToOne to keep the query legal and reach that assertion.
+        //
+        // That mechanic lives in the BASE-ANCHORED resolver, which since
+        // TECH-DEBT #71 sees a non-root metric only on a fallback shape: here,
+        // the unqualified `region` dimension below (a qualified one would put
+        // each component at its own grain and never consult the resolver).
         joins: vec![Join {
             table: "o".to_string(),
             from_alias: "li".to_string(),

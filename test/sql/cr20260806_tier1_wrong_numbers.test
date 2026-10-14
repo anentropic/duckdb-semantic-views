@@ -75,8 +75,14 @@ SELECT * FROM semantic_view(
 East	2	2	2	2	2
 West	1	1	1	1	1
 
-# A group whose orders are ALL childless: COUNT-family metrics are 0 and
-# SUM(1) is NULL -- the empty-aggregate semantics the phantom row destroyed.
+# A group whose orders are ALL childless. Since TECH-DEBT #71 these child
+# metrics are aggregated from their home table (`FROM cr0806_items`), which has
+# no row for North at all, so North has NO row (Snowflake semantics: a child
+# metric alone gives no row for a childless parent). Before #71 the
+# base-anchored LEFT JOIN gave `North 0 NULL`, and before EXP-21 the phantom
+# row made it `North 1 1`. The NULL-not-0 behaviour for a childless parent
+# that IS brought in by a parent-grain metric is pinned by
+# d1_home_table_anchoring.test (Q2, Q6).
 statement ok
 INSERT INTO cr0806_orders VALUES (4, 'North');
 
@@ -87,7 +93,6 @@ SELECT * FROM semantic_view(
   metrics := ['n_one', 's_one']
 ) WHERE region = 'North';
 ----
-North	0	NULL
 
 # Control: a column argument was never affected -- it is already NULL on the
 # phantom row, so the aggregate skipped it unaided.

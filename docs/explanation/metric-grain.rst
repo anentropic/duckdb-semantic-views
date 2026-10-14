@@ -82,18 +82,81 @@ A Single-Grain Query Is One SELECT
 ==================================
 
 When every metric in a query sits at the same grain, the extension generates one
-statement anchored at the view's **base table** -- the first table declared in
-the ``TABLES`` clause -- with a ``LEFT JOIN`` out to each table a queried
-dimension needs, and one ``GROUP BY``.
+statement anchored at that grain's table -- the metrics' **home table** -- with a
+``LEFT JOIN`` out to each table a queried dimension needs, and one ``GROUP BY``.
 
 Take the three-table shop model from :ref:`tutorial-multi-table`: both
 ``revenue`` and ``order_count`` are declared on ``o`` (orders), so grouping
-either of them by a customer or product dimension is a single-grain query.
-Joining outward from orders to customers is safe because each order has exactly
-one customer -- traversing from the "many" side to the "one" side never
-duplicates a row.
+either of them by a customer or product dimension is a single-grain query,
+anchored at ``orders``. Joining outward from orders to customers is safe because
+each order has exactly one customer -- traversing from the "many" side to the
+"one" side never duplicates a row.
 
-This is the ordinary case, and everything that follows leaves it alone.
+.. versionchanged:: 0.13.1
+
+   A metric on a table *below* the base table -- a line-item metric in a view
+   whose base table is ``orders`` -- used to be computed from the base table,
+   joined down to its rows. It is now computed from its own table like every
+   other metric, which changes two edge cases; see
+   :ref:`explanation-grain-orphans`.
+
+
+.. _explanation-grain-orphans:
+
+Orphan Rows and Parents With No Children
+========================================
+
+Every metric is aggregated from its own home table, joining only *outward* --
+from the "many" side to the "one" side -- to reach the dimensions the query asks
+for. Two consequences are worth knowing, because they are where this differs
+from the answer you would get by starting at a parent table and joining down.
+Both match Snowflake, which was run against the same fixture to settle them.
+
+**A row whose foreign key is NULL is still counted.**
+   A line item that belongs to no order (its ``order_id`` is ``NULL``, or names
+   an order that does not exist) is a real line item. Counting line items by
+   customer region counts it, under a ``NULL`` region -- the same ``NULL`` an
+   outer join gives any attribute that cannot be looked up. The grand total of
+   ``total_qty`` includes it too.
+
+**A parent with no children has no row for a child metric.**
+   An order with no line items has nothing for ``item_count`` to count, so
+   querying ``item_count`` by order returns no row for it -- not a row reading
+   ``0``. When a metric of the order's own grain is queried alongside, the row
+   appears because *that* metric has a value for it, and ``item_count`` there is
+   ``NULL``: "no rows at this grain", exactly as in the multi-grain example
+   below.
+
+With the line items of Snowflake's fixture -- one of them an orphan with
+``qty = 40``, and a customer in the US whose only order has no items:
+
+.. code-block:: sql
+
+   SELECT * FROM semantic_view('d1_sv',
+       dimensions := ['cust_region'],
+       metrics := ['n_items', 'total_qty']);
+
+.. code-block:: text
+
+   ┌─────────────┬─────────┬───────────┐
+   │ cust_region │ n_items │ total_qty │
+   ├─────────────┼─────────┼───────────┤
+   │ EU          │       3 │         6 │
+   │ NULL        │       1 │        40 │
+   └─────────────┴─────────┴───────────┘
+
+The most useful property follows from the rule rather than being added to it:
+**a metric's value never depends on what else is in the query.** ``n_items`` for
+EU is 3 whether it is queried alone, alongside a customer count, or as part of a
+derived metric.
+
+.. note::
+
+   Only metrics are anchored this way. A dimensions-only query and a ``FACTS``
+   query are row-level, and keep their earlier behaviour: they start at the base
+   table and drop the row a parent with no children would otherwise contribute.
+   A row-level query on a child fact therefore still omits a child row whose
+   foreign key is ``NULL``.
 
 
 .. _explanation-grain-multi:
@@ -227,17 +290,17 @@ exactly what was generated for a given query, use
 
 .. note::
 
-   Single-grain queries do not take this path at all -- they generate exactly the
-   SQL they always did. Per-grain assembly is entered only where the query would
-   otherwise have been rejected, so adding a parent-table metric to a view cannot
-   change the answer to a query that does not use it.
+   A single-grain query is the one-grain case of this: one aggregate, anchored at
+   its own table, with nothing to join it to. Adding a metric at another grain
+   adds a second aggregate; it does not change the first one.
 
-One requirement relaxes on this path. A ``COUNT(*)`` metric normally needs its
-table to declare a ``PRIMARY KEY``, because on the base-anchored path that table
-is reached through a ``LEFT JOIN`` whose NULL-extended rows ``COUNT(*)`` would
+One requirement relaxes on this path. A ``COUNT(*)`` metric used to need its
+table to declare a ``PRIMARY KEY`` whenever that table was reached through a
+``LEFT JOIN`` from the base table, whose NULL-extended rows ``COUNT(*)`` would
 count. A table that anchors its own grain produces no such rows, so the key is
-not required there. Querying the same metric on the base-anchored path still
-needs it.
+not required there -- and every metric is now anchored at its own table, apart
+from the few shapes listed under :ref:`explanation-grain-refused` that still
+fall back to the base table.
 
 
 .. _explanation-grain-refused:
@@ -265,7 +328,11 @@ useful to keep in mind while you model.
    already-grouped rows, so the window itself is not grain-sensitive -- the inner
    aggregate is. One window metric whose inner aggregate lives on a non-base table
    is computed at that table's grain. Two of them at *different* grains are not,
-   because those grains would have to be joined before the window could run. See
+   because those grains would have to be joined before the window could run: a
+   parent-grain pair is refused with a fan trap error, and a pair whose finer
+   inner aggregate sits *below* the base table is still computed from the base
+   table, so that inner aggregate drops orphan rows and reports ``0`` or
+   ``NULL`` for a childless parent (a known gap). See
    :ref:`howto-window-metrics`.
 
 **A role-played table reached without** ``USING``.

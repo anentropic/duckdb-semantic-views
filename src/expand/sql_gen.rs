@@ -681,7 +681,11 @@ pub fn expand(
     // `tests_per_grain`). PR #175 review: without this the guard rejected
     // eligible anchored-window queries, because it ran while `window_anchor`
     // was still computed further down.
-    if grain_plan.is_none() && window_anchor.is_none() && !resolved.count_star_no_pk.is_empty() {
+    if grain_plan.is_none()
+        && window_anchor.is_none()
+        && snapshot_anchor.is_none()
+        && !resolved.count_star_no_pk.is_empty()
+    {
         for met in &resolved_mets {
             for name in collect_transitive_metric_names(met, &def.metrics) {
                 if let Some(table_alias) = resolved.count_star_no_pk.get(&name) {

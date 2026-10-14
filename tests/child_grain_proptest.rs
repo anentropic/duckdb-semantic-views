@@ -35,24 +35,40 @@
 //!   every child of a real parent turns it into a childless one *at filter
 //!   time*, exactly where the phantom-row rewrite has to hold.
 //!
-//! Scope: SELECTED dimensions are drawn from the BASE table only. Grouping by a
-//! child dimension puts childless parents in their own NULL group, whose oracle
-//! is a different (and much less independent) formulation; that case is covered
-//! by the fixed tests in `src/expand/tests_count_star_rewrite.rs` and
-//! `src/expand/tests_phantom_row_guard.rs`. `where_clause` members, by
-//! contrast, are drawn from BOTH sides.
+//! # Since TECH-DEBT #71: home-table anchoring
 //!
-//! The oracle is formulated WITHOUT a join at all — each metric is a correlated
-//! subquery over `li`, and the fact query is a `FROM li` scan with the parent
-//! reached by correlated subquery — so it shares no structure with the
-//! expansion's `FROM o LEFT JOIN li` + `CASE WHEN li.id IS NOT NULL` rewrite. A
-//! rewrite that guards the wrong column, guards nothing, or guards too much
-//! shows up as a non-zero multiset difference.
+//! Snowflake settled (D1) that every metric is aggregated from its OWN home
+//! table, joining only outward to reach the dimensions. A child metric is
+//! therefore emitted `FROM li LEFT JOIN o`, not `FROM o LEFT JOIN li`, and the
+//! metrics oracle states that semantics directly:
+//!
+//! - a child row whose foreign key is NULL or dangling (an **orphan**) IS
+//!   counted, under a NULL parent attribute;
+//! - a parent with no children contributes **no group** — not a `COUNT` of 0.
+//!
+//! The base-anchored oracle this replaced built one group per base row and
+//! summed per-order correlated subqueries, which encoded the opposite answer to
+//! both. The phantom-row spellings above are kept: under home anchoring they
+//! must still all agree with their plain counterparts, and they still guard the
+//! FACTS path, which keeps the base-anchored row-level emission and its
+//! `WHERE <pk> IS NOT NULL` filter (TECH-DEBT #67).
+//!
+//! Scope: selected dimensions are drawn from both tables for a METRICS request
+//! (`lamt` is the child one — grouping by it used to manufacture a NULL group
+//! for every childless parent, MM-4). A FACTS request selects the base
+//! dimension only; see `arb_case`. `where_clause` members are drawn from both
+//! sides.
+//!
+//! Both oracles are formulated WITHOUT a join at all — a `FROM li` scan with
+//! each parent attribute reached by correlated scalar subquery — so they share
+//! no structure with the expansion's `LEFT JOIN`s or its PK guards. An anchor,
+//! a guard or a filter that is wrong shows up as a non-zero multiset difference.
 
 use proptest::prelude::*;
 use semantic_views::expand::{expand, DimensionName, FactName, MetricName, QueryRequest};
 use semantic_views::model::{
-    AccessModifier, Cardinality, Dimension, Fact, Join, Metric, SemanticViewDefinition, TableRef,
+    AccessModifier, Cardinality, Dimension, Fact, Join, Metric, NonAdditiveDim, NullsOrder,
+    SemanticViewDefinition, SortOrder, TableRef, WindowSpec,
 };
 
 /// Base rows `o` have ids `0..n_o`; child rows `li` carry a foreign key into
@@ -65,8 +81,13 @@ struct Instance {
     li_rows: Vec<(Option<i64>, Option<i64>)>,
 }
 
-/// Queryable objects, by stable name.
-const DIMS: [&str; 1] = ["region"];
+/// Queryable objects, by stable name. `region` lives on the BASE table, `lamt`
+/// (`li.amount`) on the CHILD — selectable since TECH-DEBT #71, when a child
+/// metric stopped being aggregated over the base-anchored join that gave a
+/// childless parent a manufactured NULL group (MM-4).
+const DIMS: [&str; 2] = ["region", "lamt"];
+/// Index of the child-table dimension in [`DIMS`].
+const D_LAMT: usize = 1;
 /// `n_star` is the spelling SG-8 always handled. `n_one`, `s_one`, `n_str` and
 /// `n_paren` are the constant-argument spellings it did not — `n_paren` is the
 /// redundantly-parenthesized literal raised by review on #203, which the first
@@ -75,10 +96,40 @@ const DIMS: [&str; 1] = ["region"];
 /// `s_parent` are EXP-26's two shapes that the whitelist could never have
 /// covered because their arguments are not constants. `s_amt` and `mx_amt` are
 /// ordinary column aggregates — the controls that must stay untouched.
-const METS: [&str; 12] = [
-    "n_star", "n_one", "s_one", "n_str", "n_paren", "n_dist", "n_expr", "mn_one", "s_coal",
-    "s_parent", "s_amt", "mx_amt",
+///
+/// `w_parent` is a window metric over `s_parent` with no `PARTITION BY` clause,
+/// which partitions by every queried dimension, so each row's window holds its
+/// own group and the value equals that group's `s_parent`. Its `__sv_agg` CTE is re-anchored at `li`, the inner
+/// metric's home table, and has to join `o` for the inlined parent fact even
+/// when no queried dimension reaches `o` (reviewbot on #250: it did not, and
+/// the query failed with a Binder Error).
+///
+/// `snap_parent` is `SUM(orate) NON ADDITIVE BY (lamt)`: a semi-additive
+/// metric on the child reaching a parent fact. Its `__sv_snapshot` CTE is
+/// re-anchored at `li` (TECH-DEBT #71), so the orphans — whose `lamt` may be
+/// NULL — are ranked with the rest (reviewbot on #250: the child-anchored
+/// snapshot had no randomized oracle).
+const METS: [&str; 14] = [
+    "n_star",
+    "n_one",
+    "s_one",
+    "n_str",
+    "n_paren",
+    "n_dist",
+    "n_expr",
+    "mn_one",
+    "s_coal",
+    "s_parent",
+    "s_amt",
+    "mx_amt",
+    "w_parent",
+    "snap_parent",
 ];
+/// Index of `w_parent` in [`METS`]: requested alone, never in a mask.
+const M_WINDOW: usize = 12;
+/// Index of `snap_parent` in [`METS`]: requested alone, never in a mask (a
+/// snapshot co-query rejects the `COUNT(*)` family, SG-5).
+const M_SNAP: usize = 13;
 /// The only requestable fact: a row-level child value. A fact query is at the
 /// grain of its facts, so a childless parent has no row in it (EXP-28).
 const FACTS: [&str; 1] = ["f_amt"];
@@ -111,32 +162,10 @@ impl WMember {
         }
     }
 
-    /// The raw SQL the member's expression stands for, evaluated where `o` and
-    /// `li` are both in scope (the metrics oracle's correlated subquery).
-    fn raw(self) -> &'static str {
-        match self {
-            WMember::Region => "o.region",
-            WMember::Fregion => "(o.region = 0 OR o.region = 2)",
-            WMember::Camt => "(li.amount > 0)",
-            WMember::Famt => "(li.amount > 0 OR li.amount < -1)",
-        }
-    }
-
-    /// The same expression as the LEFT JOIN's NULL-extended row sees it: every
-    /// child column is NULL there. Used to decide whether a CHILDLESS parent
-    /// survives the predicate at all.
-    fn raw_phantom(self) -> &'static str {
-        match self {
-            WMember::Region => "o.region",
-            WMember::Fregion => "(o.region = 0 OR o.region = 2)",
-            WMember::Camt => "(CAST(NULL AS INTEGER) > 0)",
-            WMember::Famt => "(CAST(NULL AS INTEGER) > 0 OR CAST(NULL AS INTEGER) < -1)",
-        }
-    }
-
-    /// The same expression evaluated with only `li` in scope (the fact oracle's
-    /// `FROM li` scan): the parent side is reached by correlated subquery, which
-    /// is precisely the join the expansion writes and this oracle must not.
+    /// The raw SQL the member's expression stands for, evaluated with only `li`
+    /// in scope (both oracles scan `FROM li`): the parent side is reached by
+    /// correlated subquery, which is precisely the join the expansion writes and
+    /// the oracles must not.
     fn raw_from_child(self) -> &'static str {
         match self {
             WMember::Region => "(SELECT op.region FROM o op WHERE op.id = li.order_id)",
@@ -283,36 +312,55 @@ fn arb_case() -> impl Strategy<Value = Case> {
         // 1 in 4 requests is a row-level FACTS query.
         prop::bool::weighted(0.25),
         prop::option::weighted(0.6, arb_pred()),
+        // 1 in 5 metric requests is the window metric. It cannot share a
+        // request with a plain aggregate, so it is drawn on its own.
+        prop::bool::weighted(0.2),
+        // About 1 in 6 is the semi-additive metric, also drawn on its own.
+        prop::bool::weighted(0.2),
     )
-        .prop_map(|(inst, dim_mask, met_mask, want_facts, where_pred)| {
-            let sel_dims: Vec<usize> = dim_mask
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &b)| b.then_some(i))
-                .collect();
-            let mut sel_metrics: Vec<usize> = met_mask
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &b)| b.then_some(i))
-                .collect();
-            // A request with no metrics and no facts is a different code path
-            // (dims-only DISTINCT); this harness is about the aggregates and
-            // the row-level fact query.
-            if sel_metrics.is_empty() {
-                sel_metrics.push(1); // n_one — the metric EXP-21 was about.
-            }
-            let ask = if want_facts {
-                Ask::ChildFacts
-            } else {
-                Ask::Metrics(sel_metrics)
-            };
-            Case {
-                inst,
-                sel_dims,
-                ask,
-                where_pred,
-            }
-        })
+        .prop_map(
+            |(inst, dim_mask, met_mask, want_facts, where_pred, want_window, want_snap)| {
+                let mut sel_dims: Vec<usize> = dim_mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &b)| b.then_some(i))
+                    .collect();
+                // A FACTS request keeps the base-anchored row-level path, whose
+                // phantom filter applies only when every member sits on ONE table
+                // below the base (TECH-DEBT #67 residual (3)); a base dimension
+                // next to a child dimension and a child fact is outside it.
+                if want_facts {
+                    sel_dims.retain(|&i| i != D_LAMT);
+                }
+                let mut sel_metrics: Vec<usize> = met_mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &b)| (b && i != M_WINDOW && i != M_SNAP).then_some(i))
+                    .collect();
+                if want_window {
+                    sel_metrics = vec![M_WINDOW];
+                } else if want_snap {
+                    sel_metrics = vec![M_SNAP];
+                }
+                // A request with no metrics and no facts is a different code path
+                // (dims-only DISTINCT); this harness is about the aggregates and
+                // the row-level fact query.
+                if sel_metrics.is_empty() {
+                    sel_metrics.push(1); // n_one — the metric EXP-21 was about.
+                }
+                let ask = if want_facts {
+                    Ask::ChildFacts
+                } else {
+                    Ask::Metrics(sel_metrics)
+                };
+                Case {
+                    inst,
+                    sel_dims,
+                    ask,
+                    where_pred,
+                }
+            },
+        )
 }
 
 fn build_def() -> SemanticViewDefinition {
@@ -347,6 +395,7 @@ fn build_def() -> SemanticViewDefinition {
     };
     let dimensions = vec![
         dimension("region", "o.region", "o", false),
+        dimension("lamt", "li.amount", "li", false),
         // PBT-13 filter members: never selected as output, named only by a
         // generated `where_clause`. Compound expressions, so a splice that
         // drops the parentheses changes the answer.
@@ -380,6 +429,26 @@ fn build_def() -> SemanticViewDefinition {
         base_metric("s_parent", "SUM(orate)", Some("li")),
         base_metric("s_amt", "SUM(li.amount)", Some("li")),
         base_metric("mx_amt", "MAX(li.amount)", Some("li")),
+        Metric {
+            window_spec: Some(WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "s_parent".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec![],
+                partition_dims: vec![],
+                order_by: vec![],
+                frame_clause: None,
+            }),
+            ..base_metric("w_parent", "SUM(s_parent) OVER ()", Some("li"))
+        },
+        Metric {
+            non_additive_by: vec![NonAdditiveDim {
+                dimension: "lamt".to_string(),
+                order: SortOrder::Asc,
+                nulls: NullsOrder::Last,
+            }],
+            ..base_metric("snap_parent", "SUM(orate)", Some("li"))
+        },
     ];
     let facts = vec![
         Fact {
@@ -459,89 +528,54 @@ fn make_db(inst: &Instance) -> duckdb::Connection {
     conn
 }
 
-/// The predicate, rendered for the correlated subquery over `li` (both `o` and
-/// `li` in scope), as ` AND (...)` or the empty string.
-fn subquery_pred(case: &Case) -> String {
-    case.where_pred.as_ref().map_or_else(String::new, |p| {
-        format!(" AND {}", p.to_raw_sql(WMember::raw))
-    })
-}
-
-/// Which base rows survive the pre-aggregation predicate at all.
+/// The oracle for a METRICS request, in the semantics Snowflake settled for
+/// TECH-DEBT #71 (D1): every metric here lives on `li`, so it is aggregated
+/// over `li`'s OWN rows — every one of them, including a child whose foreign
+/// key is NULL or dangling (it lands under a NULL parent attribute) — and a
+/// parent with no child rows contributes nothing at all: no group, rather than
+/// a group reporting `COUNT` 0.
 ///
-/// The expansion filters the JOINED rows: a parent keeps its group when at
-/// least one real `(o, li)` row passes, or — when it has no children — when the
-/// single NULL-extended row passes with every child column NULL. Formulated
-/// with `EXISTS` rather than a join, so it stays independent of the expansion.
-fn survivor_pred(case: &Case) -> String {
-    let Some(pred) = case.where_pred.as_ref() else {
-        return String::new();
-    };
-    let real = pred.to_raw_sql(WMember::raw);
-    let phantom = pred.to_raw_sql(WMember::raw_phantom);
-    format!(
-        " WHERE (EXISTS (SELECT 1 FROM li WHERE li.order_id = o.id AND {real}) \
-           OR (NOT EXISTS (SELECT 1 FROM li WHERE li.order_id = o.id) AND {phantom}))"
-    )
-}
-
-/// The oracle for a METRICS request: every metric as a correlated subquery over
-/// `li` combined across the group, so the formulation shares nothing with the
-/// expansion's LEFT JOIN + PK guard.
-///
-/// `count(*)` in the subquery returns 0 for a childless order and `sum(...)` /
-/// `min(...)` return NULL, which is exactly the empty-group semantics each
-/// aggregate should have had over its own rows — the property the phantom
-/// NULL-extended row destroys. Each metric names its own combiner: summing
-/// per-order counts is right for `COUNT`, but `MIN(1)` combines with `min` and
-/// `COUNT(DISTINCT 1)` — which is 1 per order with any row and 0 otherwise —
-/// combines with `max`.
+/// Formulated WITHOUT a join: one row per child, with each parent attribute
+/// fetched by correlated scalar subquery (NULL when no parent matches), then
+/// filtered by the predicate and grouped. The expansion writes
+/// `FROM li LEFT JOIN o`; this shares none of that structure, so a wrong anchor
+/// (orphans dropped, a childless parent's group manufactured) or a wrong guard
+/// shows up as a non-zero multiset difference.
 fn metrics_oracle_sql(case: &Case, sel_metrics: &[usize]) -> String {
-    let and_pred = subquery_pred(case);
-    let per_order = |i: usize| -> String {
-        let inner = match METS[i] {
+    let aggregate = |i: usize| -> &'static str {
+        match METS[i] {
             "n_star" | "n_one" | "n_str" | "n_paren" | "n_expr" => "count(*)",
             "n_dist" => "count(DISTINCT 1)",
             "s_one" => "sum(1)",
-            "s_amt" => "sum(li.amount)",
-            "s_coal" => "sum(COALESCE(li.amount, 99))",
-            // The cross-table fact reference: the parent's own `o.rate` is
-            // added once per line item of that order, and is NULL when the
-            // order has none. Written as a product rather than `sum(o.rate)`
-            // because DuckDB rejects an aggregate over a purely correlated
-            // (outer-constant) argument inside a correlated subquery.
-            "s_parent" => "o.rate * NULLIF(count(*), 0)",
+            "s_amt" => "sum(x.amount)",
+            "s_coal" => "sum(COALESCE(x.amount, 99))",
+            // The cross-table fact reference: the parent's rate, once per child.
+            "s_parent" => "sum(x.p_rate)",
             "mn_one" => "min(1)",
-            "mx_amt" => "max(li.amount)",
-            other => unreachable!("unexpected metric {other}"),
-        };
-        format!("(SELECT {inner} FROM li WHERE li.order_id = o.id{and_pred})")
-    };
-    // Combining the per-order values across the group. The COUNT family also
-    // needs `coalesce(…, 0)`: a `COUNT` over zero rows is 0, but `sum`/`max`
-    // over zero rows is NULL, and a dimensionless request whose predicate
-    // removes every base row is exactly that empty global aggregate.
-    let combined = |i: usize| -> String {
-        let per = per_order(i);
-        match METS[i] {
-            "n_star" | "n_one" | "n_str" | "n_paren" | "n_expr" => {
-                format!("coalesce(sum({per}), 0)")
+            "mx_amt" => "max(x.amount)",
+            // A window partitioned by every queried dimension holds one group,
+            // so it reads back that group's own `s_parent`.
+            "w_parent" => "sum(x.p_rate)",
+            // NON ADDITIVE BY (lamt) — ASC / NULLS LAST — keeps the LAST
+            // value of that sort in each group: the rows at the group's
+            // MAX(lamt), or every row when the group's `lamt` is all NULL
+            // (`x.snap_at` is then NULL, and NULL IS NOT DISTINCT FROM NULL).
+            // Queried, `lamt` is a group key and the metric is plain.
+            "snap_parent" if case.sel_dims.contains(&D_LAMT) => "sum(x.p_rate)",
+            "snap_parent" => {
+                "sum(CASE WHEN x.amount IS NOT DISTINCT FROM x.snap_at THEN x.p_rate END)"
             }
-            "n_dist" => format!("coalesce(max({per}), 0)"),
-            "s_one" | "s_amt" | "s_coal" | "s_parent" => format!("sum({per})"),
-            "mn_one" => format!("min({per})"),
-            "mx_amt" => format!("max({per})"),
             other => unreachable!("unexpected metric {other}"),
         }
     };
     let met_items: Vec<String> = sel_metrics
         .iter()
-        .map(|&i| format!("{} AS {}", combined(i), METS[i]))
+        .map(|&i| format!("{} AS {}", aggregate(i), METS[i]))
         .collect();
     let dim_items: Vec<String> = case
         .sel_dims
         .iter()
-        .map(|&i| format!("o.{} AS {}", DIMS[i], DIMS[i]))
+        .map(|&i| format!("x.{} AS {}", DIMS[i], DIMS[i]))
         .collect();
     let select_items = dim_items
         .iter()
@@ -549,13 +583,31 @@ fn metrics_oracle_sql(case: &Case, sel_metrics: &[usize]) -> String {
         .cloned()
         .collect::<Vec<_>>()
         .join(", ");
-    let where_sql = survivor_pred(case);
+    let where_sql = case.where_pred.as_ref().map_or_else(String::new, |p| {
+        format!(" WHERE {}", p.to_raw_sql(WMember::raw_from_child))
+    });
+    let rows = format!(
+        "SELECT li.amount AS amount, li.amount AS lamt, \
+                (SELECT op.region FROM o op WHERE op.id = li.order_id) AS region, \
+                (SELECT op.rate FROM o op WHERE op.id = li.order_id) AS p_rate \
+         FROM li{where_sql}"
+    );
+    // The snapshot value per group, over the FILTERED rows: the predicate is
+    // applied before the snapshot is picked. Partitioned by the queried
+    // dimensions by name, so nothing here reuses the expansion's RANK shape.
+    let partition: Vec<String> = case.sel_dims.iter().map(|&i| DIMS[i].to_string()).collect();
+    let over = if partition.is_empty() {
+        "OVER ()".to_string()
+    } else {
+        format!("OVER (PARTITION BY {})", partition.join(", "))
+    };
+    let rows = format!("SELECT r.*, max(r.amount) {over} AS snap_at FROM ({rows}) r");
     if case.sel_dims.is_empty() {
-        format!("SELECT {select_items} FROM o{where_sql}")
+        format!("SELECT {select_items} FROM ({rows}) x")
     } else {
         let group: Vec<String> = (1..=case.sel_dims.len()).map(|n| n.to_string()).collect();
         format!(
-            "SELECT {select_items} FROM o{where_sql} GROUP BY {}",
+            "SELECT {select_items} FROM ({rows}) x GROUP BY {}",
             group.join(", ")
         )
     }
@@ -807,5 +859,81 @@ fn generator_empties_a_real_parents_child_set_at_filter_time() {
     assert!(
         saw,
         "the generator never emptied a real parent's child set with a child-side predicate"
+    );
+}
+
+/// TECH-DEBT #71 anti-vacuity: the two data shapes on which home-table and
+/// base-table anchoring disagree must both occur, and often. Without an orphan
+/// child (NULL or dangling foreign key) the "orphans are counted" half of the
+/// oracle is never exercised; without a childless parent, the "no group, not 0"
+/// half is not. Counted separately, with a count of cases carrying both.
+#[test]
+fn generator_produces_orphans_and_childless_parents() {
+    let cases = sample_cases(256);
+    let null_fk = |c: &Case| c.inst.li_rows.iter().any(|(fk, _)| fk.is_none());
+    let dangling = |c: &Case| {
+        let n_o = c.inst.o_rows.len() as i64;
+        c.inst
+            .li_rows
+            .iter()
+            .any(|(fk, _)| fk.is_some_and(|v| v >= n_o))
+    };
+    let childless = |c: &Case| {
+        let n_o = c.inst.o_rows.len() as i64;
+        (0..n_o).any(|id| !c.inst.li_rows.iter().any(|(fk, _)| *fk == Some(id)))
+    };
+    let metric_cases: Vec<&Case> = cases
+        .iter()
+        .filter(|c| matches!(c.ask, Ask::Metrics(_)))
+        .collect();
+    let n_null = metric_cases.iter().filter(|c| null_fk(c)).count();
+    let n_dangling = metric_cases.iter().filter(|c| dangling(c)).count();
+    let n_childless = metric_cases.iter().filter(|c| childless(c)).count();
+    let n_both = metric_cases
+        .iter()
+        .filter(|c| (null_fk(c) || dangling(c)) && childless(c))
+        .count();
+    assert!(
+        n_null >= 48,
+        "only {n_null} metric cases had a child with a NULL foreign key"
+    );
+    assert!(
+        n_dangling >= 48,
+        "only {n_dangling} metric cases had a child with a dangling foreign key"
+    );
+    assert!(
+        n_childless >= 48,
+        "only {n_childless} metric cases had a childless parent"
+    );
+    assert!(
+        n_both >= 32,
+        "only {n_both} metric cases had an orphan and a childless parent together"
+    );
+}
+
+/// The child dimension (MM-4's cell) must actually be grouped by, with and
+/// without the base one, on METRICS requests — and never on a FACTS request,
+/// whose path keeps the base-anchored phantom filter scoped to one table.
+#[test]
+fn generator_groups_by_the_child_dimension() {
+    let cases = sample_cases(256);
+    let child_only = cases
+        .iter()
+        .filter(|c| matches!(c.ask, Ask::Metrics(_)) && c.sel_dims == vec![D_LAMT])
+        .count();
+    let both = cases
+        .iter()
+        .filter(|c| matches!(c.ask, Ask::Metrics(_)) && c.sel_dims.len() == 2)
+        .count();
+    assert!(
+        child_only >= 16,
+        "only {child_only} cases grouped by lamt alone"
+    );
+    assert!(both >= 16, "only {both} cases grouped by region and lamt");
+    assert!(
+        !cases
+            .iter()
+            .any(|c| matches!(c.ask, Ask::ChildFacts) && c.sel_dims.contains(&D_LAMT)),
+        "a FACTS request selected the child dimension"
     );
 }

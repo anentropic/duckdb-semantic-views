@@ -1,0 +1,121 @@
+# TECH-DEBT #71, per emission path: the home-table anchoring of
+# d1_home_table_anchoring.test holds on every path that aggregates a child
+# metric, not only the plain per-grain one. Same D1 data (a customer with no
+# orders, an order with no items, an orphan order, an orphan item of qty 40).
+#
+# Every case below returned a different answer before #71 (noted per case),
+# and each was confirmed red on its own (one case per scratch file) against the
+# pre-#71 build. The unit twins in src/expand/tests_home_anchoring.rs report
+# independently.
+
+require semantic_views
+
+statement ok
+CREATE TABLE d1p_customers (c_id INT, region VARCHAR);
+
+statement ok
+CREATE TABLE d1p_orders (o_id INT, c_id INT, amount DECIMAL(10,2));
+
+statement ok
+CREATE TABLE d1p_line_items (li_id INT, o_id INT, qty INT);
+
+statement ok
+INSERT INTO d1p_customers VALUES (1, 'EU'), (2, 'US'), (3, 'APAC');
+
+statement ok
+INSERT INTO d1p_orders VALUES (10, 1, 100), (11, 1, 50), (12, 2, 70), (13, NULL, 5);
+
+statement ok
+INSERT INTO d1p_line_items VALUES (100, 10, 1), (101, 10, 2), (102, 11, 3), (103, NULL, 40);
+
+statement ok
+CREATE SEMANTIC VIEW d1p_sv AS
+  TABLES (
+    c  AS d1p_customers  PRIMARY KEY (c_id),
+    o  AS d1p_orders     PRIMARY KEY (o_id),
+    li AS d1p_line_items PRIMARY KEY (li_id)
+  )
+  RELATIONSHIPS (
+    o_to_c  AS o(c_id)  REFERENCES c,
+    li_to_o AS li(o_id) REFERENCES o
+  )
+  DIMENSIONS (
+    c.cust_region AS c.region,
+    li.item_id    AS li.li_id,
+    li.item_qty   AS li.qty
+  )
+  METRICS (
+    li.n_items     AS COUNT(li.li_id),
+    li.total_qty   AS SUM(li.qty),
+    avg_qty        AS total_qty / NULLIF(n_items, 0),
+    li.last_qty NON ADDITIVE BY (item_id) AS SUM(li.qty),
+    li.qty_overall AS SUM(total_qty) OVER (PARTITION BY EXCLUDING cust_region)
+  );
+
+# Derived metric over two child metrics: EU 6 / 3, orphan 40 / 1.
+# Before #71: APAC / US rows of NULL, and no orphan row.
+query TR
+SELECT * FROM semantic_view('d1p_sv', dimensions := ['cust_region'], metrics := ['avg_qty'])
+ORDER BY cust_region NULLS LAST;
+----
+EU	2.0
+NULL	40.0
+
+# Grouped by a CHILD dimension: one group per item. Before #71: the childless
+# parents manufactured a `NULL 0` group and the orphan item (qty 40) vanished.
+query II
+SELECT * FROM semantic_view('d1p_sv', dimensions := ['item_qty'], metrics := ['n_items'])
+ORDER BY item_qty NULLS LAST;
+----
+1	1
+2	1
+3	1
+40	1
+
+# where_clause on a PARENT member: the orphan item's region is NULL, so
+# `IS NULL` selects exactly it. Before #71: 0 (US / APAC phantom rows matched,
+# and counted nothing; the orphan was never in the FROM).
+query I
+SELECT * FROM semantic_view('d1p_sv', metrics := ['n_items'], where_clause := 'cust_region IS NULL');
+----
+1
+
+# where_clause on a CHILD member: the orphan is the only item above 10.
+# Before #71: 0 / NULL.
+query II
+SELECT * FROM semantic_view('d1p_sv', metrics := ['n_items', 'total_qty'], where_clause := 'item_qty > 10');
+----
+1	40
+
+# Semi-additive (snapshot CTE anchored at the child): the latest item per
+# region -- EU's is item 102 (qty 3); the orphan item is the NULL-region row.
+# Before #71: US / APAC NULL rows, no orphan row.
+query TI
+SELECT * FROM semantic_view('d1p_sv', dimensions := ['cust_region'], metrics := ['last_qty'])
+ORDER BY cust_region NULLS LAST;
+----
+EU	3
+NULL	40
+
+# Window over a child metric (`__sv_agg` anchored at the child): a total across
+# the home-anchored groups, 46. Before #71: 6 on every row, US / APAC rows, no
+# orphan row.
+query TI
+SELECT cust_region, CAST(qty_overall AS BIGINT)
+FROM semantic_view('d1p_sv', dimensions := ['cust_region'], metrics := ['qty_overall'])
+ORDER BY cust_region NULLS LAST;
+----
+EU	46
+NULL	46
+
+statement ok
+DROP SEMANTIC VIEW d1p_sv;
+
+statement ok
+DROP TABLE d1p_line_items;
+
+statement ok
+DROP TABLE d1p_orders;
+
+statement ok
+DROP TABLE d1p_customers;
