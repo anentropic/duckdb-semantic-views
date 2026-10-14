@@ -43,7 +43,7 @@ wrapper script in isolation:
                        platform skip, must still exit 0 (BuildAll runs the
                        suite on Windows and macOS, where such skips are real).
   control_offline_excused  under SV_OFFLINE_EXTENSIONS=1 (CI unset), a file
-                       the Makefile lists as needing a downloaded extension
+                       passed as needing a downloaded extension
                        (`--offline-excused`) may hit a network error: it must
                        exit 0 AND say SKIPPED loudly.
 

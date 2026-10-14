@@ -48,13 +48,12 @@ UNSTABLE_C_API_FLAG=--abi-type C_STRUCT_UNSTABLE
 # submodule is left untouched.
 #
 # The wrapper also fails any file that hits an error the runner silently
-# ignores ("HTTP" / "Unable to connect" count as a PASS upstream). Under the
-# local-only SV_OFFLINE_EXTENSIONS=1 opt-in, the files in
-# OFFLINE_EXTENSION_TESTS -- the ones that need an extension downloaded from
-# extensions.duckdb.org -- are excused and reported as SKIPPED instead. The
-# list is expanded when the `:=` lines below capture TEST_RUNNER, so it may be
-# defined anywhere above them; while it is undefined nothing is excused.
-TEST_RUNNER=$(PYTHON_VENV_BIN) scripts/run_sqllogictest.py --required-extension semantic_views $(foreach t,$(OFFLINE_EXTENSION_TESTS),--offline-excused $(t))
+# ignores ("HTTP" / "Unable to connect" count as a PASS upstream), under
+# SV_OFFLINE_EXTENSIONS=1 too. Offline runs excuse nothing here: the files in
+# OFFLINE_EXTENSION_TESTS never reach the wrapper, because prepare_test_list
+# below leaves them out of the list and prints their SKIPPED lines. (The
+# wrapper's own --offline-excused flag is for running it directly.)
+TEST_RUNNER=$(PYTHON_VENV_BIN) scripts/run_sqllogictest.py --required-extension semantic_views
 
 # The DuckDB the C++ shim is compiled against. build.rs links the amalgamation
 # INTO the extension binary (the parser hook the shim registers is C++ internals

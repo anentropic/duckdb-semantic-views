@@ -27,10 +27,11 @@ runner would have reported success without actually testing anything:
    failing query's expected result is never checked, and the file reports
    SUCCESS. The only exception is the local offline opt-in: with
    ``SV_OFFLINE_EXTENSIONS=1`` (refused when ``CI`` is set), a file passed as
-   ``--offline-excused FILE`` -- the Makefile passes its
-   ``OFFLINE_EXTENSION_TESTS`` list, the files that need an extension
-   downloaded from extensions.duckdb.org -- is reported loudly as SKIPPED
-   instead. Any other file that hits a network error still fails, offline or
+   ``--offline-excused FILE`` (a file that needs an extension downloaded from
+   extensions.duckdb.org) is reported loudly as SKIPPED instead. This is for
+   running the wrapper directly: ``make`` passes no such file, because under
+   the opt-in it leaves its ``OFFLINE_EXTENSION_TESTS`` out of the list.
+   Any other file that hits a network error still fails, offline or
    not.
 
 The required extensions default to ``semantic_views``; pass

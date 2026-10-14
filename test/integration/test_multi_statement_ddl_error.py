@@ -18,11 +18,18 @@ Each scenario runs on a fresh in-memory database and reports independently:
   ddl_after_other_statements   CREATE TABLE; INSERT; CREATE SEMANTIC VIEW in one
                                execute() -- the examples/type_inference.py shape.
   ddl_before_other_statement   CREATE SEMANTIC VIEW ...; SELECT 1 in one execute().
+  ddl_after_read_call          SELECT * FROM semantic_view(...); CREATE SEMANTIC
+                               VIEW ... -- a string the override REWRITES (the
+                               read call's search path) rather than declines.
   control_override_disabled    the override really is off (SET
                                allow_parser_override_extension='DEFAULT'), DDL
                                sent alone: the original "not active" message
                                must still be what the user sees.
   control_single_statement     DDL alone with a trailing semicolon still works.
+  control_stale_other_database a multi-statement DDL error on one database,
+                               then the same DDL alone on another database
+                               whose override is off: the second must get the
+                               "not active" message, not the first one's.
 
 Run: uv run test/integration/test_multi_statement_ddl_error.py (or
 `just test-multi-statement-error`).
@@ -86,6 +93,21 @@ def scenario_ddl_before_other_statement():
     check_multi(DDL + "; SELECT 1;")
 
 
+def scenario_ddl_after_read_call():
+    con = connect()
+    try:
+        con.execute("CREATE TABLE orders (id INTEGER, region VARCHAR, amount DOUBLE)")
+        con.execute(DDL.replace("sales", "existing", 1))
+        msg = error_of(
+            con, "SELECT * FROM semantic_view('existing', metrics := ['revenue']); " + DDL
+        )
+    finally:
+        con.close()
+    assert msg is not None, "a multi-statement string with semantic-view DDL must still fail"
+    assert NEW_HINT in msg, f"error must say {NEW_HINT!r}; got: {msg}"
+    assert OLD_HINT not in msg, f"error must not blame the override setting; got: {msg}"
+
+
 def scenario_control_override_disabled():
     con = connect()
     try:
@@ -112,11 +134,30 @@ def scenario_control_single_statement():
     assert rows == [], f"empty table must give no rows; got {rows!r}"
 
 
+def scenario_control_stale_other_database():
+    off, on = connect(), connect()
+    try:
+        for con in (off, on):
+            con.execute("CREATE TABLE orders (id INTEGER, region VARCHAR, amount DOUBLE)")
+        off.execute("SET allow_parser_override_extension = 'DEFAULT'")
+        first = error_of(on, "SELECT 1; " + DDL)
+        msg = error_of(off, DDL)
+    finally:
+        off.close()
+        on.close()
+    assert first is not None and NEW_HINT in first, f"setup: expected {NEW_HINT!r}; got: {first}"
+    assert msg is not None, "DDL with the override switched off must fail"
+    assert OLD_HINT in msg, f"override-off database must keep its message; got: {msg}"
+    assert NEW_HINT not in msg, f"must not reuse another database's error; got: {msg}"
+
+
 SCENARIOS = [
     scenario_ddl_after_other_statements,
     scenario_ddl_before_other_statement,
+    scenario_ddl_after_read_call,
     scenario_control_override_disabled,
     scenario_control_single_statement,
+    scenario_control_stale_other_database,
 ]
 
 
