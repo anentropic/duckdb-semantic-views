@@ -68,6 +68,7 @@ use proptest::prelude::*;
 use semantic_views::expand::{expand, DimensionName, FactName, MetricName, QueryRequest};
 use semantic_views::model::{
     AccessModifier, Cardinality, Dimension, Fact, Join, Metric, SemanticViewDefinition, TableRef,
+    WindowSpec,
 };
 
 /// Base rows `o` have ids `0..n_o`; child rows `li` carry a foreign key into
@@ -95,10 +96,19 @@ const D_LAMT: usize = 1;
 /// `s_parent` are EXP-26's two shapes that the whitelist could never have
 /// covered because their arguments are not constants. `s_amt` and `mx_amt` are
 /// ordinary column aggregates — the controls that must stay untouched.
-const METS: [&str; 12] = [
+///
+/// `w_parent` is a window metric over `s_parent` with no `PARTITION BY` clause,
+/// which partitions by every queried dimension, so each row's window holds its
+/// own group and the value equals that group's `s_parent`. Its `__sv_agg` CTE is re-anchored at `li`, the inner
+/// metric's home table, and has to join `o` for the inlined parent fact even
+/// when no queried dimension reaches `o` (reviewbot on #250: it did not, and
+/// the query failed with a Binder Error).
+const METS: [&str; 13] = [
     "n_star", "n_one", "s_one", "n_str", "n_paren", "n_dist", "n_expr", "mn_one", "s_coal",
-    "s_parent", "s_amt", "mx_amt",
+    "s_parent", "s_amt", "mx_amt", "w_parent",
 ];
+/// Index of `w_parent` in [`METS`]: requested alone, never in a mask.
+const M_WINDOW: usize = 12;
 /// The only requestable fact: a row-level child value. A fact query is at the
 /// grain of its facts, so a childless parent has no row in it (EXP-28).
 const FACTS: [&str; 1] = ["f_amt"];
@@ -281,43 +291,51 @@ fn arb_case() -> impl Strategy<Value = Case> {
         // 1 in 4 requests is a row-level FACTS query.
         prop::bool::weighted(0.25),
         prop::option::weighted(0.6, arb_pred()),
+        // 1 in 5 metric requests is the window metric. It cannot share a
+        // request with a plain aggregate, so it is drawn on its own.
+        prop::bool::weighted(0.2),
     )
-        .prop_map(|(inst, dim_mask, met_mask, want_facts, where_pred)| {
-            let mut sel_dims: Vec<usize> = dim_mask
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &b)| b.then_some(i))
-                .collect();
-            // A FACTS request keeps the base-anchored row-level path, whose
-            // phantom filter applies only when every member sits on ONE table
-            // below the base (TECH-DEBT #67 residual (3)); a base dimension
-            // next to a child dimension and a child fact is outside it.
-            if want_facts {
-                sel_dims.retain(|&i| i != D_LAMT);
-            }
-            let mut sel_metrics: Vec<usize> = met_mask
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &b)| b.then_some(i))
-                .collect();
-            // A request with no metrics and no facts is a different code path
-            // (dims-only DISTINCT); this harness is about the aggregates and
-            // the row-level fact query.
-            if sel_metrics.is_empty() {
-                sel_metrics.push(1); // n_one — the metric EXP-21 was about.
-            }
-            let ask = if want_facts {
-                Ask::ChildFacts
-            } else {
-                Ask::Metrics(sel_metrics)
-            };
-            Case {
-                inst,
-                sel_dims,
-                ask,
-                where_pred,
-            }
-        })
+        .prop_map(
+            |(inst, dim_mask, met_mask, want_facts, where_pred, want_window)| {
+                let mut sel_dims: Vec<usize> = dim_mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &b)| b.then_some(i))
+                    .collect();
+                // A FACTS request keeps the base-anchored row-level path, whose
+                // phantom filter applies only when every member sits on ONE table
+                // below the base (TECH-DEBT #67 residual (3)); a base dimension
+                // next to a child dimension and a child fact is outside it.
+                if want_facts {
+                    sel_dims.retain(|&i| i != D_LAMT);
+                }
+                let mut sel_metrics: Vec<usize> = met_mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &b)| (b && i != M_WINDOW).then_some(i))
+                    .collect();
+                if want_window {
+                    sel_metrics = vec![M_WINDOW];
+                }
+                // A request with no metrics and no facts is a different code path
+                // (dims-only DISTINCT); this harness is about the aggregates and
+                // the row-level fact query.
+                if sel_metrics.is_empty() {
+                    sel_metrics.push(1); // n_one — the metric EXP-21 was about.
+                }
+                let ask = if want_facts {
+                    Ask::ChildFacts
+                } else {
+                    Ask::Metrics(sel_metrics)
+                };
+                Case {
+                    inst,
+                    sel_dims,
+                    ask,
+                    where_pred,
+                }
+            },
+        )
 }
 
 fn build_def() -> SemanticViewDefinition {
@@ -386,6 +404,18 @@ fn build_def() -> SemanticViewDefinition {
         base_metric("s_parent", "SUM(orate)", Some("li")),
         base_metric("s_amt", "SUM(li.amount)", Some("li")),
         base_metric("mx_amt", "MAX(li.amount)", Some("li")),
+        Metric {
+            window_spec: Some(WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "s_parent".to_string(),
+                extra_args: vec![],
+                excluding_dims: vec![],
+                partition_dims: vec![],
+                order_by: vec![],
+                frame_clause: None,
+            }),
+            ..base_metric("w_parent", "SUM(s_parent) OVER ()", Some("li"))
+        },
     ];
     let facts = vec![
         Fact {
@@ -490,6 +520,9 @@ fn metrics_oracle_sql(case: &Case, sel_metrics: &[usize]) -> String {
             "s_parent" => "sum(x.p_rate)",
             "mn_one" => "min(1)",
             "mx_amt" => "max(x.amount)",
+            // A window partitioned by every queried dimension holds one group,
+            // so it reads back that group's own `s_parent`.
+            "w_parent" => "sum(x.p_rate)",
             other => unreachable!("unexpected metric {other}"),
         }
     };

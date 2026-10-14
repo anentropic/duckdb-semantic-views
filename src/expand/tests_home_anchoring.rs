@@ -302,6 +302,83 @@ fn window_over_a_child_metric_is_home_anchored() {
     );
 }
 
+/// Reviewbot, #250: a re-anchored `__sv_agg` must join the table of a fact the
+/// inner metric inlines. `rev` lives on `li` but reads the parent fact
+/// `o.o_amount`; grouped by a `li` dimension, no queried dimension reaches `o`.
+/// Base-anchored, `resolve_joins_pkfk` joined `o` for the fact; the anchored
+/// FROM joined only the dimensions' and `where_clause` tables, so DuckDB raised
+/// a Binder Error on `o.amount`. 1*100 + 2*100 + 3*50 = 450; the orphan item's
+/// product is NULL.
+#[test]
+fn window_reanchored_at_a_child_joins_the_inner_metrics_fact_table() {
+    let def = d1_def()
+        .with_fact("o_amount", "o.amount", "o")
+        .with_metric("rev", "SUM(li.qty * o.o_amount)", Some("li"))
+        .with_metric(
+            "rev_overall",
+            "SUM(rev) OVER (PARTITION BY EXCLUDING item_qty)",
+            Some("li"),
+        )
+        .with_window_spec(
+            "rev_overall",
+            WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "rev".to_string(),
+                excluding_dims: vec!["item_qty".to_string()],
+                ..Default::default()
+            },
+        );
+    assert_eq!(
+        rows(&def, &d1_db(), &req(&["item_qty"], &["rev_overall"], None)),
+        vec!["1|450.00", "2|450.00", "3|450.00", "40|450.00"]
+    );
+}
+
+/// The window sibling for a fact a queried DIMENSION reaches: `li_amount` is a
+/// `li` dimension whose expression reads the parent fact `o.o_amount`, so the
+/// re-anchored `__sv_agg` has to join `o` for the group key too.
+#[test]
+fn window_reanchored_at_a_child_joins_a_dimensions_fact_table() {
+    let def = d1_def()
+        .with_fact("o_amount", "o.amount", "o")
+        .with_dimension("li_amount", "o.o_amount", Some("li"))
+        .with_metric(
+            "qty_overall",
+            "SUM(total_qty) OVER (PARTITION BY EXCLUDING li_amount)",
+            Some("li"),
+        )
+        .with_window_spec(
+            "qty_overall",
+            WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "total_qty".to_string(),
+                excluding_dims: vec!["li_amount".to_string()],
+                ..Default::default()
+            },
+        );
+    assert_eq!(
+        rows(&def, &d1_db(), &req(&["li_amount"], &["qty_overall"], None)),
+        vec!["100.00|46", "50.00|46", "NULL|46"]
+    );
+}
+
+/// Reviewbot, #250: the snapshot sibling. `last_rev` is semi-additive on `li`
+/// and reads the parent fact `o.o_amount`; the re-anchored snapshot SELECT must
+/// join `o`. Each `item_qty` group holds one item, so the snapshot is that
+/// item's product; the orphan's is NULL.
+#[test]
+fn snapshot_reanchored_at_a_child_joins_the_metrics_fact_table() {
+    let def = d1_def()
+        .with_fact("o_amount", "o.amount", "o")
+        .with_dimension("item_id", "li.li_id", Some("li"))
+        .with_metric("last_rev", "SUM(li.qty * o.o_amount)", Some("li"))
+        .with_non_additive_by("last_rev", &[("item_id", SortOrder::Asc, NullsOrder::Last)]);
+    assert_eq!(
+        rows(&def, &d1_db(), &req(&["item_qty"], &["last_rev"], None)),
+        vec!["1|100.00", "2|200.00", "3|150.00", "40|NULL"]
+    );
+}
+
 /// `COUNT(*)` on a child table with no PRIMARY KEY. Base-anchored, the phantom
 /// row made this an error (`CountStarRequiresPrimaryKey`); home-anchored there
 /// is no phantom, and every row is counted.
@@ -411,6 +488,79 @@ fn child_metric_grouped_by_its_role_played_dimension() {
             &req(&["city"], &["dep_n_li"], None)
         ),
         vec!["A|1", "B|1", "NULL|1"]
+    );
+}
+
+/// Reviewbot, #250: a `USING` on a TRANSITIVE dependency of a window's inner
+/// metric. `w_dep` windows the derived `li_dep_alt2`, whose component
+/// `li_dep_alt` reads the role-played fact `alt` under `USING (dep)`. Only the
+/// window metric and its direct inner metric were checked for `USING`, and
+/// neither carries one, so `__sv_agg` was re-anchored at `li` with no scoped
+/// join while the inlined fact already named `ap__dep`: a Binder Error. The
+/// window emitter cannot thread a role, so the query must keep the
+/// base-anchored route: items 0 and 1 depart from A (100) and B (200), so
+/// 2 * 300 = 600 for region 7.
+#[test]
+fn window_over_a_derived_metric_with_a_using_dependency_is_not_reanchored() {
+    let def = role_def()
+        .with_metric("li_dep_alt", "SUM(alt)", Some("li"))
+        .with_using_relationship("li_dep_alt", &["dep"])
+        .with_metric("li_dep_alt2", "li_dep_alt * 2", None)
+        .with_metric("w_dep", "SUM(li_dep_alt2) OVER ()", Some("li"))
+        .with_window_spec(
+            "w_dep",
+            WindowSpec {
+                window_function: "SUM".to_string(),
+                inner_metric: "li_dep_alt2".to_string(),
+                ..Default::default()
+            },
+        );
+    assert_eq!(
+        rows(&def, &role_db(), &req(&["region"], &["w_dep"], None)),
+        vec!["7|600"]
+    );
+}
+
+/// Reviewbot, #250: a semi-additive child metric whose `USING` selects the
+/// role for a fact it inlines, co-queried with a base-grain metric, takes a
+/// SNAPSHOT group in the per-grain plan. That group's CTE must join the scoped
+/// instance (`ap__dep`) the inlined fact was requalified to, as the plain
+/// groups do; it joined nothing, and the query failed to bind `ap__dep`.
+/// `NON ADDITIVE BY (li_id DESC)` keeps the row that sorts last, item 0, whose
+/// order departs from A (100); the other role, `arr`, would give B (200), so the
+/// value also pins which instance was joined.
+#[test]
+fn per_grain_snapshot_group_joins_its_scoped_fact() {
+    let def = role_def()
+        .with_dimension("li_id", "li.id", Some("li"))
+        .with_metric("n_o", "COUNT(*)", Some("o"))
+        .with_metric("dep_alt_snap", "MAX(alt)", Some("li"))
+        .with_using_relationship("dep_alt_snap", &["dep"])
+        .with_non_additive_by(
+            "dep_alt_snap",
+            &[("li_id", SortOrder::Desc, NullsOrder::Last)],
+        );
+    assert_eq!(
+        rows(&def, &role_db(), &req(&[], &["n_o", "dep_alt_snap"], None)),
+        vec!["2|100"]
+    );
+}
+
+/// Reviewbot, #250: two metrics in one grain group inline the same fact on
+/// `o`, one under `USING (li_o)` (requalified to `o__li_o`) and one without
+/// (bare `o`). The scoped join must not stand in for the bare one: dropping
+/// `o` from the group's joins left `m_bare` unbound. Items 0 and 1 both
+/// belong to region-7 orders; the orphan contributes NULL.
+#[test]
+fn grain_group_keeps_the_bare_join_beside_a_scoped_one() {
+    let def = role_def()
+        .with_fact("o_reg", "o.region", "o")
+        .with_metric("m_scoped", "SUM(o.o_reg)", Some("li"))
+        .with_using_relationship("m_scoped", &["li_o"])
+        .with_metric("m_bare", "SUM(o.o_reg)", Some("li"));
+    assert_eq!(
+        rows(&def, &role_db(), &req(&[], &["m_scoped", "m_bare"], None)),
+        vec!["14|14"]
     );
 }
 
