@@ -1308,6 +1308,69 @@ fn using_naming_a_non_role_played_relationship_still_declines() {
     );
 }
 
+/// The GRAIN-10 shape with the `dep` relationship declared QUOTED (`"Dep"`,
+/// stored with its quotes) while `USING` names it bare. One identifier to
+/// DuckDB, so the per-grain path must thread the same role: `scoped_roles`,
+/// the `using_is_threaded` gate and the grain-CTE join emission all matched
+/// relationship names by ASCII-lowercase spelling and so found no role.
+#[test]
+fn using_scopes_a_quoted_relationship_role_in_every_grain_cte() {
+    let mut def = flights_using_fixture();
+    def.joins[0].name = Some("\"Dep\"".to_string());
+    let sql = expand(
+        "flights_sv",
+        &def,
+        &req(&["dep_city"], &["flight_count", "leg_count"]),
+    )
+    .expect("USING names the quoted role, so the grain CTEs can join it");
+    assert_eq!(
+        sql.matches(r#"AS "a__dep""#).count(),
+        2,
+        "each grain CTE joins the scoped role exactly once, got:\n{sql}"
+    );
+    assert!(sql.contains("a__dep.city"), "{sql}");
+    assert!(
+        !sql.contains("arr_code"),
+        "the arrival role was not named by USING and must not be joined:\n{sql}"
+    );
+}
+
+/// A pre-#249 stored row (PR #249 review) holding a role-playing pair whose
+/// names differ only by quoting: `dep` (departure) and `"dep"` (arrival).
+/// `USING ("dep")` names the ARRIVAL edge, but both roles share the scoped
+/// alias `a__dep`, so `scoped_roles` records the first-declared `dep` for
+/// table `a`. The per-grain gate compared that role's spelling with the
+/// `USING` spelling and declined, leaving the query to the base-anchored path;
+/// matching them as one identifier instead threads the query here, where the
+/// grain CTEs join the DEPARTURE edge — the wrong role, silently.
+#[test]
+fn legacy_quoted_pair_using_does_not_thread_the_other_role_per_grain() {
+    let mut def = flights_using_fixture();
+    def.joins[1].name = Some("\"dep\"".to_string());
+    def.metrics[0].using_relationships = vec!["\"dep\"".to_string()];
+    let result = expand(
+        "flights_sv",
+        &def,
+        &req(&["dep_city"], &["flight_count", "leg_count"]),
+    );
+    if let Ok(sql) = &result {
+        assert!(
+            !sql.contains("dep_code"),
+            "USING (\"dep\") names the arrival edge; the departure edge must not be joined:\n{sql}"
+        );
+    }
+    let err = result.expect_err("the base-anchored path declines this shape, as before #249");
+    assert!(
+        matches!(
+            err,
+            ExpandError::MetricFanTrap { .. }
+                | ExpandError::FanTrap { .. }
+                | ExpandError::RootGrainFanTrap { .. }
+        ),
+        "expected the base-anchored fan-trap error, got: {err}"
+    );
+}
+
 /// root `f` (flights) --carrier_id--> `c` (carriers) --dep/arr--> `a` (airports).
 ///
 /// `c` is a PARENT of the base table, so a metric on it needs per-grain

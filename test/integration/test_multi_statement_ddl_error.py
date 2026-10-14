@@ -4,7 +4,7 @@
 # requires-python = ">=3.10"
 # ///
 """
-Semantic-view DDL inside a multi-statement string names the real cause (TECH-DEBT #83).
+Semantic-view DDL inside a multi-statement string names the real cause (TECH-DEBT #85).
 
 `parser_override` sees the WHOLE query string and declines a string holding
 several statements. The default parser then splits it and hands the

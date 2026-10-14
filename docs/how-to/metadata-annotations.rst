@@ -56,6 +56,7 @@ Add a ``COMMENT`` clause after the table declaration:
        o AS orders    PRIMARY KEY (id) COMMENT = 'Core order transactions',
        c AS customers PRIMARY KEY (id) COMMENT = 'Customer master data'
    )
+   RELATIONSHIPS (order_customer AS o(customer_id) REFERENCES c)
    DIMENSIONS (o.region AS o.region)
    METRICS (o.revenue AS SUM(o.amount));
 

@@ -416,6 +416,42 @@ pub fn normalize_ident_part(raw: &str) -> String {
     }
 }
 
+/// The match key of a (possibly dot-qualified, possibly quoted) identifier
+/// that KEEPS its part boundaries: each part with its quotes stripped and
+/// folded to ASCII lowercase, as [`normalize_ident_part`] does, but kept as a
+/// list rather than joined with `.`.
+///
+/// [`normalize_ident_part`] is lossy for an identifier slot that may be
+/// dot-qualified: the two-part `x.y` and the one-part `"x.y"` (a quoted name
+/// containing a dot) both normalize to `x.y`, although `DuckDB` resolves them as
+/// different identifiers. Relationship names are such a slot
+/// (`model::slot_qualified`), so they are keyed with this instead.
+///
+/// Total, like [`normalize_ident_part`]: input that does not parse as an
+/// identifier keys as [`IdentKey::Unparsed`], which never equals a parsed key.
+#[must_use]
+pub fn ident_key(raw: &str) -> IdentKey {
+    let trimmed = raw.trim();
+    match parse_qualified_identifier_with_quoting(trimmed) {
+        Ok(parts) => IdentKey::Parts(
+            parts
+                .into_iter()
+                .map(|(part, _quoted)| part.to_ascii_lowercase())
+                .collect(),
+        ),
+        Err(_) => IdentKey::Unparsed(trimmed.to_ascii_lowercase()),
+    }
+}
+
+/// See [`ident_key`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum IdentKey {
+    /// The normalized parts of a well-formed identifier, in order.
+    Parts(Vec<String>),
+    /// The lowercased trimmed text of input that is not a well-formed identifier.
+    Unparsed(String),
+}
+
 /// True when a stored identifier and a requested identifier denote the same
 /// object under `DuckDB`'s case-insensitive identifier rule (see
 /// [`normalize_ident_part`]): quoting does not affect matching, and case is
@@ -472,6 +508,21 @@ pub fn first_unquoted_dot(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ident_key_keeps_identifier_parts_apart() {
+        // One part containing a dot vs. two parts: `normalize_ident_part`
+        // joins both to `x.y`; `ident_key` does not.
+        assert_eq!(normalize_ident_part("x.y"), normalize_ident_part("\"x.y\""));
+        assert_ne!(ident_key("x.y"), ident_key("\"x.y\""));
+        // The same two parts in any quoting and case are one key.
+        assert_eq!(ident_key("x.y"), ident_key("\"X\".\"y\""));
+        assert_eq!(ident_key("\"x.y\""), ident_key("\"X.Y\""));
+        assert_eq!(ident_key("Dep"), ident_key("\"dep\""));
+        // Malformed input never equals a parsed key.
+        assert_eq!(ident_key("\"abc"), IdentKey::Unparsed("\"abc".to_string()));
+        assert_ne!(ident_key("\"abc"), ident_key("\"\"\"abc\""));
+    }
 
     mod parse_qualified_identifier_tests {
         use super::*;

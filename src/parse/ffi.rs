@@ -142,7 +142,7 @@ pub unsafe extern "C" fn sv_parser_override_rust(
         let outcome = rewrite_to_native_sql(query);
         if !matches!(outcome, Ok(Some(_))) {
             // Declining (rc=2). Remember a multi-statement string so that
-            // parse_function can name the real cause (TECH-DEBT #83).
+            // parse_function can name the real cause (TECH-DEBT #85).
             note_declined_query(query);
         }
         match outcome {
@@ -200,7 +200,7 @@ pub unsafe extern "C" fn sv_parser_override_rust(
 }
 
 // ---------------------------------------------------------------------------
-// TECH-DEBT #83: telling "override off" apart from "multi-statement string"
+// TECH-DEBT #85: telling "override off" apart from "multi-statement string"
 // ---------------------------------------------------------------------------
 
 /// Message for rc=3 when `parser_override` genuinely did not run.
@@ -374,7 +374,7 @@ pub unsafe extern "C" fn sv_parse_function_rust(
             Ok(Some(_rewritten)) => {
                 // Valid DDL but we got here. Either `parser_override` ran on
                 // a multi-statement string holding this statement and
-                // declined it (TECH-DEBT #83 -- it only rewrites a string
+                // declined it (TECH-DEBT #85 -- it only rewrites a string
                 // that is one statement), or it did not run at all. Most
                 // common cause of the latter: `disable_peg_parser` reset
                 // `allow_parser_override_extension` to DEFAULT (TECH-DEBT 21).
@@ -532,7 +532,7 @@ mod tests {
         (rc, String::from_utf8_lossy(&error_buf[..nul]).into_owned())
     }
 
-    // TECH-DEBT #83. Each #[test] runs on its own thread, so the thread-local
+    // TECH-DEBT #85. Each #[test] runs on its own thread, so the thread-local
     // record starts empty in every test below.
 
     /// Control: `parse_function` reached for valid DDL with no declined

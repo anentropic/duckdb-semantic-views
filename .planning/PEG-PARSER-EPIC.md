@@ -202,6 +202,10 @@ numeric oracle (CLAUDE.md).
   syntax users write. `.doc-writer/context.md` still describes v0.5.3 and the
   `semantic_view()` interface, so refresh it as part of the first release in this
   epic.
+- **Code review before the next release.** Before the next release only
+  (Anentropic, 2026-10-13): a thorough code review by Fable of everything going
+  into the release; its findings go to Anentropic for a decision and are resolved
+  before tagging. Whether later releases get one is decided case by case.
 
 ### Phase 0: fixes on v1.5.6 (now, in parallel with the Phase 1 spike)
 

@@ -1384,3 +1384,220 @@ fn td69_metric_on_a_single_relationship_parent_still_expands() {
         "{sql}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Relationship names follow DuckDB identifier rules (TECH-DEBT #28 sites).
+//
+// The body parser stores a relationship name and a `USING` entry as written,
+// quotes and all. Every site that matched one against the other compared
+// `to_ascii_lowercase()` spellings, so `"Dep_Airport"` and `dep_airport` — one
+// identifier to DuckDB — were two different relationships to validation, the
+// join resolver, the role-playing fence, the fact rewrite and the per-grain
+// path. They now all match with `ident::ident_matches` / normalize with
+// `ident::normalize_ident_part`, so the five agree.
+// ---------------------------------------------------------------------------
+
+/// Departure relationship declared QUOTED; the metric's `USING` names it bare.
+#[cfg(not(feature = "extension"))]
+fn mixed_quoting_role_def() -> SemanticViewDefinition {
+    let mut def = flights_airports_def();
+    def.joins[0].name = Some("\"Dep_Airport\"".to_string());
+    def.metrics[0].using_relationships = vec!["dep_airport".to_string()];
+    def
+}
+
+/// The dimension must bind to the departure role the bare `USING` names: all
+/// three flights depart `Dep City`. With ASCII-lowercase matching the join
+/// resolver found no relationship for the spelling and emitted no scoped join.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn rel_quoting_bare_using_binds_a_quoted_relationship_role() {
+    let def = mixed_quoting_role_def();
+    let sql = expand("v", &def, &metrics_req(&["city"], &["departure_count"])).unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(Some("Dep City".to_string()), 3.0)],
+        "{sql}"
+    );
+}
+
+/// The converse spelling — bare declaration, quoted upper-case `USING`.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn rel_quoting_quoted_using_binds_a_bare_relationship_role() {
+    let mut def = flights_airports_def();
+    def.metrics[1].using_relationships = vec!["\"ARR_AIRPORT\"".to_string()];
+    let sql = expand("v", &def, &metrics_req(&["city"], &["arrival_count"])).unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(Some("Arr City".to_string()), 3.0)],
+        "{sql}"
+    );
+}
+
+/// A `USING` metric over a fact on the role-played table (#69), with the
+/// relationship quoted at its declaration: the fence must find exactly one
+/// role and the fact rewrite must move `a.elevation` onto that role's alias.
+/// Three departures at elevation 100.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn rel_quoting_role_played_fact_binds_a_quoted_relationship_role() {
+    let mut def = role_played_fact_def();
+    def.joins[0].name = Some("\"Dep_Airport\"".to_string());
+    let sql = expand("v", &def, &metrics_req(&[], &["dep_elev"])).unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(None, 300.0)],
+        "{sql}"
+    );
+}
+
+/// `USING (dep_airport, "DEP_AIRPORT")` names one relationship twice. Guard
+/// against a half-migration: once every site resolves both spellings to the
+/// same edge, the fence and the fact rewrite must still count ONE role
+/// (deduplicated by edge), not two.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn rel_quoting_duplicate_spellings_differing_in_quoting_name_one_role() {
+    let mut def = role_played_fact_def();
+    def.metrics.push(Metric {
+        name: "dep_elev_quoted_twice".to_string(),
+        expr: "SUM(elev)".to_string(),
+        source_table: Some("f".to_string()),
+        using_relationships: vec!["dep_airport".to_string(), "\"DEP_AIRPORT\"".to_string()],
+        ..Default::default()
+    });
+    let sql = expand("v", &def, &metrics_req(&[], &["dep_elev_quoted_twice"])).unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(None, 300.0)],
+        "{sql}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Legacy stored pairs whose names differ only by quoting (PR #249 review).
+//
+// Before #249 the role-playing diamond check compared relationship names by
+// ASCII-lowercase spelling, so `dep` and `"dep"` were accepted as two roles of
+// one table, and every lookup by name — also by spelling — sent `USING (dep)`
+// to the bare one and `USING ("dep")` to the quoted one. CREATE now rejects
+// such a pair (TECH-DEBT #79), but a row stored earlier is never re-validated,
+// so it must keep answering exactly as it did: every lookup prefers the old
+// spelling match and only falls back to the identifier rule when no spelling
+// matches (`graph::find_relationship` / `RelNameMatch`).
+// ---------------------------------------------------------------------------
+
+/// `flights_airports_def` as a pre-#249 stored row: the departure edge is
+/// named `dep`, the arrival edge `"dep"` (stored with its quotes). Built
+/// directly, bypassing CREATE validation, as a catalog row would be loaded.
+#[cfg(not(feature = "extension"))]
+fn legacy_quoted_pair_def() -> SemanticViewDefinition {
+    let mut def = flights_airports_def();
+    def.joins[0].name = Some("dep".to_string());
+    def.joins[1].name = Some("\"dep\"".to_string());
+    def.metrics[0].using_relationships = vec!["dep".to_string()];
+    def.metrics[1].using_relationships = vec!["\"dep\"".to_string()];
+    def
+}
+
+/// Join resolver: `USING ("dep")` named the quoted (arrival) edge, so all three
+/// flights group under `Arr City`. Taking the first identifier match instead
+/// joins the departure edge and reports `Dep City`.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn legacy_quoted_pair_using_keeps_binding_the_quoted_relationship() {
+    let def = legacy_quoted_pair_def();
+    let sql = expand("v", &def, &metrics_req(&["city"], &["arrival_count"])).unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(Some("Arr City".to_string()), 3.0)],
+        "{sql}"
+    );
+}
+
+/// `find_using_context`: the two co-queried metrics name two different stored
+/// relationships to `a`, so the dimension has no single role — the query was
+/// rejected as ambiguous. Deduplicating `USING` entries by normalized name
+/// merges them into one role and silently answers with one of the two.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn legacy_quoted_pair_two_roles_in_one_query_stay_ambiguous() {
+    let def = legacy_quoted_pair_def();
+    let err = expand(
+        "v",
+        &def,
+        &metrics_req(&["city"], &["departure_count", "arrival_count"]),
+    )
+    .expect_err("two stored relationships, one dimension: no single role");
+    assert!(
+        matches!(err, ExpandError::AmbiguousPath { .. }),
+        "expected AmbiguousPath, got: {err}"
+    );
+}
+
+/// The #69 fence: a metric over a role-played fact whose `USING` names BOTH
+/// stored relationships has no single role to put the fact on, and was
+/// rejected. Counting roles by normalized name counts one and lets it through.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn legacy_quoted_pair_fact_metric_naming_both_roles_stays_rejected() {
+    let mut def = role_played_fact_def();
+    def.joins[0].name = Some("dep".to_string());
+    def.joins[1].name = Some("\"dep\"".to_string());
+    def.metrics.push(Metric {
+        name: "both_elev".to_string(),
+        expr: "SUM(elev)".to_string(),
+        source_table: Some("f".to_string()),
+        using_relationships: vec!["dep".to_string(), "\"dep\"".to_string()],
+        ..Default::default()
+    });
+    let err = expand("v", &def, &metrics_req(&[], &["both_elev"]))
+        .expect_err("USING names two stored roles of the fact's table");
+    assert!(
+        matches!(err, ExpandError::AmbiguousMemberFactPath { .. }),
+        "expected AmbiguousMemberFactPath, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Dot-qualified relationship names keep their part boundaries (PR #249 review).
+//
+// `x.y` (two identifier parts) and `"x.y"` (one part containing a dot) are
+// different identifiers to DuckDB, but both normalize to the string `x.y`.
+// ---------------------------------------------------------------------------
+
+/// `"x.y"` (to `d`) is declared before `x.y` (to `r`); `USING ("x"."y")` names
+/// the two-part `x.y`, so the scoped join must target `r`. Matching on the
+/// joined normalized string bound the first-declared `"x.y"` instead.
+#[test]
+fn using_a_two_part_relationship_name_does_not_bind_a_dotted_one_part_name() {
+    let mut def = flights_airports_def();
+    def.tables[1].alias = "d".to_string();
+    def.tables.push(TableRef {
+        alias: "r".to_string(),
+        table: "airports".to_string(),
+        pk_columns: vec!["airport_code".to_string()],
+        ..Default::default()
+    });
+    def.joins[0].table = "d".to_string();
+    def.joins[0].name = Some("\"x.y\"".to_string());
+    def.joins[1].table = "r".to_string();
+    def.joins[1].name = Some("x.y".to_string());
+    def.dimensions = vec![Dimension {
+        name: "arr_city".to_string(),
+        expr: "r.city".to_string(),
+        source_table: Some("r".to_string()),
+        ..Default::default()
+    }];
+    def.metrics = vec![Metric {
+        name: "arrivals".to_string(),
+        expr: "COUNT(*)".to_string(),
+        source_table: Some("f".to_string()),
+        using_relationships: vec!["\"x\".\"y\"".to_string()],
+        ..Default::default()
+    }];
+    let sql = expand("v", &def, &metrics_req(&["arr_city"], &["arrivals"])).unwrap();
+    assert!(sql.contains(r#"AS "r__x.y""#), "{sql}");
+    assert!(!sql.contains(r#""d__x.y""#), "{sql}");
+}

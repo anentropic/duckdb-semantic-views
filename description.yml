@@ -11,7 +11,7 @@ extension:
     - anentropic
 
 repo:
-  github: anentropic/duckdb-semantic-views
+  github: s-layer/duckdb-semantic-views
   ref: 27e6271218f3ee9687e9f15cae6e85171eded45c
 
 docs:
@@ -34,4 +34,4 @@ docs:
     composition automatically. Supports multi-table joins with PK/FK relationships,
     fan trap detection, role-playing dimensions, derived metrics, and FACTS.
 
-    Documentation: https://anentropic.github.io/duckdb-semantic-views/
+    Documentation: https://s-layer.github.io/duckdb-semantic-views/

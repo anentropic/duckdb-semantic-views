@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`CREATE SEMANTIC VIEW` rejects two relationships with the same name.** Relationship
+  names are one namespace per view, compared the way DuckDB compares identifiers, so `r`,
+  `R` and `"r"` are the same name. Two relationships sharing a name used to be accepted
+  unless both pointed at the same table, and `USING (r)` then silently meant whichever
+  was declared first. `CREATE` (and `CREATE … FROM YAML`) now fails with
+  `duplicate relationship name '<name>'`, naming both relationships. A role-playing pair
+  that repeats a name reports this error instead of the former "diamond" error. A name
+  keeps its parts: the quoted `"x.y"` is one identifier and a different name from the
+  two-part `x.y` (also spelled `"x"."y"`), and `USING` matches it the same way. Two
+  role-playing relationships to one table whose names differ only that way are rejected,
+  because both would be joined under the same alias. Views already stored keep loading,
+  and a `USING` in them keeps naming the relationship it named before, including in a
+  view that holds two relationships whose names differ only in quoting.
+- **`CREATE SEMANTIC VIEW` rejects a single-table member qualified by an undeclared
+  table alias.** In a view whose only table is `o`, a dimension or metric named
+  `x.foo` was accepted. It now fails with `unknown source table 'x'; did you mean 'o'?`,
+  the error a multi-table view already gave. An unqualified member, or one qualified by
+  the declared alias in any case or quoting (`o`, `O`, `"O"`), is still accepted. Views
+  already stored keep loading.
+
 ### Fixed
 
 - **`SHOW SEMANTIC DIMENSIONS` / `METRICS` / `FACTS`, `SHOW COLUMNS IN SEMANTIC VIEW`,
@@ -56,9 +78,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a quoted identifier (`"Dep Airport"`, or a name with an embedded `""`) used to make
   every query that went through it fail with a parser error.
 - **A table not connected to the base table is rejected at `CREATE`.** If the first table in
-  `TABLES` had no relationship, or the relationships formed two separate groups, the view
-  was accepted and every query failed with a binder error. `CREATE SEMANTIC VIEW` now
-  rejects the definition and names the unreachable table.
+  `TABLES` had no relationship, the relationships formed two separate groups, or the view
+  listed several tables with no `RELATIONSHIPS` at all, the view was accepted and every
+  query that needed an unconnected table failed with a binder error. `CREATE SEMANTIC VIEW`
+  (and `CREATE … FROM YAML`) now rejects the definition and names the unreachable table.
+  Views already stored keep loading. When several tables are unconnected, the error now
+  names the same one every time.
+- **A YAML relationship without `fk_columns` is rejected at `CREATE`.** It used to be
+  accepted, and every query on the view then failed with a misleading "legacy
+  definition format" error.
+- **Relationship names match the way DuckDB matches identifiers.** A relationship declared
+  quoted (`"Dep_Airport"`) is now named by `USING (dep_airport)`, and the converse; both
+  used to be rejected as an unknown relationship. Two role-playing relationships named
+  `dep` and `"dep"` are now rejected as a duplicate name, as `dep` and `DEP` already were.
 - **Semantic-view DDL inside a multi-statement query string now says what is wrong.** It
   used to fail with `parser_override is not active for this connection … Re-enable with: SET
   allow_parser_override_extension='FALLBACK'`, although the setting was fine and changing
@@ -688,29 +720,29 @@ Connection-lifecycle and ADBC fixes. Two downstream regressions reported against
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.13.0...HEAD
-[0.13.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.12.1...v0.13.0
-[0.12.1]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.12.0...v0.12.1
-[0.12.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.11.0...v0.12.0
-[0.11.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.4...v0.11.0
-[0.10.4]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.3...v0.10.4
-[0.10.3]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.2...v0.10.3
-[0.10.2]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.1...v0.10.2
-[0.10.1]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.10.0...v0.10.1
-[0.10.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.9.0...v0.10.0
-[0.9.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.8.0...v0.9.0
-[0.8.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.7.2...v0.8.0
-[0.7.2]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.7.1...v0.7.2
-[0.7.1]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.7.0...v0.7.1
-[0.7.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.6.0...v0.7.0
-[0.6.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.5.5...v0.6.0
-[0.5.5]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.5.4...v0.5.5
-[0.5.4]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.5.3...v0.5.4
-[0.5.3]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.5.2...tags/v0.5.3
-[0.5.2]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.5.1...v0.5.2
-[0.5.1]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.5.0...v0.5.1
-[0.5.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.4.0...v0.5.0
-[0.4.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/anentropic/duckdb-semantic-views/compare/v1.0...v0.2.0
-[0.1.0]: https://github.com/anentropic/duckdb-semantic-views/releases/tag/v1.0
+[Unreleased]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.12.1...v0.13.0
+[0.12.1]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.12.0...v0.12.1
+[0.12.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.10.4...v0.11.0
+[0.10.4]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.10.3...v0.10.4
+[0.10.3]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.10.2...v0.10.3
+[0.10.2]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.10.1...v0.10.2
+[0.10.1]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.10.0...v0.10.1
+[0.10.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.7.2...v0.8.0
+[0.7.2]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.5.5...v0.6.0
+[0.5.5]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.5.4...v0.5.5
+[0.5.4]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.5.3...v0.5.4
+[0.5.3]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.5.2...tags/v0.5.3
+[0.5.2]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v1.0...v0.2.0
+[0.1.0]: https://github.com/s-layer/duckdb-semantic-views/releases/tag/v1.0

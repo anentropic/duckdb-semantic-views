@@ -132,11 +132,49 @@ patch-runner: check_configure
 # `cargo test` (catalog::tests::tc6_restart_persistence_survives_reopen:
 # open -> persist -> close -> reopen -> init_catalog -> lookup).
 TEST_LIST_PATH := test/sql/TEST_LIST
+
+# Offline mode for sandboxes that cannot reach extensions.duckdb.org (LOCAL USE
+# ONLY). A few tests need a DuckDB extension that is neither bundled in the pip
+# `duckdb` wheel nor in this repo, so DuckDB must download it on first use:
+#   test/sql/peg_compat.test  -- `CALL enable_peg_parser()` autoloads `autocomplete`
+# Behind a proxy that blocks the download, that file fails at its first PEG
+# statement and, because the runner stops at the first failing file, halts the
+# whole suite. With SV_OFFLINE_EXTENSIONS=1 those files are left out of the run
+# and each is reported with a loud SKIPPED line; every other file still runs.
+#
+# Deliberately an explicit opt-in, NOT a sqllogictest `require autocomplete`:
+# `require` skips silently whenever the extension cannot be loaded, CI
+# included, so a broken download in CI would turn this coverage off without a
+# red. Without the variable nothing changes -- CI runs the file and fails hard
+# if it cannot load the extension -- and the variable is refused outright when
+# `CI` is set (GitHub Actions sets CI=true), so it cannot leak into CI.
+OFFLINE_EXTENSION_TESTS := test/sql/peg_compat.test
+ifeq ($(SV_OFFLINE_EXTENSIONS),1)
+ifneq ($(CI),)
+$(error SV_OFFLINE_EXTENSIONS=1 skips tests and is for local offline runs only; refusing because CI='$(CI)')
+endif
+EFFECTIVE_TEST_LIST := build/test_list_offline
+else
+EFFECTIVE_TEST_LIST := $(TEST_LIST_PATH)
+endif
+
+# Writes $(EFFECTIVE_TEST_LIST) in offline mode and prints one SKIPPED line per
+# left-out file. A no-op otherwise.
+.PHONY: prepare_test_list
+prepare_test_list:
+ifeq ($(SV_OFFLINE_EXTENSIONS),1)
+	@mkdir -p $(dir $(EFFECTIVE_TEST_LIST))
+	@grep -vxF $(foreach t,$(OFFLINE_EXTENSION_TESTS),-e $(t)) $(TEST_LIST_PATH) > $(EFFECTIVE_TEST_LIST)
+	@for t in $(OFFLINE_EXTENSION_TESTS); do \
+	  echo "SKIPPED (SV_OFFLINE_EXTENSIONS=1): $$t -- needs a DuckDB extension downloaded from extensions.duckdb.org; NOT run"; \
+	done
+endif
+
 # --test-dir is passed alongside --file-list so the runner can resolve __TEST_DIR__
 # (used by tests that create file-backed databases). The file list controls which
 # tests are actually executed.
-TEST_RUNNER_FILE_LIST_DEBUG  := $(TEST_RUNNER) --test-dir test/sql --file-list $(TEST_LIST_PATH) $(EXTRA_EXTENSIONS_PARAM) --external-extension build/debug/$(EXTENSION_NAME).duckdb_extension
-TEST_RUNNER_FILE_LIST_RELEASE := $(TEST_RUNNER) --test-dir test/sql --file-list $(TEST_LIST_PATH) $(EXTRA_EXTENSIONS_PARAM) --external-extension build/release/$(EXTENSION_NAME).duckdb_extension
+TEST_RUNNER_FILE_LIST_DEBUG  := $(TEST_RUNNER) --test-dir test/sql --file-list $(EFFECTIVE_TEST_LIST) $(EXTRA_EXTENSIONS_PARAM) --external-extension build/debug/$(EXTENSION_NAME).duckdb_extension
+TEST_RUNNER_FILE_LIST_RELEASE := $(TEST_RUNNER) --test-dir test/sql --file-list $(EFFECTIVE_TEST_LIST) $(EXTRA_EXTENSIONS_PARAM) --external-extension build/release/$(EXTENSION_NAME).duckdb_extension
 
 # Override base.Makefile test targets to patch runner before tests.
 # SKIP_TESTS platforms (musl, mingw) resolve to tests_skipped before reaching these
@@ -163,13 +201,13 @@ TEST_RUNNER_FILE_LIST_RELEASE := $(TEST_RUNNER) --test-dir test/sql --file-list 
 # run prints only per-file SUCCESS lines, and the "did the suite actually run,
 # or did it silently skip?" question this project has been bitten by twice
 # (see MAINTAINER.md, CI Workflows) needs a greppable end-of-run marker.
-test_extension_debug_internal: patch-runner
+test_extension_debug_internal: patch-runner prepare_test_list
 	@echo "Running DEBUG tests.."
 	@$(TEST_RUNNER_FILE_LIST_DEBUG)
-	@echo "$$(wc -l < $(TEST_LIST_PATH) | tr -d ' ') test files passed (single process)"
+	@echo "$$(wc -l < $(EFFECTIVE_TEST_LIST) | tr -d ' ') test files passed (single process)$(if $(filter 1,$(SV_OFFLINE_EXTENSIONS)), -- $(words $(OFFLINE_EXTENSION_TESTS)) SKIPPED offline (SV_OFFLINE_EXTENSIONS=1),)"
 
-test_extension_release_internal: patch-runner
+test_extension_release_internal: patch-runner prepare_test_list
 	@echo "Running RELEASE tests.."
 	@$(TEST_RUNNER_FILE_LIST_RELEASE)
-	@echo "$$(wc -l < $(TEST_LIST_PATH) | tr -d ' ') test files passed (single process)"
+	@echo "$$(wc -l < $(EFFECTIVE_TEST_LIST) | tr -d ' ') test files passed (single process)$(if $(filter 1,$(SV_OFFLINE_EXTENSIONS)), -- $(words $(OFFLINE_EXTENSION_TESTS)) SKIPPED offline (SV_OFFLINE_EXTENSIONS=1),)"
 

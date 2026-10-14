@@ -60,7 +60,7 @@ NEEDS_DOWNLOADED_EXTENSION: dict[str, str] = {
 # Examples that are known to fail, keyed by file name: (substring the failure
 # output must contain, why). Every entry needs a TECH-DEBT reference.
 EXPECTED_FAILURES: dict[str, tuple[str, str]] = {
-    # Empty. examples/type_inference.py was listed here (TECH-DEBT #83) until
+    # Empty. examples/type_inference.py was listed here (TECH-DEBT #85) until
     # PR #248 rewrote it without the multi-statement execute() call.
 }
 

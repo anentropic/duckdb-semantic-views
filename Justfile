@@ -315,7 +315,7 @@ test-sqllogictest-guards: build
     make patch-runner
     configure/venv/bin/python test/integration/test_sqllogictest_guards.py
 
-# Semantic-view DDL inside a multi-statement query string (TECH-DEBT #83) must
+# Semantic-view DDL inside a multi-statement query string (TECH-DEBT #85) must
 # fail with the "one statement per call" message rather than the misleading
 # "parser_override is not active" one; the real override-off case keeps its
 # message. Exercises the whole parser_override -> default parser ->

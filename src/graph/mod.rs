@@ -23,5 +23,6 @@ pub use member_refs::validate_member_references;
 #[cfg_attr(not(feature = "extension"), allow(unused_imports))]
 pub(crate) use join_tree::JoinTree;
 pub use names::validate_name_uniqueness;
+pub(crate) use relationship::{find_relationship, RelNameMatch};
 pub use relationship::{validate_graph, RelationshipGraph};
 pub use using::validate_using_relationships;
