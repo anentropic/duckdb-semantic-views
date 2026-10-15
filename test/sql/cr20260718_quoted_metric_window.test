@@ -22,8 +22,12 @@ statement ok
 INSERT INTO cr718_orders VALUES (1, 'US', 'web'), (2, 'US', 'store'), (3, 'EU', 'web');
 
 # order 3 (EU/web) has NO line items -> a NULL-extended LEFT JOIN row.
+# The item with a NULL key (order 2, US/store) is the home-table discriminator
+# for EXP-6: COUNT(li.id) skips it, the raw COUNT(*) counts it. Since #71 the
+# window's inner aggregate scans `cr718_items` directly, so the childless order
+# above no longer tells the two apart on its own.
 statement ok
-INSERT INTO cr718_items VALUES (10, 1), (11, 1), (12, 2);
+INSERT INTO cr718_items VALUES (10, 1), (11, 1), (12, 2), (NULL, 2);
 
 statement ok
 CREATE SEMANTIC VIEW cr718_v AS
@@ -79,9 +83,8 @@ SELECT count(*) FROM explain_semantic_view('cr718_v', dimensions := ['region', '
 # all rows are ORDER BY peers, so each sees the region's full sum. Since
 # TECH-DEBT #71 the window's inner aggregate is home-anchored at `li`, so EU --
 # which has only the childless order -- has no row (before #71: `EU web 0`).
-# On the home table a raw COUNT(*) and COUNT(li.id) agree, so this row set no
-# longer discriminates the EXP-6 lookup miss on its own; the two EXPLAIN guards
-# above still do.
+# The NULL-key item keeps the row set discriminating: with the EXP-6 lookup
+# miss the window would sum the raw COUNT(*) and read 4 for US, not 3.
 query TTI rowsort
 SELECT region, channel, CAST(rolling AS BIGINT)
 FROM semantic_view('cr718_v', dimensions := ['region', 'channel'], metrics := ['rolling']);
