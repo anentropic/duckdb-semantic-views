@@ -63,31 +63,66 @@
 //! each parent attribute reached by correlated scalar subquery — so they share
 //! no structure with the expansion's `LEFT JOIN`s or its PK guards. An anchor,
 //! a guard or a filter that is wrong shows up as a non-zero multiset difference.
+//!
+//! # Two hops down, and three grains in one request (TC2)
+//!
+//! One descending hop leaves home anchoring's join CHAIN unrandomized: a metric
+//! whose anchor is two edges below the table a dimension or a fact lives on. So
+//! the view also declares a grandchild `lid` (`lid -> li`, many-to-one) with its
+//! own metrics (`d_*`), and the base `o` gets metrics of its own (`o_*`). A
+//! request draws one of several grain mixes ([`Grains`]) — the original
+//! child-only one, the grandchild alone, child + grandchild (two grain CTEs), and
+//! the mixes with the base grain, up to all three grains in one request.
+//! Dimensions come from all three tables (`ldamt` is `lid.amount`), and orphans
+//! and childless rows occur at both levels: an `li` without `lid` children, an
+//! `lid` whose `li` is NULL or missing, and an `lid` whose `li` exists but whose
+//! order does not (a NULL `region` reached through two hops).
+//!
+//! The metrics oracle adds one more correlated level in the same style: a
+//! `FROM lid` scan reaching `li` attributes by one correlated subquery and `o`
+//! attributes by a nested one. A request spanning several grains is answered
+//! per grain, then combined WITHOUT a join: the result keys are the UNION of each
+//! grain's group keys, and each metric is read back from its own grain by a
+//! correlated lookup on the key — NULL when that grain has no such group.
+//!
+//! Shapes the engine rejects BY DESIGN are not generated, and
+//! `excluded_shapes_are_rejected_by_the_fan_trap_fence` pins that each one IS
+//! that rejection: a dimension below a metric's grain (`lamt` beside an `o_*`
+//! metric, `ldamt` beside an `li` or `o` metric — `FanTrap`), and a child-side
+//! `where_clause` member beside an `o_*` metric (`WhereClauseFanTrap`).
 
 use proptest::prelude::*;
-use semantic_views::expand::{expand, DimensionName, FactName, MetricName, QueryRequest};
+use semantic_views::expand::{
+    expand, DimensionName, ExpandError, FactName, MetricName, QueryRequest,
+};
 use semantic_views::model::{
     AccessModifier, Cardinality, Dimension, Fact, Join, Metric, NonAdditiveDim, NullsOrder,
     SemanticViewDefinition, SortOrder, TableRef, WindowSpec,
 };
 
 /// Base rows `o` have ids `0..n_o`; child rows `li` carry a foreign key into
-/// them. `None` is a SQL NULL throughout.
+/// them, and grandchild rows `lid` a foreign key into `li`. `None` is a SQL
+/// NULL throughout.
 #[derive(Debug, Clone)]
 struct Instance {
     /// Base rows: `(region, rate)` for ids `0..n_o`.
     o_rows: Vec<(Option<i64>, Option<i64>)>,
-    /// Child rows: `(order_id, amount)`.
+    /// Child rows: `(order_id, amount)` for ids `0..n_li`.
     li_rows: Vec<(Option<i64>, Option<i64>)>,
+    /// Grandchild rows: `(li_id, amount)`.
+    lid_rows: Vec<(Option<i64>, Option<i64>)>,
 }
 
 /// Queryable objects, by stable name. `region` lives on the BASE table, `lamt`
 /// (`li.amount`) on the CHILD — selectable since TECH-DEBT #71, when a child
 /// metric stopped being aggregated over the base-anchored join that gave a
-/// childless parent a manufactured NULL group (MM-4).
-const DIMS: [&str; 2] = ["region", "lamt"];
+/// childless parent a manufactured NULL group (MM-4). `ldamt` (`lid.amount`)
+/// is on the GRANDCHILD, and is selected only beside grandchild metrics alone.
+const DIMS: [&str; 3] = ["region", "lamt", "ldamt"];
 /// Index of the child-table dimension in [`DIMS`].
 const D_LAMT: usize = 1;
+/// Index of the grandchild-table dimension in [`DIMS`].
+const D_LDAMT: usize = 2;
 /// `n_star` is the spelling SG-8 always handled. `n_one`, `s_one`, `n_str` and
 /// `n_paren` are the constant-argument spellings it did not — `n_paren` is the
 /// redundantly-parenthesized literal raised by review on #203, which the first
@@ -109,7 +144,14 @@ const D_LAMT: usize = 1;
 /// re-anchored at `li` (TECH-DEBT #71), so the orphans — whose `lamt` may be
 /// NULL — are ranked with the rest (reviewbot on #250: the child-anchored
 /// snapshot had no randomized oracle).
-const METS: [&str; 14] = [
+///
+/// TC2 appends the other two grains. `o_n` / `o_rate` are base-grain
+/// (`COUNT(*)` / `SUM(o.rate)` on `o`). `d_star` / `d_amt` are the grandchild's
+/// own `COUNT(*)` / `SUM(lid.amount)`; `d_famt` is `SUM(f_amt)`, a fact one hop
+/// up on `li`, and `d_rate` is `SUM(orate)`, a fact TWO hops up on `o` — each
+/// inlined fact makes the `lid` grain CTE join its chain outward even when no
+/// queried dimension reaches it.
+const METS: [&str; 20] = [
     "n_star",
     "n_one",
     "s_one",
@@ -124,12 +166,90 @@ const METS: [&str; 14] = [
     "mx_amt",
     "w_parent",
     "snap_parent",
+    "o_n",
+    "o_rate",
+    "d_star",
+    "d_amt",
+    "d_famt",
+    "d_rate",
 ];
 /// Index of `w_parent` in [`METS`]: requested alone, never in a mask.
 const M_WINDOW: usize = 12;
 /// Index of `snap_parent` in [`METS`]: requested alone, never in a mask (a
 /// snapshot co-query rejects the `COUNT(*)` family, SG-5).
 const M_SNAP: usize = 13;
+/// Index of `o_n` in [`METS`]: the base grain's default metric.
+const M_O_N: usize = 14;
+/// Index of `d_star` in [`METS`]: the grandchild grain's default metric.
+const M_D_STAR: usize = 16;
+
+/// The table a metric is aggregated from — its home table (TECH-DEBT #71).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grain {
+    /// The base table `o`.
+    O,
+    /// The child `li`.
+    Li,
+    /// The grandchild `lid`.
+    Lid,
+}
+
+/// The home grain of `METS[i]`.
+fn met_grain(i: usize) -> Grain {
+    let name = METS[i];
+    if name.starts_with("o_") {
+        Grain::O
+    } else if name.starts_with("d_") {
+        Grain::Lid
+    } else {
+        Grain::Li
+    }
+}
+
+/// Which grains a METRICS request draws metrics from. Every drawn grain gets at
+/// least one metric, so a request with two flags set emits two grain CTEs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Grains {
+    o: bool,
+    li: bool,
+    lid: bool,
+}
+
+impl Grains {
+    const LI_ONLY: Grains = Grains {
+        o: false,
+        li: true,
+        lid: false,
+    };
+    const LID_ONLY: Grains = Grains {
+        o: false,
+        li: false,
+        lid: true,
+    };
+
+    fn has(self, g: Grain) -> bool {
+        match g {
+            Grain::O => self.o,
+            Grain::Li => self.li,
+            Grain::Lid => self.lid,
+        }
+    }
+}
+
+/// The grain mixes, weighted. The child-only mix keeps the largest share — it
+/// is the one every pre-TC2 guard below counts — and the grandchild is drawn in
+/// 6 of 11 metric requests: alone, beside the child, and beside the base.
+fn arb_grains() -> impl Strategy<Value = Grains> {
+    let g = |o, li, lid| Just(Grains { o, li, lid });
+    prop_oneof![
+        4 => g(false, true, false),
+        2 => g(false, false, true),
+        2 => g(false, true, true),
+        1 => g(true, true, true),
+        1 => g(true, true, false),
+        1 => g(true, false, true),
+    ]
+}
 /// The only requestable fact: a row-level child value. A fact query is at the
 /// grain of its facts, so a childless parent has no row in it (EXP-28).
 const FACTS: [&str; 1] = ["f_amt"];
@@ -175,6 +295,43 @@ impl WMember {
             }
             WMember::Camt => "(li.amount > 0)",
             WMember::Famt => "(li.amount > 0 OR li.amount < -1)",
+        }
+    }
+
+    /// The same expression evaluated with only `lid` in scope (the grandchild
+    /// rows of the metrics oracle): the child side by one correlated subquery,
+    /// the base side by a nested one through it.
+    fn raw_from_grandchild(self) -> &'static str {
+        match self {
+            WMember::Region => {
+                "(SELECT op.region FROM o op WHERE op.id = \
+                   (SELECT lp.order_id FROM li lp WHERE lp.id = lid.li_id))"
+            }
+            WMember::Fregion => {
+                "((SELECT op.region FROM o op WHERE op.id = \
+                    (SELECT lp.order_id FROM li lp WHERE lp.id = lid.li_id)) = 0 \
+                  OR (SELECT op.region FROM o op WHERE op.id = \
+                    (SELECT lp.order_id FROM li lp WHERE lp.id = lid.li_id)) = 2)"
+            }
+            WMember::Camt => "((SELECT lp.amount FROM li lp WHERE lp.id = lid.li_id) > 0)",
+            WMember::Famt => {
+                "((SELECT lp.amount FROM li lp WHERE lp.id = lid.li_id) > 0 \
+                  OR (SELECT lp.amount FROM li lp WHERE lp.id = lid.li_id) < -1)"
+            }
+        }
+    }
+
+    /// The same expression evaluated with only `o` in scope (the base rows of
+    /// the metrics oracle). A child-side member never reaches here: beside a
+    /// base-grain metric it is a `WhereClauseFanTrap`, which `arb_case` does
+    /// not generate.
+    fn raw_from_base(self) -> &'static str {
+        match self {
+            WMember::Region => "o.region",
+            WMember::Fregion => "(o.region = 0 OR o.region = 2)",
+            WMember::Camt | WMember::Famt => {
+                unreachable!("a child-side member was generated beside a base-grain metric")
+            }
         }
     }
 
@@ -291,17 +448,26 @@ struct Case {
 }
 
 fn arb_instance() -> impl Strategy<Value = Instance> {
-    // 1..=4 base rows, 0..=6 child rows. Foreign keys are drawn from a range
-    // WIDER than the base ids, so dangling references and childless orders
-    // both occur often; `None` covers the NULL foreign key.
+    // 1..=4 base rows, 0..=6 child rows, 0..=6 grandchild rows. Foreign keys
+    // are drawn from a range WIDER than the referenced ids, so dangling
+    // references and childless parents both occur often at both levels;
+    // `None` covers the NULL foreign key.
     (
         prop::collection::vec((prop::option::of(0i64..3), prop::option::of(0i64..4)), 1..5),
         prop::collection::vec(
             (prop::option::of(0i64..6), prop::option::of(-3i64..8)),
             0..7,
         ),
+        prop::collection::vec(
+            (prop::option::of(0i64..8), prop::option::of(-3i64..8)),
+            0..7,
+        ),
     )
-        .prop_map(|(o_rows, li_rows)| Instance { o_rows, li_rows })
+        .prop_map(|(o_rows, li_rows, lid_rows)| Instance {
+            o_rows,
+            li_rows,
+            lid_rows,
+        })
 }
 
 fn arb_case() -> impl Strategy<Value = Case> {
@@ -312,14 +478,15 @@ fn arb_case() -> impl Strategy<Value = Case> {
         // 1 in 4 requests is a row-level FACTS query.
         prop::bool::weighted(0.25),
         prop::option::weighted(0.6, arb_pred()),
-        // 1 in 5 metric requests is the window metric. It cannot share a
-        // request with a plain aggregate, so it is drawn on its own.
+        // 1 in 5 child-only metric requests is the window metric. It cannot
+        // share a request with a plain aggregate, so it is drawn on its own.
         prop::bool::weighted(0.2),
         // About 1 in 6 is the semi-additive metric, also drawn on its own.
         prop::bool::weighted(0.2),
+        arb_grains(),
     )
         .prop_map(
-            |(inst, dim_mask, met_mask, want_facts, where_pred, want_window, want_snap)| {
+            |(inst, dim_mask, met_mask, want_facts, where_pred, want_window, want_snap, grains)| {
                 let mut sel_dims: Vec<usize> = dim_mask
                     .iter()
                     .enumerate()
@@ -330,33 +497,54 @@ fn arb_case() -> impl Strategy<Value = Case> {
                 // below the base (TECH-DEBT #67 residual (3)); a base dimension
                 // next to a child dimension and a child fact is outside it.
                 if want_facts {
+                    sel_dims.retain(|&i| i != D_LAMT && i != D_LDAMT);
+                    return Case {
+                        inst,
+                        sel_dims,
+                        ask: Ask::ChildFacts,
+                        where_pred,
+                    };
+                }
+                // Dimensions BELOW a metric's grain fan it, and the fence
+                // rejects that by design (`FanTrap`): `ldamt` only beside
+                // grandchild metrics alone, `lamt` never beside a base metric.
+                if grains != Grains::LID_ONLY {
+                    sel_dims.retain(|&i| i != D_LDAMT);
+                }
+                if grains.o {
                     sel_dims.retain(|&i| i != D_LAMT);
                 }
+                // Likewise a child-side `where_clause` member beside a base
+                // metric (`WhereClauseFanTrap`).
+                let where_pred = where_pred.filter(|p| !(grains.o && p.touches_child()));
+
                 let mut sel_metrics: Vec<usize> = met_mask
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, &b)| (b && i != M_WINDOW && i != M_SNAP).then_some(i))
+                    .filter_map(|(i, &b)| {
+                        (b && i != M_WINDOW && i != M_SNAP && grains.has(met_grain(i))).then_some(i)
+                    })
                     .collect();
-                if want_window {
+                if grains == Grains::LI_ONLY && want_window {
                     sel_metrics = vec![M_WINDOW];
-                } else if want_snap {
+                } else if grains == Grains::LI_ONLY && want_snap {
                     sel_metrics = vec![M_SNAP];
                 }
-                // A request with no metrics and no facts is a different code path
-                // (dims-only DISTINCT); this harness is about the aggregates and
-                // the row-level fact query.
-                if sel_metrics.is_empty() {
-                    sel_metrics.push(1); // n_one — the metric EXP-21 was about.
+                // Every drawn grain gets a metric. A request with no metrics
+                // and no facts is a different code path (dims-only DISTINCT);
+                // this harness is about the aggregates and the row-level fact
+                // query. `n_one` is the metric EXP-21 was about.
+                for (grain, default) in [(Grain::O, M_O_N), (Grain::Li, 1), (Grain::Lid, M_D_STAR)]
+                {
+                    if grains.has(grain) && !sel_metrics.iter().any(|&i| met_grain(i) == grain) {
+                        sel_metrics.push(default);
+                    }
                 }
-                let ask = if want_facts {
-                    Ask::ChildFacts
-                } else {
-                    Ask::Metrics(sel_metrics)
-                };
+                sel_metrics.sort_unstable();
                 Case {
                     inst,
                     sel_dims,
-                    ask,
+                    ask: Ask::Metrics(sel_metrics),
                     where_pred,
                 }
             },
@@ -383,6 +571,15 @@ fn build_def() -> SemanticViewDefinition {
             comment: None,
             synonyms: vec![],
         },
+        // TC2: the grandchild, two descending hops from the base.
+        TableRef {
+            alias: "lid".to_string(),
+            table: "lid".to_string(),
+            pk_columns: vec!["id".to_string()],
+            unique_constraints: vec![],
+            comment: None,
+            synonyms: vec![],
+        },
     ];
     let dimension = |name: &str, expr: &str, source: &str, is_filter: bool| Dimension {
         name: name.to_string(),
@@ -396,6 +593,7 @@ fn build_def() -> SemanticViewDefinition {
     let dimensions = vec![
         dimension("region", "o.region", "o", false),
         dimension("lamt", "li.amount", "li", false),
+        dimension("ldamt", "lid.amount", "lid", false),
         // PBT-13 filter members: never selected as output, named only by a
         // generated `where_clause`. Compound expressions, so a splice that
         // drops the parentheses changes the answer.
@@ -449,6 +647,14 @@ fn build_def() -> SemanticViewDefinition {
             }],
             ..base_metric("snap_parent", "SUM(orate)", Some("li"))
         },
+        // TC2: the base grain and the grandchild grain.
+        base_metric("o_n", "COUNT(*)", Some("o")),
+        base_metric("o_rate", "SUM(o.rate)", Some("o")),
+        base_metric("d_star", "COUNT(*)", Some("lid")),
+        base_metric("d_amt", "SUM(lid.amount)", Some("lid")),
+        // A fact one hop up (`li`) and one two hops up (`o`).
+        base_metric("d_famt", "SUM(f_amt)", Some("lid")),
+        base_metric("d_rate", "SUM(orate)", Some("lid")),
     ];
     let facts = vec![
         Fact {
@@ -472,14 +678,24 @@ fn build_def() -> SemanticViewDefinition {
             is_filter: false,
         },
     ];
-    let joins = vec![Join {
-        from_alias: "li".to_string(),
-        table: "o".to_string(),
-        fk_columns: vec!["order_id".to_string()],
-        ref_columns: vec!["id".to_string()],
-        name: Some("li_o".to_string()),
-        cardinality: Cardinality::ManyToOne,
-    }];
+    let joins = vec![
+        Join {
+            from_alias: "li".to_string(),
+            table: "o".to_string(),
+            fk_columns: vec!["order_id".to_string()],
+            ref_columns: vec!["id".to_string()],
+            name: Some("li_o".to_string()),
+            cardinality: Cardinality::ManyToOne,
+        },
+        Join {
+            from_alias: "lid".to_string(),
+            table: "li".to_string(),
+            fk_columns: vec!["li_id".to_string()],
+            ref_columns: vec!["id".to_string()],
+            name: Some("lid_li".to_string()),
+            cardinality: Cardinality::ManyToOne,
+        },
+    ];
     SemanticViewDefinition {
         tables,
         dimensions,
@@ -499,7 +715,8 @@ fn make_db(inst: &Instance) -> duckdb::Connection {
     let conn = duckdb::Connection::open_in_memory().expect("in-memory DuckDB");
     conn.execute_batch(
         "CREATE TABLE o (id INTEGER, region INTEGER, rate INTEGER); \
-         CREATE TABLE li (id INTEGER, order_id INTEGER, amount INTEGER);",
+         CREATE TABLE li (id INTEGER, order_id INTEGER, amount INTEGER); \
+         CREATE TABLE lid (id INTEGER, li_id INTEGER, amount INTEGER);",
     )
     .expect("create tables");
 
@@ -525,23 +742,93 @@ fn make_db(inst: &Instance) -> duckdb::Connection {
         conn.execute_batch(&format!("INSERT INTO li VALUES {};", values.join(",")))
             .expect("insert li rows");
     }
+    if !inst.lid_rows.is_empty() {
+        let values: Vec<String> = inst
+            .lid_rows
+            .iter()
+            .enumerate()
+            .map(|(i, (li_id, amount))| format!("({i},{},{})", cell(li_id), cell(amount)))
+            .collect();
+        conn.execute_batch(&format!("INSERT INTO lid VALUES {};", values.join(",")))
+            .expect("insert lid rows");
+    }
     conn
 }
 
 /// The oracle for a METRICS request, in the semantics Snowflake settled for
-/// TECH-DEBT #71 (D1): every metric here lives on `li`, so it is aggregated
-/// over `li`'s OWN rows — every one of them, including a child whose foreign
-/// key is NULL or dangling (it lands under a NULL parent attribute) — and a
-/// parent with no child rows contributes nothing at all: no group, rather than
-/// a group reporting `COUNT` 0.
+/// TECH-DEBT #71 (D1): every metric is aggregated over its HOME table's own
+/// rows — every one of them, including a row whose foreign key is NULL or
+/// dangling (it lands under a NULL parent attribute), at either level — and a
+/// parent with no child rows contributes nothing at all to a child-grain
+/// metric: no group, rather than a group reporting `COUNT` 0.
 ///
-/// Formulated WITHOUT a join: one row per child, with each parent attribute
-/// fetched by correlated scalar subquery (NULL when no parent matches), then
-/// filtered by the predicate and grouped. The expansion writes
-/// `FROM li LEFT JOIN o`; this shares none of that structure, so a wrong anchor
-/// (orphans dropped, a childless parent's group manufactured) or a wrong guard
-/// shows up as a non-zero multiset difference.
+/// Each grain is answered by [`grain_oracle_sql`]. A request whose metrics all
+/// sit at one grain is exactly that query. A request spanning several grains
+/// is combined WITHOUT a join: the result rows are the UNION of the grains'
+/// group keys (a key reported by any grain is a result row), and each metric is
+/// read back from its own grain's answer by a correlated scalar lookup on the
+/// key — NULL where that grain has no group with that key. With no dimensions
+/// every grain answers exactly one row, so each metric is a bare scalar
+/// subquery. The expansion writes a `FULL OUTER JOIN` chain over grain CTEs
+/// with `COALESCE`d keys; a key dropped or duplicated by that chain, or a
+/// metric read from the wrong grain, is a non-zero multiset difference.
 fn metrics_oracle_sql(case: &Case, sel_metrics: &[usize]) -> String {
+    let per_grain: Vec<(String, Vec<usize>)> = [Grain::O, Grain::Li, Grain::Lid]
+        .into_iter()
+        .filter_map(|g| {
+            let mets: Vec<usize> = sel_metrics
+                .iter()
+                .copied()
+                .filter(|&i| met_grain(i) == g)
+                .collect();
+            (!mets.is_empty()).then(|| (grain_oracle_sql(case, g, &mets), mets))
+        })
+        .collect();
+    if let [(only, _)] = per_grain.as_slice() {
+        return only.clone();
+    }
+    let dims: Vec<&str> = case.sel_dims.iter().map(|&i| DIMS[i]).collect();
+    let key_match = dims
+        .iter()
+        .map(|d| format!("g.{d} IS NOT DISTINCT FROM k.{d}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let mut met_items: Vec<String> = Vec::new();
+    for (grain_sql, mets) in &per_grain {
+        for m in mets.iter().map(|&i| METS[i]) {
+            met_items.push(if dims.is_empty() {
+                format!("(SELECT g.{m} FROM ({grain_sql}) g) AS {m}")
+            } else {
+                format!("(SELECT g.{m} FROM ({grain_sql}) g WHERE {key_match}) AS {m}")
+            });
+        }
+    }
+    if dims.is_empty() {
+        return format!("SELECT {}", met_items.join(", "));
+    }
+    let key_list = dims.join(", ");
+    let keys = per_grain
+        .iter()
+        .map(|(grain_sql, _)| format!("SELECT {key_list} FROM ({grain_sql}) kg"))
+        .collect::<Vec<_>>()
+        .join(" UNION ");
+    let dim_items = dims.iter().map(|d| format!("k.{d} AS {d}"));
+    let select_items = dim_items.chain(met_items).collect::<Vec<_>>().join(", ");
+    format!("SELECT {select_items} FROM ({keys}) k")
+}
+
+/// One grain's answer: `mets` (all at `grain`) aggregated over that grain's
+/// own rows, grouped by the queried dimensions.
+///
+/// Formulated WITHOUT a join: one row per home-table row, with each ancestor
+/// attribute fetched by correlated scalar subquery (NULL when no ancestor
+/// matches — one level for `li`, a nested two-level lookup for `lid`), then
+/// filtered by the predicate and grouped. The expansion writes
+/// `FROM li LEFT JOIN o` / `FROM lid LEFT JOIN li LEFT JOIN o`; this shares
+/// none of that structure, so a wrong anchor (orphans dropped, a childless
+/// parent's group manufactured) or a wrong guard shows up as a non-zero
+/// multiset difference.
+fn grain_oracle_sql(case: &Case, grain: Grain, sel_metrics: &[usize]) -> String {
     let aggregate = |i: usize| -> &'static str {
         match METS[i] {
             "n_star" | "n_one" | "n_str" | "n_paren" | "n_expr" => "count(*)",
@@ -565,6 +852,12 @@ fn metrics_oracle_sql(case: &Case, sel_metrics: &[usize]) -> String {
             "snap_parent" => {
                 "sum(CASE WHEN x.amount IS NOT DISTINCT FROM x.snap_at THEN x.p_rate END)"
             }
+            // Base grain: `o`'s own rows, `p_rate` being its own rate.
+            "o_n" | "d_star" => "count(*)",
+            "o_rate" | "d_rate" => "sum(x.p_rate)",
+            // Grandchild grain: `amount` is `lid.amount`, `lamt` the parent's.
+            "d_amt" => "sum(x.amount)",
+            "d_famt" => "sum(x.lamt)",
             other => unreachable!("unexpected metric {other}"),
         }
     };
@@ -583,25 +876,51 @@ fn metrics_oracle_sql(case: &Case, sel_metrics: &[usize]) -> String {
         .cloned()
         .collect::<Vec<_>>()
         .join(", ");
-    let where_sql = case.where_pred.as_ref().map_or_else(String::new, |p| {
-        format!(" WHERE {}", p.to_raw_sql(WMember::raw_from_child))
-    });
-    let rows = format!(
-        "SELECT li.amount AS amount, li.amount AS lamt, \
-                (SELECT op.region FROM o op WHERE op.id = li.order_id) AS region, \
-                (SELECT op.rate FROM o op WHERE op.id = li.order_id) AS p_rate \
-         FROM li{where_sql}"
-    );
-    // The snapshot value per group, over the FILTERED rows: the predicate is
-    // applied before the snapshot is picked. Partitioned by the queried
-    // dimensions by name, so nothing here reuses the expansion's RANK shape.
-    let partition: Vec<String> = case.sel_dims.iter().map(|&i| DIMS[i].to_string()).collect();
-    let over = if partition.is_empty() {
-        "OVER ()".to_string()
-    } else {
-        format!("OVER (PARTITION BY {})", partition.join(", "))
+    let render: fn(WMember) -> &'static str = match grain {
+        Grain::O => WMember::raw_from_base,
+        Grain::Li => WMember::raw_from_child,
+        Grain::Lid => WMember::raw_from_grandchild,
     };
-    let rows = format!("SELECT r.*, max(r.amount) {over} AS snap_at FROM ({rows}) r");
+    let where_sql = case
+        .where_pred
+        .as_ref()
+        .map_or_else(String::new, |p| format!(" WHERE {}", p.to_raw_sql(render)));
+    let rows = match grain {
+        Grain::O => format!("SELECT o.region AS region, o.rate AS p_rate FROM o{where_sql}"),
+        Grain::Li => {
+            let rows = format!(
+                "SELECT li.amount AS amount, li.amount AS lamt, \
+                        (SELECT op.region FROM o op WHERE op.id = li.order_id) AS region, \
+                        (SELECT op.rate FROM o op WHERE op.id = li.order_id) AS p_rate \
+                 FROM li{where_sql}"
+            );
+            // The snapshot value per group, over the FILTERED rows: the
+            // predicate is applied before the snapshot is picked. Partitioned
+            // by the queried dimensions by name, so nothing here reuses the
+            // expansion's RANK shape.
+            let partition: Vec<String> =
+                case.sel_dims.iter().map(|&i| DIMS[i].to_string()).collect();
+            let over = if partition.is_empty() {
+                "OVER ()".to_string()
+            } else {
+                format!("OVER (PARTITION BY {})", partition.join(", "))
+            };
+            format!("SELECT r.*, max(r.amount) {over} AS snap_at FROM ({rows}) r")
+        }
+        // One more correlated level: `li` by one subquery, `o` by a subquery
+        // nested through it. An `lid` whose `li` is NULL or missing gets NULL
+        // for both; one whose `li` exists but whose order does not gets the
+        // `li` attributes and a NULL `region`.
+        Grain::Lid => format!(
+            "SELECT lid.amount AS amount, lid.amount AS ldamt, \
+                    (SELECT lp.amount FROM li lp WHERE lp.id = lid.li_id) AS lamt, \
+                    (SELECT op.region FROM o op WHERE op.id = \
+                       (SELECT lp.order_id FROM li lp WHERE lp.id = lid.li_id)) AS region, \
+                    (SELECT op.rate FROM o op WHERE op.id = \
+                       (SELECT lp.order_id FROM li lp WHERE lp.id = lid.li_id)) AS p_rate \
+             FROM lid{where_sql}"
+        ),
+    };
     if case.sel_dims.is_empty() {
         format!("SELECT {select_items} FROM ({rows}) x")
     } else {
@@ -921,9 +1240,15 @@ fn generator_groups_by_the_child_dimension() {
         .iter()
         .filter(|c| matches!(c.ask, Ask::Metrics(_)) && c.sel_dims == vec![D_LAMT])
         .count();
+    // "Both" was `sel_dims.len() == 2` while there were two dimensions; with
+    // `ldamt` added it is spelled out.
     let both = cases
         .iter()
-        .filter(|c| matches!(c.ask, Ask::Metrics(_)) && c.sel_dims.len() == 2)
+        .filter(|c| {
+            matches!(c.ask, Ask::Metrics(_))
+                && c.sel_dims.contains(&0)
+                && c.sel_dims.contains(&D_LAMT)
+        })
         .count();
     assert!(
         child_only >= 16,
@@ -936,4 +1261,216 @@ fn generator_groups_by_the_child_dimension() {
             .any(|c| matches!(c.ask, Ask::ChildFacts) && c.sel_dims.contains(&D_LAMT)),
         "a FACTS request selected the child dimension"
     );
+}
+
+/// The metric indices of a METRICS case (empty for FACTS).
+fn metrics_of(case: &Case) -> &[usize] {
+    match &case.ask {
+        Ask::Metrics(sel) => sel,
+        Ask::ChildFacts => &[],
+    }
+}
+
+/// Whether the case requests any metric at `grain`.
+fn has_grain(case: &Case, grain: Grain) -> bool {
+    metrics_of(case).iter().any(|&i| met_grain(i) == grain)
+}
+
+/// TC2 anti-vacuity: the grandchild grain must be drawn often, alone and mixed
+/// — beside the child (two grain CTEs) and beside both the child and the base
+/// (three) — and grouped by dimensions on every table.
+///
+/// Expected shares of the 256-case sample (192 METRICS cases, 3/4): the
+/// grandchild is in 6 of 11 grain mixes, ~105 cases; child + grandchild without
+/// the base 2/11, ~35; all three grains 1/11, ~17; grandchild alone 2/11, ~35,
+/// half of which group by `ldamt`. Bars sit at about half of each.
+#[test]
+fn generator_draws_grandchild_metrics_in_every_mix() {
+    let cases = sample_cases(256);
+    let lid = cases.iter().filter(|c| has_grain(c, Grain::Lid)).count();
+    let li_lid = cases
+        .iter()
+        .filter(|c| has_grain(c, Grain::Lid) && has_grain(c, Grain::Li) && !has_grain(c, Grain::O))
+        .count();
+    let three = cases
+        .iter()
+        .filter(|c| has_grain(c, Grain::Lid) && has_grain(c, Grain::Li) && has_grain(c, Grain::O))
+        .count();
+    let by_ldamt = cases
+        .iter()
+        .filter(|c| has_grain(c, Grain::Lid) && c.sel_dims.contains(&D_LDAMT))
+        .count();
+    let lid_by_lamt = cases
+        .iter()
+        .filter(|c| has_grain(c, Grain::Lid) && c.sel_dims.contains(&D_LAMT))
+        .count();
+    let lid_by_region = cases
+        .iter()
+        .filter(|c| has_grain(c, Grain::Lid) && c.sel_dims.contains(&0))
+        .count();
+    assert!(lid >= 48, "only {lid}/256 requests had a grandchild metric");
+    assert!(
+        li_lid >= 16,
+        "only {li_lid}/256 requests mixed child and grandchild metrics"
+    );
+    assert!(
+        three >= 8,
+        "only {three}/256 requests spanned all three grains"
+    );
+    assert!(
+        by_ldamt >= 8,
+        "only {by_ldamt}/256 grandchild requests grouped by ldamt"
+    );
+    assert!(
+        lid_by_lamt >= 16,
+        "only {lid_by_lamt}/256 grandchild requests grouped by lamt"
+    );
+    assert!(
+        lid_by_region >= 16,
+        "only {lid_by_region}/256 grandchild requests grouped by region"
+    );
+
+    // The exclusions are what `arb_case` says they are (each is pinned as a
+    // by-design rejection in `excluded_shapes_are_rejected_by_the_fan_trap_fence`).
+    for c in &cases {
+        if c.sel_dims.contains(&D_LDAMT) {
+            assert!(
+                metrics_of(c).iter().all(|&i| met_grain(i) == Grain::Lid),
+                "ldamt selected beside a non-grandchild metric: {c:?}"
+            );
+        }
+        if has_grain(c, Grain::O) {
+            assert!(
+                !c.sel_dims.contains(&D_LAMT),
+                "lamt beside a base metric: {c:?}"
+            );
+            assert!(
+                !c.where_pred.as_ref().is_some_and(Pred::touches_child),
+                "child-side predicate beside a base metric: {c:?}"
+            );
+        }
+    }
+}
+
+/// TC2 anti-vacuity: on the requests that carry a grandchild metric, the data
+/// shapes on which home anchoring and base anchoring disagree must occur at the
+/// SECOND level too — an `lid` whose `li` is NULL or missing (an orphan,
+/// counted under NULL `lamt` / `region`), an `lid` whose `li` exists but whose
+/// order does not (counted under NULL `region`, reached through two hops), and
+/// an `li` with no `lid` children (no group from it, for a grandchild metric).
+#[test]
+fn generator_produces_grandchild_orphans_and_childless_children() {
+    let cases = sample_cases(256);
+    let lid_cases: Vec<&Case> = cases.iter().filter(|c| has_grain(c, Grain::Lid)).collect();
+    let n_li = |c: &Case| c.inst.li_rows.len() as i64;
+    let lid_orphan = |c: &Case| {
+        c.inst
+            .lid_rows
+            .iter()
+            .any(|(fk, _)| fk.is_none_or(|v| v >= n_li(c)))
+    };
+    let two_hop_orphan = |c: &Case| {
+        let n_o = c.inst.o_rows.len() as i64;
+        c.inst.lid_rows.iter().any(|(fk, _)| {
+            fk.filter(|&v| v < n_li(c))
+                .is_some_and(|v| c.inst.li_rows[v as usize].0.is_none_or(|o| o >= n_o))
+        })
+    };
+    let childless_li =
+        |c: &Case| (0..n_li(c)).any(|id| !c.inst.lid_rows.iter().any(|(fk, _)| *fk == Some(id)));
+    let n_orphan = lid_cases.iter().filter(|c| lid_orphan(c)).count();
+    let n_two_hop = lid_cases.iter().filter(|c| two_hop_orphan(c)).count();
+    let n_childless = lid_cases.iter().filter(|c| childless_li(c)).count();
+    assert!(
+        n_orphan >= 16,
+        "only {n_orphan} grandchild cases had an orphan lid"
+    );
+    assert!(
+        n_two_hop >= 16,
+        "only {n_two_hop} grandchild cases had an lid whose li's order is missing"
+    );
+    assert!(
+        n_childless >= 16,
+        "only {n_childless} grandchild cases had an li with no lid"
+    );
+}
+
+/// TC2 anti-vacuity, asked of the ENGINE rather than the generator: grandchild
+/// requests are accepted (not rejected and so skipped), every one is anchored
+/// `FROM "lid"`, and the mixed ones are emitted as several grain CTEs — two for
+/// child + grandchild, three when the base grain joins them. A request that the
+/// planner quietly declined back to the base-anchored `FROM "o"` path would
+/// keep the property green on a different code path.
+#[test]
+fn grandchild_requests_are_accepted_as_per_grain_plans() {
+    let def = build_def();
+    let mut accepted = 0;
+    let mut two_ctes = 0;
+    let mut three_ctes = 0;
+    for case in sample_cases(256)
+        .iter()
+        .filter(|c| has_grain(c, Grain::Lid))
+    {
+        let sql = expand("child", &def, &build_request(case))
+            .unwrap_or_else(|e| panic!("grandchild request rejected: {e}\n{case:?}"));
+        accepted += 1;
+        // Home-anchored: a single grain is a plain `SELECT … FROM "lid"`, a
+        // mix is one grain CTE per grain, the grandchild's anchored the same.
+        assert!(
+            sql.contains(r#"FROM "lid" AS "lid""#),
+            "grandchild metric not anchored at its home table:\n{sql}"
+        );
+        if has_grain(case, Grain::Li) && sql.contains("__sv_grain_1") {
+            two_ctes += 1;
+        }
+        if has_grain(case, Grain::Li) && has_grain(case, Grain::O) && sql.contains("__sv_grain_2") {
+            three_ctes += 1;
+        }
+    }
+    assert!(
+        accepted >= 48,
+        "only {accepted} grandchild requests were accepted"
+    );
+    assert!(
+        two_ctes >= 24,
+        "only {two_ctes} child + grandchild requests had two grain CTEs"
+    );
+    assert!(
+        three_ctes >= 8,
+        "only {three_ctes} three-grain requests had three grain CTEs"
+    );
+}
+
+/// The shapes `arb_case` leaves out are left out because the engine rejects
+/// them BY DESIGN, not because they would fail the oracle. Pinned here, so an
+/// exclusion cannot quietly outlive the rejection it stands for.
+#[test]
+fn excluded_shapes_are_rejected_by_the_fan_trap_fence() {
+    let def = build_def();
+    let req = |dims: &[&str], mets: &[&str], where_clause: Option<&str>| QueryRequest {
+        where_clause: where_clause.map(str::to_string),
+        dimensions: dims.iter().map(|d| DimensionName::new(*d)).collect(),
+        metrics: mets.iter().map(|m| MetricName::new(*m)).collect(),
+        facts: vec![],
+    };
+    // A dimension below the metric's grain.
+    for (dims, mets) in [
+        (&["ldamt"][..], &["n_star"][..]),
+        (&["ldamt"][..], &["o_n"][..]),
+        (&["ldamt"][..], &["d_star", "s_amt"][..]),
+        (&["lamt"][..], &["o_rate"][..]),
+        (&["lamt"][..], &["o_n", "d_star"][..]),
+    ] {
+        match expand("child", &def, &req(dims, mets, None)) {
+            Err(ExpandError::FanTrap { .. }) => {}
+            other => panic!("{dims:?} x {mets:?}: expected FanTrap, got {other:?}"),
+        }
+    }
+    // A child-side `where_clause` member beside a base metric.
+    for (mets, pred) in [(&["o_n"][..], "camt"), (&["o_rate", "n_star"][..], "famt")] {
+        match expand("child", &def, &req(&["region"], mets, Some(pred))) {
+            Err(ExpandError::WhereClauseFanTrap { .. }) => {}
+            other => panic!("{mets:?} WHERE {pred}: expected WhereClauseFanTrap, got {other:?}"),
+        }
+    }
 }
