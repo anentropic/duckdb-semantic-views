@@ -248,7 +248,7 @@ A name that is not a declared dimension or fact is left as written. It binds onl
 
 **Joins and fan-out.** Tables the predicate reaches are joined in and subjected to the same reachability and fan-out checks as a queried dimension's, matching Snowflake's rule that WHERE-clause members participate in the same-logical-table constraint. A member on a role-played table -- one reached through two named relationships -- is rejected rather than bound to whichever relationship was declared first, since the predicate has no way to say which role is meant.
 
-**Where it is applied.** Before the ``GROUP BY`` on the base-anchored and fact paths, inside each grain CTE for multi-grain queries, inside the snapshot CTE ahead of the ranking for semi-additive metrics, and inside the aggregate CTE ahead of the window function for window metrics -- so a filtered number is always recomputed rather than filtered after the fact.
+**Where it is applied.** Before the ``GROUP BY`` when the query is a single ``SELECT`` (one grain, dimensions only, or facts), inside each grain CTE for multi-grain queries, inside the snapshot CTE ahead of the ranking for semi-additive metrics, and inside the aggregate CTE ahead of the window function for window metrics -- so a filtered number is always recomputed rather than filtered after the fact.
 
 An omitted, empty, or whitespace-only ``where_clause`` is treated as absent. The two filters compose: a pre-aggregation predicate and an outer ``WHERE`` in the same query each do their own job.
 

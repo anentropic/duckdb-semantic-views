@@ -133,6 +133,27 @@ Parser strictness
 - **DDL prefix keywords require a word boundary** -- ``DROP SEMANTIC VIEWS`` (plural typo) no longer drops a view named ``s``, and ``CREATE SEMANTIC VIEWfoo`` is no longer recognized as ``CREATE SEMANTIC VIEW``.
 
 
+.. _ref-err-one-statement:
+
+Semantic-view DDL in a multi-statement string
+---------------------------------------------
+
+.. versionchanged:: 0.14.0
+
+   This case used to fail with ``parser_override is not active for this
+   connection``, which pointed at a setting that was not the problem.
+
+.. code-block:: text
+
+   semantic_views: semantic-view DDL must be sent as its own statement, one
+   statement per call. This query string also contains other statements; send
+   each statement in a separate call (a single trailing ';' is fine).
+
+**Cause:** One query string holds a semantic-view statement and at least one other statement, separated by semicolons. A typical source is a Python ``execute()`` call that runs a whole setup script at once.
+
+**Fix:** Send each statement in its own call. See :ref:`explanation-txn-ddl-one-statement` for an example.
+
+
 .. _ref-err-name-uniqueness:
 
 Duplicate or colliding names
@@ -189,6 +210,16 @@ Duplicate or colliding names
 
 Graph validation errors
 -----------------------
+
+.. versionchanged:: 0.14.0
+
+   ``CREATE`` now also rejects a table that cannot be reached from the base
+   table (whether or not the view has a ``RELATIONSHIPS`` clause), a YAML
+   relationship without ``fk_columns``, two relationships with the same name,
+   and a member qualified by an undeclared alias in a single-table view. Each of
+   these used to be accepted and failed later, at query time, or silently used
+   the first relationship with a repeated name. Views stored by earlier versions
+   keep loading.
 
 .. code-block:: text
 
@@ -670,7 +701,7 @@ COUNT(*) on a joined table requires a PRIMARY KEY
 
 **Cause:** A queried metric (directly, via a derived metric, or as a window metric's inner aggregate) is ``COUNT(*)`` on a table other than the base table. Generated joins are ``LEFT JOIN``\ s, so ``COUNT(*)`` would also count the NULL-extended row produced for each base row with no match -- silently inflating the result. The expansion protects against this by rewriting ``COUNT(*)`` to ``COUNT(<first primary key column>)`` for non-base source tables, which requires the table to declare a ``PRIMARY KEY``.
 
-Since v0.13.1 a metric is normally aggregated from its own table, where there are no NULL-extended rows, so this error is rare: it is raised only for the query shapes that still use a base-table ``LEFT JOIN`` (for example a dimension with no source table in a definition stored by an older version).
+Since v0.14.0 a metric is normally aggregated from its own table, where there are no NULL-extended rows, so this error is rare: it is raised only for the query shapes that still use a base-table ``LEFT JOIN`` (for example a dimension with no source table in a definition stored by an older version).
 
 **Fix:** Declare ``PRIMARY KEY (<cols>)`` for the metric's source table in the ``TABLES`` clause, or define the metric as ``COUNT(<alias>.<column>)`` over a NOT NULL column.
 
@@ -719,6 +750,34 @@ Ambiguous dimension path
 **Cause:** A dimension comes from a table reachable via multiple named relationships (role-playing pattern), and no co-queried metric has a ``USING`` clause that selects one path.
 
 **Fix:** See :ref:`howto-role-playing`. Add a metric with ``USING (<rel_name>)`` to disambiguate, or use a dimension from a table that is not a role-playing target.
+
+
+Ambiguous fact or metric on a role-playing table
+------------------------------------------------
+
+.. versionchanged:: 0.14.0
+
+   These queries used to return the numbers of whichever relationship was
+   declared first.
+
+.. code-block:: text
+
+   semantic view '<view>': '<member>' is ambiguous -- it references fact '<fact>'
+   on table '<table>', which requires the role-playing table '<table>', joined via
+   multiple relationships: [<rel1>, <rel2>]. A metric over a fact on '<table>'
+   itself must name exactly one of them with USING; a dimension, or a fact on a
+   table reached only through '<table>', has no way to pick a role.
+
+   semantic view '<view>': metric '<metric>' is ambiguous -- it aggregates table
+   '<table>', which requires the role-playing table '<table>', joined via
+   multiple relationships: [<rel1>, <rel2>]. A metric on that table cannot name a
+   role (USING relationships must originate from the metric's own table); declare
+   it on the referencing table with USING instead, e.g.
+   <table>.<metric> USING (<relationship>) AS SUM(<fact>).
+
+**Cause:** The first form: a metric, dimension, or fact reaches a fact on a role-playing table (or on a table reached only through one), and nothing says which relationship to read it through. The second form: a metric is declared on the role-playing table itself, where ``USING`` cannot be attached. When the relationships fan out, the second case raises ``fan trap detected`` instead.
+
+**Fix:** Declare the metric on the referencing table and give it a ``USING`` that names one relationship, for example ``f.dep_elev USING (dep_airport) AS SUM(a.elev)``. See :ref:`howto-rp-facts`.
 
 
 Metric cannot be co-queried with a semi-additive metric

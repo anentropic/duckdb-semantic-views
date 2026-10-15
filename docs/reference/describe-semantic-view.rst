@@ -73,6 +73,13 @@ Object Kinds and Properties
 
 Rows appear in definition order: the view-level comment (when one is set), then ``TABLE`` objects, then ``RELATIONSHIP``, ``FACT``, ``DIMENSION``, ``METRIC``, ``DERIVED_METRIC``, and ``MATERIALIZATION``.
 
+.. versionchanged:: 0.14.0
+
+   The ``DATA_TYPE`` property rows carry each member's type again. They had been
+   empty for every view created since v0.10.0. The type is now worked out when
+   the command runs, so views created in that window report it too, with no
+   need to re-create them.
+
 **View-level comment**
    Emitted only when a view-level comment is set (in ``CREATE`` or via :ref:`ALTER SEMANTIC VIEW SET COMMENT <ref-alter-semantic-view>`). The row describes the view itself, so ``object_kind``, ``object_name``, and ``parent_entity`` are all empty strings. Produces one property row:
 

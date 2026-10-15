@@ -234,7 +234,7 @@ Declares FK/PK join paths between tables. Each entry names a relationship, speci
 
 **Parameters:**
 
-- ``<rel_name>``, a unique name identifying this relationship.
+- ``<rel_name>``, a unique name identifying this relationship. It may be a quoted identifier (``"Dep Airport"``), including one with spaces or an embedded ``""``.
 - ``<from_alias>``, the table alias containing the FK columns.
 - ``(<fk_column>, ...)``, one or more FK column names on the "from" table.
 - ``REFERENCES <to_alias> [(<ref_column>, ...)]``, the target table alias. Optionally specify which columns on the target table to join against. If omitted, the target's ``PRIMARY KEY`` columns are used. The JOIN ON clause is synthesized as ``from_alias.fk_column = to_alias.ref_column``.
@@ -257,6 +257,16 @@ Cardinality is used for :ref:`fan trap detection <howto-fan-traps>`.
 - Relationship names must be unique within the view, whichever tables the relationships connect. Names are compared the way DuckDB compares identifiers (case-insensitively, quoted or not), so ``route`` and ``"ROUTE"`` are the same name: ``duplicate relationship name 'route'``. A role-playing pair that repeats a name gets this error too.
 - Self-references (``from_alias`` equals ``to_alias``) are rejected.
 - Every table must be reachable from the base table (the first table in ``TABLES``) through some chain of relationships, in either direction. An orphan table (declared in ``TABLES`` but not connected by any relationship), a base table with no relationship, two separate groups of related tables, and several tables with no ``RELATIONSHIPS`` clause at all are all rejected, naming the table that cannot be reached. A single-table view needs no relationships.
+
+.. versionchanged:: 0.14.0
+
+   Duplicate relationship names and tables that cannot be reached from the base
+   table are now rejected at ``CREATE``. Both used to be accepted: a repeated
+   name made ``USING`` silently pick the first relationship declared with it,
+   and an unreachable table made every query that needed it fail when bound.
+   Relationship names are now matched the way DuckDB matches identifiers, and
+   quoted relationship names work on role-playing relationships. Views stored
+   by earlier versions keep loading.
 
 
 .. _ref-create-facts:
@@ -331,7 +341,7 @@ Declares named grouping expressions available for queries.
 
 - Dimension names must be unique within the view (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). For example, ``region`` and ``Region`` cannot both appear in the same ``DIMENSIONS`` clause. See :ref:`ref-err-name-uniqueness`.
 - A dimension name cannot collide with any metric name (case-insensitive, quoted or not -- DuckDB treats double-quoted identifiers as case-insensitive too). See :ref:`ref-err-name-uniqueness`.
-- The table alias that qualifies the dimension name must be declared in ``TABLES``, in any case (``o`` or ``O`` for alias ``o``). This applies to a single-table view too: ``x.foo`` in a view whose only table is ``o`` is rejected with ``unknown source table 'x'; did you mean 'o'?``. Metrics follow the same rule.
+- The table alias that qualifies the dimension name must be declared in ``TABLES``, in any case (``o`` or ``O`` for alias ``o``). This applies to a single-table view too: ``x.foo`` in a view whose only table is ``o`` is rejected with ``unknown source table 'x'; did you mean 'o'?`` (since v0.14.0; earlier versions accepted it). Metrics follow the same rule.
 
   .. note::
 
@@ -345,8 +355,13 @@ The ``data_type`` column reported by :ref:`SHOW SEMANTIC DIMENSIONS <ref-show-se
 
 .. versionchanged:: 0.10.0
 
-   The define-time inference pass was removed. ``data_type`` was empty for
-   new views until it became a read-time probe (see the release notes).
+   The define-time inference pass was removed, and ``data_type`` was empty for
+   new views.
+
+.. versionchanged:: 0.14.0
+
+   ``data_type`` is worked out when the ``SHOW`` / ``DESCRIBE`` command runs,
+   so it is populated again, also for views created by v0.10.0 to v0.13.0.
 
 
 .. _ref-create-metrics:

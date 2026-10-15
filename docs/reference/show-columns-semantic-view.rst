@@ -69,6 +69,13 @@ Returns one row per queryable column with 8 columns:
      - The comment text. Empty string if no comment is set.
 
 
+.. versionchanged:: 0.14.0
+
+   ``data_type`` is populated again. It had been empty for every view created
+   since v0.10.0. The type is now worked out when the command runs, so views
+   created in that window report it too, with no need to re-create them.
+
+
 .. _ref-show-columns-kind:
 
 Kind Values

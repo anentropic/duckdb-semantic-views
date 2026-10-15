@@ -134,14 +134,49 @@ However, querying ``total_flights`` with the ambiguous ``city`` dimension fails.
 Aggregating a Fact on the Role-Playing Table
 ============================================
 
+.. versionchanged:: 0.14.0
+
+   A ``USING`` metric can now aggregate a fact declared on the role-playing
+   table. Such a metric used to fail with ``Referenced table "a" not found``.
+
 A metric can aggregate a fact declared on the role-playing table itself. Its
 ``USING`` picks which instance of the table the fact is read from, so the same
-fact gives a different number per role:
+fact gives a different number per role. Recreate the two tables with an
+elevation and some flights:
 
 .. code-block:: sql
 
+   CREATE OR REPLACE TABLE airports (airport_code VARCHAR, city VARCHAR, elevation INTEGER);
+   INSERT INTO airports VALUES
+       ('DEN', 'Denver',        5434),
+       ('SFO', 'San Francisco',   13),
+       ('LHR', 'London',          83);
+
+   CREATE OR REPLACE TABLE flights (
+       flight_id INTEGER,
+       departure_code VARCHAR,
+       arrival_code VARCHAR,
+       carrier VARCHAR
+   );
+   INSERT INTO flights VALUES
+       (1, 'SFO', 'DEN', 'UA'),
+       (2, 'DEN', 'LHR', 'UA'),
+       (3, 'LHR', 'SFO', 'BA');
+
+   CREATE SEMANTIC VIEW flight_elevation AS
+   TABLES (
+       f AS flights  PRIMARY KEY (flight_id),
+       a AS airports PRIMARY KEY (airport_code)
+   )
+   RELATIONSHIPS (
+       dep_airport AS f(departure_code) REFERENCES a,
+       arr_airport AS f(arrival_code)   REFERENCES a
+   )
    FACTS (
        a.elev AS a.elevation
+   )
+   DIMENSIONS (
+       f.carrier AS f.carrier
    )
    METRICS (
        f.dep_elev USING (dep_airport) AS SUM(a.elev),
@@ -150,26 +185,47 @@ fact gives a different number per role:
    );
 
 ``dep_elev`` sums the departure airports' elevations and ``arr_elev`` the
-arrival airports'; ``elev_climb`` composes both roles and keeps them apart.
+arrival airports'. ``elev_climb`` composes both roles and keeps them apart:
+
+.. code-block:: sql
+
+   SELECT * FROM semantic_view('flight_elevation',
+       dimensions := ['carrier'],
+       metrics := ['dep_elev', 'arr_elev', 'elev_climb']
+   ) ORDER BY carrier;
+
+.. code-block:: text
+
+   ┌─────────┬──────────┬──────────┬────────────┐
+   │ carrier │ dep_elev │ arr_elev │ elev_climb │
+   ├─────────┼──────────┼──────────┼────────────┤
+   │ BA      │       83 │       13 │        -70 │
+   │ UA      │     5447 │     5517 │         70 │
+   └─────────┴──────────┴──────────┴────────────┘
 
 The metric's ``USING`` must name exactly one relationship to the table the fact
 lives on (spelling that relationship twice, in any case, still names one). The
 role carries through to a window metric over such a metric
 (``f.dep_elev_by_flight AS SUM(dep_elev) OVER (PARTITION BY flight_id)``) and
-to a semi-additive one. A member that reaches such a fact with no single role
-to pick -- a metric without ``USING`` (including one used as a window metric's
-inner aggregate), a dimension, or a fact on a table reached only *through* the
-role-playing table -- is rejected as ambiguous at query time (see
-:ref:`howto-rp-errors`).
+to a semi-additive one.
+
+A member that reaches such a fact with no single role to pick is rejected as
+ambiguous at query time (see :ref:`howto-rp-errors`). That covers a metric
+without ``USING`` (including one used as a window metric's inner aggregate), a
+dimension, and a fact on a table reached only *through* the role-playing table.
+Earlier versions answered these with the first-declared relationship's numbers.
 
 Declare such metrics on the *referencing* table, as above. A metric declared on
 the role-playing table itself (``a.total_elev AS SUM(a.elevation)``) cannot
-name a role -- a ``USING`` relationship must start at the metric's own table --
-so it is rejected as ambiguous too.
+name a role, because a ``USING`` relationship must start at the metric's own
+table. It is rejected as ambiguous too.
 
-Relationship names may be quoted identifiers (``"Dep Airport" AS f(...)
-REFERENCES a`` with ``USING ("Dep Airport")``), including names with spaces or
-embedded quotes.
+Relationship names may be quoted identifiers, including names with spaces or
+embedded quotes: declare ``"Dep Airport" AS f(departure_code) REFERENCES a`` and
+pick it with ``USING ("Dep Airport")``. Names match the way DuckDB matches
+identifiers, so ``USING (dep_airport)`` also finds a relationship declared as
+``"Dep_Airport"``. Before v0.14.0 a quoted name on a role-playing relationship
+made every query through it fail with a parser error.
 
 
 .. _howto-rp-inspect:
@@ -314,6 +370,8 @@ Troubleshooting
    relationship's rows.
 
 **A member references a fact on a role-playing table**
+   .. versionchanged:: 0.14.0
+
    A metric or dimension whose expression reaches a fact on a role-playing table
    (or on a table reached only through one) is rejected as ambiguous unless it
    is a metric whose ``USING`` names exactly one relationship to the fact's own
@@ -322,6 +380,8 @@ Troubleshooting
    non-role-playing table. See :ref:`howto-rp-facts`.
 
 **A metric is declared on a role-playing table**
+   .. versionchanged:: 0.14.0
+
    A metric whose own table is a role-playing table (or is reached only through
    one) is rejected as ambiguous: ``USING`` cannot be attached to it, since a
    ``USING`` relationship must start at the metric's own table. Previously, when

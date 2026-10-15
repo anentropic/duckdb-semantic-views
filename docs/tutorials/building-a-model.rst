@@ -276,6 +276,8 @@ The expanded SQL shows the full chain:
 2. **Derived metric expansion** -- ``profit`` is replaced with ``revenue - cost``, where ``revenue`` and ``cost`` are the aggregate expressions from step 1.
 3. **Selective joining** -- only the tables needed for the requested dimensions and metrics are joined. If you remove ``customer`` from the query, the ``customers`` table is dropped from the generated SQL.
 
+The expanded SQL also starts ``FROM line_items``, not ``FROM orders``. ``revenue`` and ``cost`` are declared on ``li``, so they are aggregated over the line items themselves, and the query joins outward to ``orders`` and ``customers`` only to look up the customer name. :ref:`explanation-metric-grain` explains why each metric is computed from its own table.
+
 The workflow is: define facts once, compose metrics from them, and let the extension generate the SQL.
 
 
