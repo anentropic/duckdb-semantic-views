@@ -498,8 +498,12 @@ static ParserOverrideResult sv_parser_override(
 //       syntax error, which is what rc=2 on panic used to produce.
 //   2 — not ours: DISPLAY_ORIGINAL_ERROR (let the default parser's error stand)
 //   3 — valid-but-override-disabled: actionable hint; position=0
-static ParserExtensionParseResult sv_parse_stub(
-    ParserExtensionInfo * /*info*/, const string &query) {
+//
+// `query` is one statement: v1.5 hands parse_function each `;`-separated
+// statement the default parser failed on (trimmed, `;` re-appended when it had
+// one). The registered parse_function is the version-specific `sv_parse_stub`
+// below, which feeds this.
+static ParserExtensionParseResult sv_parse_statement(const string &query) {
     // AR-7: sv_parse_function_rust no longer takes a context pointer — the
     // validation path never needed the catalog — so the SemanticViewsParserInfo
     // marker is not consulted here.
@@ -551,6 +555,88 @@ static ParserExtensionParseResult sv_parse_stub(
         }
     }
 }
+
+#ifdef SV_DUCKDB_2
+// DuckDB 2.0 changed parse_function_t from `(info, const string &query)` to
+// `(info, const vector<SimpleToken> &tokens)`: when the PEG parser fails on a
+// statement, Parser::TryParseExtensionStatement hands every parse_function the
+// token stream from the start of the failed statement to the end of the query
+// (one SimpleToken — raw source text + TokenType — per token; comments are not
+// tokens; `;` is a TERMINATOR token; an END_OF_INPUT sentinel ends it), and
+// reads the answer from `ParserExtensionParseResult::consumed_tokens` rather
+// than `type`:
+//   < 0  throw ParserException::SyntaxError(query, error, error_location) —
+//        the same call v1.5 made for DISPLAY_EXTENSION_ERROR;
+//   == 0 not claimed: the next extension is tried and then the PEG error is
+//        rethrown — v1.5's DISPLAY_ORIGINAL_ERROR;
+//   > 0  claimed (v1.5's PARSE_SUCCESSFUL), which sv_parse_statement never
+//        returns.
+//
+// So the statement text v1.5 passed is rebuilt from the tokens up to the first
+// TERMINATOR (re-appending `;` as v1.5's statement splitter did) and the result
+// mapped onto consumed_tokens.
+//
+// TODO(duckdb-2.0): SimpleToken carries no source offsets or whitespace, so the
+// rebuilt text is a normalised spelling of the statement (one space between
+// tokens, none around `.` or inside brackets, no comments, newlines folded).
+// Three things can differ from v1.5 and must be checked against a 2.0 build:
+// (1) the caret: sv_parse_function_rust reports a byte offset into the rebuilt
+//     text, which DuckDB renders against the original query, so it is exact
+//     only while the statement starts at byte 0 and the original spacing up to
+//     the error matches the normalised one;
+// (2) the Rust validator sees the normalised text, so a check sensitive to
+//     spacing or comments could word its error differently;
+// (3) the Rust multi-statement hint (TECH-DEBT #85) looks the statement up as
+//     a substring of the query the override recorded, which fails when the
+//     original spacing differs, falling back to the override-inactive hint.
+// A lossless fix needs the source offsets (e.g. the original query text) in
+// the 2.0 parse_function API, or the Rust side taking tokens.
+static std::string sv_statement_from_tokens(const vector<SimpleToken> &tokens) {
+    auto glue_left = [](const std::string &t) {  // no space before these
+        return t == "." || t == "," || t == ")" || t == "]";
+    };
+    auto glue_right = [](const std::string &t) {  // no space after these
+        return t == "." || t == "(" || t == "[";
+    };
+    std::string text;
+    const std::string *prev = nullptr;
+    for (const auto &token : tokens) {
+        if (token.type == TokenType::END_OF_INPUT ||
+            token.type == TokenType::END_OF_INPUT_AUTOCOMPLETE) {
+            break;
+        }
+        if (token.type == TokenType::TERMINATOR) {
+            text += ';';
+            break;
+        }
+        if (token.type == TokenType::COMMENT) {
+            continue;  // the tokenizer drops comments; defensive
+        }
+        if (prev != nullptr && !glue_right(*prev) && !glue_left(token.text)) {
+            text += ' ';
+        }
+        text += token.text;
+        prev = &token.text;
+    }
+    return text;
+}
+
+static ParserExtensionParseResult sv_parse_stub(
+    ParserExtensionInfo * /*info*/, const vector<SimpleToken> &tokens) {
+    auto result = sv_parse_statement(sv_statement_from_tokens(tokens));
+    // DISPLAY_EXTENSION_ERROR -> throw; DISPLAY_ORIGINAL_ERROR keeps the
+    // default 0 (not claimed). PARSE_SUCCESSFUL is never produced.
+    if (result.type == ParserExtensionResultType::DISPLAY_EXTENSION_ERROR) {
+        result.consumed_tokens = -1;
+    }
+    return result;
+}
+#else
+static ParserExtensionParseResult sv_parse_stub(
+    ParserExtensionInfo * /*info*/, const string &query) {
+    return sv_parse_statement(query);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Plan-function hook: sv_plan_unreachable  (Phase 62 Plan 03)
