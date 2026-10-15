@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
+## [0.14.0] - 2026-10-15
+
 ### Changed
 
 - **Every metric is now aggregated from its own table, so a metric on a child table can
@@ -756,7 +760,8 @@ Connection-lifecycle and ADBC fixes. Two downstream regressions reported against
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.11.0...v0.12.0
