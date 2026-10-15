@@ -22,6 +22,8 @@ Usage:
         Point `repo.<key>` at <sha>, adding the key after `ref:` if it is missing.
 """
 
+from __future__ import annotations
+
 import re
 import sys
 

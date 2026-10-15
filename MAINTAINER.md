@@ -748,7 +748,7 @@ Key fields:
 > still builds from a release-named key that its `scripts/build.py` reads instead (`variegata` for
 > v1.5.6, `andium` for v1.4.5). The gate maps `.duckdb-version` to that key and refuses a pin the
 > registry does not build; the release SHA is then written under that key, leaving `ref` as it was.
-> `just release` still writes `ref` only.
+> `just release` uses the same script, so a manual release writes the same key.
 >
 > The monitor's changelog bullet comes from `scripts/changelog_add_bullet.py`, guarded by
 > `tests/changelog_scripts.rs`. Still read the rolled section in the dry-run diff: it becomes
