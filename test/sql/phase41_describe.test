@@ -114,6 +114,9 @@ CREATE SEMANTIC VIEW p41_facts AS
     o.total_net AS SUM(li.net_price)
   )
 
+# total_net's DATA_TYPE is empty by design: it is a parent metric over a child
+# fact, which the fan-trap fence refuses to answer, so there is no type to probe
+# (pinned with its fan-trap error in member_data_type.test).
 query TTTTT
 DESCRIBE SEMANTIC VIEW p41_facts;
 ----

@@ -293,6 +293,38 @@ METRIC	g_total	(empty)
 METRIC	n_total	(empty)
 
 # ============================================================
+# A member semantic_view() refuses to answer has no type to report. A metric on
+# the parent table over a fact on a child table it fans out to is refused by the
+# fan-trap fence whatever it is queried with, so its data_type is empty BY
+# DESIGN: it is not a probe gap waiting on a fix. The two queries below pin the
+# pair together; if the metric ever becomes queryable, its type must follow.
+# (phase41_describe.test's p41_facts view reports the same shape.)
+# ============================================================
+
+statement ok
+CREATE TABLE dt_lines (id INTEGER PRIMARY KEY, order_id INTEGER, price DECIMAL(10,2));
+
+statement ok
+CREATE SEMANTIC VIEW dt_fanned AS
+TABLES (o AS dt_orders PRIMARY KEY (id), l AS dt_lines PRIMARY KEY (id))
+RELATIONSHIPS (lo AS l(order_id) REFERENCES o)
+FACTS (l.line_price AS l.price)
+METRICS (o.parent_over_child AS SUM(l.line_price), l.child_total AS SUM(l.line_price));
+
+# CASE a fanned-out parent metric is refused by semantic_view() ...
+statement error
+SELECT * FROM semantic_view('dt_fanned', metrics := ['parent_over_child']);
+----
+fan trap detected -- 'parent_over_child' (table 'o')
+
+# CASE ... so it reports an empty data_type, while its child-table sibling is typed
+query TT
+SELECT name, data_type FROM show_semantic_metrics('dt_fanned') ORDER BY name
+----
+child_total	DECIMAL(38,2)
+parent_over_child	(empty)
+
+# ============================================================
 # A view in a non-default schema over tables in that schema.
 # ============================================================
 
