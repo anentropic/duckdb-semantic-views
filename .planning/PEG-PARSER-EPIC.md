@@ -330,6 +330,24 @@ moving dev branch here and in CI:
 3. *At GA:* link the released static libraries, bump the pins, move the version-guard
    test's other host to 1.5.6, and run the full suite on 2.0.
 
+Found while porting (2026-10-15):
+
+- **The release artifacts carry no C++ headers.** `libduckdb-src.zip` and the
+  `static-libs` archives ship only the C headers (`duckdb.h`, `duckdb_extension.h` and
+  their v2 forms). The shim needs `src/include/**` (including
+  `main/capi/capi_internal.hpp` for `DatabaseWrapper`) plus the third-party include
+  directories, so the GA build fetches the engine source at the release tag alongside
+  the static libraries. A cmake install tree has `src/include` but not `third_party`.
+- **The port is syntax-checked only.** Three things need a real 2.0 build, each marked
+  `TODO(duckdb-2.0)` in the shim: `is_interrupted` does not forward 2.0's per-query
+  deadline; the `sv_query_interruptible` task loop needs its cancellation tests run; and
+  2.0's `parse_function` gets tokens without offsets, so the caret path rebuilds a
+  normalised statement text (caret position, the text the Rust validator sees, and the
+  TECH-DEBT #85 multi-statement hint can differ from 1.5). Phase 3's grammar replaces
+  that path anyway.
+- **Some errors become the engine's wording**, e.g. an unknown named parameter now reads
+  "Invalid named parameter %s for function %s"; expect small test-expectation changes.
+
 ### Phase 3: DDL and introspection as grammar productions
 
 - CREATE (including `FROM YAML`), ALTER, DROP, DESCRIBE, every SHOW form, and
