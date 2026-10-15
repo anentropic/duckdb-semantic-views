@@ -173,8 +173,11 @@ conventions:
       Verified in src/body_parser/mod.rs:461. The after-AS form is a
       define-time error and must appear in docs only as a counter-example.
   - rule: >-
-      The data_type column reports a declared type only; no surface declares
-      one and nothing infers one. Empty for every view created since v0.10.0.
+      The data_type column (and DESCRIBE's DATA_TYPE rows) reports the type the
+      member's column has in a semantic_view() query, worked out when the
+      SHOW / DESCRIBE command runs (v0.14.0). It is empty only when the
+      member's source no longer binds. It was empty for views created from
+      v0.10.0 to v0.13.0; do not describe it as empty today.
   - rule: "No internal tracker IDs (TECH-DEBT #NN, RT-N, C-N) in docs/."
   - rule: >-
       American spelling (behavior, modeling, labeled, recognized). RST labels
