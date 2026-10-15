@@ -736,14 +736,8 @@ pub fn expand(
     )?;
     // TECH-DEBT #69: and the role-playing seam beside it — a referenced fact on
     // a role-playing path binds to a role only through a base metric's single
-    // `USING`; anything else would join the first-declared relationship.
-    // The tables a `where_clause` joins, for the base-table exemption.
-    let where_tables: Vec<&str> = resolved_where
-        .iter()
-        .flat_map(|rw| &rw.members)
-        .flat_map(|m| m.table.iter().chain(m.fact_tables.iter()))
-        .map(String::as_str)
-        .collect();
+    // `USING`; anything else would join the first-declared relationship. The
+    // `where_clause` tables decide the base-table exemption.
     super::role_playing::check_member_fact_role_playing_path(
         view_name,
         def,

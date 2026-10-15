@@ -224,11 +224,11 @@ pub(super) fn check_where_clause_role_playing_path(
 /// so the exemption must not reach those queries (metamorphic (e) with a
 /// role-played root: a filter on the referencing table made a base-table
 /// metric's answer depend on declaration order).
-fn base_table_if_query_stays_on_it(
+pub(super) fn base_table_if_query_stays_on_it(
     def: &SemanticViewDefinition,
     resolved_dims: &[&crate::model::Dimension],
     bases: &[&crate::model::Metric],
-    where_tables: &[&str],
+    where_tables: &[String],
 ) -> Option<String> {
     let root = def.tables.first()?.alias.to_ascii_lowercase();
     let on_root = |t: Option<&str>| t.is_none_or(|t| t.eq_ignore_ascii_case(&root));
@@ -241,13 +241,11 @@ fn base_table_if_query_stays_on_it(
         |d: &crate::model::Dimension| on_root(d.source_table.as_deref()) && facts_on_root(&d.expr);
     // A dimension a metric references by name without it being queried (a
     // `NON ADDITIVE BY` snapshot's ordering, a window's partitioning) is joined
-    // all the same. A name that does not resolve is not known to be on the root.
-    let named_dim_on_root = |name: &str| {
-        def.dimensions
-            .iter()
-            .find(|d| crate::ident::ident_matches(&d.name, name))
-            .is_some_and(dim_on_root)
-    };
+    // all the same. It is resolved the way CREATE resolves it, so a dotted
+    // `a.snap_date` counts like `snap_date`. A name that does not resolve is
+    // not known to be on the root.
+    let named_dim_on_root =
+        |name: &str| super::resolution::find_dimension(def, name).is_some_and(dim_on_root);
     let metric_on_root = |m: &crate::model::Metric| {
         let window_dims = m.window_spec.iter().flat_map(|ws| {
             ws.partition_dims
@@ -266,7 +264,7 @@ fn base_table_if_query_stays_on_it(
     };
     let stays = resolved_dims.iter().all(|d| dim_on_root(d))
         && bases.iter().all(|m| metric_on_root(m))
-        && where_tables.iter().all(|t| on_root(Some(t)));
+        && where_tables.iter().all(|t| on_root(Some(t.as_str())));
     stays.then_some(root)
 }
 
@@ -300,7 +298,7 @@ pub(super) fn check_member_fact_role_playing_path(
     def: &SemanticViewDefinition,
     resolved_dims: &[&crate::model::Dimension],
     resolved_mets: &[&crate::model::Metric],
-    where_tables: &[&str],
+    where_tables: &[String],
 ) -> Result<(), ExpandError> {
     // Not `def.facts.is_empty()`: a metric on a role-played table needs no fact
     // to bind to an arbitrary role (the own-table check below).

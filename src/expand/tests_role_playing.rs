@@ -1540,6 +1540,86 @@ fn base_table_semi_additive_metric_by_a_referencing_table_dimension_is_rejected(
     }
 }
 
+/// A semi-additive metric on the base table snapshotting by `spelling`.
+fn base_semi_additive(spelling: &str) -> Metric {
+    Metric {
+        name: "last_elev".to_string(),
+        expr: "SUM(a.elevation)".to_string(),
+        source_table: Some("a".to_string()),
+        non_additive_by: vec![crate::model::NonAdditiveDim {
+            dimension: spelling.to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// The base-table exemption's walk over the dimensions a metric names
+/// resolves them the way CREATE does, so a dotted `NON ADDITIVE BY (a.city)`
+/// is on the base table just like `city`. It matched the bare name only, so
+/// the dotted spelling resolved to nothing and lost the exemption (PR #256
+/// review). Checked on the helper itself: end to end, the dimension fence
+/// rejects the snapshot dimension first (TECH-DEBT #86, pinned below).
+#[test]
+fn base_table_exemption_resolves_a_metrics_dimension_in_any_spelling() {
+    let def = one_to_one_role_played_base_def();
+    for spelling in ["city", "a.city", "A.\"City\""] {
+        let m = base_semi_additive(spelling);
+        assert_eq!(
+            super::role_playing::base_table_if_query_stays_on_it(&def, &[], &[&m], &[]),
+            Some("a".to_string()),
+            "NON ADDITIVE BY ({spelling}) is on the base table"
+        );
+    }
+    // CONTROL: a snapshot dimension on the referencing table, in either
+    // spelling, takes the query off the base table.
+    for spelling in ["carrier", "f.carrier"] {
+        let m = base_semi_additive(spelling);
+        assert_eq!(
+            super::role_playing::base_table_if_query_stays_on_it(&def, &[], &[&m], &[]),
+            None,
+            "NON ADDITIVE BY ({spelling}) is on the referencing table"
+        );
+    }
+    // The window dimensions take the same walk: partitioning, exclusion and
+    // ordering each, under both spellings.
+    let window = |spelling: &str, on: usize| {
+        let names = vec![spelling.to_string()];
+        let mut ws = crate::model::WindowSpec {
+            window_function: "SUM".to_string(),
+            inner_metric: "n_airports".to_string(),
+            ..Default::default()
+        };
+        match on {
+            0 => ws.partition_dims = names,
+            1 => ws.excluding_dims = names,
+            _ => {
+                ws.order_by = vec![crate::model::WindowOrderBy {
+                    expr: spelling.to_string(),
+                    ..Default::default()
+                }];
+            }
+        }
+        Metric {
+            name: "w".to_string(),
+            expr: "SUM(n_airports) OVER ()".to_string(),
+            source_table: Some("a".to_string()),
+            window_spec: Some(ws),
+            ..Default::default()
+        }
+    };
+    for on in 0..3 {
+        for (spelling, stays) in [("city", true), ("a.city", true), ("f.carrier", false)] {
+            let m = window(spelling, on);
+            assert_eq!(
+                super::role_playing::base_table_if_query_stays_on_it(&def, &[], &[&m], &[]),
+                stays.then(|| "a".to_string()),
+                "window dimension {spelling} (slot {on})"
+            );
+        }
+    }
+}
+
 /// KNOWN GAP (TECH-DEBT #86): the same base-table dimension with only a
 /// metric on the base table, or with no metric, needs no join and so has no
 /// role to pick (the answer is each airport's own city), but the dimension
@@ -1557,6 +1637,20 @@ fn known_gap_base_table_dimension_without_a_joined_metric_is_rejected() {
             }) => assert_eq!(dimension_table, "a"),
             other => panic!("TECH-DEBT #86 changed ({mets:?}); update the entry: {other:?}"),
         }
+    }
+    // The same fence rejects a semi-additive base-table metric whose snapshot
+    // dimension is on the base table, though nothing is joined: when #86 is
+    // fixed, this should expand to 100 (`Dep City`, the last city) in every
+    // spelling.
+    for spelling in ["city", "a.city"] {
+        def.metrics.push(base_semi_additive(spelling));
+        match expand("v", &def, &metrics_req(&[], &["last_elev"])) {
+            Err(ExpandError::AmbiguousPath {
+                dimension_table, ..
+            }) => assert_eq!(dimension_table, "a"),
+            other => panic!("TECH-DEBT #86 changed ({spelling}); update the entry: {other:?}"),
+        }
+        def.metrics.pop();
     }
 }
 
