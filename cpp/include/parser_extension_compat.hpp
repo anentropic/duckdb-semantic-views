@@ -417,4 +417,47 @@ inline duckdb::ValidityMask &validity_mut(duckdb::Vector &vector) {
 #endif
 }
 
+// Query results.
+//
+// v1.5: `BaseQueryResult::types` / `::type` are public members, and
+// `Connection::Query` returns a `MaterializedQueryResult` that owns its rows.
+// 2.0: the members are private behind `GetTypes()` / `GetResultType()`, which
+// return the same fields. `MaterializedQueryResult` is gone: a `QueryResult`
+// that has been completed (as `Connection::Query` and the shim's
+// `sv_query_interruptible` do) owns its collected rows, is detached from its
+// connection, and serves `Fetch()` from them, so it takes the
+// MaterializedQueryResult's place unchanged. `QueryResultType::
+// MATERIALIZED_RESULT` is still what such a result reports.
+inline const duckdb::vector<duckdb::LogicalType> &result_types(const duckdb::QueryResult &result) {
+#ifdef SV_DUCKDB_2
+	return result.GetTypes();
+#else
+	return result.types;
+#endif
+}
+
+inline duckdb::QueryResultType result_type(const duckdb::QueryResult &result) {
+#ifdef SV_DUCKDB_2
+	return result.GetResultType();
+#else
+	return result.type;
+#endif
+}
+
+#ifdef SV_DUCKDB_2
+using materialized_result_t = duckdb::QueryResult;
+#else
+using materialized_result_t = duckdb::MaterializedQueryResult;
+#endif
+
+// Hand a result already checked to be MATERIALIZED_RESULT over as the
+// materialized type.
+inline duckdb::unique_ptr<materialized_result_t> take_materialized(duckdb::unique_ptr<duckdb::QueryResult> result) {
+#ifdef SV_DUCKDB_2
+	return result;
+#else
+	return duckdb::unique_ptr_cast<duckdb::QueryResult, duckdb::MaterializedQueryResult>(std::move(result));
+#endif
+}
+
 } // namespace sv_compat

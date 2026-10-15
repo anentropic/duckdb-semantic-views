@@ -2943,7 +2943,7 @@ struct SemanticViewGlobalState : public GlobalTableFunctionState {
     // same global state. If a future change overrides `MaxThreads()` to allow
     // parallel scans, the `Fetch()` cursor must be guarded (mutex, or a
     // per-thread local state) or it will data-race.
-    std::unique_ptr<MaterializedQueryResult> result;
+    std::unique_ptr<sv_compat::materialized_result_t> result;
 };
 
 // Run `sql` on `probe` the way `Connection::Query` would, but polling the OUTER
@@ -2983,9 +2983,70 @@ struct SemanticViewGlobalState : public GlobalTableFunctionState {
 // `HasError()` handling. The one behavioural difference: a *multi*-statement
 // string would be rejected ("Cannot prepare multiple statements at once!")
 // instead of executed. `execution_sql` is always a single generated SELECT.
+//
+// DuckDB 2.0 (SV_DUCKDB_2) removed PendingQuery / PendingQueryResult /
+// MaterializedQueryResult: a single `QueryResult` handle now carries the
+// execution. `Connection::Submit` replaces `PendingQuery` (same single-statement
+// restriction, same error-carrying result on a parse/bind failure);
+// `QueryResult::ExecuteTask` / `WaitForTask` replace the pending result's; and
+// `QueryResult::Complete` collects the rows and ends the query, after which the
+// handle is detached from `probe` and serves `Fetch()` from its own collection —
+// the role `pending->Execute()` and MaterializedQueryResult had. The loop below
+// is the one `Connection::Query` runs internally in 2.0
+// (`QueryResult::CompleteInternal`): ResultEagerness::FORCED settles retention
+// at submission exactly as `Connection::Query` does, so READY is waited on like
+// BLOCKED and only a terminal state (FINISHED / EXECUTION_ERROR) ends it.
 static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
                                                       ClientContext &outer,
                                                       const std::string &sql) {
+#ifdef SV_DUCKDB_2
+    QueryParameters parameters;
+    parameters.result_eagerness = ResultEagerness::FORCED;
+    auto result = probe.Submit(sql, parameters);
+    if (result->HasError()) {
+        // Parse/bind failure — nothing has executed. Same shape
+        // Connection::Query hands back for the identical failure.
+        return make_uniq<QueryResult>(result->GetErrorObject());
+    }
+
+    bool forwarded = false;
+    // A query whose custom result collector builds its own result is run to
+    // completion inside Submit and comes back already detached; there is
+    // nothing left to drive.
+    QueryResultState state =
+        result->IsOpen() ? QueryResultState::NOT_READY : QueryResultState::FINISHED;
+    while (!IsTerminal(state)) {
+        if (!forwarded && sv_compat::is_interrupted(outer)) {
+            // Sets the inner context's flag; the inner executor picks it up at
+            // its own next poll (2.0's ExecuteTask also checks it before running
+            // a task) and unwinds into an INTERRUPT error, which ends this loop
+            // via EXECUTION_ERROR.
+            forwarded = true;
+            probe.Interrupt();
+        }
+        state = result->ExecuteTask();
+        if (state == QueryResultState::BLOCKED || state == QueryResultState::READY) {
+            result->WaitForTask();
+        }
+    }
+
+    if (sv_compat::is_interrupted(outer)) {
+        // The caller cancelled — authoritative however the inner query ended.
+        // It may have raced to completion, or stopped on the forwarded flag.
+        throw InterruptException();
+    }
+    if (result->HasError()) {
+        return make_uniq<QueryResult>(result->GetErrorObject());
+    }
+    // Collect the rows and end the query on `probe`; a commit failure lands on
+    // the result as an error, as it did from pending->Execute().
+    result->Complete();
+    // TODO(duckdb-2.0): this loop is read from the dev-build sources
+    // (QueryResult::CompleteInternal); run the semantic_view cancellation tests
+    // against a 2.0 build to confirm interrupt latency and that a cancelled
+    // query still surfaces as a bare "Interrupted!".
+    return result;
+#else
     auto pending = probe.PendingQuery(sql);
     if (pending->HasError()) {
         // Parse/bind failure — nothing has executed. Same shape
@@ -3018,6 +3079,7 @@ static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
         return make_uniq<MaterializedQueryResult>(pending->GetErrorObject());
     }
     return pending->Execute();
+#endif
 }
 
 // Look up DECIMAL/LIST logical types via a LIMIT-0 probe. Returns a
@@ -3088,18 +3150,19 @@ static std::vector<LogicalType> sv_resolve_output_logical_types(
             "semantic_view: failed to infer column types via LIMIT 0 probe: " +
             probe_result->GetError());
     }
-    if (probe_result->types.size() != cols.size()) {
+    const auto &probe_types = sv_compat::result_types(*probe_result);
+    if (probe_types.size() != cols.size()) {
         // Phase 65.1 Plan 11 / WR-07 / D-14: distinct diagnostic naming
         // both counts so a future contributor can see which side disagrees.
         throw BinderException(
             "semantic_view: LIMIT 0 probe returned " +
-            std::to_string(probe_result->types.size()) +
+            std::to_string(probe_types.size()) +
             " columns, expected " + std::to_string(cols.size()));
     }
 
     for (idx_t i = 0; i < cols.size(); ++i) {
         const auto &c = cols[i];
-        const LogicalType &probed = probe_result->types[i];
+        const LogicalType &probed = probe_types[i];
         if (c.type_id == DUCKDB_TYPE_DECIMAL || c.type_id == DUCKDB_TYPE_LIST) {
             // Use the probed logical type (preserves width/scale/child type).
             out.emplace_back(probed);
@@ -3229,11 +3292,11 @@ static unique_ptr<GlobalTableFunctionState> sv_semantic_view_init_global(
             "semantic_view: SQL execution failed: " + qresult->GetError() +
             "  (expanded SQL: " + bd.expanded_sql_for_error + ")");
     }
-    if (qresult->type != QueryResultType::MATERIALIZED_RESULT) {
+    if (sv_compat::result_type(*qresult) != QueryResultType::MATERIALIZED_RESULT) {
         throw InternalException(
             "semantic_view: expected MaterializedQueryResult from Connection::Query");
     }
-    state->result = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(qresult));
+    state->result = sv_compat::take_materialized(std::move(qresult));
     return std::move(state);
 }
 
