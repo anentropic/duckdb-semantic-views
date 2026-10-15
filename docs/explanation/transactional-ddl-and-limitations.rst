@@ -233,6 +233,33 @@ None of this arises if you do not ``ATTACH`` a second database, or if the sessio
    never read or removed.
 
 
+.. _explanation-txn-ddl-one-statement:
+
+One Statement per Call
+======================
+
+Send each semantic-view statement to DuckDB on its own. A query string that holds several statements -- for example one Python ``execute()`` call with a ``CREATE TABLE``, an ``INSERT`` and a ``CREATE SEMANTIC VIEW`` separated by semicolons -- is not supported when any of them is semantic-view DDL. It fails with this error, whatever the position of the semantic-view statement in the string:
+
+.. code-block:: text
+
+   Parser Error: semantic_views: semantic-view DDL must be sent as its own statement, one statement per call. This query string also contains other statements; send each statement in a separate call (a single trailing ';' is fine).
+
+Split the string into one call per statement (a single trailing semicolon is fine):
+
+.. code-block:: python
+
+   con.execute("CREATE TABLE orders (id INTEGER, region VARCHAR, amount DOUBLE)")
+   con.execute("INSERT INTO orders VALUES (1, 'US', 100), (2, 'EU', 200)")
+   con.execute("""
+       CREATE SEMANTIC VIEW sales AS
+       TABLES (o AS orders PRIMARY KEY (id))
+       DIMENSIONS (o.region AS o.region)
+       METRICS (o.revenue AS SUM(o.amount));
+   """)
+
+Strings of ordinary SQL statements are unaffected.
+
+
 .. _explanation-txn-ddl-peg:
 
 DuckDB's Experimental PEG Parser
@@ -252,7 +279,7 @@ After disabling the PEG parser, restore the setting with one statement:
 
    SET allow_parser_override_extension = 'FALLBACK';
 
-Sessions that never call ``disable_peg_parser`` are unaffected: the extension installs the setting at load time and leaves it in place.
+Sessions that never call ``disable_peg_parser`` are unaffected: the extension installs the setting at load time and leaves it in place. (Semantic-view DDL inside a multi-statement query string fails with a different message; see :ref:`explanation-txn-ddl-one-statement`.)
 
 
 .. _explanation-txn-ddl-summary:
@@ -269,6 +296,7 @@ The other items on this page only matter in specific situations:
 - Introspection inside an open transaction shows committed state -- commit before ``SHOW`` / ``DESCRIBE`` if you need to see your own pending changes.
 - Concurrent ``CREATE IF NOT EXISTS`` from two connections can produce a constraint or commit-conflict error on one of them; catch it and treat as success.
 - Semantic views are single-catalog: run their DDL from the database you loaded the extension into, not from a ``USE``-d attached database.
+- Send semantic-view DDL one statement per call, not inside a multi-statement string.
 - Toggling ``disable_peg_parser`` requires re-setting one parser option afterwards.
 
 See also:
