@@ -71,10 +71,15 @@
 //! - **MM-4** — [`mm4_childless_parent_manufactures_a_null_group_under_a_child_dimension`]
 //!   (fixed by the same change — now live, and (d) groups by the child
 //!   dimension on metric requests)
+//! - **MM-5** — [`mm5_window_over_a_using_metric_under_a_role_played_root`]
+//!   (TECH-DEBT #87, OPEN): with the role-played table declared first, a
+//!   window over a metric off the root falls back to the base-anchored path and
+//!   joins through the first-declared relationship. Found when (e) gained the
+//!   role-played-root variant (v0.14.0 test-coverage review TC1).
 //!
 //! Every live property now ranges over the cells those findings had fenced
-//! off; the one remaining scope is (d)'s FACTS requests, which keep the
-//! base-anchored row path and so never group by the child dimension
+//! off, except MM-5's; the other remaining scope is (d)'s FACTS requests, which
+//! keep the base-anchored row path and so never group by the child dimension
 //! (TECH-DEBT #67, residual (3)).
 
 use std::collections::BTreeSet;
@@ -1392,9 +1397,15 @@ fn arb_rollup_case() -> impl Strategy<Value = RollupCase> {
         prop::option::weighted(0.6, arb_pred(true)),
         any::<bool>(),
         prop::collection::vec(any::<bool>(), BASE_METRICS.len()),
+        // With a role chosen, half the requests also carry one ROLE-LESS metric
+        // (test-coverage review TC3). Grouped by the role-played dimension it
+        // takes the role the `USING` metric gives that dimension — the
+        // per-grain `using_scopes_a_touched_table` branch — which no draw
+        // reached while a role filtered the pool down to its own metrics.
+        prop::option::weighted(0.5, any::<prop::sample::Index>()),
     )
         .prop_map(
-            |(names, data, grain, role, dim_mask, pred_seed, want_city, met_mask)| {
+            |(names, data, grain, role, dim_mask, pred_seed, want_city, met_mask, roleless)| {
                 let eligible: Vec<usize> = (0..BASE_METRICS.len())
                     .filter(|&i| grain.is_none_or(|g| BASE_METRICS[i].grain == g))
                     .filter(|&i| match role {
@@ -1417,7 +1428,7 @@ fn arb_rollup_case() -> impl Strategy<Value = RollupCase> {
                     }
                     out
                 };
-                let metrics: Vec<usize> = match grain {
+                let mut metrics: Vec<usize> = match grain {
                     Some(_) => pick(eligible.clone(), 3),
                     None => {
                         let (child, base): (Vec<usize>, Vec<usize>) = eligible
@@ -1428,6 +1439,13 @@ fn arb_rollup_case() -> impl Strategy<Value = RollupCase> {
                         both
                     }
                 };
+                if let (Some(_), Some(ix)) = (role, roleless) {
+                    let pool: Vec<usize> = (0..BASE_METRICS.len())
+                        .filter(|&i| BASE_METRICS[i].role.is_none())
+                        .filter(|&i| grain.is_none_or(|g| BASE_METRICS[i].grain == g))
+                        .collect();
+                    metrics.push(*ix.get(&pool));
+                }
                 let mut dims = Vec::new();
                 if dim_mask[0] {
                     dims.push(D_REGION);
@@ -1731,6 +1749,11 @@ struct OrderCase {
     window: Option<usize>,
     dims: Vec<usize>,
     pred: Option<Pred>,
+    /// Declare the role-played table `ap` FIRST, so it is the base table and
+    /// both role-playing relationships point at the root (release review F1:
+    /// no harness had put the role-played table at the root). Set only by
+    /// [`arb_root_order_case`], so [`arb_order_case`]'s sample is unchanged.
+    ap_root: bool,
 }
 
 const ORDER_POOL: usize = BASE_METRICS.len() + ORDER_EXTRAS.len();
@@ -1787,9 +1810,59 @@ fn arb_order_case() -> impl Strategy<Value = OrderCase> {
                     window,
                     dims,
                     pred,
+                    ap_root: false,
                 }
             },
         )
+}
+
+/// [`arb_order_case`] with the role-played table declared first, unrestricted.
+/// Only [`mm5_window_over_a_using_metric_under_a_role_played_root`] draws from
+/// it: a window over a metric off the root still binds to the first-declared
+/// relationship (MM-5, TECH-DEBT #87).
+fn arb_root_order_case_unrestricted() -> impl Strategy<Value = OrderCase> {
+    arb_order_case().prop_map(|mut c| {
+        c.ap_root = true;
+        c
+    })
+}
+
+/// Whether pool metric `i` is declared on the role-played table.
+fn pool_on_ap(i: usize) -> bool {
+    i >= BASE_METRICS.len() && ORDER_EXTRAS[i - BASE_METRICS.len()].2 == "ap"
+}
+
+/// [`arb_order_case`] with the role-played table declared first. Half the
+/// cases are narrowed to stay on the root (metrics on `ap` only, optionally
+/// under a window, no dimension and no filter): the only requests that need no
+/// relationship at all, which the unbiased draw almost never produces (3/512).
+/// The other half keep the full draw, where every other table is reached from
+/// the root across the role-playing pair, except that a window is kept only
+/// over a metric on the root: a window over any other metric is MM-5 (TECH-DEBT
+/// #87), drawn by [`arb_root_order_case_unrestricted`] instead.
+fn arb_root_order_case() -> impl Strategy<Value = OrderCase> {
+    let on_ap: Vec<usize> = (0..ORDER_EXTRAS.len())
+        .filter(|&i| ORDER_EXTRAS[i].2 == "ap")
+        .map(|i| BASE_METRICS.len() + i)
+        .collect();
+    (
+        arb_order_case(),
+        any::<bool>(),
+        prop::sample::subsequence(on_ap.clone(), 1..=on_ap.len()),
+        prop::option::weighted(0.35, prop::sample::select(on_ap)),
+    )
+        .prop_map(|(mut c, root_only, metrics, window)| {
+            c.ap_root = true;
+            if root_only {
+                c.metrics = metrics;
+                c.window = window;
+                c.dims.clear();
+                c.pred = None;
+            } else if c.window.is_some_and(|i| !pool_on_ap(i)) {
+                c.window = None;
+            }
+            c
+        })
 }
 
 /// [`build_def`] plus property (e)'s extras, with the role-playing pair at the
@@ -1806,11 +1879,16 @@ fn build_order_def(case: &OrderCase, swapped: bool) -> SemanticViewDefinition {
         });
     }
     if let Some(inner) = case.window {
+        // On `o`, except over a metric on the role-played ROOT, where `o` would
+        // put the window across the role-playing pair from its inner metric.
+        let on_root_ap = case.ap_root
+            && inner >= BASE_METRICS.len()
+            && ORDER_EXTRAS[inner - BASE_METRICS.len()].2 == "ap";
         let inner = pool_name(names, inner);
         def.metrics.push(Metric {
             name: WIN.to_string(),
             expr: format!("SUM({inner}) OVER ()"),
-            source_table: Some("o".to_string()),
+            source_table: Some(if on_root_ap { "ap" } else { "o" }.to_string()),
             window_spec: Some(semantic_views::model::WindowSpec {
                 window_function: "SUM".to_string(),
                 inner_metric: inner,
@@ -1825,6 +1903,11 @@ fn build_order_def(case: &OrderCase, swapped: bool) -> SemanticViewDefinition {
     }
     if swapped {
         def.joins.swap(1, 2);
+    }
+    if case.ap_root {
+        let ap = def.tables.iter().position(|t| t.alias == "ap").unwrap();
+        let ap = def.tables.remove(ap);
+        def.tables.insert(0, ap);
     }
     def
 }
@@ -1855,7 +1938,17 @@ fn check_order(case: &OrderCase) -> Result<(), String> {
     let first = expand("mm", &build_order_def(case, false), &req);
     let second = expand("mm", &build_order_def(case, true), &req);
     let (sql_a, sql_b) = match (first, second) {
-        (Err(_), Err(_)) => return Ok(()),
+        // Both rejected: they must be rejected for the same reason. Accepting
+        // any pair of errors let a fence that fires for one order but a
+        // different error that fires for the other pass as "invariant".
+        (Err(a), Err(b)) => {
+            if std::mem::discriminant(&a) == std::mem::discriminant(&b) {
+                return Ok(());
+            }
+            return Err(format!(
+                "declaration order decided the rejection reason:\nAS DECLARED: {a}\nSWAPPED: {b}"
+            ));
+        }
         (Ok(a), Ok(b)) => (a, b),
         (a, b) => {
             return Err(format!(
@@ -1901,6 +1994,33 @@ proptest! {
     /// partitioned by every queried dimension must equal its inner metric.
     #[test]
     fn relationship_declaration_order_is_invisible(case in arb_order_case()) {
+        if let Err(msg) = check_order(&case) {
+            prop_assert!(false, "{}", msg);
+        }
+    }
+
+    /// (e) again with the role-played table as the BASE table: both
+    /// relationships to it now point at the root.
+    #[test]
+    fn relationship_declaration_order_is_invisible_with_a_role_played_root(
+        case in arb_root_order_case()
+    ) {
+        if let Err(msg) = check_order(&case) {
+            prop_assert!(false, "{}", msg);
+        }
+    }
+
+    /// MM-5 (TECH-DEBT #87): the same, with a window over ANY metric. A window
+    /// over a `USING` metric on `o` declines the anchored window CTE (the
+    /// emitter does not thread a role into `__sv_agg`) and falls back to the
+    /// base-anchored `FROM ap LEFT JOIN o`, which joins `o` through the
+    /// first-declared relationship: swapping the declaration order changes
+    /// the answer. Reproduction: `window = dep_alt`, `dims = [region]`.
+    #[test]
+    #[ignore = "MM-5 / TECH-DEBT #87: window under a role-played root binds to the first-declared relationship"]
+    fn mm5_window_over_a_using_metric_under_a_role_played_root(
+        case in arb_root_order_case_unrestricted()
+    ) {
         if let Err(msg) = check_order(&case) {
             prop_assert!(false, "{}", msg);
         }
@@ -1976,12 +2096,17 @@ fn generator_reaches_both_join_directions() {
         .iter()
         .filter(|c| c.grain == Some(Grain::Base))
         .count();
+    // The grain is drawn from three choices (child, base, mixed), so each
+    // single-grain cell expects about 256 / 3 = 85 cases; the deterministic
+    // sample gives 77 / 83 here and 95 / 85 for the roll-ups below. A bar of
+    // 64 (three quarters of the expectation) leaves room for a reshuffled
+    // sample without letting a cell quietly fall to a handful.
     assert!(
-        child >= 48,
+        child >= 64,
         "only {child}/256 algebra cases used the child grain"
     );
     assert!(
-        base >= 48,
+        base >= 64,
         "only {base}/256 algebra cases used the base grain"
     );
     // TECH-DEBT #71: a chain that really spans BOTH grains, so the derived
@@ -2014,7 +2139,7 @@ fn generator_reaches_both_join_directions() {
         .filter(|c| c.grain == Some(Grain::Base))
         .count();
     assert!(
-        r_child >= 48 && r_base >= 48,
+        r_child >= 64 && r_base >= 64,
         "roll-up grains are lopsided: child={r_child} base={r_base}"
     );
     let r_mixed = rollups
@@ -2349,6 +2474,80 @@ fn generator_reaches_the_declaration_order_cells() {
     assert!(
         plain_role >= 32,
         "only {plain_role}/512 accepted cases queried a role-scoped metric directly"
+    );
+}
+
+/// The role-played-root variant of (e) must reach a metric declared ON the
+/// root and have it ACCEPTED: (e) passes when both orders are rejected for the
+/// same reason, so without this count a fence that rejects every base-table
+/// metric (release review F1) would pass unnoticed. A `USING` metric from the
+/// referencing table must be accepted too.
+#[test]
+fn generator_reaches_the_role_played_root_cells() {
+    let cases = sample(&arb_root_order_case(), 512);
+    let accepted = |c: &OrderCase| {
+        let metrics: Vec<String> = match c.window {
+            Some(_) => vec![WIN.to_string()],
+            None => c.metrics.iter().map(|&i| pool_name(&c.names, i)).collect(),
+        };
+        let req = request(&c.names, &c.dims, &metrics, &[], c.pred.as_ref());
+        expand("mm", &build_order_def(c, false), &req).is_ok()
+    };
+    let on_ap = pool_on_ap;
+    let is_role_metric = |i: usize| i < BASE_METRICS.len() && BASE_METRICS[i].role.is_some();
+    let root_metric = cases
+        .iter()
+        .filter(|c| c.window.is_none() && c.metrics.iter().copied().any(on_ap) && accepted(c))
+        .count();
+    assert!(
+        root_metric >= 128,
+        "only {root_metric}/512 accepted cases queried a metric on the role-played root"
+    );
+    let root_window = cases
+        .iter()
+        .filter(|c| c.window.is_some_and(on_ap) && accepted(c))
+        .count();
+    assert!(
+        root_window >= 32,
+        "only {root_window}/512 accepted cases put a window over a metric on the role-played root"
+    );
+    let role_metric = cases
+        .iter()
+        .filter(|c| {
+            c.window.is_none() && c.metrics.iter().copied().any(is_role_metric) && accepted(c)
+        })
+        .count();
+    assert!(
+        role_metric >= 16,
+        "only {role_metric}/512 accepted cases queried a USING metric into the role-played root"
+    );
+}
+
+/// TC3 (test-coverage review): a role-scoped roll-up request must sometimes
+/// also carry a role-less metric while grouping by the role-played dimension,
+/// and be accepted, so property (b) reaches the per-grain branch where the
+/// `USING` metric's role scopes a table the role-less metric touches.
+#[test]
+fn generator_mixes_a_role_less_metric_into_a_role_scoped_request() {
+    let rollups = sample(&arb_rollup_case(), 512);
+    let mixed = rollups
+        .iter()
+        .filter(|c| {
+            c.groups_by_role_played
+                && c.metrics.iter().any(|&i| BASE_METRICS[i].role.is_none())
+                && c.metrics.iter().any(|&i| BASE_METRICS[i].role.is_some())
+        })
+        .filter(|c| {
+            let met_names: Vec<String> =
+                c.metrics.iter().map(|&i| c.names.mets[i].clone()).collect();
+            let req = request(&c.names, &c.dims, &met_names, &[], c.pred.as_ref());
+            expand("mm", &build_def(&c.names, None), &req).is_ok()
+        })
+        .count();
+    assert!(
+        mixed >= 24,
+        "only {mixed}/512 accepted roll-up cases grouped a role-less metric by the role-played \
+         dimension beside a USING metric"
     );
 }
 

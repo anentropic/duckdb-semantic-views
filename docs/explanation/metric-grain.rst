@@ -92,12 +92,12 @@ anchored at ``orders``. Joining outward from orders to customers is safe because
 each order has exactly one customer -- traversing from the "many" side to the
 "one" side never duplicates a row.
 
-.. versionchanged:: 0.13.1
+.. versionchanged:: 0.14.0
 
    A metric on a table *below* the base table -- a line-item metric in a view
    whose base table is ``orders`` -- used to be computed from the base table,
    joined down to its rows. It is now computed from its own table like every
-   other metric, which changes two edge cases; see
+   other metric. This changes the numbers in two edge cases; see
    :ref:`explanation-grain-orphans`.
 
 
@@ -110,7 +110,7 @@ Every metric is aggregated from its own home table, joining only *outward* --
 from the "many" side to the "one" side -- to reach the dimensions the query asks
 for. Two consequences are worth knowing, because they are where this differs
 from the answer you would get by starting at a parent table and joining down.
-Both match Snowflake, which was run against the same fixture to settle them.
+Snowflake gives the same answers in both cases.
 
 **A row whose foreign key is NULL is still counted.**
    A line item that belongs to no order (its ``order_id`` is ``NULL``, or names
@@ -127,14 +127,53 @@ Both match Snowflake, which was run against the same fixture to settle them.
    ``NULL``: "no rows at this grain", exactly as in the multi-grain example
    below.
 
-With the line items of Snowflake's fixture -- one of them an orphan with
-``qty = 40``, and a customer in the US whose only order has no items:
+Here is a small shop with both edge cases in its data. Customer 1 (EU) has
+two orders with line items; customer 2 (US) has one order with none; and line
+item 4 belongs to no order at all:
 
 .. code-block:: sql
 
-   SELECT * FROM semantic_view('d1_sv',
+   CREATE TABLE customers (id INTEGER, region VARCHAR);
+   INSERT INTO customers VALUES (1, 'EU'), (2, 'US');
+
+   CREATE TABLE orders (id INTEGER, customer_id INTEGER);
+   INSERT INTO orders VALUES (1, 1), (2, 1), (3, 2);
+
+   CREATE TABLE line_items (id INTEGER, order_id INTEGER, qty INTEGER);
+   INSERT INTO line_items VALUES
+       (1, 1,    1),
+       (2, 1,    2),
+       (3, 2,    3),
+       (4, NULL, 40);
+
+   CREATE SEMANTIC VIEW shop_items AS
+   TABLES (
+       o  AS orders     PRIMARY KEY (id),
+       c  AS customers  PRIMARY KEY (id),
+       li AS line_items PRIMARY KEY (id)
+   )
+   RELATIONSHIPS (
+       order_customer AS o(customer_id) REFERENCES c,
+       item_order     AS li(order_id)   REFERENCES o
+   )
+   DIMENSIONS (
+       c.cust_region AS c.region
+   )
+   METRICS (
+       o.order_count AS COUNT(*),
+       li.n_items    AS COUNT(*),
+       li.total_qty  AS SUM(li.qty)
+   );
+
+The base table is ``orders``, but ``n_items`` and ``total_qty`` live on
+``line_items``, so that is where they are aggregated:
+
+.. code-block:: sql
+
+   SELECT * FROM semantic_view('shop_items',
        dimensions := ['cust_region'],
-       metrics := ['n_items', 'total_qty']);
+       metrics := ['n_items', 'total_qty']
+   ) ORDER BY cust_region;
 
 .. code-block:: text
 
@@ -145,15 +184,37 @@ With the line items of Snowflake's fixture -- one of them an orphan with
    │ NULL        │       1 │        40 │
    └─────────────┴─────────┴───────────┘
 
+The orphan line item is counted under a ``NULL`` region, and US has no row,
+because none of its orders has an item. Add the order-grain ``order_count`` and
+US comes back, carried by the metric that has rows for it:
+
+.. code-block:: sql
+
+   SELECT * FROM semantic_view('shop_items',
+       dimensions := ['cust_region'],
+       metrics := ['n_items', 'total_qty', 'order_count']
+   ) ORDER BY cust_region;
+
+.. code-block:: text
+
+   ┌─────────────┬─────────┬───────────┬─────────────┐
+   │ cust_region │ n_items │ total_qty │ order_count │
+   ├─────────────┼─────────┼───────────┼─────────────┤
+   │ EU          │       3 │         6 │           2 │
+   │ US          │    NULL │      NULL │           1 │
+   │ NULL        │       1 │        40 │        NULL │
+   └─────────────┴─────────┴───────────┴─────────────┘
+
 The most useful property follows from the rule rather than being added to it:
 **a metric's value never depends on what else is in the query.** ``n_items`` for
-EU is 3 whether it is queried alone, alongside a customer count, or as part of a
-derived metric.
+EU is 3 whether it is queried alone, next to ``order_count``, or inside a
+derived metric. Before v0.14.0 that was not guaranteed: the same metric could
+read differently on its own than beside a metric from another table.
 
 .. note::
 
    Only metrics are anchored this way. A dimensions-only query and a ``FACTS``
-   query are row-level, and keep their earlier behaviour: they start at the base
+   query are row-level, and keep their earlier behavior: they start at the base
    table and drop the row a parent with no children would otherwise contribute.
    A row-level query on a child fact therefore still omits a child row whose
    foreign key is ``NULL``.
@@ -175,13 +236,13 @@ customer-level metric:
 
 .. code-block:: sql
 
-   CREATE TABLE customers (id INTEGER, region VARCHAR, balance DECIMAL(10,2));
+   CREATE OR REPLACE TABLE customers (id INTEGER, region VARCHAR, balance DECIMAL(10,2));
    INSERT INTO customers VALUES
        (1, 'East', 500.00),
        (2, 'East', 300.00),
        (3, 'West', 900.00);
 
-   CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount DECIMAL(10,2));
+   CREATE OR REPLACE TABLE orders (id INTEGER, customer_id INTEGER, amount DECIMAL(10,2));
    INSERT INTO orders VALUES
        (1, 1, 25.00),
        (2, 1, 50.00),
@@ -298,9 +359,10 @@ One requirement relaxes on this path. A ``COUNT(*)`` metric used to need its
 table to declare a ``PRIMARY KEY`` whenever that table was reached through a
 ``LEFT JOIN`` from the base table, whose NULL-extended rows ``COUNT(*)`` would
 count. A table that anchors its own grain produces no such rows, so the key is
-not required there -- and every metric is now anchored at its own table, apart
-from the few shapes listed under :ref:`explanation-grain-refused` that still
-fall back to the base table.
+not required there. Since every metric is now anchored at its own table, a
+``COUNT(*)`` on a child table without a key is answered too. Only the few shapes
+that still fall back to the base table, such as the one-to-one window pair
+described under :ref:`explanation-grain-refused`, need the key.
 
 
 .. _explanation-grain-refused:
@@ -328,11 +390,12 @@ useful to keep in mind while you model.
    already-grouped rows, so the window itself is not grain-sensitive -- the inner
    aggregate is. One window metric whose inner aggregate lives on a non-base table
    is computed at that table's grain. Two of them at *different* grains are not,
-   because those grains would have to be joined before the window could run: a
-   parent-grain pair is refused with a fan trap error, and a pair whose finer
-   inner aggregate sits *below* the base table is still computed from the base
-   table, so that inner aggregate drops orphan rows and reports ``0`` or
-   ``NULL`` for a childless parent (a known gap). See
+   because those grains would have to be joined before the window could run.
+   Where joining the two tables would repeat one side's rows, the query is
+   refused with a fan trap error. Where the relationship between them is
+   one-to-one, nothing fans out and the pair is answered, but it is computed
+   from the base table rather than per grain: an inner aggregate on a child of
+   the base table then leaves out orphan child rows (a known limitation). See
    :ref:`howto-window-metrics`.
 
 **A role-played table reached without** ``USING``.

@@ -199,3 +199,43 @@ statement error
 SELECT * FROM semantic_view('p0c_orders_view', dimensions := ['region'], metrics := ['li_qty_twice']);
 ----
 fan trap detected -- 'li_qty' (table 'o')
+
+# 4. v0.14.0 release review F1: the role-played table is the BASE table (both
+#    relationships point at the root). A metric declared on it is the anchor of
+#    the FROM, never joined through a relationship, so there is no role to pick.
+#    v0.13.0 answered it; the fence in 3. rejected it as ambiguous.
+
+statement ok
+CREATE SEMANTIC VIEW p0c_rp_base AS
+  TABLES (
+    a AS p0c_airports PRIMARY KEY (airport_code),
+    f AS p0c_flights PRIMARY KEY (flight_id)
+  )
+  RELATIONSHIPS (
+    dep_airport AS f(departure_code) REFERENCES a,
+    arr_airport AS f(arrival_code) REFERENCES a
+  )
+  FACTS (
+    a.elev AS a.elevation
+  )
+  METRICS (
+    a.n_airports AS COUNT(*),
+    a.any_elev AS SUM(elev),
+    f.dep_elev USING (dep_airport) AS SUM(elev)
+  );
+
+query I
+SELECT * FROM semantic_view('p0c_rp_base', metrics := ['n_airports']);
+----
+2
+
+query I
+SELECT * FROM semantic_view('p0c_rp_base', metrics := ['any_elev']);
+----
+5447
+
+# Control: the referencing table's USING metric keeps its role (13 + 13 + 5434).
+query I
+SELECT * FROM semantic_view('p0c_rp_base', metrics := ['dep_elev']);
+----
+5460

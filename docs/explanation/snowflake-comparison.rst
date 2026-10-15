@@ -331,6 +331,12 @@ Snowflake populates the ``data_type`` column of
 (and the ``DATA_TYPE`` rows of :ref:`DESCRIBE <ref-describe-semantic-view>`) with the
 member's actual data type.
 
+.. versionchanged:: 0.14.0
+
+   ``data_type`` is populated again. It had been empty for every view created
+   since v0.10.0; views created in that window report their types too, with no
+   need to re-create them.
+
 The same holds here. The type is not stored at ``CREATE``; it is worked out
 when the ``SHOW`` / ``DESCRIBE`` command runs, by preparing the query
 :ref:`semantic_view() <ref-semantic-view-function>` would run for the member and
@@ -347,6 +353,9 @@ is always the type a query returns for that member:
 - **When a member cannot be typed** -- its source table or column was dropped or
   renamed after ``CREATE`` -- ``data_type`` is empty for that member, and the command
   still succeeds for the rest. Querying the member reports the underlying error.
+  The same goes for a metric that cannot be queried on its own because it would
+  aggregate across a fan-out (see :ref:`howto-fan-traps`): its ``data_type`` is
+  empty, and querying it reports the fan trap.
 - **PRIVATE members** are typed too, though they cannot be queried directly.
 - **Role-played members** -- on a table that several relationships point at -- are
   typed too, although querying one needs a metric whose ``USING`` names the role. The
@@ -375,7 +384,7 @@ parent row with no children is not dropped.
 Before v0.12.0 the generated SQL was always anchored ``FROM <base table>``, so
 these queries were rejected with a fan trap error rather than silently inflated.
 
-.. versionchanged:: 0.13.1
+.. versionchanged:: 0.14.0
 
    This now holds for a query with a single grain too. A metric on a child of
    the base table, queried on its own, is aggregated from the child table and
@@ -404,7 +413,8 @@ Four boundaries apply:
   or a child of the base table), so it is neither inflated nor thinned by a
   base-table join. Window metrics whose inner aggregates sit
   at *different* grains still error, as those grains would need joining before the
-  window runs.
+  window runs. The exception is a pair joined one-to-one, where nothing fans out:
+  it is answered from the base table instead (see :ref:`explanation-grain-refused`).
 - An **active semi-additive metric** snapshots at its own grain, whether it is
   the query's only grain or one of several: the ``RANK()`` runs over the metric's
   own table rather than a base-anchored join, so the winning snapshot row is not
@@ -552,7 +562,7 @@ Snowflake ``CREATE SEMANTIC VIEW`` features that are commonly asked about, and w
    * - Direct SQL query interface
      - Not planned; :ref:`semantic_view() <ref-semantic-view-function>` table function is the query interface
    * - Pre-aggregation ``WHERE`` -- ``SEMANTIC_VIEW( v METRICS ... DIMENSIONS ... WHERE <predicate> )``, where the predicate `may refer only to dimensions, facts, and expressions over them <https://docs.snowflake.com/en/sql-reference/constructs/semantic_view>`_ and "is applied before the metrics are computed"
-     - **Supported** as the :ref:`where_clause <ref-sv-pre-agg-filtering>` named parameter, written ``where_clause := '...'`` (``where`` is a reserved word in DuckDB's named-parameter position, so it cannot be spelled ``where :=``). The predicate names declared dimensions and facts, is substituted to their expressions, and is applied before aggregation on every emission path -- before the ``GROUP BY`` on the base-anchored and fact paths, inside *each* per-grain aggregate for multi-grain queries, inside the snapshot selection before the ``RANK`` for semi-additive metrics, and inside the inner aggregation before the window function. So "revenue for orders shipped after X" recomputes each group over the matching rows. Referencing a metric is rejected, matching Snowflake, and members the predicate names participate in the same reachability and fan-out checks as queried dimensions.
+     - **Supported** as the :ref:`where_clause <ref-sv-pre-agg-filtering>` named parameter, written ``where_clause := '...'`` (``where`` is a reserved word in DuckDB's named-parameter position, so it cannot be spelled ``where :=``). The predicate names declared dimensions and facts, is substituted to their expressions, and is applied before aggregation on every emission path -- before the ``GROUP BY`` when the query is a single ``SELECT`` (one grain, dimensions only, or facts), inside *each* per-grain aggregate for multi-grain queries, inside the snapshot selection before the ``RANK`` for semi-additive metrics, and inside the inner aggregation before the window function. So "revenue for orders shipped after X" recomputes each group over the matching rows. Referencing a metric is rejected, matching Snowflake, and members the predicate names participate in the same reachability and fan-out checks as queried dimensions.
    * - Query-time scalar expressions -- ``SEMANTIC_VIEW( v DIMENSIONS DATE_PART('year', orders.order_date) AS year )``, where a ``DIMENSIONS`` / ``FACTS`` item `may be a scalar expression over dimensions or facts of the same logical table <https://docs.snowflake.com/en/sql-reference/constructs/semantic_view>`_, a ``METRICS`` item may be an expression over metrics, and any item may take ``AS <alias>``
      - **Not yet supported.** Each ``dimensions := [...]`` / ``metrics := [...]`` / ``facts := [...]`` item must be the name of a member the view declares; an expression is rejected as an unknown member, and output columns always carry the member's name. Declare the derived member in the view instead -- ``orders.order_year AS DATE_PART('year', orders.order_date)`` -- and query ``dimensions := ['order_year']``. Re-grouping a finer-grained result outside ``semantic_view()`` is correct only for additive metrics (``SUM``, ``COUNT``), not for ``COUNT(DISTINCT ...)``, ratios, semi-additive or window metrics.
    * - Named filters -- ``LABELS = (FILTER)`` on a fact or dimension resolving to ``BOOLEAN``, referenced bare in a query's ``WHERE`` (`Snowflake GA May 2026 <https://docs.snowflake.com/en/user-guide/views-semantic/filters>`_)

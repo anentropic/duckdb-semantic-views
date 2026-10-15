@@ -90,10 +90,17 @@ Returns one row per reachable dimension with 4 columns:
      - The dimension name.
    * - ``data_type``
      - VARCHAR
-     - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
+     - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped), or when the member cannot be queried on its own because of a fan trap. See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``required``
      - BOOLEAN
      - ``TRUE`` if the dimension is referenced in a window metric's ``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY`` clause (meaning it must be included in the query for that metric). ``FALSE`` for all other dimensions and for non-window metrics.
+
+
+.. versionchanged:: 0.14.0
+
+   ``data_type`` is populated again. It had been empty for every view created
+   since v0.10.0. The type is now worked out when the command runs, so views
+   created in that window report it too, with no need to re-create them.
 
 
 .. _ref-show-dims-for-metric-filtering:
@@ -212,7 +219,11 @@ For ``line_item_sum`` (source table: ``line_items``), the path from ``line_items
 
 .. versionadded:: 0.6.0
 
-When querying dimensions for a window function metric, the ``required`` column is ``TRUE`` for any dimension referenced in the metric's ``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY`` clauses. These dimensions must be included in the query for the window metric to function correctly.
+When querying dimensions for a window function metric, the ``required`` column is ``TRUE`` for any dimension referenced in the metric's ``PARTITION BY EXCLUDING``, ``PARTITION BY``, or ``ORDER BY`` clauses. These dimensions must be included in the query for the window metric to function correctly. This holds however the window spells the dimension: bare (``ORDER BY placed``), qualified with its table alias (``ORDER BY s.placed``), or quoted in a different case (``ORDER BY "PLACED"``).
+
+.. versionchanged:: 0.14.0
+
+   A dimension spelled qualified or quoted in the window used to be reported ``required = false``.
 
 .. code-block:: sql
 

@@ -238,6 +238,11 @@ None of this arises if you do not ``ATTACH`` a second database, or if the sessio
 One Statement per Call
 ======================
 
+.. versionchanged:: 0.14.0
+
+   The error below is new. This case used to fail with a ``parser_override is
+   not active`` message that pointed at a setting that was not the problem.
+
 Send each semantic-view statement to DuckDB on its own. A query string that holds several statements -- for example one Python ``execute()`` call with a ``CREATE TABLE``, an ``INSERT`` and a ``CREATE SEMANTIC VIEW`` separated by semicolons -- is not supported when any of them is semantic-view DDL. It fails with this error, whatever the position of the semantic-view statement in the string:
 
 .. code-block:: text

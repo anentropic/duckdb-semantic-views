@@ -66,9 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its input's (`COUNT` is `BIGINT`, `AVG` is `DOUBLE`, `SUM` of an integer column is `BIGINT`,
   as the query returns it), for dimensions, facts, derived, window, semi-additive, PRIVATE
   and role-played members alike. The type is worked out when the command runs, so it follows a source column
-  whose type changes after `CREATE`. A member whose source table or column no longer exists
+  whose type changes after `CREATE`, once that change is committed. A member whose source table or column no longer exists
   reports an empty `data_type` instead of making the whole command fail. The cross-view forms
-  (`SHOW SEMANTIC METRICS` without `IN`) take about a millisecond or two longer per view.
+  (`SHOW SEMANTIC METRICS` without `IN`) take about a millisecond or two longer per view
+  over tables in the local catalog; a view over remote files (an S3 glob, `read_csv`) binds
+  those sources to type its members and can take noticeably longer.
   Cancelling one of these commands (Ctrl-C, `interrupt()`, an ADBC cancel) stops the type
   lookup promptly with an `INTERRUPT` error, rather than once every view has been typed.
 - **`SHOW SEMANTIC DIMENSIONS FOR METRIC` marks a window metric's dimensions `required` however
@@ -94,7 +96,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metric's own table), yet where no fan trap stopped it — the relationships declared
   one-to-one — it returned the first-declared relationship's numbers. Such a query (and one
   on a table reached only through the role-playing table) now raises an ambiguity error;
-  declare the metric on the referencing table with `USING` instead.
+  declare the metric on the referencing table with `USING` instead. When the role-playing
+  table is the view's base table (declared first in `TABLES`), a metric on it needs no
+  relationship and is still answered when it is queried without dimensions, alongside only
+  other base-table metrics, and with a filter that names only base-table members (see Known
+  limitations).
 - **A window or derived metric over a metric that reaches a fact across a fanning
   relationship is rejected, like the metric itself.** Querying such a metric directly
   raised a fan-trap error, but through a window metric or a derived metric it joined the
@@ -135,6 +141,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it with other statements (for example one Python `execute()` call holding `CREATE TABLE
   …; CREATE SEMANTIC VIEW …`) is rejected. Split the string into one call per statement.
   See "One Statement per Call" in the transactional DDL and limitations page.
+- **A view whose base table is a role-playing table has two gaps.** When the table declared
+  first in `TABLES` is the target of two relationships, a dimension on it is rejected as
+  ambiguous even in a query that joins nothing else, and a window metric over a `USING`
+  metric from the referencing table is computed through the first-declared relationship.
+  Declare the referencing table first to avoid both.
 
 ## [0.13.0] - 2026-09-30
 

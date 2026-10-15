@@ -118,13 +118,20 @@ Returns one row per dimension with 8 columns:
      - The dimension name as declared in the ``DIMENSIONS`` clause.
    * - ``data_type``
      - VARCHAR
-     - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
+     - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped), or when the member cannot be queried on its own because of a fan trap. See :ref:`Reported Data Types <explanation-sf-data-types>`.
    * - ``synonyms``
      - VARCHAR
      - JSON array of synonym strings (e.g., ``["territory","sales_region"]``). ``[]`` when no synonyms are set.
    * - ``comment``
      - VARCHAR
      - The dimension comment text. Empty string if no comment is set.
+
+
+.. versionchanged:: 0.14.0
+
+   ``data_type`` is populated again. It had been empty for every view created
+   since v0.10.0. The type is now worked out when the command runs, so views
+   created in that window report it too, with no need to re-create them.
 
 
 .. _ref-show-dims-examples:

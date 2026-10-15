@@ -356,6 +356,23 @@ Troubleshooting
    not zero. Wrap the column in ``COALESCE`` in the outer query if you want
    zeros.
 
+**A child-table metric has a NULL group, or a parent is missing**
+   .. versionchanged:: 0.14.0
+
+   A metric on a table below the base table, such as a line-item count in a
+   view built around ``orders``, is aggregated from its own table even when it
+   is the only metric in the query. A child row whose foreign key is ``NULL``
+   is counted under a ``NULL`` dimension value, and a parent with no children
+   gets no row unless a metric on the parent's own table is queried alongside.
+   Earlier versions computed such a metric from the base table, so these
+   numbers can differ after an upgrade. To leave orphan rows out, declare a
+   dimension on the parent's key, such as ``o.order_key AS o.id``, and pass
+   ``where_clause := 'order_key IS NOT NULL'``, which filters them before
+   aggregation. It drops a line item whose ``order_id`` is ``NULL`` and one
+   whose ``order_id`` names an order that does not exist, since neither finds
+   an order to look up. Testing ``li.order_id IS NOT NULL`` instead would keep
+   the second kind. See :ref:`explanation-grain-orphans`.
+
 
 .. _howto-fan-related:
 

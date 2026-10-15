@@ -25,9 +25,15 @@
 //! every other member must still report its oracle type — the batch falls back
 //! to per-member probes rather than losing the whole view.
 //!
-//! Not generated here: window and semi-additive metrics, role-playing, and
-//! PRIVATE members. They are covered by `src/query/member_types.rs` unit tests
-//! and `test/sql/member_data_type.test`; none changes how a type is computed,
+//! A **role-playing axis** declares a second relationship from `t` to `u`, with
+//! a quoted name, so every member on `u` is role-played: it cannot be queried
+//! without `USING`, and the probe types it through a one-relationship copy of
+//! the definition (`single_role_copy`). Its oracle type does not change — a
+//! type never depends on which relationship reached the row.
+//!
+//! Not generated here: window and semi-additive metrics, and PRIVATE members.
+//! They are covered by `src/query/member_types.rs` unit tests and
+//! `test/sql/member_data_type.test`; neither changes how a type is computed,
 //! only which request shape the probe has to use.
 
 use proptest::prelude::*;
@@ -121,6 +127,8 @@ struct Case {
     drop_t_col: Option<usize>,
     /// Seed choosing the co-queried request members.
     pick: Vec<bool>,
+    /// Declare a second, quoted relationship `t` → `u`, making `u` role-played.
+    role_played: bool,
 }
 
 /// A member over one column: (on `u`?, column index, template / aggregate).
@@ -148,10 +156,11 @@ fn arb_case() -> impl Strategy<Value = Case> {
                 prop::collection::vec((0..DERIVED_OPS.len(), 0..8usize, 0..8usize), 0..3),
                 prop::option::weighted(0.3, 0..nt),
                 prop::collection::vec(any::<bool>(), 16),
+                prop::bool::weighted(0.3),
             )
         })
         .prop_map(
-            |(t_cols, u_cols, dims, facts, metrics, derived, drop_t_col, pick)| {
+            |(t_cols, u_cols, dims, facts, metrics, derived, drop_t_col, pick, role_played)| {
                 let cat = |on_u: bool, c: usize| TYPES[if on_u { u_cols[c] } else { t_cols[c] }].2;
                 // Re-target any template / aggregate that does not fit its
                 // column's category to the always-valid first one, so every
@@ -189,6 +198,7 @@ fn arb_case() -> impl Strategy<Value = Case> {
                     u_cols,
                     drop_t_col,
                     pick,
+                    role_played,
                 }
             },
         )
@@ -272,14 +282,17 @@ fn build_def(case: &Case) -> SemanticViewDefinition {
         tables,
         dimensions,
         metrics,
-        joins: vec![Join {
-            from_alias: "t".to_string(),
-            table: "u".to_string(),
-            fk_columns: vec!["fk".to_string()],
-            ref_columns: vec!["id".to_string()],
-            name: Some("t_u".to_string()),
-            cardinality: Cardinality::ManyToOne,
-        }],
+        joins: std::iter::once(("fk", "t_u"))
+            .chain(case.role_played.then_some(("fk2", "\"T u2\"")))
+            .map(|(fk, name)| Join {
+                from_alias: "t".to_string(),
+                table: "u".to_string(),
+                fk_columns: vec![fk.to_string()],
+                ref_columns: vec!["id".to_string()],
+                name: Some(name.to_string()),
+                cardinality: Cardinality::ManyToOne,
+            })
+            .collect(),
         facts,
         materializations: vec![],
         created_on: None,
@@ -309,10 +322,10 @@ fn make_db(case: &Case) -> RawDb {
     unsafe {
         db.exec(&format!("CREATE TABLE u (id INTEGER PRIMARY KEY, {ud})"));
         db.exec(&format!(
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, fk INTEGER, {td})"
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, fk INTEGER, fk2 INTEGER, {td})"
         ));
         db.exec(&format!("INSERT INTO u VALUES (1, {uv})"));
-        db.exec(&format!("INSERT INTO t VALUES (1, 1, {tv})"));
+        db.exec(&format!("INSERT INTO t VALUES (1, 1, 1, {tv})"));
     }
     db
 }
@@ -557,6 +570,7 @@ fn generator_reaches_the_interesting_cells() {
     let strat = arb_case();
     let (mut avg, mut sum_int, mut derived, mut u_fact, mut partial_drop) =
         (false, false, false, false, false);
+    let mut role_played_u_members = 0usize;
     for _ in 0..400 {
         let c = strat.new_tree(&mut runner).unwrap().current();
         let cat = |u: bool, col: usize| TYPES[if u { c.u_cols[col] } else { c.t_cols[col] }].2;
@@ -570,10 +584,19 @@ fn generator_reaches_the_interesting_cells() {
         let broken = broken_by_drop(&c).len();
         partial_drop |=
             broken > 0 && broken < c.dims.len() + c.facts.len() + c.metrics.len() + c.derived.len();
+        let on_u = |v: &[(bool, usize, usize)]| v.iter().any(|&(u, _, _)| u);
+        role_played_u_members +=
+            usize::from(c.role_played && on_u(&c.dims) && on_u(&c.facts) && on_u(&c.metrics));
     }
     assert!(
         avg && sum_int && derived && u_fact && partial_drop,
         "avg={avg} sum_int={sum_int} derived={derived} u_fact={u_fact} partial_drop={partial_drop}"
+    );
+    // Every member kind on the role-played table, typed through the
+    // one-relationship copy, in a fair share of cases.
+    assert!(
+        role_played_u_members >= 20,
+        "only {role_played_u_members}/400 cases put a dimension, fact and metric on a role-played `u`"
     );
 }
 

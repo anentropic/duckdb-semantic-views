@@ -73,6 +73,13 @@ Object Kinds and Properties
 
 Rows appear in definition order: the view-level comment (when one is set), then ``TABLE`` objects, then ``RELATIONSHIP``, ``FACT``, ``DIMENSION``, ``METRIC``, ``DERIVED_METRIC``, and ``MATERIALIZATION``.
 
+.. versionchanged:: 0.14.0
+
+   The ``DATA_TYPE`` property rows carry each member's type again. They had been
+   empty for every view created since v0.10.0. The type is now worked out when
+   the command runs, so views created in that window report it too, with no
+   need to re-create them.
+
 **View-level comment**
    Emitted only when a view-level comment is set (in ``CREATE`` or via :ref:`ALTER SEMANTIC VIEW SET COMMENT <ref-alter-semantic-view>`). The row describes the view itself, so ``object_kind``, ``object_name``, and ``parent_entity`` are all empty strings. Produces one property row:
 
@@ -139,7 +146,7 @@ Rows appear in definition order: the view-level comment (when one is set), then 
       * - ``EXPRESSION``
         - The row-level SQL expression defining the fact.
       * - ``DATA_TYPE``
-        - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
+        - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped), or when the member cannot be queried on its own because of a fan trap. See :ref:`Reported Data Types <explanation-sf-data-types>`.
       * - ``COMMENT``
         - The fact comment text. Only emitted when a comment is set.
       * - ``SYNONYMS``
@@ -163,7 +170,7 @@ Rows appear in definition order: the view-level comment (when one is set), then 
       * - ``EXPRESSION``
         - The SQL expression defining the dimension.
       * - ``DATA_TYPE``
-        - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
+        - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped), or when the member cannot be queried on its own because of a fan trap. See :ref:`Reported Data Types <explanation-sf-data-types>`.
       * - ``COMMENT``
         - The dimension comment text. Only emitted when a comment is set.
       * - ``SYNONYMS``
@@ -185,7 +192,7 @@ Rows appear in definition order: the view-level comment (when one is set), then 
       * - ``EXPRESSION``
         - The aggregate SQL expression defining the metric.
       * - ``DATA_TYPE``
-        - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
+        - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped), or when the member cannot be queried on its own because of a fan trap. See :ref:`Reported Data Types <explanation-sf-data-types>`.
       * - ``COMMENT``
         - The metric comment text. Only emitted when a comment is set.
       * - ``SYNONYMS``
@@ -209,7 +216,7 @@ Rows appear in definition order: the view-level comment (when one is set), then 
       * - ``EXPRESSION``
         - The expression composing other metrics.
       * - ``DATA_TYPE``
-        - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped). See :ref:`Reported Data Types <explanation-sf-data-types>`.
+        - The type the member's column has in a :ref:`semantic_view() <ref-semantic-view-function>` query, in DuckDB's spelling (``VARCHAR``, ``BIGINT``, ``DECIMAL(38,2)``). Determined when the command runs, so it follows the current source columns. Empty when the member's source no longer binds (for example, its table was dropped), or when the member cannot be queried on its own because of a fan trap. See :ref:`Reported Data Types <explanation-sf-data-types>`.
       * - ``COMMENT``
         - The derived metric comment text. Only emitted when a comment is set.
       * - ``SYNONYMS``
