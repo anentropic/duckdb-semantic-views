@@ -98,7 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on a table reached only through the role-playing table) now raises an ambiguity error;
   declare the metric on the referencing table with `USING` instead. When the role-playing
   table is the view's base table (declared first in `TABLES`), a metric on it needs no
-  relationship and is still answered, as long as the query stays on that table.
+  relationship and is still answered when it is queried without dimensions, alongside only
+  other base-table metrics, and with a filter that names only base-table members (see Known
+  limitations).
 - **A window or derived metric over a metric that reaches a fact across a fanning
   relationship is rejected, like the metric itself.** Querying such a metric directly
   raised a fan-trap error, but through a window metric or a derived metric it joined the

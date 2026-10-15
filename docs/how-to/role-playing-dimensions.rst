@@ -146,11 +146,13 @@ elevation and some flights:
 
 .. code-block:: sql
 
-   CREATE OR REPLACE TABLE airports (airport_code VARCHAR, city VARCHAR, elevation INTEGER);
+   CREATE OR REPLACE TABLE airports (
+       airport_code VARCHAR, city VARCHAR, country VARCHAR, elevation INTEGER
+   );
    INSERT INTO airports VALUES
-       ('DEN', 'Denver',        5434),
-       ('SFO', 'San Francisco',   13),
-       ('LHR', 'London',          83);
+       ('DEN', 'Denver',        'US', 5434),
+       ('SFO', 'San Francisco', 'US',   13),
+       ('LHR', 'London',        'UK',   83);
 
    CREATE OR REPLACE TABLE flights (
        flight_id INTEGER,

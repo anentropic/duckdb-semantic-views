@@ -7,8 +7,10 @@
 # quotes retained, while the window path looked it up by the quote-stripped,
 # case-folded key — so a quoted-name base metric missed the lookup and its
 # COUNT(*) counted NULL-extended LEFT JOIN rows (one per childless parent),
-# a silent overcount. `orders` row 3 (EU) has no line items, so the difference
-# is observable: the fixed count is 0, the buggy raw COUNT(*) would be 1.
+# a silent overcount. The line item with a NULL id (on order 2, US) makes the
+# difference observable: the fixed count for US is 3, the buggy raw COUNT(*)
+# would be 4. (Before #71, childless order 3 (EU) was the discriminator; the
+# window's inner aggregate now scans the line items directly, so EU has no row.)
 
 require semantic_views
 
