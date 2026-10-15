@@ -1,4 +1,28 @@
-// Parser extension type declarations for DuckDB >= 1.5.0 compatibility.
+// Parser extension type declarations for DuckDB >= 1.5.0 compatibility, plus
+// the small set of version-compat helpers the shim uses.
+//
+// SV_DUCKDB_2
+// -----------
+// The shim compiles against two DuckDB generations from one source:
+//
+//   * default (macro undefined): the DuckDB v1.5.x single-file amalgamation
+//     header `duckdb.hpp` in cpp/include/. That header lacks several types
+//     that only exist in duckdb.cpp, so this file re-declares them (below).
+//   * `-DSV_DUCKDB_2`: DuckDB 2.0, which ships no amalgamation. The shim is
+//     compiled against the engine's own header tree (`src/include` of the
+//     matching engine commit) and linked against DuckDB's static libraries.
+//     The full header tree has every type, so the real headers are included
+//     and nothing is re-declared.
+//
+// SV_DUCKDB_2 is the only switch. Every 2.0 difference is either confined to
+// this file (type aliases and `sv_compat::` helpers at the bottom) or is a
+// small `#ifdef SV_DUCKDB_2` block in shim.cpp where the two APIs cannot be
+// expressed through one helper. The v1.5 branches are the pre-existing code,
+// unchanged.
+//
+// ---------------------------------------------------------------------------
+// v1.5 amalgamation notes
+// ---------------------------------------------------------------------------
 //
 // In DuckDB 1.5.0, the parser extension types (ParserExtensionParseData,
 // ParserExtensionParseResult, ParserExtensionPlanResult, ParserExtension,
@@ -30,9 +54,26 @@
 
 #pragma once
 
-#include "duckdb.hpp"
 #include <cstddef>
 #include <type_traits>
+
+#ifdef SV_DUCKDB_2
+
+// DuckDB 2.0: the real declarations. capi_internal.hpp provides
+// `DatabaseWrapper` (what a C-API `duckdb_database` points at), which v1.5's
+// amalgamation header exposed directly.
+#include "duckdb.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/capi/capi_internal.hpp"
+#include "duckdb/main/extension_callback_manager.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parser_extension.hpp"
+
+#else // v1.5 amalgamation
+
+#include "duckdb.hpp"
 
 namespace duckdb {
 
@@ -290,3 +331,5 @@ private:
 };
 
 } // namespace duckdb
+
+#endif // SV_DUCKDB_2
