@@ -374,4 +374,22 @@ inline bool is_interrupted(const duckdb::ClientContext &context,
 #endif
 }
 
+// The output-column-names vector a table-function bind callback fills
+// (`table_function_bind_t`'s last parameter).
+//
+// v1.5: `vector<string>`.
+// 2.0: `vector<Identifier>`. An Identifier stores the string as given (case
+// preserved; `GetIdentifierName()` returns it unchanged) and only compares and
+// hashes case-insensitively. The binder already matched column names
+// case-insensitively in v1.5 (BindContext / `case_insensitive_set_t` in
+// BindTableFunctionInternal), so the emitted column names and their lookup
+// behave the same. Construction from `const char *` is implicit and from
+// `std::string` explicit, so callers append with `emplace_back`, which works
+// for both element types.
+#ifdef SV_DUCKDB_2
+using bind_names_t = duckdb::vector<duckdb::Identifier>;
+#else
+using bind_names_t = duckdb::vector<duckdb::string>;
+#endif
+
 } // namespace sv_compat

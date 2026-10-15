@@ -1209,7 +1209,7 @@ static unique_ptr<FunctionData> sv_create_from_yaml_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<CreateFromYamlBindData>();
     // FF-15 (code-review 2026-08-08): guard every positional argument before
     // GetValue<string>(), the same up-front check FF-4 gave every other table
@@ -1339,7 +1339,7 @@ static unique_ptr<FunctionData> sv_create_from_yaml_bind(
     sv_free_buffer(out_ptr, out_len);
 
     return_types.push_back(LogicalType::VARCHAR);
-    names.push_back("new_def");
+    names.emplace_back("new_def");
     return std::move(bd);
 }
 
@@ -1941,7 +1941,7 @@ static unique_ptr<FunctionData> sv_list_semantic_views_bind(
     ClientContext &context,
     TableFunctionBindInput & /*input*/,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     // Column layout must match the v0.9.0 Rust VTab exactly — SELECT * FROM
     // list_semantic_views() across the suite relies on byte-identical names
@@ -1991,7 +1991,7 @@ static unique_ptr<FunctionData> sv_list_terse_semantic_views_bind(
     ClientContext &context,
     TableFunctionBindInput & /*input*/,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COL_NAMES[] = {
         "created_on", "name", "kind", "database_name", "schema_name",
@@ -2034,7 +2034,7 @@ static unique_ptr<FunctionData> sv_show_semantic_dimensions_all_bind(
     ClientContext &context,
     TableFunctionBindInput & /*input*/,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name", "table_name",
@@ -2075,7 +2075,7 @@ static unique_ptr<FunctionData> sv_show_semantic_metrics_all_bind(
     ClientContext &context,
     TableFunctionBindInput & /*input*/,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name", "table_name",
@@ -2116,7 +2116,7 @@ static unique_ptr<FunctionData> sv_show_semantic_facts_all_bind(
     ClientContext &context,
     TableFunctionBindInput & /*input*/,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name", "table_name",
@@ -2158,7 +2158,7 @@ static unique_ptr<FunctionData> sv_show_semantic_materializations_all_bind(
     ClientContext &context,
     TableFunctionBindInput & /*input*/,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name",
@@ -2204,7 +2204,7 @@ static unique_ptr<FunctionData> sv_show_columns_in_semantic_view_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name", "column_name",
@@ -2230,7 +2230,7 @@ static unique_ptr<FunctionData> sv_describe_semantic_view_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "object_kind", "object_name", "parent_entity", "property", "property_value",
@@ -2255,7 +2255,7 @@ static unique_ptr<FunctionData> sv_show_semantic_dimensions_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name", "table_name",
@@ -2281,7 +2281,7 @@ static unique_ptr<FunctionData> sv_show_semantic_metrics_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name", "table_name",
@@ -2307,7 +2307,7 @@ static unique_ptr<FunctionData> sv_show_semantic_facts_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name", "table_name",
@@ -2333,7 +2333,7 @@ static unique_ptr<FunctionData> sv_show_semantic_materializations_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name",
@@ -2361,7 +2361,7 @@ static unique_ptr<FunctionData> sv_show_semantic_dimensions_for_metric_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBoolBindData>();
     return_types.push_back(LogicalType::VARCHAR);
     names.emplace_back("table_name");
@@ -2731,7 +2731,7 @@ static unique_ptr<FunctionData> sv_explain_semantic_view_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     bd->expected_cols = 1;
     return_types.push_back(LogicalType::VARCHAR);
@@ -3114,7 +3114,7 @@ static unique_ptr<FunctionData> sv_semantic_view_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     if (input.inputs.empty() || input.inputs[0].IsNull()) {
         throw BinderException(
             "semantic_view: view name is required (positional arg 0)");
@@ -3196,7 +3196,7 @@ static unique_ptr<FunctionData> sv_semantic_view_bind(
         probe, bd->columns, bd->execution_sql);
     for (idx_t i = 0; i < bd->columns.size(); ++i) {
         return_types.push_back(declared_types[i]);
-        names.push_back(bd->columns[i].name);
+        names.emplace_back(bd->columns[i].name);
     }
     return std::move(bd);
 }
