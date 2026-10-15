@@ -472,9 +472,15 @@ release:
       echo "ERROR: could not extract version from Cargo.toml" >&2
       exit 1
     fi
-    echo "Releasing v$VERSION (ref: $SHA)"
+    # --- Which description.yml key the registry builds our DuckDB pin from ---
+    TMP=$(mktemp -d)
+    gh api repos/duckdb/community-extensions/contents/.github/workflows/build.yml --jq '.content' | base64 -d > "$TMP/build.yml"
+    gh api repos/duckdb/community-extensions/contents/scripts/build.py --jq '.content' | base64 -d > "$TMP/build.py"
+    KEY=$(python3 scripts/registry_target.py key "$(cat .duckdb-version)" "$TMP/build.yml" "$TMP/build.py")
+    rm -rf "$TMP"
+    echo "Releasing v$VERSION (repo.$KEY: $SHA)"
     # --- Update description.yml in this repo ---
-    sed -i '' "s/^  ref: .*/  ref: $SHA/" description.yml
+    python3 scripts/registry_target.py set description.yml "$KEY" "$SHA"
     sed -i '' "s/^  version: .*/  version: $VERSION/" description.yml
     git add description.yml
     git commit -m "chore: update description.yml for v$VERSION release"

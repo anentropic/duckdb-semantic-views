@@ -74,28 +74,29 @@ jobs:
           echo "prev_tag=v$CUR" >> "$GITHUB_OUTPUT"
           echo "Publishing v$NEXT (previous v$CUR)"
 
-      # 2. GATE: our DuckDB pin must match the registry's build pin -------------
-      #    The registry builds every extension against a single maintainer-pinned
-      #    DuckDB version (the `DUCKDB_VERSION` default in its build.yml). Submitting
-      #    a descriptor whose source pins a newer DuckDB than the registry targets
-      #    just produces a failing registry build. Fail fast here instead.
-      - name: Gate — registry DuckDB pin equality
+      # 2. GATE: the registry must build our DuckDB pin ------------------------
+      #    The registry builds every extension against its default DuckDB
+      #    (`DUCKDB_LATEST_STABLE` in its build.yml), reading description.yml
+      #    `repo.ref`, and keeps building some older DuckDB releases, each reading
+      #    its own key (`variegata` for v1.5.6) per its scripts/build.py.
+      #    `scripts/registry_target.py` maps our pin to that key, and refuses a pin
+      #    the registry does not build, since that would only produce a failing
+      #    registry build.
+      - name: Gate — registry builds our DuckDB pin
+        id: target
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           OURS=$(cat .duckdb-version)
-          BUILD_YML=$(gh api repos/${{ env.CE_UPSTREAM }}/contents/.github/workflows/build.yml --jq '.content' | base64 -d)
-          REG=$(printf '%s\n' "$BUILD_YML" | grep -m1 'DUCKDB_VERSION:' | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?' | tail -1)
+          gh api "repos/${{ env.CE_UPSTREAM }}/contents/.github/workflows/build.yml" --jq '.content' | base64 -d > "$RUNNER_TEMP/build.yml"
+          gh api "repos/${{ env.CE_UPSTREAM }}/contents/scripts/build.py" --jq '.content' | base64 -d > "$RUNNER_TEMP/build.py"
           echo "repo pin (.duckdb-version): $OURS"
-          echo "registry pin (build.yml):  $REG"
-          if [ -z "$REG" ]; then
-            echo "::error::could not parse registry DUCKDB_VERSION from build.yml" ; exit 1
-          fi
-          if [ "$OURS" != "$REG" ]; then
-            echo "::error::repo pins $OURS but the community-extensions registry builds against $REG. Wait for the registry to roll forward to $OURS (or align the repo pin) before publishing."
+          if ! KEY=$(python3 scripts/registry_target.py key "$OURS" "$RUNNER_TEMP/build.yml" "$RUNNER_TEMP/build.py"); then
+            echo "::error::the community-extensions registry does not build DuckDB $OURS (see above)"
             exit 1
           fi
-          echo "Registry pin matches — safe to publish."
+          echo "description.yml key for $OURS: repo.$KEY"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
 
       # 3. Changelog roll + version bump in this repo --------------------------
       - name: Roll changelog and bump version
@@ -115,7 +116,8 @@ jobs:
 
       # 4. Commit + tag the release, then sync description.yml ref --------------
       #    Mirrors `just release`: the release commit is tagged, then a follow-up
-      #    commit sets description.yml `ref:` to the tagged commit's SHA.
+      #    commit points description.yml at the tagged commit's SHA, under the key
+      #    the gate chose (`ref`, or an older DuckDB line's key such as `variegata`).
       - name: Commit, tag, and push
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: |
@@ -129,7 +131,7 @@ jobs:
           SHA=$(git rev-parse HEAD)
 
           # Point description.yml at the tagged release commit, then commit that.
-          sed -i "s/^  ref: .*/  ref: $SHA/" description.yml
+          python3 scripts/registry_target.py set description.yml "${{ steps.target.outputs.key }}" "$SHA"
           git add description.yml
           git commit -m "chore: update description.yml for v$NEXT release"
 
@@ -162,12 +164,12 @@ jobs:
             --head "anentropic:$CE_BRANCH" \
             --base main \
             --title "Update semantic_views to v$NEXT" \
-            --body "Update semantic_views extension to v$NEXT (ref: ${RELEASE_SHA}). Built against the registry's current DuckDB pin."
+            --body "Update semantic_views extension to v$NEXT (repo.${{ steps.target.outputs.key }}: ${RELEASE_SHA}, for DuckDB $(cat ../.duckdb-version))."
 
       - name: Summary
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: |
           echo "### Published v${{ steps.ver.outputs.next }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- tag pushed: \`v${{ steps.ver.outputs.next }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- description.yml ref: \`${RELEASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- description.yml repo.${{ steps.target.outputs.key }}: \`${RELEASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- community-extensions PR opened from \`anentropic:${CE_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
