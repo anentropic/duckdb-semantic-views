@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # /// script
-# dependencies = ["duckdb==2.0.0.dev2610011535"]
 # requires-python = ">=3.10"
 # ///
 """
@@ -19,9 +18,12 @@ does not crash. The LOAD runs in a child process so that a crash, which is what
 the unguarded extension may do, reports as a failure with its exit status
 instead of killing the test.
 
-When the build moves to a new DuckDB, point the pin above at a release other
-than the new one (the old release works). The check below refuses to run the
-test against the version we build for, since it would then prove nothing.
+The host DuckDB is not pinned in this file's header, because every header pin
+must equal `.duckdb-version`. Run it with `just test-load-version-guard`, which
+supplies the host with `uv run --with`; when the build moves to a new DuckDB,
+point that pin at a release other than the new one. The check below refuses to
+run the test against the version we build for, since it would then prove
+nothing.
 
 Exit codes:
     0 = test passed
@@ -62,7 +64,8 @@ def test_mismatched_host_refuses_to_load():
     host = duckdb.sql("SELECT library_version FROM pragma_version()").fetchone()[0]
     assert host != built, (
         f"this test needs a host DuckDB other than {built}, the version we build "
-        f"for; it is running under {host}. Update the pin at the top of the file."
+        f"for; it is running under {host}. Run it through `just test-load-version-guard`, "
+        "or update the host pin in that recipe."
     )
 
     child = subprocess.run(

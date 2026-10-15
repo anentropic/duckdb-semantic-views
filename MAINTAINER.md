@@ -454,7 +454,7 @@ The DuckDB version is pinned in a single source of truth: **`.duckdb-version`** 
 | `cpp/include/duckdb.{hpp,cpp}` | Installed by `scripts/ensure_amalgamation.py` — generated from the engine tree in `./duckdb` when a harness supplied one, else downloaded from the release for `.duckdb-version`; verified against it either way |
 | `Cargo.toml` | `duckdb` and `libduckdb-sys` `"=X.Y.Z"` — updated by monitor workflow |
 | `src/lib.rs` | `MINIMUM_DUCKDB_VERSION` — the version declared to DuckDB at extension init; updated by monitor workflow |
-| `test/**/*.py`, `configure/*.py` | PEP 723 `"duckdb==X.Y.Z"` — updated by monitor workflow |
+| `test/**/*.py`, `configure/*.py` | PEP 723 `"duckdb==X.Y.Z"` — updated by monitor workflow. One deliberate exception: `test_load_version_guard.py` needs a host *other* than `.duckdb-version`, so it has no header pin; its host comes from `uv run --with duckdb==…` in the `test-load-version-guard` recipe, which neither the monitor nor the pin test touches. Point it at a release other than the new one on each bump. |
 | `.github/workflows/BuildAll.yml` | `uses:` tag, `duckdb_version`, `ci_tools_version` — updated by monitor workflow |
 | `.github/workflows/BuildQuick.yml` | `uses:` tag, `duckdb_version`, `ci_tools_version` — updated by monitor workflow |
 | `extension-ci-tools` submodule | Checked out to the `vX.Y.Z` branch of `duckdb/extension-ci-tools` — updated by monitor workflow. Supplies the makefiles local `make` uses; CI's platform builds fetch `ci_tools_version` independently, so drift here shows up as a local-vs-CI build difference rather than a red check. |

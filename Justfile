@@ -224,9 +224,13 @@ test-load-idempotent: build
 
 # A DuckDB other than the one we build for must refuse `LOAD semantic_views`
 # with the load-time version check's message, not crash (see src/load_guard.rs).
-# Runs under a DuckDB 2.0 development build from PyPI.
+# Runs under a DuckDB 2.0 development build from PyPI. That host pin lives here and
+# not in the script's PEP 723 header on purpose: every header pin must equal
+# .duckdb-version (tests::duckdb_derived_pins_agree) and the version monitor rewrites
+# them all, while this one must differ from it. When the build moves to a new DuckDB,
+# point it at a release other than the new one (at 2.0 GA: the last 1.5 release).
 test-load-version-guard: build
-    uv run test/integration/test_load_version_guard.py
+    uv run --with duckdb==2.0.0.dev2610011535 test/integration/test_load_version_guard.py
 
 # CREATE SEMANTIC VIEW ... FROM YAML FILE under the v0.10.0 read-elimination
 # architecture (Phase 65 Plan 04 D-11): OR REPLACE / IF NOT EXISTS, friendly
