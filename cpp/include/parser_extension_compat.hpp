@@ -460,4 +460,120 @@ inline duckdb::unique_ptr<materialized_result_t> take_materialized(duckdb::uniqu
 #endif
 }
 
+// Function registration.
+//
+// A function's name: v1.5 `string`; 2.0 `Identifier` (explicitly constructed
+// from a runtime string; the stored name is the string as given).
+#ifdef SV_DUCKDB_2
+using function_name_t = duckdb::Identifier;
+#else
+using function_name_t = duckdb::string;
+#endif
+
+inline function_name_t function_name(const std::string &name) {
+	return function_name_t(name);
+}
+
+// Declare an optional named parameter `name := <type>` on a table function.
+//
+// v1.5: an entry in `TableFunction::named_parameters` (a case-insensitive
+// name -> type map). The binder rejects names not in the map ("Invalid named
+// parameter"), casts a passed value with DefaultCastAs, and hands only the
+// parameters the call passed to the bind callback, in
+// `TableFunctionBindInput::named_parameters` (case-insensitive lookup).
+// 2.0: `named_parameters` is gone; a function's parameters live in its
+// `FunctionSignature`. The equivalent of the v1.5 map is the schema of a typed
+// "**kwargs" parameter (`TypedKwargs`), which is what DuckDB's own table
+// functions (read_csv, duckdb_settings, ...) moved their v1.5 named parameters
+// to: an option the call leaves out is not passed, a passed one is cast to the
+// option's type like an explicit cast (`PlaceOption` -> TryCastAs), an unknown
+// name is rejected with "Invalid named parameter", and the bind callback finds
+// it in `TableFunctionBindInput::named_parameters` keyed by the option's name
+// (Identifier: case-insensitive). The "**options" parameter itself is variadic,
+// so duckdb_functions() does not list it; it lists the options after the
+// positional parameters, in the order they were added.
+// (A keyword-only parameter would not do: without a default it is required,
+// and with one the bind callback would always receive it.)
+inline void add_named_parameter(duckdb::TableFunction &function, const std::string &name,
+                                const duckdb::LogicalType &type) {
+#ifdef SV_DUCKDB_2
+	auto add = [&](duckdb::TypedKwargs &options) { options.Add(duckdb::Identifier(name), type); };
+	auto &signature = function.GetSignature();
+	if (signature.GetTypedKwargs()) {
+		signature.ExtendTypedKwargs(add);
+	} else {
+		signature.WithTypedKwargs("options", add);
+	}
+#else
+	function.named_parameters[name] = type;
+#endif
+}
+
+// The names of `info`'s (single) table function's named parameters, in the
+// order duckdb_functions() renders them after the positional parameters.
+//
+// v1.5: duckdb_functions() iterates `named_parameters` (an unordered_map) of a
+// by-value copy of the catalog entry's function, and libc++ reverses that
+// iteration order on every copy; a `GetFunctionByOffset` copy of the info's
+// function iterates exactly like DuckDB's rendering copy (see the call site in
+// shim.cpp for the full reasoning).
+// 2.0: the options of the "**kwargs" schema, in insertion order, which is
+// exactly what duckdb_functions() (`AddOptions`) lists.
+inline duckdb::vector<std::string> rendered_named_parameters(duckdb::CreateTableFunctionInfo &info) {
+	duckdb::vector<std::string> names;
+#ifdef SV_DUCKDB_2
+	auto options = info.functions.GetFunctionByOffset(0)->GetSignature().GetTypedKwargs();
+	if (options) {
+		for (const auto &option : options->GetOptions()) {
+			names.push_back(option.name.GetIdentifierName());
+		}
+	}
+#else
+	const duckdb::TableFunction rendered = info.functions.GetFunctionByOffset(0);
+	for (const auto &np : rendered.named_parameters) {
+		names.push_back(np.first);
+	}
+#endif
+	return names;
+}
+
+// Give a function's positional parameters the documented names.
+//
+// v1.5: positional parameters are bare types; duckdb_functions() takes their
+// names from the FunctionDescription's `parameter_names`, so this is a no-op.
+// 2.0: positional parameters are named in the signature (`col0`, `col1`, ...
+// when built from a type list, as here), and duckdb_functions() reports those
+// names, falling back to the description's only when the counts disagree —
+// which they never do. So the documented names must be set on the signature
+// to render as before. The parameters stay positional-only, so, as in v1.5, a
+// caller still cannot pass them by name.
+#ifdef SV_DUCKDB_2
+template <class FUNCTION>
+inline void name_positional_parameters_of(FUNCTION &function, const duckdb::vector<duckdb::string> &names) {
+	auto &signature = function.GetSignature();
+	const auto count = signature.GetPositionalParameterCount();
+	for (duckdb::idx_t i = 0; i < count && i < names.size(); i++) {
+		signature.GetParameter(i).SetName(duckdb::Identifier(names[i]));
+	}
+}
+#endif
+
+inline void name_positional_parameters(duckdb::TableFunction &function, const duckdb::vector<duckdb::string> &names) {
+#ifdef SV_DUCKDB_2
+	name_positional_parameters_of(function, names);
+#else
+	(void)function;
+	(void)names;
+#endif
+}
+
+inline void name_positional_parameters(duckdb::ScalarFunctionSet &set, const duckdb::vector<duckdb::string> &names) {
+#ifdef SV_DUCKDB_2
+	set.ApplyToFunctions([&](duckdb::ScalarFunction &function) { name_positional_parameters_of(function, names); });
+#else
+	(void)set;
+	(void)names;
+#endif
+}
+
 } // namespace sv_compat

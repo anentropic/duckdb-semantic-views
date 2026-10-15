@@ -759,18 +759,17 @@ static FunctionDescription sv_base_description(const SvFunctionDoc &doc) {
     return desc;
 }
 
-// Build the description for a table function. `rendered` must be a copy of
-// the registered function made exactly as duckdb_functions() makes one (see
-// the call site): DuckDB lists the named parameters by iterating that copy's
-// `named_parameters` map, so the names are appended in the same iteration to
-// stay aligned with `parameter_types`.
+// Build the description for a table function. `named_parameter_names` must
+// list the named parameters in the order duckdb_functions() renders them (see
+// `sv_compat::rendered_named_parameters` and its call site), so the names are
+// appended in the same order and stay aligned with `parameter_types`.
 static FunctionDescription sv_table_function_description(
-    const SvFunctionDoc &doc, const TableFunction &rendered) {
+    const SvFunctionDoc &doc, const std::vector<std::string> &named_parameter_names) {
     auto desc = sv_base_description(doc);
     bool has_search_path = false;
-    for (const auto &np : rendered.named_parameters) {
-        desc.parameter_names.push_back(np.first);
-        has_search_path = has_search_path || np.first == "search_path";
+    for (const auto &np_name : named_parameter_names) {
+        desc.parameter_names.push_back(np_name);
+        has_search_path = has_search_path || np_name == "search_path";
     }
     if (has_search_path) {
         desc.description += SV_SEARCH_PATH_NOTE;
@@ -896,7 +895,7 @@ static bool sv_register_table_function_core(
         // init_global, init_local). Exactly one init callback is non-null
         // (enforced above); the other is nullptr.
         TableFunction tf(
-            std::string(spec.name),
+            sv_compat::function_name(spec.name),
             std::move(args),
             spec.exec_cb,
             spec.bind_cb,
@@ -904,7 +903,7 @@ static bool sv_register_table_function_core(
             spec.init_local_cb);
 
         for (const auto &np : spec.named_params) {
-            tf.named_parameters[np.first] = np.second;
+            sv_compat::add_named_parameter(tf, np.first, np.second);
         }
 
         const SvFunctionDoc *doc = sv_function_doc(spec.name);
@@ -914,6 +913,9 @@ static bool sv_register_table_function_core(
                 "sv_function_docs in cpp/src/shim.cpp)");
             return false;
         }
+        // DuckDB 2.0 renders a table function's parameter names from its
+        // signature (no-op on v1.5, which takes them from the description).
+        sv_compat::name_positional_parameters(tf, doc->positional_names);
 
         CreateTableFunctionInfo info(tf);
         // ALTER_ON_CONFLICT: extension reload replaces the registration cleanly
@@ -930,9 +932,11 @@ static bool sv_register_table_function_core(
         // GetFunctionByOffset copy of the info's function iterates exactly like
         // DuckDB's rendering copy. Iterating `info.functions.functions[0]`
         // directly is one copy short, and misaligned names and types on macOS.
-        const TableFunction rendered = info.functions.GetFunctionByOffset(0);
-        info.descriptions.push_back(
-            sv_table_function_description(*doc, rendered));
+        // (`sv_compat::rendered_named_parameters` makes that copy on v1.5; on
+        // DuckDB 2.0 named parameters are an ordered list, so there is no
+        // copy-order question.)
+        info.descriptions.push_back(sv_table_function_description(
+            *doc, sv_compat::rendered_named_parameters(info)));
 
         auto &system_catalog = Catalog::GetSystemCatalog(db);
         auto txn = CatalogTransaction::GetSystemTransaction(db);
@@ -1074,6 +1078,10 @@ static bool sv_register_scalar_function_set(
                 name);
             return false;
         }
+        // DuckDB 2.0 renders a scalar function's parameter names from each
+        // overload's signature (no-op on v1.5, which takes them from the
+        // description).
+        sv_compat::name_positional_parameters(set, doc->positional_names);
 
         CreateScalarFunctionInfo info(std::move(set));
         info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
@@ -1144,8 +1152,8 @@ extern "C" {
 
             // Braces, not parens: `ScalarFunctionSet set(std::string(name));`
             // is a function declaration (most vexing parse), not a variable.
-            ScalarFunctionSet set{std::string(name)};
-            set.AddFunction(ScalarFunction(std::string(name), std::move(args),
+            ScalarFunctionSet set{sv_compat::function_name(name)};
+            set.AddFunction(ScalarFunction(sv_compat::function_name(name), std::move(args),
                                            return_type, exec_cb));
             return sv_register_scalar_function_set(
                 db_handle, name, std::move(set), error_buf, error_buf_len);
