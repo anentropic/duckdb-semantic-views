@@ -738,9 +738,16 @@ Key fields:
 > version bump, the `[Unreleased]` → `[X.Y.Z]` changelog roll (`scripts/changelog_release.py`),
 > the tag, and the registry-pin gate. `just release` does **none** of those: it publishes
 > whatever version `Cargo.toml` already says, so running it before bumping resubmits the
-> previous release under a new `ref`. The workflow authenticates with `CE_PUBLISH_PAT`,
-> falling back to `VERSION_MONITOR_PAT`. When that token expires, this workflow and the DuckDB
-> Version Monitor both fail at `actions/checkout` with `could not read Username for 'https://github.com'`.
+> previous release under a new `ref`. The workflow pushes the release commits and tag to this
+> repo with the job's own `GITHUB_TOKEN`, and uses `CE_PUBLISH_PAT` (falling back to
+> `VERSION_MONITOR_PAT`) only to push to the `anentropic/community-extensions` fork and open the
+> registry PR. A personal token is refused for this repo since it moved to the s-layer org (the
+> first v0.14.0 run failed its push with a 403 that way). Pushes made with `GITHUB_TOKEN` don't
+> start other workflows, so the release commits get no CI run of their own; they change only
+> versions, the changelog and `description.yml`. When the PAT expires, this workflow fails at the
+> community-extensions step, and the DuckDB Version Monitor, which still checks out and opens its
+> PR with `VERSION_MONITOR_PAT`, fails at `actions/checkout` with
+> `could not read Username for 'https://github.com'`.
 >
 > The registry-pin gate and the descriptor update use `scripts/registry_target.py`, guarded by
 > `tests/registry_target_script.rs`. The registry builds its default DuckDB (`DUCKDB_LATEST_STABLE`
