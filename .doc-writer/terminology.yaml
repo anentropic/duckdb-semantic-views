@@ -175,9 +175,11 @@ conventions:
   - rule: >-
       The data_type column (and DESCRIBE's DATA_TYPE rows) reports the type the
       member's column has in a semantic_view() query, worked out when the
-      SHOW / DESCRIBE command runs (v0.14.0). It is empty only when the
-      member's source no longer binds. It was empty for views created from
-      v0.10.0 to v0.13.0; do not describe it as empty today.
+      SHOW / DESCRIBE command runs (v0.14.0). It is empty when the member
+      cannot be queried on its own: its source no longer binds, or the
+      fan-trap check rejects it (a metric aggregating a parent table's column
+      across a fan-out). It was empty for views created from v0.10.0 to
+      v0.13.0; do not describe it as empty for every member today.
   - rule: "No internal tracker IDs (TECH-DEBT #NN, RT-N, C-N) in docs/."
   - rule: >-
       American spelling (behavior, modeling, labeled, recognized). RST labels

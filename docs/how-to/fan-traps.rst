@@ -366,9 +366,12 @@ Troubleshooting
    gets no row unless a metric on the parent's own table is queried alongside.
    Earlier versions computed such a metric from the base table, so these
    numbers can differ after an upgrade. To leave orphan rows out, declare a
-   fact such as ``li.has_order AS li.order_id IS NOT NULL`` and pass
-   ``where_clause := 'has_order'``, which filters them before aggregation. See
-   :ref:`explanation-grain-orphans`.
+   dimension on the parent's key, such as ``o.order_key AS o.id``, and pass
+   ``where_clause := 'order_key IS NOT NULL'``, which filters them before
+   aggregation. It drops a line item whose ``order_id`` is ``NULL`` and one
+   whose ``order_id`` names an order that does not exist, since neither finds
+   an order to look up. Testing ``li.order_id IS NOT NULL`` instead would keep
+   the second kind. See :ref:`explanation-grain-orphans`.
 
 
 .. _howto-fan-related:

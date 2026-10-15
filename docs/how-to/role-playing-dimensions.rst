@@ -389,6 +389,13 @@ Troubleshooting
    first-declared relationship's rows. Declare the metric on the referencing
    table with ``USING`` instead. See :ref:`howto-rp-facts`.
 
+   The one exception is the base table, the first table in ``TABLES``. A metric
+   declared on it is accepted when it is queried without dimensions, alongside
+   only other base-table metrics, and with a filter (if any) that names only
+   base-table members. Nothing is joined then, so there is no relationship to
+   choose. Grouping it by a dimension, even one on the base table, or giving it
+   ``NON ADDITIVE BY`` is still rejected.
+
 **Semi-additive metric snapshotting on a role-playing dimension**
    .. versionchanged:: 0.11.0
 

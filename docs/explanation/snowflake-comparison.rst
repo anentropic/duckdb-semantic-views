@@ -353,6 +353,9 @@ is always the type a query returns for that member:
 - **When a member cannot be typed** -- its source table or column was dropped or
   renamed after ``CREATE`` -- ``data_type`` is empty for that member, and the command
   still succeeds for the rest. Querying the member reports the underlying error.
+  The same goes for a metric that cannot be queried on its own because it would
+  aggregate across a fan-out (see :ref:`howto-fan-traps`): its ``data_type`` is
+  empty, and querying it reports the fan trap.
 - **PRIVATE members** are typed too, though they cannot be queried directly.
 - **Role-played members** -- on a table that several relationships point at -- are
   typed too, although querying one needs a metric whose ``USING`` names the role. The
