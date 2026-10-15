@@ -13,10 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Loading the extension into the wrong DuckDB release now fails with a clear message
   instead of crashing.** The extension now uses DuckDB's stable C extension API and checks
-  the DuckDB version itself when it loads. A build for one DuckDB release loaded into another
-  stops with `semantic_views was built for DuckDB X and cannot run in DuckDB Y`. For a released
+  the DuckDB version itself when it loads. A build for one DuckDB release loaded into a newer
+  one stops with `semantic_views was built for DuckDB X and cannot run in DuckDB Y`. For a released
   DuckDB it also names the `FORCE INSTALL semantic_views FROM community;` command that fetches
-  the matching build.
+  the matching build, once one has been published for that DuckDB.
 
 ## [0.14.0] - 2026-10-15
 

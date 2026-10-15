@@ -31,7 +31,7 @@ pub fn check_host_version(built: &str, host: &str) -> Result<(), String> {
     let remedy = if host.contains('-') {
         "Load a semantic_views build compiled against this DuckDB."
     } else {
-        "Install the semantic_views build for this DuckDB with: \
+        "If a semantic_views build for this DuckDB has been published, install it with: \
          FORCE INSTALL semantic_views FROM community;"
     };
     Err(format!(
