@@ -1915,29 +1915,6 @@ static void sv_run_varchar_bool_bind_with_two_names(
     sv_parse_varchar_bool_payload(payload.ptr, payload.len, bd, fn_name);
 }
 
-template <typename DispatcherFn>
-static void sv_run_varchar_bool_bind(ClientContext &context,
-                                     SvVarcharBoolBindData &bd,
-                                     size_t expected_varchar_cols,
-                                     const char *fn_name,
-                                     DispatcherFn &&dispatcher) {
-    bd.expected_varchar_cols = expected_varchar_cols;
-    Connection probe(*context.db);
-    SvBindCancellationScope cancellation(context, probe);
-    duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
-    SvOwnedBuffer payload;
-    char error_buf[1024];
-    std::memset(error_buf, 0, sizeof(error_buf));
-    uint8_t rc = dispatcher(borrowed,
-                            &payload.ptr, &payload.len,
-                            error_buf, sizeof(error_buf));
-    cancellation.ThrowIfCancelled();
-    if (rc != 0) {
-        throw BinderException(std::string(fn_name) + " failed: " + error_buf);
-    }
-    sv_parse_varchar_bool_payload(payload.ptr, payload.len, bd, fn_name);
-}
-
 // ---------------------------------------------------------------------------
 // list_semantic_views — Phase 65 Plan 05 Task 1 (Wave 0 spike), folded onto
 // the generic scaffold (C-1, code-review 2026-07-11)

@@ -290,10 +290,12 @@ def _run_metadata_probe_tests(con, csv_dir) -> bool:
         n *= 2
 
     # One statement per bind helper the probes run under: the single-name SHOW,
-    # DESCRIBE, and the two-name DIMENSIONS FOR METRIC (a separate C++ helper).
+    # DESCRIBE, and the two-name DIMENSIONS FOR METRIC (a separate C++ helper),
+    # plus SHOW COLUMNS, which the docstring lists as probing too.
     single = [
         ("SHOW SEMANTIC DIMENSIONS IN <view>", one_sql),
         ("DESCRIBE SEMANTIC VIEW <view>", "DESCRIBE SEMANTIC VIEW mp_one"),
+        ("SHOW COLUMNS IN SEMANTIC VIEW <view>", "SHOW COLUMNS IN SEMANTIC VIEW mp_one"),
         (
             "SHOW SEMANTIC DIMENSIONS IN <view> FOR METRIC",
             "SHOW SEMANTIC DIMENSIONS IN mp_one FOR METRIC total",
