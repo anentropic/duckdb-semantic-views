@@ -1392,6 +1392,174 @@ fn td69_metric_on_a_single_relationship_parent_still_expands() {
     );
 }
 
+/// `role_played_fact_def` with the role-played table `a` declared FIRST, so it
+/// is the base table and both relationships point at the root.
+#[cfg(not(feature = "extension"))]
+fn role_played_base_def() -> SemanticViewDefinition {
+    let mut def = role_played_fact_def();
+    def.tables.reverse();
+    assert_eq!(def.tables[0].alias, "a");
+    def
+}
+
+/// v0.14.0 release review F1: a metric declared on the role-played table when
+/// that table is the BASE table. It is the anchor of the base-anchored `FROM`
+/// and of its own grain, so nothing joins it through a relationship and there
+/// is no role to pick. v0.13.0 answered 2 (two airports); the own-table fence
+/// rejected it as `AmbiguousMetricPath`.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn metric_on_a_role_played_base_table_over_a_raw_column_expands() {
+    let mut def = role_played_base_def();
+    def.metrics.push(metric_on("a", "n_airports", "COUNT(*)"));
+    let sql = expand("v", &def, &metrics_req(&[], &["n_airports"]))
+        .unwrap_or_else(|e| panic!("a base-table metric has no role to pick: {e}"));
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(None, 2.0)],
+        "{sql}"
+    );
+}
+
+/// The same base-table metric over the fact on its own table: 100 + 7.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn metric_on_a_role_played_base_table_over_its_own_fact_expands() {
+    let mut def = role_played_base_def();
+    def.metrics.push(metric_on("a", "any_elev", "SUM(elev)"));
+    let sql = expand("v", &def, &metrics_req(&[], &["any_elev"]))
+        .unwrap_or_else(|e| panic!("a base-table metric has no role to pick: {e}"));
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(None, 107.0)],
+        "{sql}"
+    );
+}
+
+/// CONTROL for the two above: the referencing table's metrics keep binding to
+/// the role their `USING` names when the role-played table is the base table.
+#[test]
+#[cfg(not(feature = "extension"))]
+fn using_metric_into_a_role_played_base_table_keeps_its_role() {
+    let def = role_played_base_def();
+    let sql = expand("v", &def, &metrics_req(&[], &["arr_elev"])).unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(None, 21.0)],
+        "{sql}"
+    );
+}
+
+/// A DIMENSION on the role-played base table, co-queried with a `USING`
+/// metric from the referencing table, binds to that metric's role: all three
+/// flights depart `Dep City` at elevation 100. (Test-coverage review TC1: the
+/// dimension branch was only ever exercised with the dimension on a joined
+/// table.)
+#[test]
+#[cfg(not(feature = "extension"))]
+fn dimension_on_a_role_played_base_table_binds_to_the_using_role() {
+    let def = role_played_base_def();
+    let sql = expand("v", &def, &metrics_req(&["city"], &["dep_elev"])).unwrap();
+    assert_eq!(
+        run_rows(&role_numbers_db(), &sql),
+        vec![(Some("Dep City".to_string()), 300.0)],
+        "{sql}"
+    );
+}
+
+/// `one_to_one_role_played_fact_def` with the role-played table declared
+/// first, plus a metric on it and one on the referencing table. One-to-one, so
+/// the fan-trap fence does not stand in front of the role-playing one.
+fn one_to_one_role_played_base_def() -> SemanticViewDefinition {
+    let mut def = one_to_one_role_played_fact_def();
+    def.tables.reverse();
+    def.metrics.push(metric_on("a", "n_airports", "COUNT(*)"));
+    def.metrics.push(metric_on("f", "n_flights", "COUNT(*)"));
+    def
+}
+
+/// Assert the request is rejected as ambiguous in both declaration orders.
+fn expect_base_metric_rejected_both_orders(req: &QueryRequest) {
+    for swapped in [false, true] {
+        let mut def = one_to_one_role_played_base_def();
+        if swapped {
+            def.joins.swap(0, 1);
+        }
+        expect_metric_path_ambiguity(&def, req, "n_airports");
+    }
+}
+
+/// The base-table exemption holds only while the query stays on the base
+/// table. A filter on the referencing table joins it across the role-playing
+/// relationships, through the first-declared one, so swapping their
+/// declaration order changed the answer (found by metamorphic (e) with a
+/// role-played root). Rejected, as it was before the exemption.
+#[test]
+fn base_table_metric_filtered_on_the_referencing_table_is_rejected() {
+    let mut req = metrics_req(&[], &["n_airports"]);
+    req.where_clause = Some("carrier = 'c1'".to_string());
+    expect_base_metric_rejected_both_orders(&req);
+}
+
+/// The same with a dimension on the referencing table.
+#[test]
+fn base_table_metric_grouped_by_a_referencing_table_dimension_is_rejected() {
+    expect_base_metric_rejected_both_orders(&metrics_req(&["carrier"], &["n_airports"]));
+}
+
+/// The same with a metric on the referencing table co-queried.
+#[test]
+fn base_table_metric_co_queried_with_a_referencing_table_metric_is_rejected() {
+    expect_base_metric_rejected_both_orders(&metrics_req(&[], &["n_airports", "n_flights"]));
+}
+
+/// The same through a semi-additive metric on the base table whose
+/// `NON ADDITIVE BY` dimension lives on the referencing table: that dimension
+/// is not a queried one, but the snapshot must still join its table.
+#[test]
+fn base_table_semi_additive_metric_by_a_referencing_table_dimension_is_rejected() {
+    for swapped in [false, true] {
+        let mut def = one_to_one_role_played_base_def();
+        if swapped {
+            def.joins.swap(0, 1);
+        }
+        def.metrics.push(Metric {
+            name: "last_airports".to_string(),
+            expr: "SUM(a.elevation)".to_string(),
+            source_table: Some("a".to_string()),
+            non_additive_by: vec![crate::model::NonAdditiveDim {
+                dimension: "carrier".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        match expand("v", &def, &metrics_req(&[], &["last_airports"])) {
+            Err(ExpandError::AmbiguousMetricPath { .. }) => {}
+            other => panic!("expected AmbiguousMetricPath (swapped: {swapped}), got: {other:?}"),
+        }
+    }
+}
+
+/// KNOWN GAP (TECH-DEBT #86): the same base-table dimension with only a
+/// metric on the base table, or with no metric, needs no join and so has no
+/// role to pick (the answer is each airport's own city), but the dimension
+/// check still reports it as ambiguous. Pinned so the fix flips it on purpose:
+/// it should then return one row per city with `n_airports` = 1.
+#[test]
+fn known_gap_base_table_dimension_without_a_joined_metric_is_rejected() {
+    let mut def = role_played_fact_def();
+    def.tables.reverse();
+    def.metrics.push(metric_on("a", "n_airports", "COUNT(*)"));
+    for mets in [&["n_airports"][..], &[][..]] {
+        match expand("v", &def, &metrics_req(&["city"], mets)) {
+            Err(ExpandError::AmbiguousPath {
+                dimension_table, ..
+            }) => assert_eq!(dimension_table, "a"),
+            other => panic!("TECH-DEBT #86 changed ({mets:?}); update the entry: {other:?}"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Relationship names follow DuckDB identifier rules (TECH-DEBT #28 sites).
 //

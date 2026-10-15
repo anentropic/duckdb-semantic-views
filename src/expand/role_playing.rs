@@ -211,6 +211,65 @@ pub(super) fn check_where_clause_role_playing_path(
     Ok(())
 }
 
+/// The base table's alias when every table the query touches is the base
+/// table itself: each dimension's, each base metric's, each fact they reach,
+/// each dimension a metric names (`NON ADDITIVE BY`, window partitioning and
+/// ordering) and each `where_clause` member's. `None` otherwise.
+///
+/// The base table is exempt from the metric own-table check only while the
+/// query touches no other table. It is the anchor of its own grain, never
+/// joined through a relationship, so a query that stays on it has no role to
+/// pick (v0.14.0 release review F1). Any other table, though, is reached from
+/// it across the role-playing relationships, through the first-declared one,
+/// so the exemption must not reach those queries (metamorphic (e) with a
+/// role-played root: a filter on the referencing table made a base-table
+/// metric's answer depend on declaration order).
+fn base_table_if_query_stays_on_it(
+    def: &SemanticViewDefinition,
+    resolved_dims: &[&crate::model::Dimension],
+    bases: &[&crate::model::Metric],
+    where_tables: &[&str],
+) -> Option<String> {
+    let root = def.tables.first()?.alias.to_ascii_lowercase();
+    let on_root = |t: Option<&str>| t.is_none_or(|t| t.eq_ignore_ascii_case(&root));
+    let facts_on_root = |expr: &str| {
+        collect_referenced_facts(expr, &def.facts)
+            .iter()
+            .all(|(_, t)| on_root(Some(t)))
+    };
+    let dim_on_root =
+        |d: &crate::model::Dimension| on_root(d.source_table.as_deref()) && facts_on_root(&d.expr);
+    // A dimension a metric references by name without it being queried (a
+    // `NON ADDITIVE BY` snapshot's ordering, a window's partitioning) is joined
+    // all the same. A name that does not resolve is not known to be on the root.
+    let named_dim_on_root = |name: &str| {
+        def.dimensions
+            .iter()
+            .find(|d| crate::ident::ident_matches(&d.name, name))
+            .is_some_and(dim_on_root)
+    };
+    let metric_on_root = |m: &crate::model::Metric| {
+        let window_dims = m.window_spec.iter().flat_map(|ws| {
+            ws.partition_dims
+                .iter()
+                .chain(&ws.excluding_dims)
+                .map(String::as_str)
+                .chain(ws.order_by.iter().map(|o| o.expr.as_str()))
+        });
+        on_root(m.source_table.as_deref())
+            && facts_on_root(&m.expr)
+            && m.non_additive_by
+                .iter()
+                .map(|na| na.dimension.as_str())
+                .chain(window_dims)
+                .all(named_dim_on_root)
+    };
+    let stays = resolved_dims.iter().all(|d| dim_on_root(d))
+        && bases.iter().all(|m| metric_on_root(m))
+        && where_tables.iter().all(|t| on_root(Some(t)));
+    stays.then_some(root)
+}
+
 /// Reject a dimension or metric whose expression reaches a FACT on a table that
 /// is (or is reached only through) a role-playing table, unless the member can
 /// name the role (TECH-DEBT #69 — the fence that change walks past).
@@ -241,6 +300,7 @@ pub(super) fn check_member_fact_role_playing_path(
     def: &SemanticViewDefinition,
     resolved_dims: &[&crate::model::Dimension],
     resolved_mets: &[&crate::model::Metric],
+    where_tables: &[&str],
 ) -> Result<(), ExpandError> {
     // Not `def.facts.is_empty()`: a metric on a role-played table needs no fact
     // to bind to an arbitrary role (the own-table check below).
@@ -296,6 +356,7 @@ pub(super) fn check_member_fact_role_playing_path(
         }
     }
 
+    let exempt_base = base_table_if_query_stays_on_it(def, resolved_dims, &bases, where_tables);
     for base in bases {
         let own = base.source_table.as_ref().map(|t| t.to_ascii_lowercase());
         // A metric declared ON (or below) the role-playing table is joined
@@ -304,8 +365,12 @@ pub(super) fn check_member_fact_role_playing_path(
         // originate from the metric's own table (`validate_using_relationships`),
         // so no relationship TO that table is ever nameable from it (PR #247
         // review). Checked before its fact references, which on its own table
-        // the loop below deliberately skips.
-        if let Some(own_table) = own.as_deref() {
+        // the loop below deliberately skips. The base table is exempt when the
+        // query stays on it (`exempt_base`, above).
+        if let Some(own_table) = own
+            .as_deref()
+            .filter(|t| Some(*t) != exempt_base.as_deref())
+        {
             if let Some(rp) = role_playing_on_path(view_name, def, own_table)? {
                 let available_relationships = relationships_to_table(def, &rp);
                 return Err(ExpandError::AmbiguousMetricPath {

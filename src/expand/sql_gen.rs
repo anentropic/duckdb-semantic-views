@@ -362,7 +362,13 @@ fn expand_facts(
     }
     // TECH-DEBT #69: a queried dimension's expression may reach a fact on a
     // role-playing path too (#54 inlines it), and a fact query has no USING.
-    super::role_playing::check_member_fact_role_playing_path(view_name, def, &resolved_dims, &[])?;
+    super::role_playing::check_member_fact_role_playing_path(
+        view_name,
+        def,
+        &resolved_dims,
+        &[],
+        &[],
+    )?;
 
     // 3d. EXP-10: a `where_clause` member on (or reached only through) a
     // role-playing table has no way to name its role either — the predicate is
@@ -731,11 +737,19 @@ pub fn expand(
     // TECH-DEBT #69: and the role-playing seam beside it — a referenced fact on
     // a role-playing path binds to a role only through a base metric's single
     // `USING`; anything else would join the first-declared relationship.
+    // The tables a `where_clause` joins, for the base-table exemption.
+    let where_tables: Vec<&str> = resolved_where
+        .iter()
+        .flat_map(|rw| &rw.members)
+        .flat_map(|m| m.table.iter().chain(m.fact_tables.iter()))
+        .map(String::as_str)
+        .collect();
     super::role_playing::check_member_fact_role_playing_path(
         view_name,
         def,
         &resolved_dims,
         &resolved_mets,
+        &where_tables,
     )?;
     if let Some(rw) = &resolved_where {
         super::fan_trap::check_where_clause_fan_traps(view_name, def, &rw.members, &resolved_mets)?;
