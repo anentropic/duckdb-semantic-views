@@ -1737,7 +1737,7 @@ static thread_local ClientContext *sv_bind_caller = nullptr;
 
 extern "C" bool sv_bind_caller_interrupted() {
     return sv_bind_caller != nullptr &&
-           sv_bind_caller->interrupted.load(std::memory_order_relaxed);
+           sv_compat::is_interrupted(*sv_bind_caller, std::memory_order_relaxed);
 }
 
 class SvBindCancellationScope {
@@ -1770,7 +1770,7 @@ public:
 
     // A cancelled caller is authoritative however the dispatcher ended.
     void ThrowIfCancelled() const {
-        if (outer_.interrupted.load(std::memory_order_relaxed)) {
+        if (sv_compat::is_interrupted(outer_, std::memory_order_relaxed)) {
             throw InterruptException();
         }
     }
@@ -1779,7 +1779,7 @@ private:
     void Watch() {
         std::unique_lock<std::mutex> lock(mutex_);
         while (!stop_) {
-            if (outer_.interrupted.load(std::memory_order_relaxed)) {
+            if (sv_compat::is_interrupted(outer_, std::memory_order_relaxed)) {
                 probe_.Interrupt();
             }
             wake_.wait_for(lock, std::chrono::milliseconds(10));
@@ -2996,7 +2996,7 @@ static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
     bool forwarded = false;
     PendingExecutionResult exec_result = PendingExecutionResult::RESULT_NOT_READY;
     while (!PendingQueryResult::IsResultReady(exec_result)) {
-        if (!forwarded && outer.interrupted) {
+        if (!forwarded && sv_compat::is_interrupted(outer)) {
             // Sets the inner context's flag; the inner executor picks it up at
             // its own next poll and unwinds into an INTERRUPT error, which ends
             // this loop via EXECUTION_ERROR.
@@ -3009,7 +3009,7 @@ static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
         }
     }
 
-    if (outer.interrupted) {
+    if (sv_compat::is_interrupted(outer)) {
         // The caller cancelled — authoritative however the inner query ended.
         // It may have raced to completion, or stopped on the forwarded flag.
         throw InterruptException();

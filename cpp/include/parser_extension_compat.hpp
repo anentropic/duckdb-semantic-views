@@ -333,3 +333,45 @@ private:
 } // namespace duckdb
 
 #endif // SV_DUCKDB_2
+
+//===--------------------------------------------------------------------===//
+// sv_compat — helpers that spell one operation for both DuckDB generations
+//===--------------------------------------------------------------------===//
+// Each helper's v1.5 branch is exactly the expression shim.cpp used before the
+// 2.0 port; the 2.0 branch is the replacement API, with a note on why it is
+// equivalent.
+namespace sv_compat {
+
+// Whether `context`'s current query has been interrupted (duckdb_interrupt,
+// Connection::Interrupt, Ctrl-C).
+//
+// v1.5: the public `atomic<bool> ClientContext::interrupted`, loaded with
+// `order` (callers pass what they used before).
+// 2.0: the flag became `atomic<ClientInterruptState> interrupt_state`
+// (NOT_INTERRUPTED / INTERRUPTED / INTERRUPTS_SUPPRESSED) and is read through
+// `IsInterrupted()`, a relaxed load comparing against INTERRUPTED. It is set
+// by `ClientContext::Interrupt()` (what Connection::Interrupt and
+// duckdb_interrupt call) and cleared at the same points v1.5 cleared
+// `interrupted` (InitialCleanup, new autocommit transaction, failed
+// statement). INTERRUPTS_SUPPRESSED, which DuckDB enters after an irreversible
+// step such as COMMIT, reads as "not interrupted", which is the point of it.
+// `order` has no 2.0 counterpart; a single polled flag carries no data, so the
+// relaxed load is equivalent for every caller here.
+//
+// TODO(duckdb-2.0): 2.0 adds a per-query deadline (max execution time) that
+// `ClientContext::InterruptCheck()` enforces separately from this flag, so a
+// caller whose query times out is not seen here and the timeout is not
+// forwarded to the shim's probe connections. v1.5 had no deadline, so this
+// matches v1.5 behaviour; verify at runtime whether the probe connections
+// inherit the setting or whether the deadline should be forwarded too.
+inline bool is_interrupted(const duckdb::ClientContext &context,
+                           std::memory_order order = std::memory_order_seq_cst) {
+#ifdef SV_DUCKDB_2
+	(void)order;
+	return context.IsInterrupted();
+#else
+	return context.interrupted.load(order);
+#endif
+}
+
+} // namespace sv_compat
