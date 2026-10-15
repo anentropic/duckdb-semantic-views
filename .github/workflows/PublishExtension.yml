@@ -18,9 +18,12 @@ name: Publish Extension
 #     (Settings -> Environments). This is the human gate.
 #   * Secret CE_PUBLISH_PAT: a PAT with `repo` scope that can push to your fork
 #     `anentropic/community-extensions` AND open PRs against
-#     `duckdb/community-extensions`. Falls back to VERSION_MONITOR_PAT.
-#   * If `main` is branch-protected, the token above must be allowed to push the
-#     release commits + tag to `main` (or relax protection for this actor).
+#     `duckdb/community-extensions`. Falls back to VERSION_MONITOR_PAT. It is used
+#     ONLY for that fork and PR: it is a personal token, and the s-layer org
+#     refuses it for this repo (the v0.14.0 push failed with a 403 that way).
+#   * The release commits + tag go to this repo's `main` with the job's own
+#     GITHUB_TOKEN (`contents: write` above). If `main` becomes branch-protected,
+#     allow github-actions to push to it (or relax protection for this actor).
 # ──────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -54,7 +57,10 @@ jobs:
         with:
           ref: main
           fetch-depth: 0          # need tags + full history for changelog/compare
-          token: ${{ secrets.CE_PUBLISH_PAT || secrets.VERSION_MONITOR_PAT || secrets.GITHUB_TOKEN }}
+          # This repo's own token pushes the release commits + tag. The personal
+          # CE_PUBLISH_PAT is refused for s-layer repos; it is used only below,
+          # for the community-extensions fork.
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       # 1. Resolve current + next version --------------------------------------
       - name: Resolve versions
