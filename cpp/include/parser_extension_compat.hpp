@@ -392,4 +392,29 @@ using bind_names_t = duckdb::vector<duckdb::Identifier>;
 using bind_names_t = duckdb::vector<duckdb::string>;
 #endif
 
+// Writable access to a flat vector's data and validity mask.
+//
+// v1.5: `FlatVector::GetData<T>` / `FlatVector::Validity` return mutable
+// references for a non-const Vector.
+// 2.0: those accessors return `const T *` / `const ValidityMask &`; writing
+// goes through `GetDataMutable<T>` / `ValidityMutable`, which return the same
+// buffer and mask (`Vector::BufferMutable()` vs `Buffer()` on the one
+// `buffer` member, no copy-on-write) after the same flat/constant checks.
+template <class T>
+inline T *flat_data_mut(duckdb::Vector &vector) {
+#ifdef SV_DUCKDB_2
+	return duckdb::FlatVector::GetDataMutable<T>(vector);
+#else
+	return duckdb::FlatVector::GetData<T>(vector);
+#endif
+}
+
+inline duckdb::ValidityMask &validity_mut(duckdb::Vector &vector) {
+#ifdef SV_DUCKDB_2
+	return duckdb::FlatVector::ValidityMutable(vector);
+#else
+	return duckdb::FlatVector::Validity(vector);
+#endif
+}
+
 } // namespace sv_compat

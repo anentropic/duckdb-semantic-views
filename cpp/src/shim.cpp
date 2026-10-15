@@ -2508,7 +2508,7 @@ static void sv_emit_scalar_row(Vector &result, idx_t row_idx,
     const char *out_data = payload.ptr == nullptr ? "" : payload.ptr;
     idx_t out_len = payload.ptr == nullptr ? 0 : payload.len;
     string_t out_value = StringVector::AddString(result, out_data, out_len);
-    FlatVector::GetData<string_t>(result)[row_idx] = out_value;
+    sv_compat::flat_data_mut<string_t>(result)[row_idx] = out_value;
 }
 
 // get_ddl(object_type VARCHAR, name VARCHAR [, use_fully_qualified_names
@@ -2533,14 +2533,14 @@ static void sv_get_ddl_exec(DataChunk &args, ExpressionState &state,
 
     // Only touched when the third arity was bound; `data[2]` does not exist on
     // the two-argument call.
-    bool *qualify_data = nullptr;
+    const bool *qualify_data = nullptr;
     if (has_qualify_arg) {
         auto &qualify_vec = args.data[2];
         qualify_vec.Flatten(args.size());
         qualify_data = FlatVector::GetData<bool>(qualify_vec);
     }
 
-    auto &result_validity = FlatVector::Validity(result);
+    auto &result_validity = sv_compat::validity_mut(result);
 
     Connection probe(*state.GetContext().db);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
@@ -2591,7 +2591,7 @@ static void sv_read_yaml_from_semantic_view_exec(DataChunk &args,
     name_vec.Flatten(args.size());
     auto name_data = FlatVector::GetData<string_t>(name_vec);
     auto &name_validity = FlatVector::Validity(name_vec);
-    auto &result_validity = FlatVector::Validity(result);
+    auto &result_validity = sv_compat::validity_mut(result);
 
     Connection probe(*state.GetContext().db);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
