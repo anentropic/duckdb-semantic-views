@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Decide where in description.yml a release goes for the community-extensions registry.
+
+The registry builds every extension against one default DuckDB (`DUCKDB_LATEST_STABLE`
+in its `.github/workflows/build.yml`), reading the descriptor's `repo.ref`. It also
+keeps building some older DuckDB releases, and for each of those its `scripts/build.py`
+reads a release-named key instead of `ref` when the descriptor has one, e.g.
+
+    elif os.environ['DUCKDB_VERSION'] == 'v1.5.6':
+        if 'variegata' in desc['repo']:
+            extension_ref = desc['repo']['variegata']
+
+So a release pinned to the registry's default goes in `ref`, and a release pinned to
+one of those older versions goes in that version's key. Any other pin is not built by
+the registry at all, and publishing it would only produce a failing registry build.
+
+Usage:
+    registry_target.py key <our-pin> <build.yml> <build.py>
+        Print the descriptor key (`ref`, or e.g. `variegata`). Exit 1, with the reason
+        on stderr, when the registry does not build <our-pin>.
+    registry_target.py set <description.yml> <key> <sha>
+        Point `repo.<key>` at <sha>, adding the key after `ref:` if it is missing.
+"""
+
+import re
+import sys
+
+# `DUCKDB_LATEST_STABLE: 'b15358c…'` (current layout), else the default in
+# `DUCKDB_VERSION: ${{ inputs.duckdb_version || 'v1.5.6' }}` or a bare
+# `DUCKDB_VERSION: v1.5.6` (the layout through v1.5.6).
+LATEST_STABLE = re.compile(r"^\s*DUCKDB_LATEST_STABLE:\s*['\"]?([^'\"\s]+)", re.M)
+VERSION_DEFAULT = re.compile(r"^\s*DUCKDB_VERSION:\s*(?:\$\{\{.*\|\|\s*)?['\"]?([^'\"\s}]+)", re.M)
+# One `== '<version>'` branch of build.py and the descriptor key it reads.
+VERSION_BRANCH = re.compile(
+    r"os\.environ\['DUCKDB_VERSION'\]\s*==\s*'([^']+)'\s*:\s*"
+    r"if\s+'([A-Za-z_][A-Za-z0-9_]*)'\s+in\s+desc\['repo'\]"
+)
+
+
+def registry_default(build_yml: str) -> str | None:
+    m = LATEST_STABLE.search(build_yml) or VERSION_DEFAULT.search(build_yml)
+    return m.group(1) if m else None
+
+
+def descriptor_key(pin: str, build_yml: str, build_py: str) -> str:
+    default = registry_default(build_yml)
+    if default is None:
+        raise SystemExit("could not find the registry's default DuckDB in build.yml")
+    if default == pin:
+        return "ref"
+    keys = {version: key for version, key in VERSION_BRANCH.findall(build_py)}
+    if pin in keys:
+        return keys[pin]
+    supported = ", ".join(sorted(keys)) or "none"
+    raise SystemExit(
+        f"the registry does not build DuckDB {pin}: its default is {default} and the "
+        f"older releases it builds are {supported}. Align .duckdb-version with one of "
+        "those (or wait for the registry) before publishing."
+    )
+
+
+def set_key(text: str, key: str, sha: str) -> str:
+    lines = text.splitlines(keepends=True)
+    try:
+        start = next(i for i, line in enumerate(lines) if line.rstrip() == "repo:")
+    except StopIteration:
+        raise SystemExit("description.yml has no top-level `repo:` block") from None
+    end = next(
+        (
+            i
+            for i in range(start + 1, len(lines))
+            if lines[i].strip() and not lines[i].startswith(" ")
+        ),
+        len(lines),
+    )
+    entry = re.compile(rf"^  {re.escape(key)}:")
+    for i in range(start + 1, end):
+        if entry.match(lines[i]):
+            lines[i] = f"  {key}: {sha}\n"
+            return "".join(lines)
+    ref = next((i for i in range(start + 1, end) if lines[i].startswith("  ref:")), None)
+    if ref is None:
+        raise SystemExit("description.yml `repo:` block has no `ref:`")
+    lines.insert(ref + 1, f"  {key}: {sha}\n")
+    return "".join(lines)
+
+
+def main(argv: list[str]) -> None:
+    if len(argv) == 5 and argv[1] == "key":
+        pin = argv[2].strip()
+        with open(argv[3]) as f:
+            build_yml = f.read()
+        with open(argv[4]) as f:
+            build_py = f.read()
+        print(descriptor_key(pin, build_yml, build_py))
+    elif len(argv) == 5 and argv[1] == "set":
+        path, key, sha = argv[2], argv[3], argv[4]
+        with open(path) as f:
+            text = f.read()
+        with open(path, "w") as f:
+            f.write(set_key(text, key, sha))
+    else:
+        raise SystemExit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

@@ -728,7 +728,8 @@ Key fields:
 | `license` | `MIT` | Must match LICENSE file |
 | `excluded_platforms` | semicolon-separated | Platforms we cannot support (WASM, musl, mingw, etc.) |
 | `requires_toolchains` | `rust;python3` | Build-time dependencies for CE CI |
-| `ref` | 40-char commit SHA | Points to main branch commit to build from |
+| `ref` | 40-char commit SHA | Commit the registry builds against its default DuckDB |
+| `variegata` (and other release-named keys) | 40-char commit SHA | Commit the registry builds against an older DuckDB line it still supports (`variegata` = v1.5.6); read in place of `ref` for that line |
 
 ### Submitting a New Release
 
@@ -740,6 +741,14 @@ Key fields:
 > previous release under a new `ref`. The workflow authenticates with `CE_PUBLISH_PAT`,
 > falling back to `VERSION_MONITOR_PAT`. When that token expires, this workflow and the DuckDB
 > Version Monitor both fail at `actions/checkout` with `could not read Username for 'https://github.com'`.
+>
+> The registry-pin gate and the descriptor update use `scripts/registry_target.py`, guarded by
+> `tests/registry_target_script.rs`. The registry builds its default DuckDB (`DUCKDB_LATEST_STABLE`
+> in its `build.yml`, a DuckDB 2.0 commit since October 2026) from `repo.ref`, and each older line it
+> still builds from a release-named key that its `scripts/build.py` reads instead (`variegata` for
+> v1.5.6, `andium` for v1.4.5). The gate maps `.duckdb-version` to that key and refuses a pin the
+> registry does not build; the release SHA is then written under that key, leaving `ref` as it was.
+> `just release` still writes `ref` only.
 >
 > The monitor's changelog bullet comes from `scripts/changelog_add_bullet.py`, guarded by
 > `tests/changelog_scripts.rs`. Still read the rolled section in the dry-run diff: it becomes
