@@ -2096,12 +2096,17 @@ fn generator_reaches_both_join_directions() {
         .iter()
         .filter(|c| c.grain == Some(Grain::Base))
         .count();
+    // The grain is drawn from three choices (child, base, mixed), so each
+    // single-grain cell expects about 256 / 3 = 85 cases; the deterministic
+    // sample gives 77 / 83 here and 95 / 85 for the roll-ups below. A bar of
+    // 64 (three quarters of the expectation) leaves room for a reshuffled
+    // sample without letting a cell quietly fall to a handful.
     assert!(
-        child >= 48,
+        child >= 64,
         "only {child}/256 algebra cases used the child grain"
     );
     assert!(
-        base >= 48,
+        base >= 64,
         "only {base}/256 algebra cases used the base grain"
     );
     // TECH-DEBT #71: a chain that really spans BOTH grains, so the derived
@@ -2134,7 +2139,7 @@ fn generator_reaches_both_join_directions() {
         .filter(|c| c.grain == Some(Grain::Base))
         .count();
     assert!(
-        r_child >= 48 && r_base >= 48,
+        r_child >= 64 && r_base >= 64,
         "roll-up grains are lopsided: child={r_child} base={r_base}"
     );
     let r_mixed = rollups
