@@ -59,6 +59,7 @@ src/
 ├── model.rs                   # Core data types: SemanticViewDefinition, Dimension, Metric, Fact, Relationship…
 ├── errors.rs                  # Typed error surface (ParseError + optional caret) for the CREATE/parse boundary
 ├── ident.rs                   # Identifier grammar: quoting, case-folding, qualified-name splitting
+├── load_guard.rs              # Load-time check that the host DuckDB is the release we were built for
 ├── expr_tokens.rs             # Quote/literal-aware tokenizer for stored SQL expressions (reference find/inline)
 ├── sql_lit.rs                 # SqlLit newtype — makes "forgot to escape a string literal" a compile error
 ├── util.rs                    # Shared lexical helpers (is_ident_byte, blank_sql_comments, dollar-tag grammar, QuoteState)
@@ -303,6 +304,7 @@ Fix: `rustup update stable`
 | `just test-sqllogictest-guards` | The sqllogictest wrapper itself | Drives the real `make test_debug` with a one-file `TEST_LIST` per scenario and asserts each silent-skip case — missing extension, renamed extension, zero statements executed, unparseable file, `halt`, and a query failing with an "HTTP" / "Unable to connect" error (which the runner's `ignore_error_messages` counts as a pass) — now exits non-zero with its own reason, and that a normal file and a `require windows` platform skip still exit 0. The offline scenarios drive the wrapper directly: under `SV_OFFLINE_EXTENSIONS=1` only a file passed as `--offline-excused` may hit a network error, reported as `SKIPPED` (`make` passes none; it leaves `OFFLINE_EXTENSION_TESTS` out of the list instead); any other file still fails, and the variable is refused when `CI` is set (`test/integration/test_sqllogictest_guards.py`). Part of `test-integration`. |
 | `just test-multi-statement-error` | The multi-statement DDL error (TECH-DEBT #85) | Semantic-view DDL inside a multi-statement `execute()` string must fail with the "one statement per call" message, not the misleading "parser_override is not active" one, while the real override-off case keeps its message. Part of `test-integration`. |
 | `just test-interrupt` | Query cancellation (TECH-DEBT #42) | Builds the extension and fires `con.interrupt()` from a second thread mid-query; asserts `semantic_view()` aborts early (not just eventually) and reports a bare `Interrupted!`, then the same for the SHOW / DESCRIBE member-type probes (single-view, DIMENSIONS FOR METRIC and cross-view) over a source whose bind expands thousands of globs. Part of `test-integration`. |
+| `just test-load-version-guard` | The load-time DuckDB version check | Builds the extension and `LOAD`s it, in a child process, into a DuckDB other than `.duckdb-version` (a 2.0 development build from PyPI, pinned in the script's header). Asserts the load fails with the check's message from `src/load_guard.rs` rather than loading or crashing; without the check a v1.5.6 build segfaults the 2.0 host. When the build moves to a new DuckDB, repin the script to a different release. Part of `test-integration`. |
 | `just test-legacy-schema-spelling` | Legacy-catalog migration (TECH-DEBT #44) | Builds a real pre-scoping database file (`_definitions` keyed on `name` alone), opens it through a real `LOAD`, and asserts the migration records the **catalog's** spelling of a schema rather than the row's — then that `CREATE OR REPLACE` replaces the migrated row instead of duplicating it. Part of `test-integration`. |
 | `just test-all` | Rust + SQL logic + DuckLake CI + integration | Runs `test-rust`, `test-sql`, `test-ducklake-ci`, and `test-integration` sequentially |
 
@@ -452,7 +454,7 @@ The DuckDB version is pinned in a single source of truth: **`.duckdb-version`** 
 | `cpp/include/duckdb.{hpp,cpp}` | Installed by `scripts/ensure_amalgamation.py` — generated from the engine tree in `./duckdb` when a harness supplied one, else downloaded from the release for `.duckdb-version`; verified against it either way |
 | `Cargo.toml` | `duckdb` and `libduckdb-sys` `"=X.Y.Z"` — updated by monitor workflow |
 | `src/lib.rs` | `MINIMUM_DUCKDB_VERSION` — the version declared to DuckDB at extension init; updated by monitor workflow |
-| `test/**/*.py`, `configure/*.py` | PEP 723 `"duckdb==X.Y.Z"` — updated by monitor workflow |
+| `test/**/*.py`, `configure/*.py` | PEP 723 `"duckdb==X.Y.Z"` — updated by monitor workflow. One deliberate exception: `test_load_version_guard.py` needs a host *other* than `.duckdb-version`, so it has no header pin; its host comes from `uv run --with duckdb==…` in the `test-load-version-guard` recipe, which neither the monitor nor the pin test touches. Point it at a release other than the new one on each bump. |
 | `.github/workflows/BuildAll.yml` | `uses:` tag, `duckdb_version`, `ci_tools_version` — updated by monitor workflow |
 | `.github/workflows/BuildQuick.yml` | `uses:` tag, `duckdb_version`, `ci_tools_version` — updated by monitor workflow |
 | `extension-ci-tools` submodule | Checked out to the `vX.Y.Z` branch of `duckdb/extension-ci-tools` — updated by monitor workflow. Supplies the makefiles local `make` uses; CI's platform builds fetch `ci_tools_version` independently, so drift here shows up as a local-vs-CI build difference rather than a red check. |
@@ -902,13 +904,14 @@ fn test_window_metric_type() {
 
 ## Troubleshooting
 
-### "Symbol not found" or ABI mismatch when LOADing
+### "built for DuckDB vX and cannot run in DuckDB vY", "Symbol not found" or another ABI mismatch when LOADing
 
 ```
+semantic_views was built for DuckDB v1.5.6 and cannot run in DuckDB v2.0.0, because it depends on that exact DuckDB release. ...
 Error: Catalog Error: Failed to load extension: Symbol not found
 ```
 
-**Why:** The extension was built against a different DuckDB version than the one loading it. DuckDB's ABI is not stable across minor versions, so the extension binary must match exactly.
+**Why:** The extension was built against a different DuckDB version than the one loading it. Our C++ shim depends on DuckDB internals, which change between releases, so the extension binary must match exactly. The extension declares the `C_STRUCT` ABI pinned to the v1.5.6 C API, so DuckDB itself accepts it in any newer host; the first message is our own load-time check (`src/load_guard.rs`) refusing it instead.
 
 **Fix:** Ensure the DuckDB Python package version matches the pin in `Cargo.toml`:
 

@@ -1,4 +1,28 @@
-// Parser extension type declarations for DuckDB >= 1.5.0 compatibility.
+// Parser extension type declarations for DuckDB >= 1.5.0 compatibility, plus
+// the small set of version-compat helpers the shim uses.
+//
+// SV_DUCKDB_2
+// -----------
+// The shim compiles against two DuckDB generations from one source:
+//
+//   * default (macro undefined): the DuckDB v1.5.x single-file amalgamation
+//     header `duckdb.hpp` in cpp/include/. That header lacks several types
+//     that only exist in duckdb.cpp, so this file re-declares them (below).
+//   * `-DSV_DUCKDB_2`: DuckDB 2.0, which ships no amalgamation. The shim is
+//     compiled against the engine's own header tree (`src/include` of the
+//     matching engine commit) and linked against DuckDB's static libraries.
+//     The full header tree has every type, so the real headers are included
+//     and nothing is re-declared.
+//
+// SV_DUCKDB_2 is the only switch. Every 2.0 difference is either confined to
+// this file (type aliases and `sv_compat::` helpers at the bottom) or is a
+// small `#ifdef SV_DUCKDB_2` block in shim.cpp where the two APIs cannot be
+// expressed through one helper. The v1.5 branches are the pre-existing code,
+// unchanged.
+//
+// ---------------------------------------------------------------------------
+// v1.5 amalgamation notes
+// ---------------------------------------------------------------------------
 //
 // In DuckDB 1.5.0, the parser extension types (ParserExtensionParseData,
 // ParserExtensionParseResult, ParserExtensionPlanResult, ParserExtension,
@@ -30,9 +54,26 @@
 
 #pragma once
 
-#include "duckdb.hpp"
 #include <cstddef>
 #include <type_traits>
+
+#ifdef SV_DUCKDB_2
+
+// DuckDB 2.0: the real declarations. capi_internal.hpp provides
+// `DatabaseWrapper` (what a C-API `duckdb_database` points at), which v1.5's
+// amalgamation header exposed directly.
+#include "duckdb.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/capi/capi_internal.hpp"
+#include "duckdb/main/extension_callback_manager.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parser_extension.hpp"
+
+#else // v1.5 amalgamation
+
+#include "duckdb.hpp"
 
 namespace duckdb {
 
@@ -290,3 +331,249 @@ private:
 };
 
 } // namespace duckdb
+
+#endif // SV_DUCKDB_2
+
+//===--------------------------------------------------------------------===//
+// sv_compat — helpers that spell one operation for both DuckDB generations
+//===--------------------------------------------------------------------===//
+// Each helper's v1.5 branch is exactly the expression shim.cpp used before the
+// 2.0 port; the 2.0 branch is the replacement API, with a note on why it is
+// equivalent.
+namespace sv_compat {
+
+// Whether `context`'s current query has been interrupted (duckdb_interrupt,
+// Connection::Interrupt, Ctrl-C).
+//
+// v1.5: the public `atomic<bool> ClientContext::interrupted`, loaded with
+// `order` (callers pass what they used before).
+// 2.0: the flag became `atomic<ClientInterruptState> interrupt_state`
+// (NOT_INTERRUPTED / INTERRUPTED / INTERRUPTS_SUPPRESSED) and is read through
+// `IsInterrupted()`, a relaxed load comparing against INTERRUPTED. It is set
+// by `ClientContext::Interrupt()` (what Connection::Interrupt and
+// duckdb_interrupt call) and cleared at the same points v1.5 cleared
+// `interrupted` (InitialCleanup, new autocommit transaction, failed
+// statement). INTERRUPTS_SUPPRESSED, which DuckDB enters after an irreversible
+// step such as COMMIT, reads as "not interrupted", which is the point of it.
+// `order` has no 2.0 counterpart; a single polled flag carries no data, so the
+// relaxed load is equivalent for every caller here.
+//
+// TODO(duckdb-2.0, TECH-DEBT #88): 2.0 adds a per-query deadline (max execution time) that
+// `ClientContext::InterruptCheck()` enforces separately from this flag, so a
+// caller whose query times out is not seen here and the timeout is not
+// forwarded to the shim's probe connections. v1.5 had no deadline, so this
+// matches v1.5 behaviour; verify at runtime whether the probe connections
+// inherit the setting or whether the deadline should be forwarded too.
+inline bool is_interrupted(const duckdb::ClientContext &context,
+                           std::memory_order order = std::memory_order_seq_cst) {
+#ifdef SV_DUCKDB_2
+	(void)order;
+	return context.IsInterrupted();
+#else
+	return context.interrupted.load(order);
+#endif
+}
+
+// The output-column-names vector a table-function bind callback fills
+// (`table_function_bind_t`'s last parameter).
+//
+// v1.5: `vector<string>`.
+// 2.0: `vector<Identifier>`. An Identifier stores the string as given (case
+// preserved; `GetIdentifierName()` returns it unchanged) and only compares and
+// hashes case-insensitively. The binder already matched column names
+// case-insensitively in v1.5 (BindContext / `case_insensitive_set_t` in
+// BindTableFunctionInternal), so the emitted column names and their lookup
+// behave the same. Construction from `const char *` is implicit and from
+// `std::string` explicit, so callers append with `emplace_back`, which works
+// for both element types.
+#ifdef SV_DUCKDB_2
+using bind_names_t = duckdb::vector<duckdb::Identifier>;
+#else
+using bind_names_t = duckdb::vector<duckdb::string>;
+#endif
+
+// Writable access to a flat vector's data and validity mask.
+//
+// v1.5: `FlatVector::GetData<T>` / `FlatVector::Validity` return mutable
+// references for a non-const Vector.
+// 2.0: those accessors return `const T *` / `const ValidityMask &`; writing
+// goes through `GetDataMutable<T>` / `ValidityMutable`, which return the same
+// buffer and mask (`Vector::BufferMutable()` vs `Buffer()` on the one
+// `buffer` member, no copy-on-write) after the same flat/constant checks.
+template <class T>
+inline T *flat_data_mut(duckdb::Vector &vector) {
+#ifdef SV_DUCKDB_2
+	return duckdb::FlatVector::GetDataMutable<T>(vector);
+#else
+	return duckdb::FlatVector::GetData<T>(vector);
+#endif
+}
+
+inline duckdb::ValidityMask &validity_mut(duckdb::Vector &vector) {
+#ifdef SV_DUCKDB_2
+	return duckdb::FlatVector::ValidityMutable(vector);
+#else
+	return duckdb::FlatVector::Validity(vector);
+#endif
+}
+
+// Query results.
+//
+// v1.5: `BaseQueryResult::types` / `::type` are public members, and
+// `Connection::Query` returns a `MaterializedQueryResult` that owns its rows.
+// 2.0: the members are private behind `GetTypes()` / `GetResultType()`, which
+// return the same fields. `MaterializedQueryResult` is gone: a `QueryResult`
+// that has been completed (as `Connection::Query` and the shim's
+// `sv_query_interruptible` do) owns its collected rows, is detached from its
+// connection, and serves `Fetch()` from them, so it takes the
+// MaterializedQueryResult's place unchanged. `QueryResultType::
+// MATERIALIZED_RESULT` is still what such a result reports.
+inline const duckdb::vector<duckdb::LogicalType> &result_types(const duckdb::QueryResult &result) {
+#ifdef SV_DUCKDB_2
+	return result.GetTypes();
+#else
+	return result.types;
+#endif
+}
+
+inline duckdb::QueryResultType result_type(const duckdb::QueryResult &result) {
+#ifdef SV_DUCKDB_2
+	return result.GetResultType();
+#else
+	return result.type;
+#endif
+}
+
+#ifdef SV_DUCKDB_2
+using materialized_result_t = duckdb::QueryResult;
+#else
+using materialized_result_t = duckdb::MaterializedQueryResult;
+#endif
+
+// Hand a result already checked to be MATERIALIZED_RESULT over as the
+// materialized type.
+inline duckdb::unique_ptr<materialized_result_t> take_materialized(duckdb::unique_ptr<duckdb::QueryResult> result) {
+#ifdef SV_DUCKDB_2
+	return result;
+#else
+	return duckdb::unique_ptr_cast<duckdb::QueryResult, duckdb::MaterializedQueryResult>(std::move(result));
+#endif
+}
+
+// Function registration.
+//
+// A function's name: v1.5 `string`; 2.0 `Identifier` (explicitly constructed
+// from a runtime string; the stored name is the string as given).
+#ifdef SV_DUCKDB_2
+using function_name_t = duckdb::Identifier;
+#else
+using function_name_t = duckdb::string;
+#endif
+
+inline function_name_t function_name(const std::string &name) {
+	return function_name_t(name);
+}
+
+// Declare an optional named parameter `name := <type>` on a table function.
+//
+// v1.5: an entry in `TableFunction::named_parameters` (a case-insensitive
+// name -> type map). The binder rejects names not in the map ("Invalid named
+// parameter"), casts a passed value with DefaultCastAs, and hands only the
+// parameters the call passed to the bind callback, in
+// `TableFunctionBindInput::named_parameters` (case-insensitive lookup).
+// 2.0: `named_parameters` is gone; a function's parameters live in its
+// `FunctionSignature`. The equivalent of the v1.5 map is the schema of a typed
+// "**kwargs" parameter (`TypedKwargs`), which is what DuckDB's own table
+// functions (read_csv, duckdb_settings, ...) moved their v1.5 named parameters
+// to: an option the call leaves out is not passed, a passed one is cast to the
+// option's type like an explicit cast (`PlaceOption` -> TryCastAs), an unknown
+// name is rejected with "Invalid named parameter", and the bind callback finds
+// it in `TableFunctionBindInput::named_parameters` keyed by the option's name
+// (Identifier: case-insensitive). The "**options" parameter itself is variadic,
+// so duckdb_functions() does not list it; it lists the options after the
+// positional parameters, in the order they were added.
+// (A keyword-only parameter would not do: without a default it is required,
+// and with one the bind callback would always receive it.)
+inline void add_named_parameter(duckdb::TableFunction &function, const std::string &name,
+                                const duckdb::LogicalType &type) {
+#ifdef SV_DUCKDB_2
+	auto add = [&](duckdb::TypedKwargs &options) { options.Add(duckdb::Identifier(name), type); };
+	auto &signature = function.GetSignature();
+	if (signature.GetTypedKwargs()) {
+		signature.ExtendTypedKwargs(add);
+	} else {
+		signature.WithTypedKwargs("options", add);
+	}
+#else
+	function.named_parameters[name] = type;
+#endif
+}
+
+// The names of `info`'s (single) table function's named parameters, in the
+// order duckdb_functions() renders them after the positional parameters.
+//
+// v1.5: duckdb_functions() iterates `named_parameters` (an unordered_map) of a
+// by-value copy of the catalog entry's function, and libc++ reverses that
+// iteration order on every copy; a `GetFunctionByOffset` copy of the info's
+// function iterates exactly like DuckDB's rendering copy (see the call site in
+// shim.cpp for the full reasoning).
+// 2.0: the options of the "**kwargs" schema, in insertion order, which is
+// exactly what duckdb_functions() (`AddOptions`) lists.
+inline duckdb::vector<std::string> rendered_named_parameters(duckdb::CreateTableFunctionInfo &info) {
+	duckdb::vector<std::string> names;
+#ifdef SV_DUCKDB_2
+	auto options = info.functions.GetFunctionByOffset(0)->GetSignature().GetTypedKwargs();
+	if (options) {
+		for (const auto &option : options->GetOptions()) {
+			names.push_back(option.name.GetIdentifierName());
+		}
+	}
+#else
+	const duckdb::TableFunction rendered = info.functions.GetFunctionByOffset(0);
+	for (const auto &np : rendered.named_parameters) {
+		names.push_back(np.first);
+	}
+#endif
+	return names;
+}
+
+// Give a function's positional parameters the documented names.
+//
+// v1.5: positional parameters are bare types; duckdb_functions() takes their
+// names from the FunctionDescription's `parameter_names`, so this is a no-op.
+// 2.0: positional parameters are named in the signature (`col0`, `col1`, ...
+// when built from a type list, as here), and duckdb_functions() reports those
+// names, falling back to the description's only when the counts disagree —
+// which they never do. So the documented names must be set on the signature
+// to render as before. The parameters stay positional-only, so, as in v1.5, a
+// caller still cannot pass them by name.
+#ifdef SV_DUCKDB_2
+template <class FUNCTION>
+inline void name_positional_parameters_of(FUNCTION &function, const duckdb::vector<duckdb::string> &names) {
+	auto &signature = function.GetSignature();
+	const auto count = signature.GetPositionalParameterCount();
+	for (duckdb::idx_t i = 0; i < count && i < names.size(); i++) {
+		signature.GetParameter(i).SetName(duckdb::Identifier(names[i]));
+	}
+}
+#endif
+
+inline void name_positional_parameters(duckdb::TableFunction &function, const duckdb::vector<duckdb::string> &names) {
+#ifdef SV_DUCKDB_2
+	name_positional_parameters_of(function, names);
+#else
+	(void)function;
+	(void)names;
+#endif
+}
+
+inline void name_positional_parameters(duckdb::ScalarFunctionSet &set, const duckdb::vector<duckdb::string> &names) {
+#ifdef SV_DUCKDB_2
+	set.ApplyToFunctions([&](duckdb::ScalarFunction &function) { name_positional_parameters_of(function, names); });
+#else
+	(void)set;
+	(void)names;
+#endif
+}
+
+} // namespace sv_compat

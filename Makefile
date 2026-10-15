@@ -31,10 +31,19 @@ all: configure debug
 include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
 include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
-# Override UNSTABLE_C_API_FLAG AFTER the include (base.Makefile resets it).
-# C_STRUCT_UNSTABLE ABI with C++ helper for parser hooks (Option A).
-# Rust owns the entry point (semantic_views_init_c_api), C++ helper registers hooks.
-UNSTABLE_C_API_FLAG=--abi-type C_STRUCT_UNSTABLE
+# Set UNSTABLE_C_API_FLAG AFTER the include (base.Makefile resets it).
+# C_STRUCT ABI pinned to the TARGET_DUCKDB_VERSION C API, with a C++ helper for
+# the parser hooks (Option A): Rust owns the entry point
+# (semantic_views_init_c_api), the C++ helper registers the hooks.
+#
+# Not C_STRUCT_UNSTABLE: DuckDB 2.0 loads an unstable-ABI extension only through
+# its new `_init_c_api_v2` entry point, while a C_STRUCT one pinned to the v1.5.6
+# C API loads through the entry point we already have. The cost is that DuckDB
+# no longer refuses a host whose version differs from ours. Our C++ reads host
+# objects by layout, so it needs that exact match, and the extension checks it
+# itself at load time (sv_compiled_duckdb_version in cpp/src/shim.cpp, compared
+# in src/lib.rs).
+UNSTABLE_C_API_FLAG=--abi-type C_STRUCT
 
 # Run sqllogictest through a strict wrapper instead of the bare
 # `python -m duckdb_sqllogictest` base.Makefile sets (overridden AFTER the

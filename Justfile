@@ -222,6 +222,16 @@ test-concurrent: build
 test-load-idempotent: build
     uv run test/integration/test_load_extension_twice_idempotent.py
 
+# A DuckDB other than the one we build for must refuse `LOAD semantic_views`
+# with the load-time version check's message, not crash (see src/load_guard.rs).
+# Runs under a DuckDB 2.0 development build from PyPI. That host pin lives here and
+# not in the script's PEP 723 header on purpose: every header pin must equal
+# .duckdb-version (tests::duckdb_derived_pins_agree) and the version monitor rewrites
+# them all, while this one must differ from it. When the build moves to a new DuckDB,
+# point it at a release other than the new one (at 2.0 GA: the last 1.5 release).
+test-load-version-guard: build
+    uv run --with duckdb==2.0.0.dev2610011535 test/integration/test_load_version_guard.py
+
 # CREATE SEMANTIC VIEW ... FROM YAML FILE under the v0.10.0 read-elimination
 # architecture (Phase 65 Plan 04 D-11): OR REPLACE / IF NOT EXISTS, friendly
 # error surfaces, YAML size cap, transactional rollback, get_ddl round-trip.
@@ -328,7 +338,7 @@ test-multi-statement-error: build
 # exact set the `python-integration` CI job runs (IntegrationChecks.yml) —
 # keep the two in sync by editing THIS recipe, not the workflow.
 # (test-ducklake-ci is excluded: it has its own dedicated CI job.)
-test-integration: test-legacy-schema-spelling test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-yaml-file-create test-attach-migration test-readonly-fresh-drop test-chunk-boundary test-differential test-show-scope-case test-show-scope-qualified test-get-ddl-qualified test-interrupt test-examples test-sqllogictest-guards test-multi-statement-error
+test-integration: test-legacy-schema-spelling test-vtab-crash test-caret test-adbc test-adbc-queries test-large-view test-multi-db test-readonly test-concurrent test-load-idempotent test-load-version-guard test-yaml-file-create test-attach-migration test-readonly-fresh-drop test-chunk-boundary test-differential test-show-scope-case test-show-scope-qualified test-get-ddl-qualified test-interrupt test-examples test-sqllogictest-guards test-multi-statement-error
 
 # Run all tests: Rust unit tests + SQL logic tests + DuckLake integration + all Python integration suites
 # Note: test-iceberg requires `just setup-ducklake` first. test-ducklake-ci uses synthetic data.

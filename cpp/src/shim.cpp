@@ -58,6 +58,18 @@ static_assert(sizeof(duckdb_connection) == sizeof(void*),
     "Phase 65.1 D-12");
 
 // ---------------------------------------------------------------------------
+// sv_compiled_duckdb_version -- the DuckDB release this binary was built from
+// ---------------------------------------------------------------------------
+// The version of the amalgamation compiled into this binary, which is the
+// release this file's layout assumptions hold for. The Rust entry point
+// compares it with the host's `duckdb_library_version()` before calling any
+// other function here, and refuses to load on a mismatch: the C_STRUCT ABI
+// (see the Makefile) no longer has DuckDB make that check for us.
+extern "C" const char *sv_compiled_duckdb_version() {
+    return DUCKDB_VERSION;
+}
+
+// ---------------------------------------------------------------------------
 // Rust FFI declarations (defined in src/parse.rs)
 // ---------------------------------------------------------------------------
 extern "C" {
@@ -486,8 +498,12 @@ static ParserOverrideResult sv_parser_override(
 //       syntax error, which is what rc=2 on panic used to produce.
 //   2 — not ours: DISPLAY_ORIGINAL_ERROR (let the default parser's error stand)
 //   3 — valid-but-override-disabled: actionable hint; position=0
-static ParserExtensionParseResult sv_parse_stub(
-    ParserExtensionInfo * /*info*/, const string &query) {
+//
+// `query` is one statement: v1.5 hands parse_function each `;`-separated
+// statement the default parser failed on (trimmed, `;` re-appended when it had
+// one). The registered parse_function is the version-specific `sv_parse_stub`
+// below, which feeds this.
+static ParserExtensionParseResult sv_parse_statement(const string &query) {
     // AR-7: sv_parse_function_rust no longer takes a context pointer — the
     // validation path never needed the catalog — so the SemanticViewsParserInfo
     // marker is not consulted here.
@@ -539,6 +555,88 @@ static ParserExtensionParseResult sv_parse_stub(
         }
     }
 }
+
+#ifdef SV_DUCKDB_2
+// DuckDB 2.0 changed parse_function_t from `(info, const string &query)` to
+// `(info, const vector<SimpleToken> &tokens)`: when the PEG parser fails on a
+// statement, Parser::TryParseExtensionStatement hands every parse_function the
+// token stream from the start of the failed statement to the end of the query
+// (one SimpleToken — raw source text + TokenType — per token; comments are not
+// tokens; `;` is a TERMINATOR token; an END_OF_INPUT sentinel ends it), and
+// reads the answer from `ParserExtensionParseResult::consumed_tokens` rather
+// than `type`:
+//   < 0  throw ParserException::SyntaxError(query, error, error_location) —
+//        the same call v1.5 made for DISPLAY_EXTENSION_ERROR;
+//   == 0 not claimed: the next extension is tried and then the PEG error is
+//        rethrown — v1.5's DISPLAY_ORIGINAL_ERROR;
+//   > 0  claimed (v1.5's PARSE_SUCCESSFUL), which sv_parse_statement never
+//        returns.
+//
+// So the statement text v1.5 passed is rebuilt from the tokens up to the first
+// TERMINATOR (re-appending `;` as v1.5's statement splitter did) and the result
+// mapped onto consumed_tokens.
+//
+// TODO(duckdb-2.0, TECH-DEBT #88): SimpleToken carries no source offsets or whitespace, so the
+// rebuilt text is a normalised spelling of the statement (one space between
+// tokens, none around `.` or inside brackets, no comments, newlines folded).
+// Three things can differ from v1.5 and must be checked against a 2.0 build:
+// (1) the caret: sv_parse_function_rust reports a byte offset into the rebuilt
+//     text, which DuckDB renders against the original query, so it is exact
+//     only while the statement starts at byte 0 and the original spacing up to
+//     the error matches the normalised one;
+// (2) the Rust validator sees the normalised text, so a check sensitive to
+//     spacing or comments could word its error differently;
+// (3) the Rust multi-statement hint (TECH-DEBT #85) looks the statement up as
+//     a substring of the query the override recorded, which fails when the
+//     original spacing differs, falling back to the override-inactive hint.
+// A lossless fix needs the source offsets (e.g. the original query text) in
+// the 2.0 parse_function API, or the Rust side taking tokens.
+static std::string sv_statement_from_tokens(const vector<SimpleToken> &tokens) {
+    auto glue_left = [](const std::string &t) {  // no space before these
+        return t == "." || t == "," || t == ")" || t == "]";
+    };
+    auto glue_right = [](const std::string &t) {  // no space after these
+        return t == "." || t == "(" || t == "[";
+    };
+    std::string text;
+    const std::string *prev = nullptr;
+    for (const auto &token : tokens) {
+        if (token.type == TokenType::END_OF_INPUT ||
+            token.type == TokenType::END_OF_INPUT_AUTOCOMPLETE) {
+            break;
+        }
+        if (token.type == TokenType::TERMINATOR) {
+            text += ';';
+            break;
+        }
+        if (token.type == TokenType::COMMENT) {
+            continue;  // the tokenizer drops comments; defensive
+        }
+        if (prev != nullptr && !glue_right(*prev) && !glue_left(token.text)) {
+            text += ' ';
+        }
+        text += token.text;
+        prev = &token.text;
+    }
+    return text;
+}
+
+static ParserExtensionParseResult sv_parse_stub(
+    ParserExtensionInfo * /*info*/, const vector<SimpleToken> &tokens) {
+    auto result = sv_parse_statement(sv_statement_from_tokens(tokens));
+    // DISPLAY_EXTENSION_ERROR -> throw; DISPLAY_ORIGINAL_ERROR keeps the
+    // default 0 (not claimed). PARSE_SUCCESSFUL is never produced.
+    if (result.type == ParserExtensionResultType::DISPLAY_EXTENSION_ERROR) {
+        result.consumed_tokens = -1;
+    }
+    return result;
+}
+#else
+static ParserExtensionParseResult sv_parse_stub(
+    ParserExtensionInfo * /*info*/, const string &query) {
+    return sv_parse_statement(query);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Plan-function hook: sv_plan_unreachable  (Phase 62 Plan 03)
@@ -747,18 +845,17 @@ static FunctionDescription sv_base_description(const SvFunctionDoc &doc) {
     return desc;
 }
 
-// Build the description for a table function. `rendered` must be a copy of
-// the registered function made exactly as duckdb_functions() makes one (see
-// the call site): DuckDB lists the named parameters by iterating that copy's
-// `named_parameters` map, so the names are appended in the same iteration to
-// stay aligned with `parameter_types`.
+// Build the description for a table function. `named_parameter_names` must
+// list the named parameters in the order duckdb_functions() renders them (see
+// `sv_compat::rendered_named_parameters` and its call site), so the names are
+// appended in the same order and stay aligned with `parameter_types`.
 static FunctionDescription sv_table_function_description(
-    const SvFunctionDoc &doc, const TableFunction &rendered) {
+    const SvFunctionDoc &doc, const std::vector<std::string> &named_parameter_names) {
     auto desc = sv_base_description(doc);
     bool has_search_path = false;
-    for (const auto &np : rendered.named_parameters) {
-        desc.parameter_names.push_back(np.first);
-        has_search_path = has_search_path || np.first == "search_path";
+    for (const auto &np_name : named_parameter_names) {
+        desc.parameter_names.push_back(np_name);
+        has_search_path = has_search_path || np_name == "search_path";
     }
     if (has_search_path) {
         desc.description += SV_SEARCH_PATH_NOTE;
@@ -884,7 +981,7 @@ static bool sv_register_table_function_core(
         // init_global, init_local). Exactly one init callback is non-null
         // (enforced above); the other is nullptr.
         TableFunction tf(
-            std::string(spec.name),
+            sv_compat::function_name(spec.name),
             std::move(args),
             spec.exec_cb,
             spec.bind_cb,
@@ -892,7 +989,7 @@ static bool sv_register_table_function_core(
             spec.init_local_cb);
 
         for (const auto &np : spec.named_params) {
-            tf.named_parameters[np.first] = np.second;
+            sv_compat::add_named_parameter(tf, np.first, np.second);
         }
 
         const SvFunctionDoc *doc = sv_function_doc(spec.name);
@@ -902,6 +999,9 @@ static bool sv_register_table_function_core(
                 "sv_function_docs in cpp/src/shim.cpp)");
             return false;
         }
+        // DuckDB 2.0 renders a table function's parameter names from its
+        // signature (no-op on v1.5, which takes them from the description).
+        sv_compat::name_positional_parameters(tf, doc->positional_names);
 
         CreateTableFunctionInfo info(tf);
         // ALTER_ON_CONFLICT: extension reload replaces the registration cleanly
@@ -918,9 +1018,11 @@ static bool sv_register_table_function_core(
         // GetFunctionByOffset copy of the info's function iterates exactly like
         // DuckDB's rendering copy. Iterating `info.functions.functions[0]`
         // directly is one copy short, and misaligned names and types on macOS.
-        const TableFunction rendered = info.functions.GetFunctionByOffset(0);
-        info.descriptions.push_back(
-            sv_table_function_description(*doc, rendered));
+        // (`sv_compat::rendered_named_parameters` makes that copy on v1.5; on
+        // DuckDB 2.0 named parameters are an ordered list, so there is no
+        // copy-order question.)
+        info.descriptions.push_back(sv_table_function_description(
+            *doc, sv_compat::rendered_named_parameters(info)));
 
         auto &system_catalog = Catalog::GetSystemCatalog(db);
         auto txn = CatalogTransaction::GetSystemTransaction(db);
@@ -1062,6 +1164,10 @@ static bool sv_register_scalar_function_set(
                 name);
             return false;
         }
+        // DuckDB 2.0 renders a scalar function's parameter names from each
+        // overload's signature (no-op on v1.5, which takes them from the
+        // description).
+        sv_compat::name_positional_parameters(set, doc->positional_names);
 
         CreateScalarFunctionInfo info(std::move(set));
         info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
@@ -1132,8 +1238,8 @@ extern "C" {
 
             // Braces, not parens: `ScalarFunctionSet set(std::string(name));`
             // is a function declaration (most vexing parse), not a variable.
-            ScalarFunctionSet set{std::string(name)};
-            set.AddFunction(ScalarFunction(std::string(name), std::move(args),
+            ScalarFunctionSet set{sv_compat::function_name(name)};
+            set.AddFunction(ScalarFunction(sv_compat::function_name(name), std::move(args),
                                            return_type, exec_cb));
             return sv_register_scalar_function_set(
                 db_handle, name, std::move(set), error_buf, error_buf_len);
@@ -1197,7 +1303,7 @@ static unique_ptr<FunctionData> sv_create_from_yaml_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<CreateFromYamlBindData>();
     // FF-15 (code-review 2026-08-08): guard every positional argument before
     // GetValue<string>(), the same up-front check FF-4 gave every other table
@@ -1327,7 +1433,7 @@ static unique_ptr<FunctionData> sv_create_from_yaml_bind(
     sv_free_buffer(out_ptr, out_len);
 
     return_types.push_back(LogicalType::VARCHAR);
-    names.push_back("new_def");
+    names.emplace_back("new_def");
     return std::move(bd);
 }
 
@@ -1725,7 +1831,7 @@ static thread_local ClientContext *sv_bind_caller = nullptr;
 
 extern "C" bool sv_bind_caller_interrupted() {
     return sv_bind_caller != nullptr &&
-           sv_bind_caller->interrupted.load(std::memory_order_relaxed);
+           sv_compat::is_interrupted(*sv_bind_caller, std::memory_order_relaxed);
 }
 
 class SvBindCancellationScope {
@@ -1758,7 +1864,7 @@ public:
 
     // A cancelled caller is authoritative however the dispatcher ended.
     void ThrowIfCancelled() const {
-        if (outer_.interrupted.load(std::memory_order_relaxed)) {
+        if (sv_compat::is_interrupted(outer_, std::memory_order_relaxed)) {
             throw InterruptException();
         }
     }
@@ -1767,7 +1873,7 @@ private:
     void Watch() {
         std::unique_lock<std::mutex> lock(mutex_);
         while (!stop_) {
-            if (outer_.interrupted.load(std::memory_order_relaxed)) {
+            if (sv_compat::is_interrupted(outer_, std::memory_order_relaxed)) {
                 probe_.Interrupt();
             }
             wake_.wait_for(lock, std::chrono::milliseconds(10));
@@ -1929,7 +2035,7 @@ static unique_ptr<FunctionData> sv_list_semantic_views_bind(
     ClientContext &context,
     TableFunctionBindInput & /*input*/,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     // Column layout must match the v0.9.0 Rust VTab exactly — SELECT * FROM
     // list_semantic_views() across the suite relies on byte-identical names
@@ -1979,7 +2085,7 @@ static unique_ptr<FunctionData> sv_list_terse_semantic_views_bind(
     ClientContext &context,
     TableFunctionBindInput & /*input*/,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COL_NAMES[] = {
         "created_on", "name", "kind", "database_name", "schema_name",
@@ -2022,7 +2128,7 @@ static unique_ptr<FunctionData> sv_show_semantic_dimensions_all_bind(
     ClientContext &context,
     TableFunctionBindInput & /*input*/,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name", "table_name",
@@ -2063,7 +2169,7 @@ static unique_ptr<FunctionData> sv_show_semantic_metrics_all_bind(
     ClientContext &context,
     TableFunctionBindInput & /*input*/,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name", "table_name",
@@ -2104,7 +2210,7 @@ static unique_ptr<FunctionData> sv_show_semantic_facts_all_bind(
     ClientContext &context,
     TableFunctionBindInput & /*input*/,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name", "table_name",
@@ -2146,7 +2252,7 @@ static unique_ptr<FunctionData> sv_show_semantic_materializations_all_bind(
     ClientContext &context,
     TableFunctionBindInput & /*input*/,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name",
@@ -2192,7 +2298,7 @@ static unique_ptr<FunctionData> sv_show_columns_in_semantic_view_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name", "column_name",
@@ -2218,7 +2324,7 @@ static unique_ptr<FunctionData> sv_describe_semantic_view_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "object_kind", "object_name", "parent_entity", "property", "property_value",
@@ -2243,7 +2349,7 @@ static unique_ptr<FunctionData> sv_show_semantic_dimensions_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name", "table_name",
@@ -2269,7 +2375,7 @@ static unique_ptr<FunctionData> sv_show_semantic_metrics_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name", "table_name",
@@ -2295,7 +2401,7 @@ static unique_ptr<FunctionData> sv_show_semantic_facts_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name", "table_name",
@@ -2321,7 +2427,7 @@ static unique_ptr<FunctionData> sv_show_semantic_materializations_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     static const char *const COLS[] = {
         "database_name", "schema_name", "semantic_view_name",
@@ -2349,7 +2455,7 @@ static unique_ptr<FunctionData> sv_show_semantic_dimensions_for_metric_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBoolBindData>();
     return_types.push_back(LogicalType::VARCHAR);
     names.emplace_back("table_name");
@@ -2496,7 +2602,7 @@ static void sv_emit_scalar_row(Vector &result, idx_t row_idx,
     const char *out_data = payload.ptr == nullptr ? "" : payload.ptr;
     idx_t out_len = payload.ptr == nullptr ? 0 : payload.len;
     string_t out_value = StringVector::AddString(result, out_data, out_len);
-    FlatVector::GetData<string_t>(result)[row_idx] = out_value;
+    sv_compat::flat_data_mut<string_t>(result)[row_idx] = out_value;
 }
 
 // get_ddl(object_type VARCHAR, name VARCHAR [, use_fully_qualified_names
@@ -2521,14 +2627,14 @@ static void sv_get_ddl_exec(DataChunk &args, ExpressionState &state,
 
     // Only touched when the third arity was bound; `data[2]` does not exist on
     // the two-argument call.
-    bool *qualify_data = nullptr;
+    const bool *qualify_data = nullptr;
     if (has_qualify_arg) {
         auto &qualify_vec = args.data[2];
         qualify_vec.Flatten(args.size());
         qualify_data = FlatVector::GetData<bool>(qualify_vec);
     }
 
-    auto &result_validity = FlatVector::Validity(result);
+    auto &result_validity = sv_compat::validity_mut(result);
 
     Connection probe(*state.GetContext().db);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
@@ -2579,7 +2685,7 @@ static void sv_read_yaml_from_semantic_view_exec(DataChunk &args,
     name_vec.Flatten(args.size());
     auto name_data = FlatVector::GetData<string_t>(name_vec);
     auto &name_validity = FlatVector::Validity(name_vec);
-    auto &result_validity = FlatVector::Validity(result);
+    auto &result_validity = sv_compat::validity_mut(result);
 
     Connection probe(*state.GetContext().db);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
@@ -2719,7 +2825,7 @@ static unique_ptr<FunctionData> sv_explain_semantic_view_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     auto bd = make_uniq<SvVarcharBindData>();
     bd->expected_cols = 1;
     return_types.push_back(LogicalType::VARCHAR);
@@ -2931,7 +3037,7 @@ struct SemanticViewGlobalState : public GlobalTableFunctionState {
     // same global state. If a future change overrides `MaxThreads()` to allow
     // parallel scans, the `Fetch()` cursor must be guarded (mutex, or a
     // per-thread local state) or it will data-race.
-    std::unique_ptr<MaterializedQueryResult> result;
+    std::unique_ptr<sv_compat::materialized_result_t> result;
 };
 
 // Run `sql` on `probe` the way `Connection::Query` would, but polling the OUTER
@@ -2971,9 +3077,70 @@ struct SemanticViewGlobalState : public GlobalTableFunctionState {
 // `HasError()` handling. The one behavioural difference: a *multi*-statement
 // string would be rejected ("Cannot prepare multiple statements at once!")
 // instead of executed. `execution_sql` is always a single generated SELECT.
+//
+// DuckDB 2.0 (SV_DUCKDB_2) removed PendingQuery / PendingQueryResult /
+// MaterializedQueryResult: a single `QueryResult` handle now carries the
+// execution. `Connection::Submit` replaces `PendingQuery` (same single-statement
+// restriction, same error-carrying result on a parse/bind failure);
+// `QueryResult::ExecuteTask` / `WaitForTask` replace the pending result's; and
+// `QueryResult::Complete` collects the rows and ends the query, after which the
+// handle is detached from `probe` and serves `Fetch()` from its own collection —
+// the role `pending->Execute()` and MaterializedQueryResult had. The loop below
+// is the one `Connection::Query` runs internally in 2.0
+// (`QueryResult::CompleteInternal`): ResultEagerness::FORCED settles retention
+// at submission exactly as `Connection::Query` does, so READY is waited on like
+// BLOCKED and only a terminal state (FINISHED / EXECUTION_ERROR) ends it.
 static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
                                                       ClientContext &outer,
                                                       const std::string &sql) {
+#ifdef SV_DUCKDB_2
+    QueryParameters parameters;
+    parameters.result_eagerness = ResultEagerness::FORCED;
+    auto result = probe.Submit(sql, parameters);
+    if (result->HasError()) {
+        // Parse/bind failure — nothing has executed. Same shape
+        // Connection::Query hands back for the identical failure.
+        return make_uniq<QueryResult>(result->GetErrorObject());
+    }
+
+    bool forwarded = false;
+    // A query whose custom result collector builds its own result is run to
+    // completion inside Submit and comes back already detached; there is
+    // nothing left to drive.
+    QueryResultState state =
+        result->IsOpen() ? QueryResultState::NOT_READY : QueryResultState::FINISHED;
+    while (!IsTerminal(state)) {
+        if (!forwarded && sv_compat::is_interrupted(outer)) {
+            // Sets the inner context's flag; the inner executor picks it up at
+            // its own next poll (2.0's ExecuteTask also checks it before running
+            // a task) and unwinds into an INTERRUPT error, which ends this loop
+            // via EXECUTION_ERROR.
+            forwarded = true;
+            probe.Interrupt();
+        }
+        state = result->ExecuteTask();
+        if (state == QueryResultState::BLOCKED || state == QueryResultState::READY) {
+            result->WaitForTask();
+        }
+    }
+
+    if (sv_compat::is_interrupted(outer)) {
+        // The caller cancelled — authoritative however the inner query ended.
+        // It may have raced to completion, or stopped on the forwarded flag.
+        throw InterruptException();
+    }
+    if (result->HasError()) {
+        return make_uniq<QueryResult>(result->GetErrorObject());
+    }
+    // Collect the rows and end the query on `probe`; a commit failure lands on
+    // the result as an error, as it did from pending->Execute().
+    result->Complete();
+    // TODO(duckdb-2.0, TECH-DEBT #88): this loop is read from the dev-build sources
+    // (QueryResult::CompleteInternal); run the semantic_view cancellation tests
+    // against a 2.0 build to confirm interrupt latency and that a cancelled
+    // query still surfaces as a bare "Interrupted!".
+    return result;
+#else
     auto pending = probe.PendingQuery(sql);
     if (pending->HasError()) {
         // Parse/bind failure — nothing has executed. Same shape
@@ -2984,7 +3151,7 @@ static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
     bool forwarded = false;
     PendingExecutionResult exec_result = PendingExecutionResult::RESULT_NOT_READY;
     while (!PendingQueryResult::IsResultReady(exec_result)) {
-        if (!forwarded && outer.interrupted) {
+        if (!forwarded && sv_compat::is_interrupted(outer)) {
             // Sets the inner context's flag; the inner executor picks it up at
             // its own next poll and unwinds into an INTERRUPT error, which ends
             // this loop via EXECUTION_ERROR.
@@ -2997,7 +3164,7 @@ static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
         }
     }
 
-    if (outer.interrupted) {
+    if (sv_compat::is_interrupted(outer)) {
         // The caller cancelled — authoritative however the inner query ended.
         // It may have raced to completion, or stopped on the forwarded flag.
         throw InterruptException();
@@ -3006,6 +3173,7 @@ static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
         return make_uniq<MaterializedQueryResult>(pending->GetErrorObject());
     }
     return pending->Execute();
+#endif
 }
 
 // Look up DECIMAL/LIST logical types via a LIMIT-0 probe. Returns a
@@ -3076,18 +3244,19 @@ static std::vector<LogicalType> sv_resolve_output_logical_types(
             "semantic_view: failed to infer column types via LIMIT 0 probe: " +
             probe_result->GetError());
     }
-    if (probe_result->types.size() != cols.size()) {
+    const auto &probe_types = sv_compat::result_types(*probe_result);
+    if (probe_types.size() != cols.size()) {
         // Phase 65.1 Plan 11 / WR-07 / D-14: distinct diagnostic naming
         // both counts so a future contributor can see which side disagrees.
         throw BinderException(
             "semantic_view: LIMIT 0 probe returned " +
-            std::to_string(probe_result->types.size()) +
+            std::to_string(probe_types.size()) +
             " columns, expected " + std::to_string(cols.size()));
     }
 
     for (idx_t i = 0; i < cols.size(); ++i) {
         const auto &c = cols[i];
-        const LogicalType &probed = probe_result->types[i];
+        const LogicalType &probed = probe_types[i];
         if (c.type_id == DUCKDB_TYPE_DECIMAL || c.type_id == DUCKDB_TYPE_LIST) {
             // Use the probed logical type (preserves width/scale/child type).
             out.emplace_back(probed);
@@ -3102,7 +3271,7 @@ static unique_ptr<FunctionData> sv_semantic_view_bind(
     ClientContext &context,
     TableFunctionBindInput &input,
     vector<LogicalType> &return_types,
-    vector<string> &names) {
+    sv_compat::bind_names_t &names) {
     if (input.inputs.empty() || input.inputs[0].IsNull()) {
         throw BinderException(
             "semantic_view: view name is required (positional arg 0)");
@@ -3184,7 +3353,7 @@ static unique_ptr<FunctionData> sv_semantic_view_bind(
         probe, bd->columns, bd->execution_sql);
     for (idx_t i = 0; i < bd->columns.size(); ++i) {
         return_types.push_back(declared_types[i]);
-        names.push_back(bd->columns[i].name);
+        names.emplace_back(bd->columns[i].name);
     }
     return std::move(bd);
 }
@@ -3217,11 +3386,11 @@ static unique_ptr<GlobalTableFunctionState> sv_semantic_view_init_global(
             "semantic_view: SQL execution failed: " + qresult->GetError() +
             "  (expanded SQL: " + bd.expanded_sql_for_error + ")");
     }
-    if (qresult->type != QueryResultType::MATERIALIZED_RESULT) {
+    if (sv_compat::result_type(*qresult) != QueryResultType::MATERIALIZED_RESULT) {
         throw InternalException(
             "semantic_view: expected MaterializedQueryResult from Connection::Query");
     }
-    state->result = unique_ptr_cast<QueryResult, MaterializedQueryResult>(std::move(qresult));
+    state->result = sv_compat::take_materialized(std::move(qresult));
     return std::move(state);
 }
 

@@ -70,11 +70,12 @@ These are intentional trade-offs made during v0.1.0 development. Each was the be
 - **Decision:** `duckdb.cpp` (the DuckDB amalgamation, ~23MB / ~300K lines) is compiled alongside `shim.cpp` via the `cc` crate. First build takes ~2.5 minutes; cached on subsequent builds. This provides ALL DuckDB C++ symbols (constructors, RTTI, vtables) without manual stubs. Symbol visibility restricts exports to the entry point only, preventing ODR conflicts with the host DuckDB process. The amalgamation must be version-pinned to match `TARGET_DUCKDB_VERSION`.
 - **Action:** The compilation cost is one-time per clean build. `build.rs` feature-gates the C++ compilation behind `CARGO_FEATURE_EXTENSION`, so `cargo test` (default features) is unaffected.
 
-### 11. ✅ C_STRUCT_UNSTABLE ABI (evaluated, kept)
+### 11. ✅ C_STRUCT_UNSTABLE ABI (evaluated, kept; replaced by pinned C_STRUCT for DuckDB 2.0)
 
 - **Origin:** v0.5.0 Phase 18, ABI evaluation
 - **Decision:** Evaluated switching from `C_STRUCT_UNSTABLE` to `CPP` ABI for community extension registry compatibility. Rejected: CPP entry point failed in Phase 15 because `ExtensionLoader` referenced non-inlined C++ symbols unavailable under Python DuckDB's `-fvisibility=hidden`. `C_STRUCT_UNSTABLE` pins the binary to an exact DuckDB version (same as CPP in practice). Compatible with the community extension registry (`rusty_quack` uses the same approach). The version-pinning cost is mitigated by the DuckDB Version Monitor CI workflow.
-- **Action:** No change. Re-evaluate if DuckDB stabilizes the C API or adds a new ABI type for mixed Rust+C++ extensions.
+- **Action:** Superseded by the update below: DuckDB 2.0 forced the re-evaluation, and the extension now declares `C_STRUCT`.
+- **Update (DuckDB 2.0 epic, Phase 2):** DuckDB 2.0 loads a `C_STRUCT_UNSTABLE` extension only through a new `<name>_init_c_api_v2` entry point, so the extension now declares `C_STRUCT` pinned to the v1.5.6 C API, which 2.0 loads through the existing entry point. `C_STRUCT` drops DuckDB's exact-version check, which the shim still needs (it reads host objects by layout; a v1.5.6 build segfaulted a 2.0 host on `LOAD`), so the entry point now makes that check itself before calling into the shim: `src/load_guard.rs`, guarded by `just test-load-version-guard`. Like the old check, it compares version strings and not source ids.
 
 ### 12. ✅ DDL pipeline uses all-VARCHAR result forwarding — SUPERSEDED (historical)
 
@@ -567,6 +568,14 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **What the target asserts now:** the invariant its header always described and that is unconditionally true — render is a **fixpoint on a parser-produced definition**. Stage 0 renders the arbitrary def and parses it back purely to LAND in the parser's image; a failure there is a skip, because an arbitrary `SemanticViewDefinition` is not in that image and never was. From `d1` onward there is no escape. The `render_ddl.rs` mirror test matches, and both carry the reasoning inline.
 - **What is given up, explicitly:** the implication "YAML-storable ⇒ renders to parseable DDL" is no longer machine-checked over random definitions. It is still *enforced* — `validate_ddl_representable` is unchanged and still runs at the YAML choke point — and still tested, by the unit tests in `src/model.rs` and `test/sql/cr20260806_yaml_ddl_contract.test`. What is lost is randomized search for the next rule the validator does not yet know.
 - **What would finish it:** a target that fuzzes DDL **text**, not a struct — feed arbitrary bytes to `parse_keyword_body`, skip on parse failure (arbitrary bytes legitimately are not DDL), and assert that anything that DOES parse re-renders and re-parses to a fixpoint. That needs no precondition, since everything it asserts on came from the parser, and it searches the direction this target structurally cannot: what the parser *accepts*. It would subsume this entry and **#59**.
+
+### 88. ❌ The DuckDB 2.0 shim port has three behaviours only a 2.0 build can settle — OPEN
+
+- **Origin:** 2026-10-15, Phase 2 of the DuckDB 2.0 epic (`.planning/PEG-PARSER-EPIC.md`). The C++ shim was ported to the 2.0 headers behind `SV_DUCKDB_2` before 2.0 GA; that path is syntax-checked only, not linked or run. Each gap is marked `TODO(duckdb-2.0)` at its site.
+- **Statement text from tokens (`shim.cpp`, `sv_statement_from_tokens`):** 2.0's `parse_function` hands the extension tokens with no source offsets, so the shim rebuilds a normalised statement (one space between tokens, no comments). Under 2.0 the error caret can land on the wrong column unless the statement starts at byte 0 with the normalised spacing, the Rust validator sees the normalised text, and the multi-statement hint from #85 can miss its substring lookup and fall back to the generic error.
+- **Interrupt latency (`shim.cpp`, `sv_query_interruptible`):** the 2.0 loop is written from the dev-build `QueryResult::CompleteInternal` source; whether cancellation still stops `semantic_view()` promptly with a bare `Interrupted!` is unverified.
+- **Per-query deadline (`parser_extension_compat.hpp`, `sv_compat::is_interrupted`):** 2.0 adds a max-execution-time deadline enforced apart from the interrupt flag, so a timed-out caller is not seen by the shim's probe connections. This matches v1.5, which had no deadline.
+- **What would finish it:** at 2.0 GA, build against the released libraries, run `just test-all` (the caret, interrupt and multi-statement tests exercise the first two; nothing yet tests a deadline), and either confirm each behaviour or fix it (for the caret, map the token list back onto the original query text; for the deadline, forward it to the probe connections). Then delete the `TODO(duckdb-2.0)` notes.
 
 ### 87. ❌ Under a role-played BASE table, a window over a metric off the root binds to the first-declared relationship (silent) — OPEN
 
