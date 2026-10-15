@@ -6,6 +6,7 @@ pub(crate) mod expr_tokens;
 pub mod ffi_util;
 pub mod graph;
 pub mod ident;
+pub mod load_guard;
 pub mod model;
 pub mod parse;
 // The `query` module itself is always compiled; its FFI-heavy submodules
@@ -346,6 +347,13 @@ mod extension {
     // surfaced through the ABI-stable channel by `decode_register_err_buf`.
     type RegisterFn = unsafe extern "C" fn(ffi::duckdb_database, *mut c_char, usize) -> bool;
 
+    extern "C" {
+        /// The `DuckDB` release the shim and its amalgamation were compiled
+        /// from (`DUCKDB_VERSION`), for the load-time check in
+        /// `semantic_views_init_c_api_internal`.
+        fn sv_compiled_duckdb_version() -> *const c_char;
+    }
+
     macro_rules! sv_registrations {
         ($( ($label:literal, $sym:ident) ),+ $(,)?) => {
             extern "C" {
@@ -588,6 +596,17 @@ mod extension {
         if !have_api_struct {
             return Ok(false);
         }
+
+        // Refuse a host other than the DuckDB release the shim was compiled
+        // against, before anything below reaches into host objects by layout.
+        // See `crate::load_guard` for why DuckDB no longer does this for us.
+        let host_ptr = ffi::duckdb_library_version();
+        if host_ptr.is_null() {
+            return Err("DuckDB did not report its library version".into());
+        }
+        let host = CStr::from_ptr(host_ptr).to_string_lossy();
+        let built = CStr::from_ptr(sv_compiled_duckdb_version()).to_string_lossy();
+        crate::load_guard::check_host_version(&built, &host)?;
 
         // Get the raw database handle BEFORE wrapping in Connection.
         let Some(get_database) = (*access).get_database else {

@@ -307,6 +307,29 @@ All tests stay green with **no** user-visible change. This separates "new engine
 so a regression can be bisected to one or the other. Decision D2 decides whether
 1.5.x keeps a maintenance branch.
 
+**Found on 2026-10-15: 2.0 has no amalgamation.** `scripts/amalgamation.py` on the 2.0
+branch is a 97-line remnant (616 lines on v1.5.6) that no longer emits
+`duckdb.{hpp,cpp}`. The spike linked 2.0's static libraries directly, so it did not
+notice. `build.rs` compiles the amalgamation into the extension today, so Phase 2 also
+has to change the build: compile the shim against the engine's `src/include` tree and
+link DuckDB's static libraries. That touches `scripts/ensure_amalgamation.py`, the
+offline fetcher, and every CI job that builds the extension.
+
+**Staged, per Anentropic (2026-10-15).** Do what does not need a released 2.0 now, and
+the rest at 2.0.0 GA (scheduled 2026-10-21), rather than building the engine from the
+moving dev branch here and in CI:
+
+1. *Now, on v1.5.6:* switch to `C_STRUCT` pinned to the v1.5.6 C API, and add the
+   load-time version check (`src/load_guard.rs`; it compares version strings only, as
+   `C_STRUCT_UNSTABLE` did, so the offline amalgamation's placeholder source id still
+   loads). Without the check, a v1.5.6 build segfaults a 2.0 host on `LOAD`
+   (`test/integration/test_load_version_guard.py`).
+2. *Now:* port the shim to compile against 2.0's headers as well, behind one
+   `SV_DUCKDB_2` macro, syntax-checked against the dev engine (commit 96063b9e39,
+   PyPI wheel `2.0.0.dev2610011535`).
+3. *At GA:* link the released static libraries, bump the pins, move the version-guard
+   test's other host to 1.5.6, and run the full suite on 2.0.
+
 ### Phase 3: DDL and introspection as grammar productions
 
 - CREATE (including `FROM YAML`), ALTER, DROP, DESCRIBE, every SHOW form, and
@@ -436,12 +459,12 @@ the same fixture answers both.
 | # | Question | Recommendation |
 |---|---|---|
 | D1 | #71 semantics: count orphan child rows (FK NULL)? Childless parent's child-COUNT = `NULL` or `0`? | **Settled 2026-10-13 by the Snowflake fixture:** home-table anchoring; orphans counted under a NULL dimension; a childless parent's child COUNT is `NULL` (no `COALESCE`) when a parent-grain metric brings its row in, and a child metric alone gives no row for it. Implemented in Phase 0b. (Earlier leaning, superseded: `0` for COUNT.) |
-| D2 | Drop DuckDB 1.x when Phase 2 lands? | Yes, once spike item 6 shows that duckdb-rs and community CI are ready for 2.0. 1.5 is end of life on 2026-11-01. Tag v0.13.x as the last 1.5 line (fixes only). |
+| D2 | Drop DuckDB 1.x when Phase 2 lands? | Yes, once spike item 6 shows that duckdb-rs and community CI are ready for 2.0. 1.5 is end of life on 2026-11-01. Tag v0.14.x as the last 1.5 line (fixes only). |
 | D3 | Keep `semantic_view('v', dimensions := …)` after `SEMANTIC_VIEW(...)` ships? | Keep it one release as a documented, deprecated alias that maps onto the same IR, then remove it. `explain_semantic_view` becomes a `semantic_view_sql`-style function over any statement. |
 | D4 | Store member expressions as verbatim source text (today) or as DuckDB-normalised text? | The spike shows a transform can rebuild the expression's exact code text, spacing included, from its tokens. Only comments inside an expression are lost, and they become spaces. Recommendation: keep storing that text, and document comment loss as a known divergence with a TECH-DEBT entry and a round-trip test pinning it. That preserves `GET_DDL` fidelity. Moving to AST storage would also retire #73 and IDENT-2/3/4, but it is a separate decision. |
 | D5 | Snowflake metadata clauses (`AI_*`, `TAG`, `COPY GRANTS`, `SAMPLE_VALUES`, `IS_ENUM`, Cortex search, `MAX_STALENESS`): reject (today), or accept and store? | Accept, store, show in DESCRIBE, and round-trip through GET_DDL/YAML, so Snowflake DDL pastes as is. `COPY GRANTS` and `MAX_STALENESS` are accepted as no-ops. Budget it: about 9 clauses, each touching model + JSON + YAML + `render_ddl` + DESCRIBE. |
 | D6 | BI placeholder views share the table/view namespace (a semantic view can't share a name with a table). OK? | Yes, behind the Phase 5 spike. It is what lets BI tools see them at all. |
-| D7 | Version line for the 2.0 cut? | Ship Phase 2 as v0.14.0. Consider v1.0.0 once Phase 4 lands **and** D4's expression storage format has settled. |
+| D7 | Version line for the 2.0 cut? | Ship Phase 2 as v0.15.0 (v0.14.0 shipped on 1.5.6 as the last 1.5 line, published to the registry's `variegata` key). Consider v1.0.0 once Phase 4 lands **and** D4's expression storage format has settled. |
 
 ## 8. Done when
 

@@ -70,11 +70,12 @@ These are intentional trade-offs made during v0.1.0 development. Each was the be
 - **Decision:** `duckdb.cpp` (the DuckDB amalgamation, ~23MB / ~300K lines) is compiled alongside `shim.cpp` via the `cc` crate. First build takes ~2.5 minutes; cached on subsequent builds. This provides ALL DuckDB C++ symbols (constructors, RTTI, vtables) without manual stubs. Symbol visibility restricts exports to the entry point only, preventing ODR conflicts with the host DuckDB process. The amalgamation must be version-pinned to match `TARGET_DUCKDB_VERSION`.
 - **Action:** The compilation cost is one-time per clean build. `build.rs` feature-gates the C++ compilation behind `CARGO_FEATURE_EXTENSION`, so `cargo test` (default features) is unaffected.
 
-### 11. ✅ C_STRUCT_UNSTABLE ABI (evaluated, kept)
+### 11. ✅ C_STRUCT_UNSTABLE ABI (evaluated, kept; replaced by pinned C_STRUCT for DuckDB 2.0)
 
 - **Origin:** v0.5.0 Phase 18, ABI evaluation
 - **Decision:** Evaluated switching from `C_STRUCT_UNSTABLE` to `CPP` ABI for community extension registry compatibility. Rejected: CPP entry point failed in Phase 15 because `ExtensionLoader` referenced non-inlined C++ symbols unavailable under Python DuckDB's `-fvisibility=hidden`. `C_STRUCT_UNSTABLE` pins the binary to an exact DuckDB version (same as CPP in practice). Compatible with the community extension registry (`rusty_quack` uses the same approach). The version-pinning cost is mitigated by the DuckDB Version Monitor CI workflow.
 - **Action:** No change. Re-evaluate if DuckDB stabilizes the C API or adds a new ABI type for mixed Rust+C++ extensions.
+- **Update (DuckDB 2.0 epic, Phase 2):** DuckDB 2.0 loads a `C_STRUCT_UNSTABLE` extension only through a new `<name>_init_c_api_v2` entry point, so the extension now declares `C_STRUCT` pinned to the v1.5.6 C API, which 2.0 loads through the existing entry point. `C_STRUCT` drops DuckDB's exact-version check, which the shim still needs (it reads host objects by layout; a v1.5.6 build segfaulted a 2.0 host on `LOAD`), so the entry point now makes that check itself before calling into the shim: `src/load_guard.rs`, guarded by `just test-load-version-guard`. Like the old check, it compares version strings and not source ids.
 
 ### 12. ✅ DDL pipeline uses all-VARCHAR result forwarding — SUPERSEDED (historical)
 

@@ -58,6 +58,18 @@ static_assert(sizeof(duckdb_connection) == sizeof(void*),
     "Phase 65.1 D-12");
 
 // ---------------------------------------------------------------------------
+// sv_compiled_duckdb_version -- the DuckDB release this binary was built from
+// ---------------------------------------------------------------------------
+// The version of the amalgamation compiled into this binary, which is the
+// release this file's layout assumptions hold for. The Rust entry point
+// compares it with the host's `duckdb_library_version()` before calling any
+// other function here, and refuses to load on a mismatch: the C_STRUCT ABI
+// (see the Makefile) no longer has DuckDB make that check for us.
+extern "C" const char *sv_compiled_duckdb_version() {
+    return DUCKDB_VERSION;
+}
+
+// ---------------------------------------------------------------------------
 // Rust FFI declarations (defined in src/parse.rs)
 // ---------------------------------------------------------------------------
 extern "C" {

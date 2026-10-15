@@ -186,10 +186,11 @@ own (blocked) download. Output is byte-identical to the release amalgamation
 except `DUCKDB_SOURCE_ID` (a placeholder — the real SHA isn't reachable without
 GitHub).
 
-**The placeholder source-id does NOT block loading the extension.** The debug
-extension this produces uses the `C_STRUCT_UNSTABLE` ABI, which does not enforce
-a source-id match, so it **loads and runs** — `just test-sql` / `just test-all`
-(and `make test_debug`) pass end-to-end against it (empirically verified). So in
+**The placeholder source-id does NOT block loading the extension.** Neither DuckDB
+nor the extension's own load-time check (`src/load_guard.rs`, which compares the
+version string only) enforces a source-id match, so it **loads and runs** —
+`just test-sql` / `just test-all` (and `make test_debug`) pass end-to-end against
+it (empirically verified). So in
 a blocked-GitHub session, after `python3 scripts/fetch_amalgamation_offline.py`,
 run the **full** local gate — `just build` + `just test-sql` — as usual. Do
 **not** assume the offline extension "can't load" and skip local sqllogictest in
