@@ -358,7 +358,7 @@ namespace sv_compat {
 // `order` has no 2.0 counterpart; a single polled flag carries no data, so the
 // relaxed load is equivalent for every caller here.
 //
-// TODO(duckdb-2.0): 2.0 adds a per-query deadline (max execution time) that
+// TODO(duckdb-2.0, TECH-DEBT #88): 2.0 adds a per-query deadline (max execution time) that
 // `ClientContext::InterruptCheck()` enforces separately from this flag, so a
 // caller whose query times out is not seen here and the timeout is not
 // forwarded to the shim's probe connections. v1.5 had no deadline, so this

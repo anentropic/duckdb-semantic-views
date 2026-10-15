@@ -16,6 +16,11 @@
 /// `Ok` when `host` is the `DuckDB` release `built` names, otherwise the
 /// message the failed `LOAD` reports.
 ///
+/// The community repository only has builds for tagged releases, so the
+/// `FORCE INSTALL` hint is given only when `host` is one. A development or
+/// nightly host (`v1.5.7-dev42`) has a `-` in its version, and no install
+/// command would find a build for it.
+///
 /// # Errors
 ///
 /// Returns the user-facing refusal when the two versions differ.
@@ -23,10 +28,15 @@ pub fn check_host_version(built: &str, host: &str) -> Result<(), String> {
     if built == host {
         return Ok(());
     }
+    let remedy = if host.contains('-') {
+        "Load a semantic_views build compiled against this DuckDB."
+    } else {
+        "Install the semantic_views build for this DuckDB with: \
+         FORCE INSTALL semantic_views FROM community;"
+    };
     Err(format!(
         "semantic_views was built for DuckDB {built} and cannot run in DuckDB {host}, \
-         because it depends on that exact DuckDB release. Install the semantic_views \
-         build for this DuckDB with: FORCE INSTALL semantic_views FROM community;"
+         because it depends on that exact DuckDB release. {remedy}"
     ))
 }
 
@@ -56,5 +66,18 @@ mod tests {
     #[test]
     fn a_development_build_is_not_the_release() {
         assert!(check_host_version("v2.0.0", "v2.0.0-alpha43763").is_err());
+    }
+
+    /// The community repository has no build for a development host, so the
+    /// refusal must not send the user to an install command that would fail.
+    #[test]
+    fn a_development_host_is_not_told_to_install_from_community() {
+        let err = check_host_version("v1.5.6", "v2.0.0-dev2610011535").unwrap_err();
+        assert!(
+            err.contains("cannot run in DuckDB v2.0.0-dev2610011535"),
+            "{err}"
+        );
+        assert!(!err.contains("FORCE INSTALL"), "{err}");
+        assert!(err.contains("compiled against this DuckDB"), "{err}");
     }
 }

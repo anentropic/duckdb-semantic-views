@@ -576,7 +576,7 @@ static ParserExtensionParseResult sv_parse_statement(const string &query) {
 // TERMINATOR (re-appending `;` as v1.5's statement splitter did) and the result
 // mapped onto consumed_tokens.
 //
-// TODO(duckdb-2.0): SimpleToken carries no source offsets or whitespace, so the
+// TODO(duckdb-2.0, TECH-DEBT #88): SimpleToken carries no source offsets or whitespace, so the
 // rebuilt text is a normalised spelling of the statement (one space between
 // tokens, none around `.` or inside brackets, no comments, newlines folded).
 // Three things can differ from v1.5 and must be checked against a 2.0 build:
@@ -3135,7 +3135,7 @@ static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
     // Collect the rows and end the query on `probe`; a commit failure lands on
     // the result as an error, as it did from pending->Execute().
     result->Complete();
-    // TODO(duckdb-2.0): this loop is read from the dev-build sources
+    // TODO(duckdb-2.0, TECH-DEBT #88): this loop is read from the dev-build sources
     // (QueryResult::CompleteInternal); run the semantic_view cancellation tests
     // against a 2.0 build to confirm interrupt latency and that a cancelled
     // query still surfaces as a bare "Interrupted!".
