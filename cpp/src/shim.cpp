@@ -16,10 +16,10 @@
 //     parse_function; should never fire because sv_parse_stub never returns
 //     PARSE_SUCCESSFUL.
 //
-// All DuckDB C++ symbols are provided by compiling duckdb.cpp (the
-// amalgamation source) alongside this file. Symbol visibility on the cdylib
-// restricts exports to just the Rust entry point, so these definitions stay
-// internal to the binary.
+// All DuckDB C++ symbols come from the DuckDB engine linked statically into
+// the extension (`duckdb_static`, built by scripts/ensure_engine.py; see
+// cpp/engine.manifest). Symbol visibility on the cdylib restricts exports to
+// just the Rust entry point, so these definitions stay internal to the binary.
 //
 // DuckDB 1.5.0 moved the parser extension type declarations from duckdb.hpp
 // into duckdb.cpp. The compat header re-declares them so this translation
@@ -60,8 +60,8 @@ static_assert(sizeof(duckdb_connection) == sizeof(void*),
 // ---------------------------------------------------------------------------
 // sv_compiled_duckdb_version -- the DuckDB release this binary was built from
 // ---------------------------------------------------------------------------
-// The version of the amalgamation compiled into this binary, which is the
-// release this file's layout assumptions hold for. The Rust entry point
+// The version of the engine linked into this binary, which is the release
+// this file's layout assumptions hold for. The Rust entry point
 // compares it with the host's `duckdb_library_version()` before calling any
 // other function here, and refuses to load on a mismatch: the C_STRUCT ABI
 // (see the Makefile) no longer has DuckDB make that check for us.
@@ -428,8 +428,12 @@ struct SemanticViewsParserInfo : public ParserExtensionInfo {};
 // The query the last parser_override call on this thread saw. DuckDB 2.0's
 // parse_function gets tokens without source offsets; when it runs, it is inside
 // the same Parser::ParseQuery as the override call that recorded this, so the
-// tokens can be located in it (sv_locate_tail). Only ever a hint: a stale value
-// fails that match and the stub falls back to rebuilding the text.
+// tokens can be located in it (sv_locate_tail). Only ever a hint: the stub
+// clears it once it has rendered an error against it, and a value left by a
+// parse that needed no stub fails the match (the tokens of a statement that
+// parsed cannot be those of one that did not), so the stub falls back to
+// rebuilding the text. Without the clearing, a connection whose override is
+// off (nothing recorded) would quote an earlier failed query on this thread.
 static thread_local std::string sv_override_query;
 #endif
 
@@ -726,6 +730,7 @@ static ParserExtensionParseResult sv_parse_stub(
                                                      start + result.error_location.GetIndex());
         }
         result.error_location = optional_idx();
+        sv_override_query.clear();
     }
     return result;
 }
@@ -2962,6 +2967,9 @@ static unique_ptr<FunctionData> sv_explain_semantic_view_bind(
     std::vector<uint8_t> sp_buf = sv_search_path_payload(input);
 
     Connection probe(*context.db);
+    // The EXPLAIN of the expanded query binds the view's tables on `probe`, so
+    // a cancelled caller is forwarded and raised bare, as in semantic_view().
+    SvBindCancellationScope cancellation(context, probe);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
 
     SvOwnedBuffer payload;
@@ -2979,7 +2987,7 @@ static unique_ptr<FunctionData> sv_explain_semantic_view_bind(
         where_clause.size(),
         &payload.ptr, &payload.len,
         error_buf, sizeof(error_buf));
-
+    cancellation.ThrowIfCancelled();
     if (rc != 0) {
         throw BinderException(std::string("explain_semantic_view: ") + error_buf);
     }

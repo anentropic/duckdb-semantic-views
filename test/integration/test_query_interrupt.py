@@ -364,6 +364,12 @@ def _run_metadata_probe_tests(con, csv_dir) -> bool:
             "semantic_view(<view>) bind with a DECIMAL output",
             "SELECT * FROM semantic_view('mp_dec', metrics := ['dtotal'])",
         ),
+        # explain_semantic_view() runs EXPLAIN of the expanded query on its
+        # probe, which binds the slow source the same way.
+        (
+            "explain_semantic_view(<view>) bind",
+            "SELECT * FROM explain_semantic_view('mp_one', metrics := ['total'])",
+        ),
     ]
     for label, sql in binds:
         ok &= check_interrupted_statement(con, label, sql)

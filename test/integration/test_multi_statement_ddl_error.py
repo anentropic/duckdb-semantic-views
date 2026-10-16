@@ -35,6 +35,11 @@ Each scenario runs on a fresh in-memory database and reports independently:
                                trailing comment) and succeeded.
   control_stale_after_typo     the same, but the first database's string
                                failed on a typo before reaching its DDL.
+  control_stale_caret_query    an invalid DDL in a multi-statement string on
+                               one database, then the same invalid DDL alone on
+                               another database whose override is off: the
+                               second error must quote its own query, not the
+                               first one's.
 
 Run: uv run test/integration/test_multi_statement_ddl_error.py (or
 `just test-multi-statement-error`).
@@ -181,6 +186,22 @@ def scenario_control_stale_after_typo():
     check_not_blamed_after("SELEC 1; " + DDL, expect_first_error=True)
 
 
+def scenario_control_stale_caret_query():
+    bad = DDL.replace("DIMENSIONS", "DIMENSIONZ", 1)
+    off, on = connect(), connect()
+    try:
+        off.execute("SET allow_parser_override_extension = 'DEFAULT'")
+        # The DDL starts on line 2 here, so an error quoting this query says so.
+        first = error_of(on, "SELECT 'other query';\n" + bad)
+        msg = error_of(off, bad)
+    finally:
+        off.close()
+        on.close()
+    assert first is not None and "LINE 2:" in first, f"setup: unexpected first error: {first}"
+    assert msg is not None, "an invalid DDL must fail"
+    assert "LINE 2:" not in msg, f"must not quote another query; got: {msg}"
+
+
 SCENARIOS = [
     scenario_ddl_after_other_statements,
     scenario_ddl_before_other_statement,
@@ -190,6 +211,7 @@ SCENARIOS = [
     scenario_control_stale_other_database,
     scenario_control_stale_after_success,
     scenario_control_stale_after_typo,
+    scenario_control_stale_caret_query,
 ]
 
 
