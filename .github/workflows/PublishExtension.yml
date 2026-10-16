@@ -72,7 +72,7 @@ jobs:
           fetch-depth: 0          # need tags + full history for changelog/compare
           # This repo's own token pushes the release commits + tag. The personal
           # CE_PUBLISH_PAT is refused for s-layer repos; it is used only below,
-          # for the community-extensions fork.
+          # to open the PR on duckdb/community-extensions.
           token: ${{ secrets.GITHUB_TOKEN }}
 
       # 1. Resolve current + next version --------------------------------------
@@ -140,6 +140,11 @@ jobs:
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
           owner: ${{ env.CE_FORK_OWNER }}
           repositories: ${{ env.CE_FORK_REPO }}
+          # Ask for both explicitly: minting fails here, before anything is
+          # tagged, if the installation lacks either. The preflight's empty
+          # push can't detect a missing Workflows grant.
+          permission-contents: write
+          permission-workflows: write
 
       - name: Preflight — the app token can push to the fork
         env:
