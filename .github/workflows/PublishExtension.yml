@@ -17,11 +17,17 @@ name: Publish Extension
 # ── Required repo setup (one-time) ────────────────────────────────────────────
 #   * An Environment named `release` with required reviewers
 #     (Settings -> Environments). This is the human gate.
-#   * Secret CE_PUBLISH_PAT: a PAT with `repo` scope that can push to your fork
-#     `anentropic/community-extensions` AND open PRs against
+#   * The fork `s-layer/community-extensions` is pushed to with a token from the
+#     project's GitHub App (secrets BOT_APP_ID / BOT_APP_PRIVATE_KEY). The app
+#     must be installed on that fork with Contents and Workflows read/write
+#     (the branch is cut from upstream main, so it can carry workflow-file
+#     changes the fork lacks, and GitHub refuses those without Workflows
+#     access). The s-layer org refuses personal tokens (the v0.14.0 push
+#     failed with a 403 that way), so the push cannot use the PAT below.
+#   * Secret CE_PUBLISH_PAT: a personal token that can open PRs against
 #     `duckdb/community-extensions`. Falls back to VERSION_MONITOR_PAT. It is used
-#     ONLY for that fork and PR: it is a personal token, and the s-layer org
-#     refuses it for this repo (the v0.14.0 push failed with a 403 that way).
+#     ONLY to open that PR; an app token can't, because the app isn't installed
+#     on the upstream repo.
 #   * The release commits + tag go to this repo's `main` with the job's own
 #     GITHUB_TOKEN (`contents: write` above). If `main` becomes branch-protected,
 #     allow github-actions to push to it (or relax protection for this actor).
@@ -48,7 +54,9 @@ permissions:
   pull-requests: write
 
 env:
-  CE_FORK: anentropic/community-extensions
+  CE_FORK: s-layer/community-extensions
+  CE_FORK_OWNER: s-layer
+  CE_FORK_REPO: community-extensions
   CE_BRANCH: semantic-views
   CE_UPSTREAM: duckdb/community-extensions
 
@@ -64,7 +72,7 @@ jobs:
           fetch-depth: 0          # need tags + full history for changelog/compare
           # This repo's own token pushes the release commits + tag. The personal
           # CE_PUBLISH_PAT is refused for s-layer repos; it is used only below,
-          # for the community-extensions fork.
+          # to open the PR on duckdb/community-extensions.
           token: ${{ secrets.GITHUB_TOKEN }}
 
       # 1. Resolve current + next version --------------------------------------
@@ -116,19 +124,50 @@ jobs:
           echo "description.yml key for $OURS: repo.$KEY"
           echo "key=$KEY" >> "$GITHUB_OUTPUT"
 
-      # 3. PREFLIGHT: the registry token can push to the fork ------------------
+      # 3. PREFLIGHT: the app token can push to the fork ----------------------
       #    Checked before anything is committed or tagged (and in a dry run), so a
       #    token that cannot push fails here instead of after the release is cut.
       #    `git push --dry-run` sends nothing, but GitHub still asks for push
       #    access to answer it, so it is refused exactly as the real push would be.
       #    It runs from a scratch repo: this checkout's git config carries the
-      #    GITHUB_TOKEN auth header for github.com, which would replace the PAT.
-      - name: Preflight — the registry token can push to the fork
+      #    GITHUB_TOKEN auth header for github.com, which would replace the token.
+      #    The PAT that opens the upstream PR is checked for being live and, for a
+      #    classic PAT, for the public_repo scope. `--no-maintainer-edit` below
+      #    matters too: GitHub refuses maintainer edits on an org-owned fork.
+      - name: Get app token for the fork
+        id: fork-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          owner: ${{ env.CE_FORK_OWNER }}
+          repositories: ${{ env.CE_FORK_REPO }}
+          # Ask for both explicitly: minting fails here, before anything is
+          # tagged, if the installation lacks either. The preflight's empty
+          # push can't detect a missing Workflows grant.
+          permission-contents: write
+          permission-workflows: write
+
+      - name: Preflight — the app token can push to the fork
         env:
+          FORK_TOKEN: ${{ steps.fork-token.outputs.token }}
           GH_TOKEN: ${{ secrets.CE_PUBLISH_PAT || secrets.VERSION_MONITOR_PAT }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "::error::neither CE_PUBLISH_PAT nor VERSION_MONITOR_PAT is set"
+            echo "::error::neither CE_PUBLISH_PAT nor VERSION_MONITOR_PAT is set; one is needed to open the PR on ${CE_UPSTREAM}"
+            exit 1
+          fi
+          # The PAT must be live (an expired one fails with 401 even on a public
+          # repo) and, if it is a classic PAT, carry public_repo or repo.
+          if ! HDRS=$(gh api -i "repos/${CE_UPSTREAM}" 2>&1); then
+            echo "::error::the PAT that opens the PR on ${CE_UPSTREAM} was rejected (expired or revoked?). Replace CE_PUBLISH_PAT with a classic PAT with the public_repo scope."
+            exit 1
+          fi
+          # Only classic PATs send X-OAuth-Scopes; a fine-grained one sends none.
+          SCOPE_LINE=$(printf '%s\n' "$HDRS" | tr -d '\r' | grep -i '^x-oauth-scopes:' || true)
+          SCOPES=${SCOPE_LINE#*:}
+          if [ -n "$SCOPE_LINE" ] && ! printf '%s\n' "$SCOPES" | grep -qwE 'public_repo|repo'; then
+            echo "::error::the PAT that opens the PR on ${CE_UPSTREAM} has scopes '${SCOPES}' but needs public_repo."
             exit 1
           fi
           PROBE="$RUNNER_TEMP/ce-preflight"
@@ -136,12 +175,12 @@ jobs:
           git -C "$PROBE" -c user.name=preflight -c user.email=preflight@localhost \
             commit -q --allow-empty -m preflight
           if ! git -C "$PROBE" push --dry-run \
-              "https://x-access-token:${GH_TOKEN}@github.com/${CE_FORK}.git" \
+              "https://x-access-token:${FORK_TOKEN}@github.com/${CE_FORK}.git" \
               "HEAD:refs/heads/${CE_BRANCH}-preflight"; then
-            echo "::error::the token cannot push to ${CE_FORK}. CE_PUBLISH_PAT must be a token of the fork's owner with write access to it: a classic PAT with the public_repo scope, or a fine-grained PAT whose resource owner is the fork's owner, with ${CE_FORK} selected and Contents set to read and write. Fix the secret, then run again (with registry_pr_only if the release is already tagged)."
+            echo "::error::the app token cannot push to ${CE_FORK}. Install the GitHub App behind BOT_APP_ID on ${CE_FORK} with Contents and Workflows set to read and write, then run again (with registry_pr_only if the release is already tagged)."
             exit 1
           fi
-          echo "the token can push to ${CE_FORK}"
+          echo "the app token can push to ${CE_FORK}"
 
       # 4. Changelog roll + version bump in this repo --------------------------
       - name: Roll changelog and bump version
@@ -191,7 +230,7 @@ jobs:
         if: ${{ github.event.inputs.registry_pr_only == 'true' }}
         run: |
           NEXT="${{ steps.ver.outputs.next }}"
-          if ! SHA=$(git rev-parse --verify --quiet "v$NEXT^{commit}"); then
+          if ! SHA=$(git rev-parse --verify --quiet "refs/tags/v$NEXT^{commit}"); then
             echo "::error::tag v$NEXT does not exist; run without registry_pr_only to cut the release"
             exit 1
           fi
@@ -206,10 +245,11 @@ jobs:
       - name: Open community-extensions PR
         if: ${{ github.event.inputs.dry_run != 'true' }}
         env:
+          FORK_TOKEN: ${{ steps.fork-token.outputs.token }}
           GH_TOKEN: ${{ secrets.CE_PUBLISH_PAT || secrets.VERSION_MONITOR_PAT }}
         run: |
           NEXT="${{ steps.ver.outputs.next }}"
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/${CE_FORK}.git" ce-fork
+          git clone "https://x-access-token:${FORK_TOKEN}@github.com/${CE_FORK}.git" ce-fork
           cd ce-fork
           git remote add upstream "https://github.com/${CE_UPSTREAM}.git"
           git fetch upstream main
@@ -222,23 +262,38 @@ jobs:
           git add extensions/semantic_views/description.yml
           git commit -m "Update semantic_views to v$NEXT"
           git push --force -u origin "$CE_BRANCH"
-          # The force-push updates an open PR from this branch in place.
-          OPEN=$(gh pr list --repo "$CE_UPSTREAM" --head "$CE_BRANCH" --state open --json url --jq '.[0].url // empty')
+          TITLE="Update semantic_views to v$NEXT"
+          BODY="Update semantic_views extension to v$NEXT (repo.${{ steps.target.outputs.key }}: ${RELEASE_SHA}, for DuckDB $(cat ../.duckdb-version))."
+          # The force-push updates an open PR from this branch in place. `--head`
+          # matches the branch name only, so filter on the fork's owner too.
+          OPEN=$(gh pr list --repo "$CE_UPSTREAM" --head "$CE_BRANCH" --base main --state open \
+            --json url,headRepositoryOwner \
+            --jq "[.[] | select(.headRepositoryOwner.login == \"${CE_FORK_OWNER}\")][0].url // empty")
           if [ -n "$OPEN" ]; then
-            echo "updated the open community-extensions PR: $OPEN"
-            exit 0
+            # It may have been opened for an earlier version: retitle it to match.
+            # Cosmetic, and only the PR's author can do it, so don't fail on it.
+            gh pr edit "$OPEN" --title "$TITLE" --body "$BODY" \
+              || echo "::warning::could not retitle $OPEN"
+            echo "CE_PR=updated the open community-extensions PR $OPEN" >> "$GITHUB_ENV"
+          else
+            URL=$(gh pr create \
+              --repo "$CE_UPSTREAM" \
+              --head "${CE_FORK_OWNER}:$CE_BRANCH" \
+              --base main \
+              --no-maintainer-edit \
+              --title "$TITLE" \
+              --body "$BODY")
+            echo "CE_PR=opened community-extensions PR $URL" >> "$GITHUB_ENV"
           fi
-          gh pr create \
-            --repo "$CE_UPSTREAM" \
-            --head "anentropic:$CE_BRANCH" \
-            --base main \
-            --title "Update semantic_views to v$NEXT" \
-            --body "Update semantic_views extension to v$NEXT (repo.${{ steps.target.outputs.key }}: ${RELEASE_SHA}, for DuckDB $(cat ../.duckdb-version))."
 
       - name: Summary
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: |
           echo "### Published v${{ steps.ver.outputs.next }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- tag pushed: \`v${{ steps.ver.outputs.next }}\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ github.event.inputs.registry_pr_only }}" = "true" ]; then
+            echo "- registry PR only: used the existing tag \`v${{ steps.ver.outputs.next }}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- tag pushed: \`v${{ steps.ver.outputs.next }}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
           echo "- description.yml repo.${{ steps.target.outputs.key }}: \`${RELEASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- community-extensions PR opened from \`anentropic:${CE_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ${CE_PR} (from \`${CE_FORK_OWNER}:${CE_BRANCH}\`)" >> "$GITHUB_STEP_SUMMARY"
