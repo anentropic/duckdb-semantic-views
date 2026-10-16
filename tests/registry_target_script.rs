@@ -249,3 +249,13 @@ fn a_release_with_no_tag_is_refused() {
     let err = got.expect_err("a missing tag must fail");
     assert!(err.contains("v9.9.9"), "{err}");
 }
+
+#[test]
+fn a_branch_named_like_the_tag_does_not_count_as_the_release() {
+    let (dir, _, _) = repo_with_tag_behind_head("sha-branch", false);
+    git(&dir, &["branch", "v9.9.9"]);
+    let got = release_sha(&dir, "9.9.9");
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = got.expect_err("a branch is not a release tag");
+    assert!(err.contains("v9.9.9"), "{err}");
+}

@@ -500,9 +500,11 @@ release:
       echo "description.yml already pins v$VERSION; nothing to commit"
     else
       git commit -m "chore: update description.yml for v$VERSION release"
-      git push origin main
-      echo "Committed and pushed description.yml update to main"
     fi
+    # Outside the if: a re-run after a failed push still has that commit to push
+    # (a no-op when main is already up to date).
+    git push origin main
+    echo "description.yml for v$VERSION is on origin/main"
     DESC_SRC="$PWD/description.yml"
     # --- Copy to CE fork and open PR ---
     CE_REPO="${CE_REPO:-$HOME/Documents/Dev/Sources/community-extensions}"

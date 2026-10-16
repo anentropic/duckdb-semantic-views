@@ -96,7 +96,7 @@ def set_key(text: str, key: str, sha: str) -> str:
 def release_sha(version: str) -> str:
     tag = f"v{version}"
     out = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"{tag}^{{commit}}"],
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}"],
         capture_output=True,
         text=True,
     )
