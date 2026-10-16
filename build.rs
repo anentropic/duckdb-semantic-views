@@ -254,6 +254,17 @@ fn main() {
                  builds it with scripts/ensure_engine.py."
             );
         };
+        // `cpp/include` is on the include path ahead of the engine's headers, so
+        // the v1.x amalgamation a pre-engine build left there would be compiled
+        // in place of the engine's `duckdb.hpp`. `make ensure_engine` removes it.
+        let stale = std::path::Path::new("cpp/include/duckdb.hpp");
+        assert!(
+            !stale.exists(),
+            "{} is the DuckDB 1.x amalgamation a pre-engine build left behind, and it \
+             would shadow the engine's own duckdb.hpp. Run `make ensure_engine` (or \
+             `just build`), which removes it, or delete it.",
+            stale.display()
+        );
         let spec = cpp_build_spec(is_windows, Some(engine));
         let mut build = cc::Build::new();
         build.cpp(true).std(spec.std).warnings(false); // DuckDB headers are not warning-clean

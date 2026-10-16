@@ -287,11 +287,22 @@ static MSVC runtime (`/MT`), so `.cargo/config.toml` links the extension with
 Builds are cached under `.engine/<id>/` (the static libraries, plus the extracted source
 for the pinned release's headers), keyed on the pin or on the tree's label and commit, so
 switching branches or engines is a cache hit; the wheel pin and a cross-compile
-architecture are part of the key, and a tree with no git commit is rebuilt every time. The first build of an engine takes a while (~20 minutes on four cores); after that
+architecture are part of the key, and a tree with no git commit, or with uncommitted
+changes to tracked files, is rebuilt every time. The first build of an engine takes a while (~20 minutes on four cores); after that
 `make` only checks the cache. An entry counts as cached only when its own `manifest`
-(written last, atomically) is complete; anything an interrupted or failed run left (a
-partial source tree, a build directory with another generator's CMake cache) is discarded
-and rebuilt. `cpp/engine.manifest` is rewritten only when it changes, so
+(written last, atomically) is complete and every include directory and library it names
+still exists; the manifest is deleted before a rebuild starts, and anything an interrupted
+or failed run left (a partial source tree, a build directory with another generator's
+CMake cache) is discarded and rebuilt.
+
+The include directories are the engine's `src/include` and, for each `third_party/`
+library, its `include/` directory when it has one (else its root), as DuckDB's own CMake
+does. A library root next to an `include/` holds files such as brotli's `VERSION`, which
+macOS's case-insensitive file system returns for `#include <version>`. `ensure_engine`
+also deletes the DuckDB 1.x amalgamation (`cpp/include/duckdb.{hpp,cpp}`,
+`.amalgamation_id`) that a pre-2.0 build of this repo left behind: `duckdb.hpp` there
+would shadow the engine's for the shim's quoted includes, and `build.rs` refuses to build
+while it exists. `cpp/engine.manifest` is rewritten only when it changes, so
 an unchanged engine keeps `cargo build` incremental; every rebuild of the libraries
 changes it (its `built` line), and `build.rs` also watches the libraries themselves, so a
 rebuilt engine is always relinked. `tests/build_config.rs` covers the
@@ -350,6 +361,8 @@ It is an explicit opt-in on purpose. A sqllogictest `require autocomplete` would
 ### The Critical Difference: `cargo test` vs `just test-sql`
 
 `cargo test` (or `just test-rust`) runs unit tests with a **bundled** DuckDB compiled into the test binary. It exercises `model.rs`, `catalog/`, and `expand/` -- the pure Rust logic.
+
+**The bundled DuckDB is not the engine the extension ships for.** duckdb-rs has no 2.0 release, so the bundled build is DuckDB 1.5.6 (the `.duckdb-capi-version` pin), while the extension links and loads only in the DuckDB 2.0 engine in `.duckdb-version`. `cargo test`, the differential proptests and the coverage gate therefore check 1.5.6; only `just test-sql`, `test-ducklake-ci` and the Python integration suites run on 2.0. TECH-DEBT #92 records the gap and what would close it.
 
 `just test-sql` builds the **actual extension binary** and loads it into a real DuckDB process via `LOAD`. This catches:
 - ABI mismatches between the Rust code and the DuckDB version

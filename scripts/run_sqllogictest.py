@@ -51,6 +51,8 @@ guards go quiet.
 from __future__ import annotations
 
 import argparse
+import faulthandler
+import io
 import os
 import sys
 from dataclasses import dataclass, field
@@ -88,6 +90,14 @@ def _hook(cls, name):
 
 
 def main() -> int:
+    # A crash in the engine or the extension kills the process with no Python
+    # error, and on Windows an access violation leaves only make's exit code.
+    # faulthandler prints where each thread was, and line buffering keeps the
+    # runner's `[n/N] <file>` line, which a pipe would otherwise hold in a
+    # buffer the crash discards.
+    faulthandler.enable()
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(line_buffering=True)
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--required-extension", action="append", default=None)
     pre.add_argument("--offline-excused", action="append", default=[])

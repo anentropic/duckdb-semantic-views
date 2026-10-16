@@ -428,12 +428,11 @@ struct SemanticViewsParserInfo : public ParserExtensionInfo {};
 // The query the last parser_override call on this thread saw. DuckDB 2.0's
 // parse_function gets tokens without source offsets; when it runs, it is inside
 // the same Parser::ParseQuery as the override call that recorded this, so the
-// tokens can be located in it (sv_locate_tail). Only ever a hint: the stub
-// clears it once it has rendered an error against it, and a value left by a
-// parse that needed no stub fails the match (the tokens of a statement that
-// parsed cannot be those of one that did not), so the stub falls back to
-// rebuilding the text. Without the clearing, a connection whose override is
-// off (nothing recorded) would quote an earlier failed query on this thread.
+// tokens can be located in it (sv_locate_tail). It is kept only while the stub
+// may still need it: the override clears it when its rewrite of the query
+// parses, and the stub once it has rendered an error against it. Otherwise a
+// connection whose override is off, which records nothing, would quote an
+// earlier query on this thread that ended with the same statement.
 static thread_local std::string sv_override_query;
 #endif
 
@@ -486,7 +485,8 @@ static ParserOverrideResult sv_parser_override(
         return ParserOverrideResult();
     }
 
-    // rc == 0: native SQL produced. Re-parse via DuckDB's Parser. Use
+    // rc == 0: native SQL produced. Once it parses, no stub runs for this
+    // query, so its recorded text is dropped. Re-parse via DuckDB's Parser. Use
     // default-constructed ParserOptions so parser_override doesn't recurse
     // (DEFAULT_OVERRIDE skips parser_override hooks entirely). The
     // rewritten SQL is read by exact length, so size is unbounded.
@@ -494,6 +494,9 @@ static ParserOverrideResult sv_parser_override(
     try {
         Parser parser = sv_compat::builtin_parser();
         parser.ParseQuery(native_sql);
+#ifdef SV_DUCKDB_2
+        sv_override_query.clear();
+#endif
         return ParserOverrideResult(std::move(parser.statements));
     } catch (std::exception &e) {
         return ParserOverrideResult(e);

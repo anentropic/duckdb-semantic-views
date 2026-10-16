@@ -399,6 +399,16 @@ fn write_engine_source(dir: &Path, marker: &str) {
         &dir.join("third_party/fmt/include/fmt/format.h"),
         "// stub\n",
     );
+    // Like the real `third_party/brotli`: an `include/` directory, and next to
+    // it a `VERSION` file that a case-insensitive file system finds for
+    // `#include <version>`.
+    write(
+        &dir.join("third_party/brotli/include/brotli/decode.h"),
+        "// stub\n",
+    );
+    write(&dir.join("third_party/brotli/VERSION"), "1.1.0\n");
+    // Like `third_party/re2`: headers at the root, no `include/`.
+    write(&dir.join("third_party/re2/re2/re2.h"), "// stub\n");
     write(&dir.join("MARKER"), &format!("{marker}\n"));
 }
 
@@ -530,7 +540,7 @@ fn sdist_engine_id() -> String {
 }
 
 /// `LAYOUT` in `scripts/ensure_engine.py`.
-const LAYOUT: &str = "2";
+const LAYOUT: &str = "3";
 
 /// The installed manifest as (version, include dirs, libraries).
 fn manifest(root: &Path) -> (String, Vec<String>, Vec<String>) {
@@ -602,6 +612,39 @@ fn pinned_release_is_built_from_the_sdist_under_the_pin() {
     assert!(!root
         .join(format!(".engine/{}/src/pyproject.toml", sdist_engine_id()))
         .exists());
+}
+
+/// A third-party library with an `include/` directory is reached through
+/// that directory only, as DuckDB's own CMake does. Its root holds sources and
+/// files such as brotli's `VERSION`, which macOS's case-insensitive file system
+/// returns for `#include <version>`, so putting the root on the include path
+/// breaks the shim's compile there.
+#[test]
+fn a_third_party_root_with_an_include_directory_is_not_on_the_include_path() {
+    let root = script_project("third-party-includes");
+    let sdist = plant_sdist(&root, "SDIST");
+
+    run_script_ok(&root, &["--sdist", sdist.to_str().expect("utf-8")], &[]);
+
+    let (_, includes, _) = manifest(&root);
+    for name in ["brotli", "fmt"] {
+        assert!(
+            includes
+                .iter()
+                .any(|i| i.ends_with(&format!("third_party/{name}/include"))),
+            "{name}'s include directory must be on the include path: {includes:?}"
+        );
+        assert!(
+            !includes
+                .iter()
+                .any(|i| i.ends_with(&format!("third_party/{name}"))),
+            "{name}'s root must not be on the include path: {includes:?}"
+        );
+    }
+    assert!(
+        includes.iter().any(|i| i.ends_with("third_party/re2")),
+        "a library with no include directory is reached through its root: {includes:?}"
+    );
 }
 
 /// A configure that stamps a label other than the pin would give the
@@ -1085,4 +1128,116 @@ fn a_cache_manifest_cut_before_its_libraries_is_rebuilt_not_trusted() {
     check_a_truncated_cache_manifest_is_rebuilt("cut-stamp", |full| {
         full.find("\nlib ").expect("a lib line")
     });
+}
+
+/// A checkout that built before the engine build has the v1.5 amalgamation in
+/// `cpp/include`, where the shim's `#include "duckdb.hpp"` finds it before the
+/// engine's own header. The engine build must remove it.
+#[test]
+fn the_amalgamation_left_by_a_pre_engine_build_is_removed() {
+    let root = script_project("stale-amalgamation");
+    let sdist = plant_sdist(&root, "SDIST");
+    let stale = [
+        "cpp/include/duckdb.hpp",
+        "cpp/include/duckdb.cpp",
+        "cpp/include/.amalgamation_id",
+    ];
+    for path in stale {
+        write(&root.join(path), "// DuckDB v1.5.6 amalgamation\n");
+    }
+    write(
+        &root.join("cpp/include/parser_extension_compat.hpp"),
+        "// ours\n",
+    );
+
+    let out = run_script_ok(&root, &["--sdist", sdist.to_str().expect("utf-8")], &[]);
+
+    for path in stale {
+        assert!(!root.join(path).exists(), "{path} must be removed");
+    }
+    assert!(
+        root.join("cpp/include/parser_extension_compat.hpp")
+            .exists(),
+        "the shim's own headers must stay"
+    );
+    assert!(
+        out.contains("amalgamation"),
+        "the removal must be logged: {out}"
+    );
+}
+
+/// The paths a manifest names, all of which a usable engine has.
+fn manifest_paths_exist(root: &Path) -> bool {
+    let (_, includes, libs) = manifest(root);
+    includes.iter().chain(&libs).all(|p| Path::new(p).exists())
+}
+
+/// A forced rebuild deletes the engine's source before rebuilding it. If it
+/// then fails (here the sdist is missing, as when PyPI is unreachable), the
+/// old entry must not be served by the next run: its headers are gone.
+#[test]
+fn a_failed_forced_rebuild_is_not_served_from_the_cache() {
+    let root = script_project("failed-force");
+    let sdist = plant_sdist(&root, "SDIST");
+    let sdist = sdist.to_str().expect("utf-8");
+    run_script_ok(&root, &["--sdist", sdist], &[]);
+    let missing = root.join("no-such-sdist.tar.gz");
+    let out = run_script(
+        &root,
+        &["--sdist", missing.to_str().expect("utf-8"), "--force"],
+        &[],
+    );
+    assert!(
+        !out.status.success(),
+        "a rebuild without its sdist must fail"
+    );
+
+    run_script_ok(&root, &["--sdist", sdist], &[]);
+
+    assert!(
+        manifest_paths_exist(&root),
+        "the installed manifest names paths that are gone: {:?}",
+        manifest(&root)
+    );
+}
+
+/// The cache entry's libraries can disappear without the run that made them
+/// (pruned by hand, or the checkout moved): an entry whose files are gone is
+/// rebuilt, not installed.
+#[test]
+fn a_cache_entry_whose_libraries_are_gone_is_rebuilt() {
+    let root = script_project("pruned-lib");
+    let sdist = plant_sdist(&root, "SDIST");
+    let sdist = sdist.to_str().expect("utf-8");
+    run_script_ok(&root, &["--sdist", sdist], &[]);
+    std::fs::remove_dir_all(sdist_cache(&root).join("lib")).expect("remove lib");
+
+    run_script_ok(&root, &["--sdist", sdist], &[]);
+
+    assert_eq!(cmake_calls(&root).len(), 4, "the pruned entry must rebuild");
+    assert!(manifest_paths_exist(&root));
+}
+
+/// Edits to a tree that are not committed yet (debugging a fork's engine, say)
+/// leave its commit unchanged; they must still reach the build rather than be
+/// served the build of the commit.
+#[test]
+fn uncommitted_edits_to_a_tree_are_built() {
+    let root = script_project("tree-dirty");
+    let tree = plant_git_engine_tree(&root, "TREE", Some("v2.0.0"));
+    run_script_ok(&root, &[], &[]);
+
+    write(&tree.join("MARKER"), "TREE-EDITED\n");
+    run_script_ok(&root, &[], &[]);
+
+    assert!(
+        linked_engine(&root).starts_with("TREE-EDITED "),
+        "the edit must be built, got {}",
+        linked_engine(&root)
+    );
+
+    // And the edited build is not then served for the commit itself.
+    git(&tree, &["checkout", "--", "MARKER"]);
+    run_script_ok(&root, &[], &[]);
+    assert!(linked_engine(&root).starts_with("TREE "));
 }

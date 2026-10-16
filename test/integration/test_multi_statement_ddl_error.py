@@ -40,6 +40,9 @@ Each scenario runs on a fresh in-memory database and reports independently:
                                another database whose override is off: the
                                second error must quote its own query, not the
                                first one's.
+  control_stale_caret_success  a DDL that succeeds on one database, then the
+                               same DDL on another whose override is off: the
+                               "not active" error must not quote the first.
 
 Run: uv run test/integration/test_multi_statement_ddl_error.py (or
 `just test-multi-statement-error`).
@@ -202,6 +205,22 @@ def scenario_control_stale_caret_query():
     assert "LINE 2:" not in msg, f"must not quote another query; got: {msg}"
 
 
+def scenario_control_stale_caret_success():
+    off, on = connect(), connect()
+    try:
+        on.execute("CREATE TABLE orders (id INTEGER, region VARCHAR, amount DOUBLE)")
+        off.execute("SET allow_parser_override_extension = 'DEFAULT'")
+        # One statement, on its second line, that the override rewrites and runs.
+        on.execute("\n" + DDL)
+        msg = error_of(off, DDL)
+    finally:
+        off.close()
+        on.close()
+    assert msg is not None, "DDL with the override switched off must fail"
+    assert OLD_HINT in msg, f"override-off database must keep its message; got: {msg}"
+    assert "LINE 2:" not in msg, f"must not quote another query; got: {msg}"
+
+
 SCENARIOS = [
     scenario_ddl_after_other_statements,
     scenario_ddl_before_other_statement,
@@ -212,6 +231,7 @@ SCENARIOS = [
     scenario_control_stale_after_success,
     scenario_control_stale_after_typo,
     scenario_control_stale_caret_query,
+    scenario_control_stale_caret_success,
 ]
 
 

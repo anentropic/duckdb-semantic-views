@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Build the DuckDB engine the C++ shim links against, and point build.rs at it.
+"""
+Build the DuckDB engine the C++ shim links against, and point build.rs at it.
 
 `build.rs` links a static DuckDB engine *into* the extension binary alongside
 `cpp/src/shim.cpp`, because the parser-extension hook the shim registers is C++
@@ -52,6 +53,7 @@ library is needed.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import json
 import os
@@ -69,13 +71,21 @@ DEFAULT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MANIFEST = os.path.join("cpp", "engine.manifest")
 # Engine builds that predate this layout or a change to how it is built would
 # be reused from the cache without this in the id.
-LAYOUT = "2"
+LAYOUT = "3"
 # A DuckDB release label, as DuckDB's CMake parses one.
 RELEASE_LABEL_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|dev)[0-9]+)?$")
 # A commit, as extension-ci-tools passes `duckdb_version` when it is a SHA.
 COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 # The variables a harness labels its engine build with, in the order DuckDB's
 # CMake reads them.
+# What a pre-engine (DuckDB 1.x) build installed. `cpp/include` is on the shim's
+# include path, so a leftover `duckdb.hpp` there would be included in place of
+# the engine's own header.
+STALE_AMALGAMATION = (
+    "cpp/include/duckdb.hpp",
+    "cpp/include/duckdb.cpp",
+    "cpp/include/.amalgamation_id",
+)
 HARNESS_LABEL_VARS = ("DUCKDB_VERSION", "OVERRIDE_GIT_DESCRIBE")
 # The CMake configure line logs the label the build stamps into the library.
 CMAKE_VERSION_RE = re.compile(r"git hash \S+, version (\S+),")
@@ -106,7 +116,8 @@ def pypi_version(root: str, version: str) -> str:
 
 
 def engine_source_tree(root: str, src_dir: str) -> str | None:
-    """Absolute path of a usable engine source tree, or None.
+    """
+    Absolute path of a usable engine source tree, or None.
 
     "Usable" means it carries a CMake build and the headers the shim compiles
     against. A bare `duckdb/` directory that is something else -- an empty
@@ -124,7 +135,8 @@ def engine_source_tree(root: str, src_dir: str) -> str | None:
 
 
 def git_commit(tree: str) -> str | None:
-    """Short commit hash of `tree`, or None when it is not a git checkout.
+    """
+    Short commit hash of `tree`, or None when it is not a git checkout.
 
     `safe.directory=*` because CI hands the tree to the build across an
     ownership boundary (the community-extensions Linux leg clones on the host
@@ -140,6 +152,29 @@ def git_commit(tree: str) -> str | None:
     except (OSError, subprocess.CalledProcessError):
         return None
     return out.stdout.strip() or None
+
+
+def git_dirty(tree: str) -> bool:
+    """Whether `tree` has uncommitted changes to its tracked files."""
+    try:
+        out = subprocess.run(
+            [
+                "git",
+                "-c",
+                "safe.directory=*",
+                "-C",
+                tree,
+                "status",
+                "--porcelain",
+                "--untracked-files=no",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return bool(out.stdout.strip())
 
 
 def git_exact_tag(tree: str) -> str | None:
@@ -158,15 +193,15 @@ def git_exact_tag(tree: str) -> str | None:
 
 
 def git_ref_names(tree: str) -> set[str]:
-    """Every branch and tag name in `tree`, short and remote-relative.
+    """
+    Every branch and tag name in `tree`, short and remote-relative.
 
     `origin/main` is listed as `main` too: a harness checks out a branch
     detached, so its name survives only as the remote-tracking ref.
     """
     try:
         out = subprocess.run(
-            ["git", "-c", "safe.directory=*", "-C", tree, "for-each-ref",
-             "--format=%(refname)"],
+            ["git", "-c", "safe.directory=*", "-C", tree, "for-each-ref", "--format=%(refname)"],
             capture_output=True,
             text=True,
             check=True,
@@ -177,16 +212,17 @@ def git_ref_names(tree: str) -> set[str]:
     for ref in out.split():
         for prefix in ("refs/heads/", "refs/tags/"):
             if ref.startswith(prefix):
-                names.add(ref[len(prefix):])
+                names.add(ref[len(prefix) :])
         if ref.startswith("refs/remotes/"):
-            remote_ref = ref[len("refs/remotes/"):]
+            remote_ref = ref[len("refs/remotes/") :]
             names.add(remote_ref)
             names.add(remote_ref.split("/", 1)[-1])
     return names
 
 
 def tree_label(tree: str) -> tuple[str | None, str]:
-    """The version label to build `tree` with, and where it came from.
+    """
+    The version label to build `tree` with, and where it came from.
 
     The library reports this label as its version, and the extension refuses
     any host reporting another, so it has to be what the host's own build of
@@ -252,7 +288,8 @@ def download_sdist(pypi: str, archive: str) -> None:
 
 
 def check_sdist_version(tar: tarfile.TarFile, pypi: str) -> None:
-    """Fail unless the archive is the sdist of `duckdb` release `pypi`.
+    """
+    Fail unless the archive is the sdist of `duckdb` release `pypi`.
 
     The engine source carries no commit or label of its own -- the build
     takes its label from us -- so the archive's own metadata is the only
@@ -264,7 +301,11 @@ def check_sdist_version(tar: tarfile.TarFile, pypi: str) -> None:
     fh = tar.extractfile(info[0])
     text = fh.read().decode("utf-8", "replace") if fh else ""
     found = next(
-        (line.split(":", 1)[1].strip() for line in text.splitlines() if line.startswith("Version:")),
+        (
+            line.split(":", 1)[1].strip()
+            for line in text.splitlines()
+            if line.startswith("Version:")
+        ),
         None,
     )
     if found != pypi:
@@ -275,7 +316,8 @@ def check_sdist_version(tar: tarfile.TarFile, pypi: str) -> None:
 
 
 def extract_engine(pypi: str, dest: str, sdist: str | None) -> None:
-    """Extract the engine source (`external/duckdb`) of the sdist into `dest`.
+    """
+    Extract the engine source (`external/duckdb`) of the sdist into `dest`.
 
     `sdist` is a local copy of the archive; without one it comes from PyPI.
     """
@@ -306,7 +348,8 @@ def extract_engine(pypi: str, dest: str, sdist: str | None) -> None:
 
 
 def platform_flags() -> list[str]:
-    """CMake flags that make the engine match the target the extension is built for.
+    """
+    CMake flags that make the engine match the target the extension is built for.
 
     extension-ci-tools cross-compiles osx_amd64 on an arm64 runner and says so
     in the `OSX_BUILD_ARCH` environment variable; DuckDB's CMake reads it only
@@ -342,9 +385,7 @@ def configure_engine(src: str, build: str, env: dict[str, str]) -> str:
     ]
     log("configuring: " + " ".join(configure))
     try:
-        out = subprocess.run(
-            configure, env=env, check=True, capture_output=True, text=True
-        ).stdout
+        out = subprocess.run(configure, env=env, check=True, capture_output=True, text=True).stdout
     except FileNotFoundError:
         fail("cmake is not on PATH; it is needed to build the DuckDB engine")
     except subprocess.CalledProcessError as exc:
@@ -359,8 +400,15 @@ def build_engine(build: str, env: dict[str, str]) -> None:
     """Build the configured engine's `duckdb_static` target."""
     jobs = str(os.cpu_count() or 2)
     command = [
-        "cmake", "--build", build, "--target", "duckdb_static",
-        "--config", "Release", "--parallel", jobs,
+        "cmake",
+        "--build",
+        build,
+        "--target",
+        "duckdb_static",
+        "--config",
+        "Release",
+        "--parallel",
+        jobs,
     ]
     log("building (the first build takes a while): " + " ".join(command))
     try:
@@ -397,9 +445,12 @@ def include_dirs(src: str) -> list[str]:
         path = os.path.join(third_party, name)
         if not os.path.isdir(path):
             continue
-        dirs.append(path)
-        if os.path.isdir(os.path.join(path, "include")):
-            dirs.append(os.path.join(path, "include"))
+        # As DuckDB's CMake does: a library with an `include/` directory is
+        # reached through it alone. Its root holds files such as brotli's
+        # `VERSION`, which a case-insensitive file system (macOS) returns for
+        # `#include <version>`.
+        include = os.path.join(path, "include")
+        dirs.append(include if os.path.isdir(include) else path)
     return dirs
 
 
@@ -431,10 +482,13 @@ def manifest_label(text: str) -> str | None:
 
 
 def cached_manifest(stamp: str, engine_id: str) -> str | None:
-    """The cache entry's manifest, or None when it is missing or incomplete.
+    """
+    The cache entry's manifest, or None when it is missing or unusable.
 
     It is written atomically, but an entry from an interrupted run of an older
-    script, or a damaged file, must be rebuilt rather than handed to `build.rs`.
+    script, a damaged file, or one whose headers or libraries have since gone
+    (pruned by hand, a moved checkout) must be rebuilt rather than handed to
+    `build.rs`.
     """
     if not os.path.exists(stamp):
         return None
@@ -445,6 +499,11 @@ def cached_manifest(stamp: str, engine_id: str) -> str | None:
         lines[:1] == [f"id {engine_id}"]
         and manifest_label(text) is not None
         and any(line.startswith("lib ") for line in lines)
+        and all(
+            os.path.exists(line.split(" ", 1)[1])
+            for line in lines
+            if line.startswith(("include ", "lib "))
+        )
     )
     return text if complete else None
 
@@ -473,6 +532,11 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     root = os.path.abspath(args.repo_root)
+    for stale in STALE_AMALGAMATION:
+        path = os.path.join(root, stale)
+        if os.path.exists(path):
+            os.remove(path)
+            log(f"removed {stale}, left by a DuckDB 1.x (amalgamation) build")
     version = args.version or read_pin(root, ".duckdb-version")
     if not version:
         fail("no target version: pass --version or create .duckdb-version")
@@ -489,12 +553,20 @@ def main(argv: list[str] | None = None) -> int:
     cacheable = True
     if tree:
         commit = git_commit(tree)
-        cacheable = commit is not None
+        # Uncommitted edits are not part of the commit: such a tree is rebuilt
+        # every time, under an id of its own so the commit's build is not
+        # replaced by the edited one.
+        dirty = commit is not None and git_dirty(tree)
+        cacheable = commit is not None and not dirty
         label, evidence = tree_label(tree)
         if label:
             env["DUCKDB_VERSION"] = label
-        engine_id = f"src-{label or 'dev'}-{commit or 'unidentified'}{target}-{LAYOUT}"
-        log(f"engine source tree: {tree} (commit {commit or 'unknown'}; {evidence})")
+        state = "-dirty" if dirty else ""
+        engine_id = f"src-{label or 'dev'}-{commit or 'unidentified'}{state}{target}-{LAYOUT}"
+        log(
+            f"engine source tree: {tree} (commit {commit or 'unknown'}"
+            f"{', with uncommitted changes' if dirty else ''}; {evidence})"
+        )
     else:
         env["DUCKDB_VERSION"] = version
         # The wheel pin is part of the id: correcting it must not be served the
@@ -510,7 +582,11 @@ def main(argv: list[str] | None = None) -> int:
     if manifest is None:
         # Nothing an earlier, unfinished run left is trusted: its source may be
         # a partial extraction, and its build directory may hold a CMake cache
-        # for another generator, which CMake refuses to configure over.
+        # for another generator, which CMake refuses to configure over. The
+        # entry's own manifest goes first, so a rebuild that fails part-way
+        # (after removing the source) leaves no entry behind that looks finished.
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(stamp)
         if not tree:
             shutil.rmtree(src, ignore_errors=True)
             extract_engine(pypi_version(root, version), src, args.sdist)

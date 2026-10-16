@@ -67,6 +67,14 @@ build/
 # DuckDB engine build cache (populated by make ensure_engine, survives branch switches)
 .engine/
 
+# What DuckDB 1.x (amalgamation) builds left behind. make ensure_engine removes
+# the copies in cpp/include, which would shadow the engine's own duckdb.hpp, and
+# build.rs refuses to compile while one is there.
+cpp/include/duckdb.hpp
+cpp/include/duckdb.cpp
+cpp/include/.amalgamation_id
+.amalgamation/
+
 # Engine source tree supplied by a CI harness (community-extensions and its
 # Haybarn fork clone the DuckDB they build against into ./duckdb)
 /duckdb/
