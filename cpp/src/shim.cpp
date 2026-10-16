@@ -3638,6 +3638,128 @@ extern "C" {
     }
 }
 
+#ifdef SV_DUCKDB_2
+// ---------------------------------------------------------------------------
+// Grammar productions (DuckDB 2.0 PEG parser) -- Phase 3 prototype
+// ---------------------------------------------------------------------------
+// The parser override above sees a whole statement's text, so it can only
+// rewrite statements that *start* with our syntax. A grammar extension adds
+// rules to DuckDB's own PEG grammar instead, so our syntax can sit anywhere
+// the grammar allows: `SELECT ... FROM (SHOW SEMANTIC VIEWS)`, a CTE, a view
+// body (TECH-DEBT #77).
+//
+// Prototype scope: `SHOW [TERSE] SEMANTIC VIEWS` as a DescribeStatement
+// alternative, lowered through the same Rust rewrite the override uses. The
+// override still owns every top-level statement, so the production is only
+// reached where the override cannot go.
+
+static const char *SV_GRAMMAR_NAME = "semantic_views";
+
+// The source text a parse result spans. A transform has no query string, only
+// the tokens (text and offset), so the gaps between tokens are refilled with
+// spaces of the original width. Comments inside the span are lost (spike
+// finding D4).
+static string sv_grammar_source_text(PEGTransformer &transformer, ParseResult &pr) {
+    auto loc = pr.GetLocation();
+    string out;
+    idx_t prev_end = loc.offset;
+    bool first = true;
+    auto &tokens = transformer.token_iterator;
+    for (idx_t i = 0; i < tokens.Size(); i++) {
+        auto &tok = tokens.GetToken(i);
+        if (tok.offset < loc.offset || tok.offset >= loc.offset + loc.length) {
+            continue;
+        }
+        if (!first) {
+            out.append(tok.offset - prev_end, ' ');
+        }
+        first = false;
+        out += tok.text;
+        prev_end = tok.offset + tok.length;
+    }
+    return out;
+}
+
+// Lower a recognised statement through the Rust rewrite and parse the result
+// with DuckDB's builtin parser. The rewrite of a read statement is one SELECT.
+static unique_ptr<QueryNode> sv_grammar_lower_query(const string &statement) {
+    SvOwnedBuffer sql_buf;
+    char error_buf[1024];
+    memset(error_buf, 0, sizeof(error_buf));
+    uint8_t rc = sv_parser_override_rust(statement.c_str(), statement.size(),
+                                         &sql_buf.ptr, &sql_buf.len, error_buf, sizeof(error_buf));
+    if (rc != 0) {
+        throw ParserException("semantic_views: cannot lower '%s'%s%s", statement,
+                              error_buf[0] ? ": " : "", string(error_buf));
+    }
+    Parser parser = sv_compat::builtin_parser();
+    parser.ParseQuery(sql_buf.to_string());
+    if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+        throw ParserException("semantic_views: '%s' does not lower to a single query", statement);
+    }
+    return std::move(parser.statements[0]->Cast<SelectStatement>().node);
+}
+
+static arena_ptr<TransformResultValue> sv_grammar_finalize_show(PEGTransformer &transformer, ParseResult &pr) {
+    auto node = sv_grammar_lower_query(sv_grammar_source_text(transformer, pr));
+    return transformer.MakeResult<unique_ptr<QueryNode>>(std::move(node));
+}
+
+static arena_ptr<TransformProcess> sv_grammar_start_show(PEGTransformer &transformer, ParseResult &pr) {
+    return transformer.MakeProcess<FinalizeTransformProcess>(transformer, pr, sv_grammar_finalize_show);
+}
+
+class SemanticViewsGrammar final : public GrammarExtension {
+public:
+    SemanticViewsGrammar() : GrammarExtension(SV_GRAMMAR_NAME, "CREATE / SHOW / DESCRIBE SEMANTIC VIEW syntax") {
+    }
+    vector<GrammarChange> GetChanges() const override {
+        vector<GrammarChange> c;
+        c.push_back(GrammarChange::AddChoice("UnreservedKeyword", "'SEMANTIC'"));
+        c.push_back(GrammarChange::AddChoice("UnreservedKeyword", "'TERSE'"));
+        c.push_back(GrammarChange::AddRule("SvShowViews <- 'SHOW' 'TERSE'? 'SEMANTIC' 'VIEWS'", sv_grammar_start_show));
+        c.push_back(GrammarChange::PrependChoice("DescribeStatement", "SvShowViews"));
+        return c;
+    }
+};
+
+// Turn the grammar on for one connection. `active_grammar_extensions` is a
+// per-connection setting, so a LOAD reaches the connections that exist now
+// (sv_grammar_activate_all) and an ExtensionCallback reaches the ones opened
+// later.
+static void sv_grammar_activate(ClientContext &context) {
+    auto &config = ClientConfig::GetConfig(context);
+    vector<Value> names;
+    for (auto &existing : config.active_grammar_extensions) {
+        if (StringUtil::CIEquals(existing, SV_GRAMMAR_NAME)) {
+            return;
+        }
+        names.emplace_back(existing);
+    }
+    names.emplace_back(SV_GRAMMAR_NAME);
+    ActiveGrammarExtensionsSetting::SetLocal(context, Value::LIST(LogicalType::VARCHAR, std::move(names)));
+}
+
+class SemanticViewsGrammarActivation final : public ExtensionCallback {
+public:
+    void OnConnectionOpened(ClientContext &context) override {
+        sv_grammar_activate(context);
+    }
+};
+
+// Register the grammar once per database and activate it on every connection.
+static void sv_register_grammar(DatabaseInstance &db) {
+    auto &config = DBConfig::GetConfig(db);
+    if (!config.GetCallbackManager().FindGrammarExtension(SV_GRAMMAR_NAME)) {
+        GrammarExtension::Register(db, make_shared_ptr<SemanticViewsGrammar>());
+        ExtensionCallback::Register(config, make_shared_ptr<SemanticViewsGrammarActivation>());
+    }
+    for (auto &context : db.GetConnectionManager().GetConnectionList()) {
+        sv_grammar_activate(*context);
+    }
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // sv_register_parser_hooks -- called from Rust after C API init
 // ---------------------------------------------------------------------------
@@ -3852,6 +3974,10 @@ extern "C" {
                 // `LINE 1: ... ^` for every CREATE/DROP/ALTER validation error.
                 config.SetOption("allow_parser_override_extension", Value("FALLBACK"));
             }
+
+#ifdef SV_DUCKDB_2
+            sv_register_grammar(db);
+#endif
 
             return true;
         } catch (const std::exception &e) {

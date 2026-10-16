@@ -1,0 +1,67 @@
+# SHOW SEMANTIC VIEWS is a query wherever DuckDB accepts one (TECH-DEBT #77).
+#
+# The parser override rewrites a statement only when the statement *starts*
+# with our syntax, so SHOW nested in a subquery, a CTE or a view body failed
+# with a generic syntax error. The grammar extension adds SHOW as a production
+# of DuckDB's own grammar, so the nesting comes from DuckDB.
+
+require semantic_views
+
+statement ok
+CREATE TABLE gq_t (id INTEGER, region VARCHAR);
+
+statement ok
+CREATE SEMANTIC VIEW gq_a AS TABLES (t AS gq_t PRIMARY KEY (id)) DIMENSIONS (t.region AS region);
+
+statement ok
+CREATE SEMANTIC VIEW gq_b AS TABLES (t AS gq_t PRIMARY KEY (id)) DIMENSIONS (t.region AS region);
+
+# --- as a subquery -------------------------------------------------------------
+
+query I
+SELECT count(*) FROM (SHOW SEMANTIC VIEWS);
+----
+2
+
+query T
+SELECT name FROM (SHOW SEMANTIC VIEWS) ORDER BY name;
+----
+gq_a
+gq_b
+
+query I
+SELECT count(*) FROM (show terse semantic views) WHERE name LIKE 'gq_%';
+----
+2
+
+# --- as a CTE ------------------------------------------------------------------
+
+query T
+WITH s AS (SHOW SEMANTIC VIEWS) SELECT name FROM s WHERE name = 'gq_b';
+----
+gq_b
+
+# --- as a view body --------------------------------------------------------------
+# The stored body is the lowered query, so the view keeps working as views are
+# added and dropped.
+
+statement ok
+CREATE VIEW gq_listing AS SELECT name FROM (SHOW SEMANTIC VIEWS);
+
+statement ok
+DROP SEMANTIC VIEW gq_b;
+
+query T
+SELECT name FROM gq_listing;
+----
+gq_a
+
+# --- the top-level statement is unchanged ----------------------------------------
+
+query I
+SELECT count(*) FROM (SHOW SEMANTIC VIEWS) WHERE name = 'gq_a';
+----
+1
+
+statement ok
+SHOW SEMANTIC VIEWS;
