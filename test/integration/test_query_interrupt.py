@@ -277,8 +277,7 @@ def build_slow_source(con, view, csv_dir, n):
     """A view whose every bind expands `n` globs, one directory scan each."""
     globs = ", ".join(f"'{csv_dir}/f{i}.cs?'" for i in range(n))
     con.execute(
-        f"CREATE OR REPLACE VIEW {view} AS "
-        f"SELECT * FROM read_csv([{globs}], union_by_name = true)"
+        f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM read_csv([{globs}], union_by_name = true)"
     )
 
 
@@ -388,7 +387,9 @@ def _run_metadata_probe_tests(con, csv_dir) -> bool:
     for i in range(1, views):
         create_probe_view(con, f"mp_v{i}", "mp_small")
     print(f"  cross-view: {views} views over {small} globs, ~{per_view:.2f}s per view")
-    ok &= check_interrupted_statement(con, "cross-view SHOW SEMANTIC METRICS", "SHOW SEMANTIC METRICS")
+    ok &= check_interrupted_statement(
+        con, "cross-view SHOW SEMANTIC METRICS", "SHOW SEMANTIC METRICS"
+    )
 
     for i in range(views):
         con.execute(f"DROP SEMANTIC VIEW mp_v{i}")
@@ -427,6 +428,60 @@ def check_interrupted_statement(con, label, sql) -> bool:
             message.startswith(f"INTERRUPT Error: {expected}") and "failed:" not in message,
             f"message={message!r}",
         )
+    return ok
+
+
+def check_generous_deadline(con) -> bool:
+    """
+    A deadline that has not passed must not cancel anything.
+
+    Every other deadline check expects a failure, and an instant one passes
+    them. If the forwarded deadline were read on the wrong clock or epoch, any
+    limit at all would cancel every probing bind at once; this control would
+    then fail where the others pass.
+    """
+    print("\nControl (deadline): a deadline far in the future cancels nothing")
+    con.execute(
+        "CREATE OR REPLACE TABLE gd_src AS SELECT range AS id, range % 7 AS x FROM range(100)"
+    )
+    con.execute("DROP SEMANTIC VIEW IF EXISTS gd_view")
+    con.execute(
+        """
+        CREATE SEMANTIC VIEW gd_view AS
+          TABLES (s AS gd_src PRIMARY KEY (id))
+          DIMENSIONS (s.x AS s.x)
+          METRICS (s.total AS sum(s.x), s.dtotal AS sum(s.x::DECIMAL(18, 2)))
+        """
+    )
+    statements = [
+        (
+            "semantic_view() with a DECIMAL output",
+            "SELECT * FROM semantic_view('gd_view', dimensions := ['x'], metrics := ['dtotal'])",
+        ),
+        ("SHOW SEMANTIC DIMENSIONS IN <view>", "SHOW SEMANTIC DIMENSIONS IN gd_view"),
+        (
+            "explain_semantic_view()",
+            "SELECT * FROM explain_semantic_view('gd_view', metrics := ['total'])",
+        ),
+    ]
+    ok = True
+    con.execute("SET max_execution_time = 600000")
+    try:
+        for label, sql in statements:
+            try:
+                rows = con.execute(sql).fetchall()
+                err = None
+            except Exception as exc:  # noqa: BLE001 - the exception IS the observation
+                rows, err = [], exc
+            ok &= check(
+                f"{label} returns rows under a 10-minute deadline",
+                err is None and len(rows) > 0,
+                f"rows={len(rows)} error={err!r}",
+            )
+    finally:
+        con.execute("RESET max_execution_time")
+        con.execute("DROP SEMANTIC VIEW gd_view")
+        con.execute("DROP TABLE gd_src")
     return ok
 
 
@@ -545,6 +600,8 @@ def run_tests() -> int:
             "SQL execution failed" not in message,
             f"message={message!r}",
         )
+
+    ok &= check_generous_deadline(con)
 
     ok &= run_metadata_probe_tests(con)
 

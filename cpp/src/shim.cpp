@@ -430,9 +430,9 @@ struct SemanticViewsParserInfo : public ParserExtensionInfo {};
 // the same Parser::ParseQuery as the override call that recorded this, so the
 // tokens can be located in it (sv_locate_tail). It is kept only while the stub
 // may still need it: the override clears it when its rewrite of the query
-// parses, and the stub once it has rendered an error against it. Otherwise a
-// connection whose override is off, which records nothing, would quote an
-// earlier query on this thread that ended with the same statement.
+// parses, and the stub whenever it runs, since its answer ends the parse.
+// Otherwise a connection whose override is off, which records nothing, would
+// quote an earlier query on this thread that ended with the same statement.
 static thread_local std::string sv_override_query;
 #endif
 
@@ -733,8 +733,12 @@ static ParserExtensionParseResult sv_parse_stub(
                                                      start + result.error_location.GetIndex());
         }
         result.error_location = optional_idx();
-        sv_override_query.clear();
     }
+    // Whatever the answer, this query's parse is over for us: an error is
+    // thrown, and an unclaimed statement makes DuckDB rethrow its own error.
+    // (Only another extension claiming the statement lets the parse go on;
+    // a later failing statement then gets no caret, as with the override off.)
+    sv_override_query.clear();
     return result;
 }
 #else
