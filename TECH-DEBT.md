@@ -69,6 +69,7 @@ These are intentional trade-offs made during v0.1.0 development. Each was the be
 - **Origin:** v0.5.0 Phase 15, C++ shim infrastructure
 - **Decision:** `duckdb.cpp` (the DuckDB amalgamation, ~23MB / ~300K lines) is compiled alongside `shim.cpp` via the `cc` crate. First build takes ~2.5 minutes; cached on subsequent builds. This provides ALL DuckDB C++ symbols (constructors, RTTI, vtables) without manual stubs. Symbol visibility restricts exports to the entry point only, preventing ODR conflicts with the host DuckDB process. The amalgamation must be version-pinned to match `TARGET_DUCKDB_VERSION`.
 - **Action:** The compilation cost is one-time per clean build. `build.rs` feature-gates the C++ compilation behind `CARGO_FEATURE_EXTENSION`, so `cargo test` (default features) is unaffected.
+- **Update (DuckDB 2.0 epic, Phase 2):** Superseded. DuckDB 2.0 ships no amalgamation, so `scripts/ensure_engine.py` builds the engine's `duckdb_static` library with DuckDB's own CMake (from the PyPI sdist, or from a harness's `./duckdb` tree), caches it under `.engine/`, and `build.rs` links it and compiles the shim against the engine's full headers (`cpp/engine.manifest`). The visibility restriction is unchanged. See MAINTAINER.md, "The DuckDB engine build".
 
 ### 11. ✅ C_STRUCT_UNSTABLE ABI (evaluated, kept; replaced by pinned C_STRUCT for DuckDB 2.0)
 
@@ -182,6 +183,7 @@ Areas where test coverage is reduced compared to ideal, with justification.
   - **Consequence for schema-scoped resolution:** the read-side table functions cannot resolve an unqualified semantic-view name against the caller's schema on their own. Resolution is therefore threaded in **at rewrite time** — the parser override embeds the caller's search path, which DuckDB evaluates on the caller's connection before the table function is bound.
   - **The injection landed 2026-08-03** (`src/parse/search_path.rs`). Every resolving read table function gained a `search_path` named parameter (`LIST(VARCHAR)`), and the parser override appends `search_path := list_concat(current_schemas(false), [current_schema()])` to each call it sees. What makes this work is that **DuckDB constant-folds table-function arguments on the caller's connection, before the bind callback runs** — so an ordinary scalar expression is the one channel into a bind that the two walls above do not close. (A subquery is not: `Table function cannot contain subqueries`.) `current_schemas(true)` is deliberately not used — it prepends the *temp* schema, itself named `main`, which would win over a real schema of that name.
     - **Not covered: the two scalar functions.** `get_ddl` and `read_yaml_from_semantic_view` are scalars, which have no named parameters, so giving them the path needs a second registered arity. They keep the no-path fallback — the unique match, else an ambiguity error — which is conservative rather than wrong. Recorded under #25.
+  - **Update (DuckDB 2.0 epic, Phase 2): the header wall is gone.** The shim now compiles against the engine's full headers, which define `ClientData` (`duckdb/main/client_data.hpp`, with `catalog_search_path`), so a bind could read the caller's search path off its `ClientContext` without a query and so without the `context_lock` deadlock. The rewrite-time injection is kept for now: it works, it is covered, and replacing it changes how every resolving read function binds, which belongs in its own change with its own tests, not in the engine port. Doing so would also give the two scalar functions (`get_ddl`, `read_yaml_from_semantic_view`) the caller's path, closing the #25 gap. The `context_lock` wall above is unaffected and still blocks reading on the caller's transaction.
   - **That injection is forward-compatible and should be deleted when this entry resolves.** The action above would fix the session-config problem incidentally: once reads run on the caller's context, `current_schemas()` inside the catalog query simply evaluates in the caller's session and the injected argument becomes redundant. So the two are the *same* upstream ask, not separate ones — but the injection is what makes DuckDB-conventional resolution possible in the meantime.
 
 ### 20. ✅ Bounded LRU evictions are silent at the parser-override site
@@ -823,12 +825,16 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Origin:** 2026-08-28, fixing the Haybarn distribution's build of this extension (its
   `make configure` failed on every platform, and its binary would then have been compiled
   against upstream headers rather than the fork's).
-- **What ships:** `scripts/ensure_amalgamation.py` generates the amalgamation from an
-  engine source tree in `./duckdb` when a harness supplies one, and the `DUCKDB_TEST_VERSION`
-  pin stands down when `DUCKDB_GIT_VERSION` names an engine other than our pinned release.
-  Both paths are entered **only** by a CI harness we do not run: our own `BuildAll` /
-  `BuildQuick` workflows call upstream `_extension_distribution.yml`, which supplies no
-  engine tree, so every workflow in this repo exercises the *download* path exclusively.
+- **What ships:** `scripts/ensure_engine.py` builds the engine from a source tree in
+  `./duckdb` when a harness supplies one (else from the pinned release's sdist), and the
+  `DUCKDB_TEST_VERSION` pin stands down when `DUCKDB_GIT_VERSION` names an engine other than
+  our pinned release.
+- **Update (DuckDB 2.0 epic, Phase 2):** our own `BuildAll` / `BuildQuick` now run the tree
+  path too, since extension-ci-tools clones the upstream engine into `./duckdb` and the
+  engine is built from it. What stays uncovered is a *distribution's* tree: no workflow here
+  builds against a fork's engine, its labels or its headers. The amalgamation-specific
+  findings below (generating `libhaybarn-src.zip`) are historical; the fork-labelling rules
+  now live in `ensure_engine.py`'s `tree_label`.
 - **What is covered:** `tests/build_config.rs` drives the real `Makefile` and the real
   script over a stub engine tree and a `file://` release zip, so the *selection* rules,
   the version guard and the provenance stamp are guarded under `cargo test`. What no test
@@ -856,7 +862,7 @@ Areas where test coverage is reduced compared to ideal, with justification.
     upstream DuckDB and tests extensions against *that*). The check above was driven
     through their CLI instead.
 - **What would finish it:** a scheduled workflow that clones a distribution engine at its
-  release tag, builds with `AMALGAMATION_SRC_DIR` pointed at it, and runs the suite against
+  release tag into `./duckdb`, builds the extension against it, and runs the suite against
   that distribution's own test runner — the same shape as `DuckDBVersionMonitor`, which
   already exists to catch upstream drift on a schedule.
 
