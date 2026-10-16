@@ -10,6 +10,38 @@ Error Messages
 This page documents the error messages produced by DuckDB Semantic Views, their causes, and how to resolve them.
 
 
+.. _ref-err-load:
+
+Load Errors
+===========
+
+These errors occur when ``LOAD semantic_views`` runs.
+
+
+Built for a different DuckDB release
+------------------------------------
+
+.. code-block:: text
+
+   semantic_views was built for DuckDB <built> and cannot run in DuckDB <host>,
+   because it depends on that exact DuckDB release. If a semantic_views build
+   for this DuckDB has been published, install it with: FORCE INSTALL
+   semantic_views FROM community;
+
+**Cause:** Each build of the extension is compiled against one exact DuckDB release. The file being loaded was built for ``<built>``, but the running DuckDB is ``<host>``. The extension checks this before it starts, so the ``LOAD`` fails instead of crashing DuckDB.
+
+**Fix:** Install the build that matches the running DuckDB, then load it:
+
+.. code-block:: sql
+
+   FORCE INSTALL semantic_views FROM community;
+   LOAD semantic_views;
+
+If no build for ``<host>`` has been published yet, the install fails. Until one is, run DuckDB ``<built>``.
+
+When ``<host>`` is a development or nightly DuckDB build (its version contains a ``-``, such as ``v1.5.7-dev42``), the message ends with ``Load a semantic_views build compiled against this DuckDB.`` instead. The community repository only has builds for tagged releases, so build the extension from source against that DuckDB.
+
+
 .. _ref-err-ddl:
 
 DDL Errors (CREATE SEMANTIC VIEW)
