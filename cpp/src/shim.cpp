@@ -3401,6 +3401,11 @@ static unique_ptr<FunctionData> sv_semantic_view_bind(
     std::vector<uint8_t> sp_buf = sv_search_path_payload(input);
 
     Connection probe(*context.db);
+    // The Rust bind types the requested members on `probe`, and a DECIMAL or
+    // LIST output adds a LIMIT 0 probe below; both read the view's tables, so a
+    // cancelled caller (interrupt or deadline) is forwarded and raised bare, as
+    // in the metadata binds.
+    SvBindCancellationScope cancellation(context, probe);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
 
     SvOwnedBuffer payload;
@@ -3417,6 +3422,7 @@ static unique_ptr<FunctionData> sv_semantic_view_bind(
         where_clause.size(),
         &payload.ptr, &payload.len,
         error_buf, sizeof(error_buf));
+    cancellation.ThrowIfCancelled();
     if (rc != 0) {
         throw BinderException(std::string("semantic_view: ") + error_buf);
     }
@@ -3447,8 +3453,17 @@ static unique_ptr<FunctionData> sv_semantic_view_bind(
     // Phase 65.1 WR-07: reusing `probe` here avoids a second Connection
     // ctor/dtor pair and keeps both queries on the same
     // transaction/catalog snapshot.
-    auto declared_types = sv_resolve_output_logical_types(
-        probe, bd->columns, bd->execution_sql);
+    std::vector<LogicalType> declared_types;
+    try {
+        declared_types = sv_resolve_output_logical_types(
+            probe, bd->columns, bd->execution_sql);
+    } catch (...) {
+        // A probe stopped by the forwarded cancellation fails as a probe error;
+        // the cancellation is what the caller sees.
+        cancellation.ThrowIfCancelled();
+        throw;
+    }
+    cancellation.ThrowIfCancelled();
     for (idx_t i = 0; i < bd->columns.size(); ++i) {
         return_types.push_back(declared_types[i]);
         names.emplace_back(bd->columns[i].name);
