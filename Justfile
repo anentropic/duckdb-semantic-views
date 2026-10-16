@@ -494,9 +494,15 @@ release:
     python3 scripts/registry_target.py set description.yml "$KEY" "$SHA"
     sed -i '' "s/^  version: .*/  version: $VERSION/" description.yml
     git add description.yml
-    git commit -m "chore: update description.yml for v$VERSION release"
-    git push origin main
-    echo "Committed and pushed description.yml update to main"
+    # A re-run for the same release (e.g. to reopen the registry PR) finds
+    # description.yml already up to date; go straight to the registry step.
+    if git diff --cached --quiet; then
+      echo "description.yml already pins v$VERSION; nothing to commit"
+    else
+      git commit -m "chore: update description.yml for v$VERSION release"
+      git push origin main
+      echo "Committed and pushed description.yml update to main"
+    fi
     DESC_SRC="$PWD/description.yml"
     # --- Copy to CE fork and open PR ---
     CE_REPO="${CE_REPO:-$HOME/Documents/Dev/Sources/community-extensions}"
