@@ -20,11 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Windows: a failed `SHOW` / `DESCRIBE` or semantic-view table function no longer
-  crashes DuckDB later.** On Windows, an error raised by one of these calls (for example,
-  a view that does not exist) skipped the extension's cleanup. In v0.14.0 that left a
-  background thread running against freed memory, which crashed the process with an
-  access violation soon afterwards. Errors now clean up as they do on Linux and macOS.
+- **Windows: an error from a `SHOW` or `DESCRIBE` command, or from `list_semantic_views()`,
+  no longer crashes DuckDB later.** On Windows these commands skipped the extension's
+  cleanup when they raised an error (for example, naming a view that does not exist). In
+  v0.14.0 that left a background thread running against freed memory, which crashed the
+  process with an access violation soon afterwards. Errors now clean up as they do on Linux
+  and macOS.
 
 ## [0.14.0] - 2026-10-15
 
