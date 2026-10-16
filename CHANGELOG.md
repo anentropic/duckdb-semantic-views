@@ -34,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DuckDB it also names the `FORCE INSTALL semantic_views FROM community;` command that fetches
   the matching build, once one has been published for that DuckDB.
 
+### Fixed
+
+- **Windows: a failed `SHOW` / `DESCRIBE` or semantic-view table function no longer
+  crashes DuckDB later.** On Windows, an error raised by one of these calls (for example,
+  a view that does not exist) skipped the extension's cleanup. Since v0.14.0 that left a
+  background thread running against freed memory, which crashed the process with an
+  access violation soon afterwards. Errors now clean up as they do on Linux and macOS.
+
 ### Known limitations
 
 - **ADBC needs `import duckdb` first.** With the DuckDB 2.0 Python wheel, a connection from

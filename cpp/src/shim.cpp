@@ -36,6 +36,18 @@
 #include <system_error>
 #include <thread>
 
+// Destructors here release things while a DuckDB exception unwinds a bind:
+// SvBindCancellationScope joins its watcher thread, the probe Connection
+// closes, owned buffers are freed. MSVC emits those unwinding calls only
+// under /EHsc (`_CPPUNWIND`), which the cc crate does not pass on its own
+// (build.rs does). Without it every bind that threw left its watcher thread
+// waiting on a condition variable in the dead frame, and the process crashed
+// with an access violation once that stack was reused (windows_amd64, from
+// the watcher's introduction in #248 until the flag).
+#if defined(_MSC_VER) && !defined(_CPPUNWIND)
+#error "shim.cpp must be compiled with C++ exception unwinding (/EHsc)"
+#endif
+
 using namespace duckdb;
 
 // ---------------------------------------------------------------------------

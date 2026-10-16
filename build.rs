@@ -289,6 +289,13 @@ fn main() {
         let spec = cpp_build_spec(is_windows, Some(engine));
         let mut build = cc::Build::new();
         build.cpp(true).std(spec.std).warnings(false); // DuckDB headers are not warning-clean
+                                                       // cl (and clang-cl) compile C++ without exception unwinding unless told,
+                                                       // so a DuckDB exception thrown through a shim frame would skip its
+                                                       // destructors; DuckDB's own CMake build gets /EHsc from CMake's
+                                                       // defaults. shim.cpp refuses to compile without it.
+        if std::env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|env| env == "msvc") {
+            build.flag("/EHsc");
+        }
         for include in &spec.includes {
             build.include(include);
         }

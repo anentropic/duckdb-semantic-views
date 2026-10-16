@@ -286,6 +286,10 @@ static MSVC runtime (`/MT`), so `.cargo/config.toml` links the extension with
 `+crt-static` to match; the `cc`-compiled shim follows that. A `RUSTFLAGS` in the
 environment replaces that config's flags rather than adding to them, so `build.rs`
 refuses an MSVC build without `crt-static` instead of failing at the link.
+The shim is also compiled with `/EHsc`, which the `cc` crate does not add on its own:
+without it MSVC skips the destructors of a frame a C++ exception unwinds through, and a
+bind that threw left its cancellation watcher thread running against a dead stack frame
+(the windows_amd64 access violations from #248 on). `shim.cpp` refuses to compile without it.
 
 Builds are cached under `.engine/<id>/` (the static libraries, plus the extracted source
 for the pinned release's headers), keyed on the pin or on the tree's label and commit, so
