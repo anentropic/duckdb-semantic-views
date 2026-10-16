@@ -743,10 +743,12 @@ Key fields:
 > the tag, and the registry-pin gate. `just release` does **none** of those: it publishes
 > whatever version `Cargo.toml` already says, so running it before bumping (and tagging)
 > reopens the registry PR for the previous release rather than publishing a new one. The workflow pushes the release commits and tag to this
-> repo with the job's own `GITHUB_TOKEN`, and uses `CE_PUBLISH_PAT` (falling back to
-> `VERSION_MONITOR_PAT`) only to push to the `anentropic/community-extensions` fork and open the
-> registry PR. A personal token is refused for this repo since it moved to the s-layer org (the
-> first v0.14.0 run failed its push with a 403 that way). Pushes made with `GITHUB_TOKEN` don't
+> repo with the job's own `GITHUB_TOKEN`, pushes the release branch to the
+> `s-layer/community-extensions` fork with a GitHub App token (`BOT_APP_ID` / `BOT_APP_PRIVATE_KEY`;
+> the app must be installed on the fork), and uses `CE_PUBLISH_PAT` (falling back to
+> `VERSION_MONITOR_PAT`) only to open the registry PR on `duckdb/community-extensions`. The s-layer
+> org refuses personal tokens, for this repo and the fork alike (the first v0.14.0 run failed its
+> push with a 403 that way). Pushes made with `GITHUB_TOKEN` don't
 > start other workflows, so the release commits get no CI run of their own; they change only
 > versions, the changelog and `description.yml`. When the PAT expires, this workflow fails at the
 > community-extensions step, and the DuckDB Version Monitor, which still checks out and opens its

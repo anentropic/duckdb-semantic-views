@@ -16,11 +16,15 @@ name: Publish Extension
 # ── Required repo setup (one-time) ────────────────────────────────────────────
 #   * An Environment named `release` with required reviewers
 #     (Settings -> Environments). This is the human gate.
-#   * Secret CE_PUBLISH_PAT: a PAT with `repo` scope that can push to your fork
-#     `anentropic/community-extensions` AND open PRs against
+#   * The fork `s-layer/community-extensions` is pushed to with a token from the
+#     project's GitHub App (secrets BOT_APP_ID / BOT_APP_PRIVATE_KEY). The app
+#     must be installed on that fork with Contents read/write. The s-layer org
+#     refuses personal tokens (the v0.14.0 push failed with a 403 that way), so
+#     the push cannot use the PAT below.
+#   * Secret CE_PUBLISH_PAT: a personal token that can open PRs against
 #     `duckdb/community-extensions`. Falls back to VERSION_MONITOR_PAT. It is used
-#     ONLY for that fork and PR: it is a personal token, and the s-layer org
-#     refuses it for this repo (the v0.14.0 push failed with a 403 that way).
+#     ONLY to open that PR; an app token can't, because the app isn't installed
+#     on the upstream repo.
 #   * The release commits + tag go to this repo's `main` with the job's own
 #     GITHUB_TOKEN (`contents: write` above). If `main` becomes branch-protected,
 #     allow github-actions to push to it (or relax protection for this actor).
@@ -43,7 +47,9 @@ permissions:
   pull-requests: write
 
 env:
-  CE_FORK: anentropic/community-extensions
+  CE_FORK: s-layer/community-extensions
+  CE_FORK_OWNER: s-layer
+  CE_FORK_REPO: community-extensions
   CE_BRANCH: semantic-views
   CE_UPSTREAM: duckdb/community-extensions
 
@@ -146,13 +152,24 @@ jobs:
           echo "RELEASE_SHA=$SHA" >> "$GITHUB_ENV"
 
       # 5. Open the community-extensions PR from the fork ----------------------
+      - name: Get app token for the fork
+        id: fork-token
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          owner: ${{ env.CE_FORK_OWNER }}
+          repositories: ${{ env.CE_FORK_REPO }}
+
       - name: Open community-extensions PR
         if: ${{ github.event.inputs.dry_run != 'true' }}
         env:
+          FORK_TOKEN: ${{ steps.fork-token.outputs.token }}
           GH_TOKEN: ${{ secrets.CE_PUBLISH_PAT || secrets.VERSION_MONITOR_PAT }}
         run: |
           NEXT="${{ steps.ver.outputs.next }}"
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/${CE_FORK}.git" ce-fork
+          git clone "https://x-access-token:${FORK_TOKEN}@github.com/${CE_FORK}.git" ce-fork
           cd ce-fork
           git remote add upstream "https://github.com/${CE_UPSTREAM}.git"
           git fetch upstream main
@@ -167,7 +184,7 @@ jobs:
           git push --force -u origin "$CE_BRANCH"
           gh pr create \
             --repo "$CE_UPSTREAM" \
-            --head "anentropic:$CE_BRANCH" \
+            --head "${CE_FORK_OWNER}:$CE_BRANCH" \
             --base main \
             --title "Update semantic_views to v$NEXT" \
             --body "Update semantic_views extension to v$NEXT (repo.${{ steps.target.outputs.key }}: ${RELEASE_SHA}, for DuckDB $(cat ../.duckdb-version))."
@@ -178,4 +195,4 @@ jobs:
           echo "### Published v${{ steps.ver.outputs.next }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- tag pushed: \`v${{ steps.ver.outputs.next }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- description.yml repo.${{ steps.target.outputs.key }}: \`${RELEASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- community-extensions PR opened from \`anentropic:${CE_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- community-extensions PR opened from \`${CE_FORK_OWNER}:${CE_BRANCH}\`" >> "$GITHUB_STEP_SUMMARY"
