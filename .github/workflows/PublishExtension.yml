@@ -7,7 +7,8 @@ name: Publish Extension
 # AFTER that PR merges (the published description.yml `ref` must point at a commit
 # that exists on `main`). This workflow performs that release:
 #
-#   gate -> version bump -> changelog roll -> tag -> description.yml sync -> CE PR
+#   gate -> fork-push preflight -> version bump -> changelog roll -> tag ->
+#   description.yml sync -> CE PR
 #
 # It is intentionally MANUAL (workflow_dispatch) and runs in the `release`
 # environment so a required reviewer must approve each publish. The approval is
@@ -39,6 +40,10 @@ on:
         default: ""
       dry_run:
         description: "Build the release locally and show the diff, but do not push, tag, or open the CE PR."
+        type: boolean
+        default: false
+      registry_pr_only:
+        description: "Only open the community-extensions PR for the release already on main (Cargo.toml's version, already tagged). Use when a run tagged the release but failed to open the PR."
         type: boolean
         default: false
 
@@ -75,7 +80,14 @@ jobs:
           CUR=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           if [ -z "$CUR" ]; then echo "could not read version from Cargo.toml" >&2; exit 1; fi
           IN="${{ github.event.inputs.version }}"
-          if [ -n "$IN" ]; then
+          if [ "${{ github.event.inputs.registry_pr_only }}" = "true" ]; then
+            # The release is already committed and tagged: publish it as it is.
+            if [ -n "$IN" ] && [ "$IN" != "$CUR" ]; then
+              echo "::error::registry_pr_only publishes the version on main ($CUR), not $IN" >&2
+              exit 1
+            fi
+            NEXT="$CUR"
+          elif [ -n "$IN" ]; then
             NEXT="$IN"
           else
             IFS=. read -r MA MI PA <<< "$CUR"
@@ -110,8 +122,47 @@ jobs:
           echo "description.yml key for $OURS: repo.$KEY"
           echo "key=$KEY" >> "$GITHUB_OUTPUT"
 
-      # 3. Changelog roll + version bump in this repo --------------------------
+      # 3. PREFLIGHT: the app token can push to the fork ----------------------
+      #    Checked before anything is committed or tagged (and in a dry run), so a
+      #    token that cannot push fails here instead of after the release is cut.
+      #    `git push --dry-run` sends nothing, but GitHub still asks for push
+      #    access to answer it, so it is refused exactly as the real push would be.
+      #    It runs from a scratch repo: this checkout's git config carries the
+      #    GITHUB_TOKEN auth header for github.com, which would replace the token.
+      #    The PAT that opens the upstream PR can only be checked for presence.
+      - name: Get app token for the fork
+        id: fork-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          owner: ${{ env.CE_FORK_OWNER }}
+          repositories: ${{ env.CE_FORK_REPO }}
+
+      - name: Preflight — the app token can push to the fork
+        env:
+          FORK_TOKEN: ${{ steps.fork-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.CE_PUBLISH_PAT || secrets.VERSION_MONITOR_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::neither CE_PUBLISH_PAT nor VERSION_MONITOR_PAT is set; one is needed to open the PR on ${CE_UPSTREAM}"
+            exit 1
+          fi
+          PROBE="$RUNNER_TEMP/ce-preflight"
+          git init -q "$PROBE"
+          git -C "$PROBE" -c user.name=preflight -c user.email=preflight@localhost \
+            commit -q --allow-empty -m preflight
+          if ! git -C "$PROBE" push --dry-run \
+              "https://x-access-token:${FORK_TOKEN}@github.com/${CE_FORK}.git" \
+              "HEAD:refs/heads/${CE_BRANCH}-preflight"; then
+            echo "::error::the app token cannot push to ${CE_FORK}. Install the GitHub App behind BOT_APP_ID on ${CE_FORK} with Contents set to read and write, then run again (with registry_pr_only if the release is already tagged)."
+            exit 1
+          fi
+          echo "the app token can push to ${CE_FORK}"
+
+      # 4. Changelog roll + version bump in this repo --------------------------
       - name: Roll changelog and bump version
+        if: ${{ github.event.inputs.registry_pr_only != 'true' }}
         run: |
           NEXT="${{ steps.ver.outputs.next }}"
           PREV_TAG="${{ steps.ver.outputs.prev_tag }}"
@@ -126,12 +177,12 @@ jobs:
       - name: Show diff (dry run inspection)
         run: git --no-pager diff
 
-      # 4. Commit + tag the release, then sync description.yml ref --------------
+      # 5. Commit + tag the release, then sync description.yml ref --------------
       #    Mirrors `just release`: the release commit is tagged, then a follow-up
       #    commit points description.yml at the tagged commit's SHA, under the key
       #    the gate chose (`ref`, or an older DuckDB line's key such as `variegata`).
       - name: Commit, tag, and push
-        if: ${{ github.event.inputs.dry_run != 'true' }}
+        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.registry_pr_only != 'true' }}
         run: |
           NEXT="${{ steps.ver.outputs.next }}"
           git config user.name "github-actions[bot]"
@@ -151,17 +202,24 @@ jobs:
           git push origin "v$NEXT"
           echo "RELEASE_SHA=$SHA" >> "$GITHUB_ENV"
 
-      # 5. Open the community-extensions PR from the fork ----------------------
-      - name: Get app token for the fork
-        id: fork-token
-        if: ${{ github.event.inputs.dry_run != 'true' }}
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ secrets.BOT_APP_ID }}
-          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
-          owner: ${{ env.CE_FORK_OWNER }}
-          repositories: ${{ env.CE_FORK_REPO }}
+      # 5b. registry_pr_only: the release is already tagged. Take its SHA from the
+      #     tag and check that description.yml on main already points at it.
+      - name: Find the tagged release
+        if: ${{ github.event.inputs.registry_pr_only == 'true' }}
+        run: |
+          NEXT="${{ steps.ver.outputs.next }}"
+          if ! SHA=$(git rev-parse --verify --quiet "v$NEXT^{commit}"); then
+            echo "::error::tag v$NEXT does not exist; run without registry_pr_only to cut the release"
+            exit 1
+          fi
+          KEY="${{ steps.target.outputs.key }}"
+          if ! grep -qE "^  ${KEY}: ${SHA}\$" description.yml; then
+            echo "::error::description.yml on main does not point repo.${KEY} at v$NEXT ($SHA)"
+            exit 1
+          fi
+          echo "RELEASE_SHA=$SHA" >> "$GITHUB_ENV"
 
+      # 6. Open the community-extensions PR from the fork ----------------------
       - name: Open community-extensions PR
         if: ${{ github.event.inputs.dry_run != 'true' }}
         env:
@@ -182,6 +240,12 @@ jobs:
           git add extensions/semantic_views/description.yml
           git commit -m "Update semantic_views to v$NEXT"
           git push --force -u origin "$CE_BRANCH"
+          # The force-push updates an open PR from this branch in place.
+          OPEN=$(gh pr list --repo "$CE_UPSTREAM" --head "$CE_BRANCH" --state open --json url --jq '.[0].url // empty')
+          if [ -n "$OPEN" ]; then
+            echo "updated the open community-extensions PR: $OPEN"
+            exit 0
+          fi
           gh pr create \
             --repo "$CE_UPSTREAM" \
             --head "${CE_FORK_OWNER}:$CE_BRANCH" \
