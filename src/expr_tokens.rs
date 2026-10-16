@@ -125,8 +125,10 @@ impl IdentRef<'_> {
 /// whitespace; a part is either a bare run of identifier bytes
 /// ([`crate::util::is_ident_byte`] — ASCII alphanumerics, `_`, and every
 /// non-ASCII byte, so Unicode identifiers scan intact) or a `"…"` quoted part
-/// (with `""` escape). The returned spans are non-overlapping and tile the
-/// non-literal identifier text.
+/// (with `""` escape). The returned spans are non-overlapping. Together with
+/// [`scan_function_heads`] they tile the non-literal identifier text, except
+/// for the words in a keyword position, which neither returns (COR-3: see
+/// [`scan_chains`]).
 ///
 /// A chain immediately followed by `(` (skipping whitespace) is a **function
 /// call**, not a name reference (`SUM(x)`, `date_trunc (...)`), and is not
@@ -139,7 +141,8 @@ pub(crate) fn scan_references(expr: &str) -> Vec<IdentRef<'_>> {
 
 /// Which class of identifier chain a scan collects: [`scan_references`] keeps
 /// the chains that are *not* function-call heads; [`scan_function_heads`] keeps
-/// the ones that *are*. Every chain is exactly one of the two.
+/// the ones that *are*. Every chain is at most one of the two; a chain in a
+/// keyword position (a cast's type, an `INTERVAL` unit, …) is neither.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ChainKind {
     /// A name reference — a chain not immediately followed by `(`.
@@ -152,10 +155,25 @@ enum ChainKind {
 /// in source order, skipping single-quoted (`''`-escaped) and `$tag$…$tag$`
 /// literal content. The one place that knows the tokenizer's lexical structure;
 /// both public scanners are thin polarity choices over it.
+///
+/// Besides literals, it skips the words that sit in a **keyword position** of
+/// `DuckDB`'s expression grammar (COR-3), which are part of the syntax rather
+/// than names: a cast's target type, a typed literal's type, the field of
+/// `EXTRACT(field FROM …)`, an `INTERVAL`'s unit and `AT TIME ZONE`. A chain
+/// there belongs to neither [`ChainKind`].
 fn scan_chains(expr: &str, kind: ChainKind) -> Vec<IdentRef<'_>> {
     let bytes = expr.as_bytes();
     let len = bytes.len();
     let mut out = Vec::new();
+    // COR-3: the paren depth, and the depths of the argument lists of the open
+    // `CAST(` / `TRY_CAST(` calls, so an `AS` directly inside one is known to
+    // introduce the cast's target type (and an `AS` anywhere else is not).
+    let mut depth = 0usize;
+    let mut cast_depths: Vec<usize> = Vec::new();
+    // COR-3: start offsets of chains already classified as keyword-position
+    // words by a look-ahead (an EXTRACT field, an INTERVAL unit), which the
+    // walk reaches later because the text in between still has to be scanned.
+    let mut keyword_at: Vec<usize> = Vec::new();
     let mut i = 0;
     while i < len {
         let b = bytes[i];
@@ -168,8 +186,34 @@ fn scan_chains(expr: &str, kind: ChainKind) -> Vec<IdentRef<'_>> {
                     i += 1;
                 }
             }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                if cast_depths.last() == Some(&depth) {
+                    cast_depths.pop();
+                }
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            // COR-3: `::` is the cast operator; what follows is a type.
+            b':' if bytes.get(i + 1) == Some(&b':') => {
+                i = skip_type(bytes, skip_whitespace(bytes, i + 2));
+            }
             _ if b == b'"' || crate::util::is_ident_byte(b) => {
                 let end = scan_chain(bytes, i);
+                let raw = &expr[i..end];
+                // COR-3: an INTERVAL literal's unit (`INTERVAL '1' DAY`, and
+                // `INTERVAL'1' DAY` with no space) is marked before the
+                // typed-literal rules below swallow the `INTERVAL` keyword itself.
+                if raw.eq_ignore_ascii_case("interval") {
+                    if let Some(unit) = interval_unit_start(bytes, end) {
+                        keyword_at.push(unit);
+                        i = end;
+                        continue;
+                    }
+                }
                 // PARSE-12 (code-review 2026-08-08): a chain IMMEDIATELY
                 // followed by `'` is a literal's introducer, not a name — the
                 // escape-string forms `e'…'` / `E'…'` (PARSE-7 made them
@@ -189,18 +233,48 @@ fn scan_chains(expr: &str, kind: ChainKind) -> Vec<IdentRef<'_>> {
                     i = skip_single_quoted(bytes, end);
                     continue;
                 }
+                // COR-3: PARSE-12's rule holds with whitespace between too —
+                // `DATE '…'` is the usual spelling of a typed literal — and for
+                // every word of a multi-word type (`TIMESTAMP WITH TIME ZONE '…'`,
+                // `DOUBLE PRECISION '…'`). In a valid expression a NAME is never
+                // followed directly by a string literal, so the chain is a type
+                // or a keyword (`LIKE '…'`) either way, never a reference. The
+                // string itself is left to the walk: it is not an escape string,
+                // and the skipper's adjacency test agrees.
+                let type_end = skip_type_name_words(bytes, end);
+                if bytes.get(skip_whitespace(bytes, type_end)) == Some(&b'\'') {
+                    i = type_end;
+                    continue;
+                }
+                if keyword_at.contains(&i) {
+                    i = end;
+                    continue;
+                }
+                if cast_depths.last() == Some(&depth) && raw.eq_ignore_ascii_case("as") {
+                    i = skip_type(bytes, skip_whitespace(bytes, end));
+                    continue;
+                }
+                if let Some(next) = match_words(bytes, i, &["at", "time", "zone"]) {
+                    i = next;
+                    continue;
+                }
                 let is_head = followed_by_open_paren(bytes, end);
+                if is_head {
+                    if raw.eq_ignore_ascii_case("cast") || raw.eq_ignore_ascii_case("try_cast") {
+                        cast_depths.push(depth + 1);
+                    } else if raw.eq_ignore_ascii_case("extract") {
+                        if let Some(field) = extract_field_start(bytes, end) {
+                            keyword_at.push(field);
+                        }
+                    }
+                }
                 let want = if is_head {
                     ChainKind::FunctionHead
                 } else {
                     ChainKind::Reference
                 };
                 if want == kind {
-                    out.push(IdentRef {
-                        start: i,
-                        end,
-                        raw: &expr[i..end],
-                    });
+                    out.push(IdentRef { start: i, end, raw });
                 }
                 i = end;
             }
@@ -215,9 +289,11 @@ fn scan_chains(expr: &str, kind: ChainKind) -> Vec<IdentRef<'_>> {
 /// source order, skipping single-quoted and `$tag$…$tag$` literal content
 /// exactly as [`scan_references`] does.
 ///
-/// This is the exact complement of [`scan_references`]: every identifier chain
-/// in an expression is classified as *either* a name reference (returned there)
-/// *or* a call head (returned here), never both and never neither. It is the
+/// This is the complement of [`scan_references`] over the chains outside
+/// keyword positions: such a chain is *either* a name reference (returned
+/// there) *or* a call head (returned here), never both. A chain in a keyword
+/// position (COR-3: a cast's type, a typed literal's type, an `EXTRACT` field,
+/// an `INTERVAL` unit, `AT TIME ZONE`) is in neither result. It is the
 /// engine primitive behind aggregate-function detection — matching the last
 /// part of each head against a known-aggregate set — so that detection shares
 /// the tokenizer's literal handling (a `sum(` inside `'…'` is not a call) and
@@ -235,6 +311,196 @@ fn followed_by_open_paren(bytes: &[u8], pos: usize) -> bool {
         j += 1;
     }
     j < bytes.len() && bytes[j] == b'('
+}
+
+/// Offset of the first non-whitespace byte at or after `pos` (or `len`).
+fn skip_whitespace(bytes: &[u8], pos: usize) -> usize {
+    let mut j = pos;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    j
+}
+
+/// If the bare words `words` (case-insensitive, whole chains, whitespace
+/// between) start at `pos`, the offset just past the last one.
+fn match_words(bytes: &[u8], pos: usize, words: &[&str]) -> Option<usize> {
+    let mut p = pos;
+    let mut last = pos;
+    for (n, word) in words.iter().enumerate() {
+        if n > 0 {
+            p = skip_whitespace(bytes, last);
+        }
+        if !bytes
+            .get(p)
+            .copied()
+            .is_some_and(crate::util::is_ident_byte)
+        {
+            return None;
+        }
+        let end = scan_chain(bytes, p);
+        if !bytes[p..end].eq_ignore_ascii_case(word.as_bytes()) {
+            return None;
+        }
+        last = end;
+    }
+    Some(last)
+}
+
+/// The words that continue a multi-word `DuckDB` type name, after its first
+/// word (`DOUBLE PRECISION`, `TIMESTAMP WITH TIME ZONE`, `INT ARRAY`).
+const TYPE_NAME_CONTINUATIONS: &[&[&str]] = &[
+    &["precision"],
+    &["varying"],
+    &["with", "time", "zone"],
+    &["without", "time", "zone"],
+    &["array"],
+];
+
+/// COR-3: for a chain ending at `end`, the offset just past the words that
+/// continue it as a multi-word type name (`end` itself when none do).
+fn skip_type_name_words(bytes: &[u8], end: usize) -> usize {
+    let mut end = end;
+    while let Some(next) = TYPE_NAME_CONTINUATIONS
+        .iter()
+        .find_map(|words| match_words(bytes, skip_whitespace(bytes, end), words))
+    {
+        end = next;
+    }
+    end
+}
+
+/// COR-3: skip a type name starting at `start` — a cast's target type — and
+/// return the offset just past it. A type is a chain (bare, quoted or
+/// qualified: `BLOB`, `"blob"`, `main.blob`) followed by any of a parameter
+/// list (`DECIMAL(10, 2)`, `STRUCT(blob BLOB)` — field names, not members),
+/// array suffixes (`[]`, `[3]`) and the words of a multi-word name, in any
+/// order. Returns `start` unchanged when no chain starts there.
+fn skip_type(bytes: &[u8], start: usize) -> usize {
+    match bytes.get(start) {
+        Some(&b) if b == b'"' || crate::util::is_ident_byte(b) => {}
+        _ => return start,
+    }
+    let mut end = scan_chain(bytes, start);
+    loop {
+        let j = skip_whitespace(bytes, end);
+        end = match bytes.get(j) {
+            Some(b'(') => skip_balanced(bytes, j, b'(', b')'),
+            Some(b'[') => skip_balanced(bytes, j, b'[', b']'),
+            _ => match TYPE_NAME_CONTINUATIONS
+                .iter()
+                .find_map(|words| match_words(bytes, j, words))
+            {
+                Some(next) => next,
+                None => return end,
+            },
+        };
+    }
+}
+
+/// Offset just past the bracket that closes the `open` at `bytes[i]`, skipping
+/// literal and quoted-identifier content and nested pairs. Saturates at `len`.
+fn skip_balanced(bytes: &[u8], i: usize, open: u8, close: u8) -> usize {
+    let len = bytes.len();
+    let mut nesting = 0usize;
+    let mut j = i;
+    while j < len {
+        let b = bytes[j];
+        if b == b'\'' {
+            j = skip_single_quoted(bytes, j);
+            continue;
+        }
+        if b == b'"' {
+            j = skip_quoted_part(bytes, j);
+            continue;
+        }
+        if b == b'$' {
+            if let Some(next) = try_skip_dollar_quoted(bytes, j) {
+                j = next;
+                continue;
+            }
+        }
+        if b == open {
+            nesting += 1;
+        } else if b == close {
+            nesting -= 1;
+            if nesting == 0 {
+                return j + 1;
+            }
+        }
+        j += 1;
+    }
+    len
+}
+
+/// `DuckDB`'s `INTERVAL` units, singular and plural.
+const INTERVAL_UNITS: &[&str] = &[
+    "year",
+    "years",
+    "month",
+    "months",
+    "day",
+    "days",
+    "hour",
+    "hours",
+    "minute",
+    "minutes",
+    "second",
+    "seconds",
+    "millisecond",
+    "milliseconds",
+    "microsecond",
+    "microseconds",
+    "week",
+    "weeks",
+    "quarter",
+    "quarters",
+    "decade",
+    "decades",
+    "century",
+    "centuries",
+    "millennium",
+    "millennia",
+    "millenniums",
+];
+
+/// COR-3: for the keyword `INTERVAL` ending at `end`, the start of its unit
+/// word — `INTERVAL 1 DAY`, `INTERVAL '1' DAY`, `INTERVAL (n) DAY` — or `None`
+/// when no unit follows. The operand `DuckDB` accepts there is a string, a number
+/// or a parenthesized expression; only its extent is measured, so the
+/// references inside `(n)` are still scanned by the walk.
+fn interval_unit_start(bytes: &[u8], end: usize) -> Option<usize> {
+    let op = skip_whitespace(bytes, end);
+    let op_end = match bytes.get(op)? {
+        b'\'' => skip_single_quoted(bytes, op),
+        b'(' => skip_balanced(bytes, op, b'(', b')'),
+        b if b.is_ascii_digit() || *b == b'.' => {
+            let mut j = op;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b'.') {
+                j += 1;
+            }
+            j
+        }
+        _ => return None,
+    };
+    let unit = skip_whitespace(bytes, op_end);
+    INTERVAL_UNITS
+        .iter()
+        .any(|u| match_words(bytes, unit, &[u]).is_some())
+        .then_some(unit)
+}
+
+/// COR-3: for the head `EXTRACT` ending at `end` (an open paren follows), the
+/// start of its field — the word before `FROM` in `EXTRACT(year FROM ts)`, bare
+/// or quoted — or `None` for any other argument shape.
+fn extract_field_start(bytes: &[u8], end: usize) -> Option<usize> {
+    let field = skip_whitespace(bytes, skip_whitespace(bytes, end) + 1);
+    match bytes.get(field) {
+        Some(&b) if b == b'"' || crate::util::is_ident_byte(b) => {}
+        _ => return None,
+    }
+    let after = skip_whitespace(bytes, scan_chain(bytes, field));
+    match_words(bytes, after, &["from"]).map(|_| field)
 }
 
 /// Byte offset just past the closing `'` of a single-quoted string starting at
@@ -797,6 +1063,54 @@ mod tests {
     }
 
     #[test]
+    fn a_spaced_typed_literal_prefix_is_not_a_reference() {
+        // DuckDB reads `DATE '2020-01-01'` — with the space, the usual
+        // spelling — as the same typed literal as `DATE'2020-01-01'`, so a
+        // member named `date` must not be spliced over its type either.
+        let expr = "o.ts > DATE '2020-01-01'";
+        assert_eq!(keys(expr), vec!["o.ts"]);
+        let mut m: HashMap<String, &str> = HashMap::new();
+        m.insert("date".to_string(), "(o.day)");
+        assert_eq!(inline_references(expr, &m), expr);
+        assert_eq!(keys("x > TIMESTAMP\n  '2020-01-01 00:00'"), vec!["x"]);
+        assert_eq!(keys("ts + INTERVAL '1 day'"), vec!["ts"]);
+    }
+
+    #[test]
+    fn a_multi_word_typed_literal_type_is_not_a_reference() {
+        // Review of #267: every word of a multi-word type is the literal's
+        // type, not just the one before the quote.
+        assert_eq!(
+            keys("ts > TIMESTAMP WITH TIME ZONE '2020-01-01 00:00:00+00'"),
+            vec!["ts"]
+        );
+        assert_eq!(keys("x = DOUBLE PRECISION '1.5'"), vec!["x"]);
+        assert_eq!(keys("x = CHARACTER VARYING 'x'"), vec!["x"]);
+        assert_eq!(keys("t = TIME WITHOUT TIME ZONE '10:00'"), vec!["t"]);
+        assert_eq!(
+            keys("ts > TIMESTAMP WITH TIME ZONE'2020-01-01'"),
+            vec!["ts"]
+        );
+        let expr = "ts > TIMESTAMP WITH TIME ZONE '2020-01-01 00:00:00+00'";
+        let mut m: HashMap<String, &str> = HashMap::new();
+        m.insert("time".to_string(), "(o.t)");
+        assert_eq!(inline_references(expr, &m), expr);
+    }
+
+    #[test]
+    fn the_unit_of_an_abutting_interval_literal_is_not_a_reference() {
+        // Review of #267: `INTERVAL'1' DAY` (no space before the quote) is the
+        // same literal as `INTERVAL '1' DAY`.
+        assert_eq!(keys("ts + INTERVAL'1' DAY"), vec!["ts"]);
+        let mut m: HashMap<String, &str> = HashMap::new();
+        m.insert("day".to_string(), "(o.ts::DATE)");
+        assert_eq!(
+            inline_references("ts < INTERVAL'1' DAY", &m),
+            "ts < INTERVAL'1' DAY"
+        );
+    }
+
+    #[test]
     fn a_chain_not_abutting_a_quote_still_scans() {
         // Controls for the suppression rule — it is ADJACENCY-based (the same
         // rule `util::opens_escape_string` uses), so an ordinary reference near
@@ -817,6 +1131,160 @@ mod tests {
         assert!(scan_function_heads("count_if(x = e'\\'')")
             .iter()
             .all(|h| h.key() != "e"));
+    }
+
+    // ----- COR-3: a cast's TARGET TYPE is not a reference -----
+    //
+    // (semolina review 2026-10-16) The type name after `::`, or after `AS`
+    // inside `CAST(…)` / `TRY_CAST(…)`, is a type, not a name. Emitting it as a
+    // reference let a member named like a type (`blob`, `date`, `time`) be
+    // substituted OVER the type: a where_clause `payload = '\x41'::BLOB` on a
+    // view with a fact named `blob` became `'\x41'::((blob))` — a query-time
+    // syntax error from a valid predicate — and the type was reported as a
+    // phantom dependency.
+
+    fn blob_member() -> HashMap<String, &'static str> {
+        let mut m: HashMap<String, &str> = HashMap::new();
+        m.insert("blob".to_string(), "(o.payload)");
+        m
+    }
+
+    #[test]
+    fn the_type_after_a_cast_operator_is_not_a_reference() {
+        assert_eq!(keys("x::BLOB"), vec!["x"]);
+        assert_eq!(keys("x :: blob"), vec!["x"], "whitespace around `::`");
+        assert!(!references_ref("'\\x41'::BLOB", "blob", None));
+    }
+
+    #[test]
+    fn a_quoted_or_qualified_cast_type_is_not_a_reference() {
+        // DuckDB accepts both (`'a'::"blob"`, `1::main.integer` — verified).
+        assert_eq!(keys("x::\"blob\""), vec!["x"]);
+        assert_eq!(keys("x::main.blob"), vec!["x"]);
+    }
+
+    #[test]
+    fn inlining_does_not_corrupt_a_cast_operator_type() {
+        let expr = "blob = '\\x41'::BLOB";
+        assert_eq!(
+            inline_references(expr, &blob_member()),
+            "(o.payload) = '\\x41'::BLOB"
+        );
+    }
+
+    #[test]
+    fn the_type_in_cast_as_is_not_a_reference() {
+        assert_eq!(keys("CAST(x AS blob)"), vec!["x"]);
+        assert_eq!(keys("cast (x as Blob)"), vec!["x"], "case and spacing");
+        assert!(!references_ref("CAST('A' AS blob)", "blob", None));
+    }
+
+    #[test]
+    fn the_type_in_try_cast_as_is_not_a_reference() {
+        assert_eq!(keys("TRY_CAST(x AS blob)"), vec!["x"]);
+    }
+
+    #[test]
+    fn inlining_does_not_corrupt_a_cast_as_type() {
+        let expr = "blob = CAST('A' AS BLOB)";
+        assert_eq!(
+            inline_references(expr, &blob_member()),
+            "(o.payload) = CAST('A' AS BLOB)"
+        );
+    }
+
+    #[test]
+    fn a_multi_word_cast_type_is_not_a_reference() {
+        // DuckDB's multi-word type names: a member named `time` or `zone`
+        // must not land inside `TIMESTAMP WITH TIME ZONE`.
+        assert_eq!(keys("x::TIMESTAMP WITH TIME ZONE"), vec!["x"]);
+        assert_eq!(keys("x::TIME WITHOUT TIME ZONE"), vec!["x"]);
+        assert_eq!(keys("x::DOUBLE PRECISION"), vec!["x"]);
+        assert_eq!(keys("x::CHARACTER VARYING"), vec!["x"]);
+        assert_eq!(keys("CAST(x AS TIMESTAMP WITH TIME ZONE)"), vec!["x"]);
+    }
+
+    #[test]
+    fn a_parameterized_or_array_cast_type_is_not_a_reference() {
+        // The type's own parameter list and array suffixes belong to the type:
+        // `STRUCT(blob BLOB)` names a field and its type, not two members.
+        assert_eq!(keys("x::STRUCT(blob BLOB)"), vec!["x"]);
+        assert_eq!(keys("x::DECIMAL(10, 2)"), vec!["x"]);
+        assert_eq!(keys("x::VARCHAR[]"), vec!["x"]);
+        assert_eq!(keys("x::INT[3] [ ]"), vec!["x"]);
+        assert_eq!(keys("x::INT ARRAY"), vec!["x"]);
+        assert_eq!(keys("CAST(x AS MAP(VARCHAR, blob))"), vec!["x"]);
+        // A parameterized type is not a function call either.
+        assert!(scan_function_heads("x::DECIMAL(10, 2)").is_empty());
+    }
+
+    #[test]
+    fn references_around_a_cast_still_scan() {
+        // Controls: only the TYPE is suppressed, never its operand or what
+        // follows the cast.
+        assert_eq!(keys("blob::VARCHAR"), vec!["blob"]);
+        assert_eq!(keys("x::INT + blob"), vec!["x", "blob"]);
+        assert_eq!(keys("CAST(blob AS INT)"), vec!["blob"]);
+        assert_eq!(keys("CAST(a AS INT) + b"), vec!["a", "b"]);
+        assert_eq!(keys("CAST(CAST(a AS INT) AS BIGINT) * b"), vec!["a", "b"]);
+        // `TIME` alone is a type; a following reference is not a type keyword.
+        assert_eq!(keys("x::TIME + zone"), vec!["x", "zone"]);
+        assert_eq!(keys("x::TIMESTAMP AND time"), vec!["x", "and", "time"]);
+        // `AS` outside a cast is not a cast's type position.
+        assert_eq!(keys("f(a AS b)"), vec!["a", "as", "b"]);
+        assert_eq!(keys("(CAST(a AS INT), b AS c)"), vec!["a", "b", "as", "c"]);
+        // A slice is a single colon, not a cast.
+        assert_eq!(keys("l[a:b]"), vec!["l", "a", "b"]);
+    }
+
+    // The same defect at the other keyword positions DuckDB's expression
+    // grammar has, where a member named like the keyword (`year`, `day`,
+    // `time`) is common: the field of `EXTRACT(field FROM …)`, the unit of an
+    // `INTERVAL` literal, and `AT TIME ZONE`.
+
+    #[test]
+    fn the_field_of_extract_is_not_a_reference() {
+        assert_eq!(keys("EXTRACT(year FROM ts)"), vec!["from", "ts"]);
+        assert_eq!(keys("extract ( Year from ts )"), vec!["from", "ts"]);
+        let mut m: HashMap<String, &str> = HashMap::new();
+        m.insert("year".to_string(), "(EXTRACT(year FROM o.ts))");
+        assert_eq!(
+            inline_references("year = EXTRACT(year FROM ts)", &m),
+            "(EXTRACT(year FROM o.ts)) = EXTRACT(year FROM ts)"
+        );
+    }
+
+    #[test]
+    fn the_unit_of_an_interval_is_not_a_reference() {
+        // A numeric operand scans as a chain, as numbers do everywhere here.
+        assert_eq!(keys("ts + INTERVAL 1 DAY"), vec!["ts", "1"]);
+        assert_eq!(keys("ts + INTERVAL '1' day"), vec!["ts"]);
+        assert_eq!(keys("ts + INTERVAL 1.5 DAYS"), vec!["ts", "1.5"]);
+        // A parenthesized operand is an expression: its references still scan.
+        assert_eq!(keys("ts + INTERVAL (n) DAY"), vec!["ts", "n"]);
+        let mut m: HashMap<String, &str> = HashMap::new();
+        m.insert("day".to_string(), "(o.ts::DATE)");
+        assert_eq!(
+            inline_references("day < INTERVAL 1 DAY", &m),
+            "(o.ts::DATE) < INTERVAL 1 DAY"
+        );
+    }
+
+    #[test]
+    fn at_time_zone_is_not_a_reference() {
+        assert_eq!(keys("ts AT TIME ZONE 'UTC'"), vec!["ts"]);
+        assert_eq!(keys("ts at time zone tz"), vec!["ts", "tz"]);
+    }
+
+    #[test]
+    fn references_around_keyword_positions_still_scan() {
+        // Controls: only the keyword position is suppressed.
+        assert_eq!(keys("EXTRACT(year FROM year)"), vec!["from", "year"]);
+        assert_eq!(keys("extract_year(day)"), vec!["day"]);
+        assert_eq!(keys("INTERVAL 1 DAY + day"), vec!["1", "day"]);
+        assert_eq!(keys("interval_col + day"), vec!["interval_col", "day"]);
+        assert_eq!(keys("ts + time"), vec!["ts", "time"]);
+        assert_eq!(keys("at + time"), vec!["at", "time"]);
     }
 
     // ----- generative proptests -----
@@ -845,6 +1313,26 @@ mod tests {
             "[a-z]{1,4}'[a-zA-Z0-9 :.-]{0,8}'",
             Just("main.date'2020-01-01'".to_string()),
             Just("\"date\"'2020-01-01'".to_string()),
+            // COR-3: a cast's target type is not a reference — after `::`
+            // (bare, quoted, multi-word, parameterized) and after `AS` inside
+            // `CAST(…)`. Generated so the tiling / FIND-INLINE-agree properties
+            // see the shape, not only the fixed examples.
+            "::[a-zA-Z]{1,5}",
+            Just(" :: \"blob\"".to_string()),
+            Just("::TIMESTAMP WITH TIME ZONE".to_string()),
+            Just("::STRUCT(blob BLOB)[]".to_string()),
+            "CAST\\(x AS [a-zA-Z]{1,5}\\)",
+            // COR-3: the other keyword positions — an EXTRACT field and an
+            // INTERVAL unit (offsets recorded ahead of the walk), AT TIME ZONE,
+            // and a multi-word typed literal's type. The unit word is random,
+            // so it is sometimes a real unit and sometimes an ordinary name.
+            "EXTRACT\\([a-z]{1,4} FROM ",
+            "INTERVAL [0-9] [a-zA-Z]{1,4}",
+            "INTERVAL \\([a-z]{1,3}\\) [a-zA-Z]{1,4}",
+            "INTERVAL ?'[0-9]' [a-zA-Z]{1,4}",
+            Just(" AT TIME ZONE ".to_string()),
+            "[a-zA-Z]{1,5} (WITH|WITHOUT) TIME ZONE ?'[0-9 :-]{0,8}'",
+            "[a-zA-Z]{1,5} (PRECISION|VARYING) '[0-9.]{0,4}'",
             // dollar-quoted strings
             Just("$$a.b revenue$$".to_string()),
             // operators / punctuation / whitespace
@@ -924,6 +1412,61 @@ mod tests {
             // Anti-vacuity: the scan really ran — the ordinary reference before
             // the literal is still found (so "nothing scans" cannot pass this).
             prop_assert!(references_ref(&expr, "lhs col", None), "expr={expr:?}");
+        }
+
+        /// COR-3: the target type of a cast — after `::`, or after `AS` in
+        /// `CAST` / `TRY_CAST` — is never found as a reference nor
+        /// substituted, whatever the type is named.
+        #[test]
+        fn a_cast_type_is_never_a_reference(
+            ty in "[a-zA-Z_][a-zA-Z0-9_]{0,4}",
+            func in prop::sample::select(vec!["CAST", "try_cast"]),
+        ) {
+            let key = crate::ident::normalize_ident_part(&ty);
+            let mut m: HashMap<String, &str> = HashMap::new();
+            m.insert(key, "<R>");
+            for expr in [
+                format!("\"lhs col\"::{ty}"),
+                format!("\"lhs col\" :: \"{ty}\""),
+                format!("{func}(\"lhs col\" AS {ty})"),
+            ] {
+                prop_assert!(!references_ref(&expr, &ty, None), "expr={expr:?}");
+                prop_assert_eq!(inline_references(&expr, &m), expr.clone());
+                // Anti-vacuity: the cast's operand is still found.
+                prop_assert!(references_ref(&expr, "lhs col", None), "expr={expr:?}");
+            }
+        }
+
+        /// COR-3: a word in an EXTRACT field, an INTERVAL unit, or any word of
+        /// a multi-word typed literal's type is never found as a reference nor
+        /// substituted, while the references around it still are.
+        #[test]
+        fn a_keyword_position_word_is_never_a_reference(
+            word in "[a-zA-Z_][a-zA-Z0-9_]{0,4}",
+            unit in prop::sample::select(INTERVAL_UNITS.to_vec()),
+            tail in prop::sample::select(vec!["WITH TIME ZONE", "WITHOUT TIME ZONE", "PRECISION", "VARYING"]),
+            gap in prop::sample::select(vec!["", " ", "\n  "]),
+        ) {
+            let cases = [
+                (format!("EXTRACT({word} FROM \"lhs col\")"), word.clone()),
+                (format!("\"lhs col\" + INTERVAL{gap}'1' {unit}"), unit.to_string()),
+                (format!("\"lhs col\" + INTERVAL 1 {unit}"), unit.to_string()),
+                (format!("\"lhs col\" + INTERVAL (\"lhs col\") {unit}"), unit.to_string()),
+                (format!("\"lhs col\" = {word} {tail}{gap}'1'"), word.clone()),
+                (
+                    format!("\"lhs col\" = {word} {tail}{gap}'1'"),
+                    tail.split(' ').next().unwrap_or_default().to_string(),
+                ),
+            ];
+            for (expr, name) in cases {
+                let key = crate::ident::normalize_ident_part(&name);
+                let mut m: HashMap<String, &str> = HashMap::new();
+                m.insert(key, "<R>");
+                prop_assert!(!references_ref(&expr, &name, None), "expr={expr:?} name={name:?}");
+                prop_assert_eq!(inline_references(&expr, &m), expr.clone());
+                // Anti-vacuity: the reference beside the keyword is still found.
+                prop_assert!(references_ref(&expr, "lhs col", None), "expr={expr:?}");
+            }
         }
 
         /// FIND and INLINE agree: a name is reported as referenced iff inlining

@@ -1,0 +1,127 @@
+# COR-3 (semolina review 2026-10-16): a word in a KEYWORD POSITION of DuckDB's
+# expression grammar is not a member reference -- a cast's target type, the
+# type of a typed literal, the field of EXTRACT, the unit of an INTERVAL.
+#
+# The reference scanner emitted the type name after `::`, and after `AS` inside
+# `CAST(...)` / `TRY_CAST(...)`, as an ordinary identifier. A member named like
+# the type (`blob`, `date`) was then substituted OVER the type, so a valid
+# where_clause such as semolina's rendering of a `bytes` filter,
+# `blob = '\x41'::BLOB`, reached DuckDB as `((blob)) = '\x41'::((blob))` -- a
+# parser error. The same splice hit fact inlining in a dimension expression,
+# and the same scanner gap covered `DATE '...'` (written with a space -- the
+# abutting `DATE'...'` was already fixed as PARSE-12), `EXTRACT(year FROM ...)`
+# and `INTERVAL 1 DAY` whenever a member is named `date`, `year` or `day`.
+#
+# The runner halts a file at its first failing statement, so the per-case red
+# proof lives at the unit layer (`expr_tokens::tests`,
+# `expand::where_clause::tests`), each watched failing before the fix; every
+# query below was also run against the pre-fix build and failed there. This
+# file covers the whole pipeline.
+#
+# Keyword positions the scanner still does not know are listed in TECH-DEBT #93.
+
+require semantic_views
+
+statement ok
+CREATE TABLE cor3_sales (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR,
+    payload BLOB,
+    ts TIMESTAMP,
+    qty INTEGER
+);
+
+statement ok
+INSERT INTO cor3_sales VALUES
+    (1, 'a', '\x41'::BLOB, TIMESTAMP '2020-01-01 10:00:00', 10),
+    (2, 'b', '\x42'::BLOB, TIMESTAMP '2021-06-01 12:30:00', 20);
+
+# Facts named `blob` and `date`, like the type names the predicates and the
+# `day` dimension cast to, and `double`, like the first word of a multi-word
+# type; dimensions named `day` and `year`, like an INTERVAL unit and an EXTRACT
+# field.
+statement ok
+CREATE SEMANTIC VIEW cor3_v AS
+TABLES (s AS cor3_sales PRIMARY KEY (id))
+FACTS (s.blob AS s.payload, s.date AS s.ts, s.double AS s.qty)
+DIMENSIONS (s.name AS s.name, s.day AS s.ts::DATE, s.year AS EXTRACT(year FROM s.ts))
+METRICS (s.total AS SUM(s.qty))
+
+# The `::` cast semolina renders for a `bytes` value.
+query TI
+SELECT * FROM semantic_view('cor3_v', dimensions := ['name'], metrics := ['total'],
+    where_clause := $$blob = '\x41'::BLOB$$)
+----
+a	10
+
+# `CAST(... AS type)`, with the type in the member's own spelling.
+query TI
+SELECT * FROM semantic_view('cor3_v', dimensions := ['name'], metrics := ['total'],
+    where_clause := $$blob = CAST('B' AS blob)$$)
+----
+b	20
+
+# `TRY_CAST(... AS type)`.
+query TI
+SELECT * FROM semantic_view('cor3_v', dimensions := ['name'], metrics := ['total'],
+    where_clause := $$blob = TRY_CAST('A' AS BLOB)$$)
+----
+a	10
+
+# A parameterized type: the field name inside `STRUCT(blob VARCHAR)` is not a
+# reference either.
+query TI
+SELECT * FROM semantic_view('cor3_v', dimensions := ['name'], metrics := ['total'],
+    where_clause := $${'blob': name}::STRUCT(blob VARCHAR) = {'blob': 'b'}$$)
+----
+b	20
+
+# Fact inlining in a dimension expression: `s.ts::DATE` with a fact named `date`.
+query TI
+SELECT * FROM semantic_view('cor3_v', dimensions := ['day'], metrics := ['total'])
+ORDER BY day
+----
+2020-01-01	10
+2021-06-01	20
+
+# A typed literal written with a space, next to a fact named `date`.
+query TI
+SELECT * FROM semantic_view('cor3_v', dimensions := ['name'], metrics := ['total'],
+    where_clause := $$date < DATE '2021-01-01'$$)
+----
+a	10
+
+# The field of EXTRACT, next to a dimension named `year`.
+query TI
+SELECT * FROM semantic_view('cor3_v', dimensions := ['name'], metrics := ['total'],
+    where_clause := $$year = EXTRACT(year FROM TIMESTAMP '2021-06-01 00:00:00')$$)
+----
+b	20
+
+# The unit of an INTERVAL, next to a dimension named `day`.
+query TI
+SELECT * FROM semantic_view('cor3_v', dimensions := ['name'], metrics := ['total'],
+    where_clause := $$ts < TIMESTAMP '2020-01-01' + INTERVAL 1 DAY$$)
+----
+a	10
+
+# The same unit with no space between INTERVAL and its string.
+query TI
+SELECT * FROM semantic_view('cor3_v', dimensions := ['name'], metrics := ['total'],
+    where_clause := $$ts < TIMESTAMP '2020-01-01' + INTERVAL'1' DAY$$)
+----
+a	10
+
+# Every word of a multi-word typed literal's type, next to a fact named `double`.
+query TI
+SELECT * FROM semantic_view('cor3_v', dimensions := ['name'], metrics := ['total'],
+    where_clause := $$qty > DOUBLE PRECISION '15'$$)
+----
+b	20
+
+# Control: the member as the cast's OPERAND still resolves.
+query TI
+SELECT * FROM semantic_view('cor3_v', dimensions := ['name'], metrics := ['total'],
+    where_clause := $$blob::VARCHAR = 'B'$$)
+----
+b	20
