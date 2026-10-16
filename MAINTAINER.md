@@ -288,7 +288,10 @@ Builds are cached under `.engine/<id>/` (the static libraries, plus the extracte
 for the pinned release's headers), keyed on the pin or on the tree's label and commit, so
 switching branches or engines is a cache hit; the wheel pin and a cross-compile
 architecture are part of the key, and a tree with no git commit is rebuilt every time. The first build of an engine takes a while (~20 minutes on four cores); after that
-`make` only checks the cache. `cpp/engine.manifest` is rewritten only when it changes, so
+`make` only checks the cache. An entry counts as cached only when its own `manifest`
+(written last, atomically) is complete; anything an interrupted or failed run left (a
+partial source tree, a build directory with another generator's CMake cache) is discarded
+and rebuilt. `cpp/engine.manifest` is rewritten only when it changes, so
 an unchanged engine keeps `cargo build` incremental; every rebuild of the libraries
 changes it (its `built` line), and `build.rs` also watches the libraries themselves, so a
 rebuilt engine is always relinked. `tests/build_config.rs` covers the

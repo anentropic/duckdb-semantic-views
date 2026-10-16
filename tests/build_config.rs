@@ -339,7 +339,12 @@ with open(os.environ["STUB_LOG"], "a") as log:
         build = pathlib.Path(args[args.index("-B") + 1])
         label = (os.environ.get("STUB_LABEL") or os.environ.get("DUCKDB_VERSION")
                  or os.environ.get("OVERRIDE_GIT_DESCRIBE") or "v2.0.0-dev7")
+        generator = args[args.index("-G") + 1] if "-G" in args else "default"
+        cache = build / "CMakeCache.txt"
+        if cache.exists() and cache.read_text() != generator:
+            sys.exit("CMake Error: generator does not match the generator used previously")
         build.mkdir(parents=True, exist_ok=True)
+        cache.write_text(generator)
         (build / "stub-src").write_text(src)
         (build / "stub-label").write_text(label)
         log.write(f"configure {label}\n")
@@ -981,4 +986,103 @@ fn a_forced_rebuild_changes_the_manifest() {
         out.contains("installed"),
         "expected a reinstall, got: {out}"
     );
+}
+
+/// The cache entry `.engine/<id>/` of the pinned release, in `root`.
+fn sdist_cache(root: &Path) -> PathBuf {
+    root.join(".engine").join(sdist_engine_id())
+}
+
+/// An interrupted extraction (a Ctrl-C or a full disk while the source is
+/// copied into place) leaves a partial source tree. A run that finds no cached
+/// build must not take that tree for the engine source.
+#[test]
+fn a_source_tree_left_by_an_unfinished_run_is_extracted_again() {
+    let root = script_project("partial-src");
+    let sdist = plant_sdist(&root, "SDIST");
+    let sdist = sdist.to_str().expect("utf-8");
+    // A run that extracts the source and then stops short of caching a build.
+    let out = run_script(&root, &["--sdist", sdist], &[("STUB_LABEL", "v1.4.0")]);
+    assert!(!out.status.success());
+    // What an interruption leaves: some of the tree, not all of it.
+    write(&sdist_cache(&root).join("src/MARKER"), "PARTIAL\n");
+
+    run_script_ok(&root, &["--sdist", sdist], &[]);
+
+    assert_eq!(linked_engine(&root), format!("SDIST {}", target_version()));
+}
+
+/// A failed configure or build leaves its build directory behind, CMake cache
+/// included. CMake refuses to configure over a cache made with another
+/// generator (installing ninja between runs is enough), so the next run must
+/// start from an empty build directory, `--force` or not.
+fn check_a_stale_build_directory_is_not_reused(name: &str, force: bool) {
+    let root = script_project(name);
+    let sdist = plant_sdist(&root, "SDIST");
+    let sdist = sdist.to_str().expect("utf-8");
+    let out = run_script(&root, &["--sdist", sdist], &[("STUB_LABEL", "v1.4.0")]);
+    assert!(!out.status.success());
+    write(
+        &sdist_cache(&root).join("build/CMakeCache.txt"),
+        "another generator",
+    );
+
+    let args: &[&str] = if force {
+        &["--sdist", sdist, "--force"]
+    } else {
+        &["--sdist", sdist]
+    };
+    run_script_ok(&root, args, &[]);
+
+    assert_eq!(manifest(&root).0, target_version());
+}
+
+#[test]
+fn a_build_directory_left_by_an_unfinished_run_is_not_reused() {
+    check_a_stale_build_directory_is_not_reused("stale-build", false);
+}
+
+#[test]
+fn a_forced_rebuild_does_not_reuse_a_stale_build_directory() {
+    check_a_stale_build_directory_is_not_reused("stale-build-force", true);
+}
+
+/// The cache entry's manifest is what marks a build as finished. One cut short
+/// (an interrupted write, a full disk) must be rebuilt, not handed to
+/// `build.rs` with half its libraries, or crash the script. `cut` keeps the
+/// first `cut(full)` bytes of a complete manifest.
+fn check_a_truncated_cache_manifest_is_rebuilt(name: &str, cut: fn(&str) -> usize) {
+    let root = script_project(name);
+    let sdist = plant_sdist(&root, "SDIST");
+    let sdist = sdist.to_str().expect("utf-8");
+    run_script_ok(&root, &["--sdist", sdist], &[]);
+    let stamp = sdist_cache(&root).join("manifest");
+    let full = read(&stamp);
+    write(&stamp, &full[..cut(&full)]);
+
+    run_script_ok(&root, &["--sdist", sdist], &[]);
+
+    assert_eq!(
+        cmake_calls(&root).len(),
+        4,
+        "a truncated manifest must rebuild"
+    );
+    let (version, _, libs) = manifest(&root);
+    assert_eq!(version, target_version());
+    assert!(
+        libs.iter().any(|l| l.ends_with("libduckdb_static.a")),
+        "the rebuilt manifest must list the libraries: {libs:?}"
+    );
+}
+
+#[test]
+fn an_empty_cache_manifest_is_rebuilt_not_trusted() {
+    check_a_truncated_cache_manifest_is_rebuilt("empty-stamp", |_| 0);
+}
+
+#[test]
+fn a_cache_manifest_cut_before_its_libraries_is_rebuilt_not_trusted() {
+    check_a_truncated_cache_manifest_is_rebuilt("cut-stamp", |full| {
+        full.find("\nlib ").expect("a lib line")
+    });
 }

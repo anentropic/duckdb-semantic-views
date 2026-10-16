@@ -414,17 +414,48 @@ def render_manifest(
     return "\n".join(lines) + "\n"
 
 
+def write_atomically(path: str, text: str) -> None:
+    """Write `path` so that an interrupted write leaves the old file or none."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    partial = path + ".partial"
+    with open(partial, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(partial, path)
+
+
+def manifest_label(text: str) -> str | None:
+    for line in text.splitlines():
+        if line.startswith("version "):
+            return line.removeprefix("version ")
+    return None
+
+
+def cached_manifest(stamp: str, engine_id: str) -> str | None:
+    """The cache entry's manifest, or None when it is missing or incomplete.
+
+    It is written atomically, but an entry from an interrupted run of an older
+    script, or a damaged file, must be rebuilt rather than handed to `build.rs`.
+    """
+    if not os.path.exists(stamp):
+        return None
+    with open(stamp, encoding="utf-8") as fh:
+        text = fh.read()
+    lines = text.splitlines()
+    complete = (
+        lines[:1] == [f"id {engine_id}"]
+        and manifest_label(text) is not None
+        and any(line.startswith("lib ") for line in lines)
+    )
+    return text if complete else None
+
+
 def install_manifest(root: str, text: str) -> bool:
     path = os.path.join(root, MANIFEST)
     if os.path.exists(path):
         with open(path, encoding="utf-8") as fh:
             if fh.read() == text:
                 return False
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    partial = path + ".partial"
-    with open(partial, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.replace(partial, path)
+    write_atomically(path, text)
     return True
 
 
@@ -475,15 +506,16 @@ def main(argv: list[str] | None = None) -> int:
     src = tree or os.path.join(cache, "src")
     stamp = os.path.join(cache, "manifest")
 
-    if os.path.exists(stamp) and cacheable and not args.force:
-        with open(stamp, encoding="utf-8") as fh:
-            manifest = fh.read()
-    else:
+    manifest = cached_manifest(stamp, engine_id) if cacheable and not args.force else None
+    if manifest is None:
+        # Nothing an earlier, unfinished run left is trusted: its source may be
+        # a partial extraction, and its build directory may hold a CMake cache
+        # for another generator, which CMake refuses to configure over.
         if not tree:
-            if args.force or not os.path.isdir(src):
-                shutil.rmtree(src, ignore_errors=True)
-                extract_engine(pypi_version(root, version), src, args.sdist)
+            shutil.rmtree(src, ignore_errors=True)
+            extract_engine(pypi_version(root, version), src, args.sdist)
         build = os.path.join(cache, "build")
+        shutil.rmtree(build, ignore_errors=True)
         label = configure_engine(src, build, env)
         # Checked before the (long) build: the label is settled at configure.
         # DuckDB's CMake stamps the DUCKDB_VERSION we set, so this only catches
@@ -510,14 +542,11 @@ def main(argv: list[str] | None = None) -> int:
         # The libraries are copied out, so the object files can go; the cache
         # keeps only what a link needs.
         shutil.rmtree(build, ignore_errors=True)
-        with open(stamp, "w", encoding="utf-8") as fh:
-            fh.write(manifest)
+        write_atomically(stamp, manifest)
         log(f"cached {cache}")
 
     changed = install_manifest(root, manifest)
-    label = next(
-        line.removeprefix("version ") for line in manifest.splitlines() if line.startswith("version ")
-    )
+    label = manifest_label(manifest)
     log(f"{'installed' if changed else 'already current'}: {MANIFEST} ({label}, {engine_id})")
     if label != version:
         log(
