@@ -58,6 +58,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <type_traits>
 
@@ -363,12 +364,6 @@ namespace sv_compat {
 // `order` has no 2.0 counterpart; a single polled flag carries no data, so the
 // relaxed load is equivalent for every caller here.
 //
-// TODO(duckdb-2.0, TECH-DEBT #88): 2.0 adds a per-query deadline (max execution time) that
-// `ClientContext::InterruptCheck()` enforces separately from this flag, so a
-// caller whose query times out is not seen here and the timeout is not
-// forwarded to the shim's probe connections. v1.5 had no deadline, so this
-// matches v1.5 behaviour; verify at runtime whether the probe connections
-// inherit the setting or whether the deadline should be forwarded too.
 inline bool is_interrupted(const duckdb::ClientContext &context,
                            std::memory_order order = std::memory_order_seq_cst) {
 #ifdef SV_DUCKDB_2
@@ -377,6 +372,50 @@ inline bool is_interrupted(const duckdb::ClientContext &context,
 #else
 	return context.interrupted.load(order);
 #endif
+}
+
+// Whether `context`'s current query has run past its deadline.
+//
+// v1.5: there is no deadline.
+// 2.0: `SET max_execution_time` gives each query a deadline
+// (`ClientContext::query_deadline`, milliseconds on the steady clock, set when
+// the query begins). The engine enforces it in `InterruptCheck()`, apart from
+// the interrupt flag, so it never reaches a probe connection the shim opens:
+// those are separate ClientContexts, and the setting is the caller's. Checking
+// it next to the flag lets the shim forward and raise it the same way.
+inline bool deadline_passed(const duckdb::ClientContext &context) {
+#ifdef SV_DUCKDB_2
+	if (!context.query_deadline.IsValid()) {
+		return false;
+	}
+	auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+	               std::chrono::steady_clock::now().time_since_epoch())
+	               .count();
+	return static_cast<duckdb::idx_t>(now) >= context.query_deadline.GetIndex();
+#else
+	(void)context;
+	return false;
+#endif
+}
+
+// Whether `context`'s current query has been cancelled, by an interrupt or
+// by its deadline: the condition to forward to a probe connection.
+inline bool is_cancelled(const duckdb::ClientContext &context,
+                         std::memory_order order = std::memory_order_seq_cst) {
+	return is_interrupted(context, order) || deadline_passed(context);
+}
+
+// Throws what the engine itself throws for a cancelled `context`: a bare
+// InterruptException ("Interrupted!") for an interrupt, and one carrying the
+// engine's deadline message for a deadline (`ClientContext::InterruptCheck`).
+inline void throw_if_cancelled(const duckdb::ClientContext &context,
+                               std::memory_order order = std::memory_order_seq_cst) {
+	if (is_interrupted(context, order)) {
+		throw duckdb::InterruptException();
+	}
+	if (deadline_passed(context)) {
+		throw duckdb::InterruptException("Query exceeded maximum execution time");
+	}
 }
 
 // The output-column-names vector a table-function bind callback fills

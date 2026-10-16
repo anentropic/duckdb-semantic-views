@@ -590,13 +590,13 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **Workaround:** `test/integration/test_adbc_queries.py` and `test_adbc_transactions.py` import `duckdb` before the driver, with a comment pointing here. Nothing is skipped: both suites run in full.
 - **What would finish it:** re-check on each 2.0 wheel (a script that imports only `adbc_driver_duckdb` and runs `LOAD '<path>'`). When the driver loads extensions on its own, delete the two imports. If GA ships with it, report it upstream (duckdb-python), since every ADBC user loading an extension hits it.
 
-### 88. ❌ The DuckDB 2.0 shim port has three behaviours only a 2.0 build can settle — OPEN
+### 88. ✅ The DuckDB 2.0 shim port has three behaviours only a 2.0 build can settle — RESOLVED 2026-10-16
 
 - **Origin:** 2026-10-15, Phase 2 of the DuckDB 2.0 epic (`.planning/PEG-PARSER-EPIC.md`). The C++ shim was ported to the 2.0 headers behind `SV_DUCKDB_2` before 2.0 GA, syntax-checked only.
-- **Settled so far by building and running it** against the `v2.0.0-alpha47600` engine (v0.15.0, TECH-DEBT #90):
+- **Resolved by building and running it** against the `v2.0.0-alpha47600` engine (v0.15.0, TECH-DEBT #90):
   - **Statement text from tokens.** 2.0's `parse_function` gets tokens with no offsets, and the 2.0 Python client renders no caret for a parser error. The shim now records the query `parser_override` saw (`sv_override_query`), finds the failed statement's tokens in it (`sv_locate_tail`, from the end, skipping whitespace and comments between tokens), validates that exact text, and renders the caret itself with `QueryErrorContext::Format`. The token-joined text is only the fallback when the tokens cannot be located. The caret tests (`test_caret_position.py`, the caret `.test` files) and the multi-statement hint (`test_multi_statement_ddl_error.py`) pass unchanged.
   - **Interrupt latency.** `sv_query_interruptible`'s 2.0 loop (`Submit` + `Materialize` + `ExecuteTask` / `WaitForTask`) passes `test_query_interrupt.py`: the cancelled query stops early with a bare `Interrupted!`.
-  - **Per-query deadline.** Still open: 2.0 enforces `max_execution_time` in `InterruptCheck()` apart from the interrupt flag, so the shim's probe connections never see the caller's deadline. Forward it like the interrupt flag (`sv_compat::is_interrupted`).
+  - **Per-query deadline.** It was not forwarded: under `SET max_execution_time`, `semantic_view()` and every metadata bind that probes member types ran to completion past the deadline (confirmed red for each statement in `test_query_interrupt.py`, which now runs every cancellation check under both an interrupt and a deadline). `sv_compat::is_cancelled` / `throw_if_cancelled` now treat the caller's passed deadline like its interrupt flag: it is forwarded to the probe connection, and the query fails with the engine's own bare "Query exceeded maximum execution time".
   - **`sv_compiled_duckdb_version()`** returns `DuckDB::LibraryVersion()` of the linked engine under `SV_DUCKDB_2`.
 
 ### 87. ❌ Under a role-played BASE table, a window over a metric off the root binds to the first-declared relationship (silent) — OPEN

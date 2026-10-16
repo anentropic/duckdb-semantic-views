@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`SET max_execution_time` stops semantic-view queries.** DuckDB 2.0's per-query time
+  limit now applies to `semantic_view()` and to the `SHOW` / `DESCRIBE` commands that look
+  up member types, which fail with DuckDB's own `Query exceeded maximum execution time`
+  like any other query instead of running past the limit.
+
 ### Changed
 
 - **The extension now runs on DuckDB 2.0, and only there.** This release is built

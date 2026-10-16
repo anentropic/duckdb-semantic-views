@@ -1929,7 +1929,7 @@ static thread_local ClientContext *sv_bind_caller = nullptr;
 
 extern "C" bool sv_bind_caller_interrupted() {
     return sv_bind_caller != nullptr &&
-           sv_compat::is_interrupted(*sv_bind_caller, std::memory_order_relaxed);
+           sv_compat::is_cancelled(*sv_bind_caller, std::memory_order_relaxed);
 }
 
 class SvBindCancellationScope {
@@ -1962,16 +1962,14 @@ public:
 
     // A cancelled caller is authoritative however the dispatcher ended.
     void ThrowIfCancelled() const {
-        if (sv_compat::is_interrupted(outer_, std::memory_order_relaxed)) {
-            throw InterruptException();
-        }
+        sv_compat::throw_if_cancelled(outer_, std::memory_order_relaxed);
     }
 
 private:
     void Watch() {
         std::unique_lock<std::mutex> lock(mutex_);
         while (!stop_) {
-            if (sv_compat::is_interrupted(outer_, std::memory_order_relaxed)) {
+            if (sv_compat::is_cancelled(outer_, std::memory_order_relaxed)) {
                 probe_.Interrupt();
             }
             wake_.wait_for(lock, std::chrono::milliseconds(10));
@@ -3166,6 +3164,11 @@ struct SemanticViewGlobalState : public GlobalTableFunctionState {
 // query as an internal error. Hence it is thrown from in here, ahead of any
 // caller's wrap, instead of being returned as an error-carrying result.
 //
+// DuckDB 2.0's per-query deadline (`SET max_execution_time`) is handled the
+// same way. It belongs to the caller's context, so the inner connection never
+// sees it: the loop forwards it as an interrupt and raises the engine's own
+// "Query exceeded maximum execution time" (`sv_compat::throw_if_cancelled`).
+//
 // Interrupt latency is one task slice. A BLOCKED inner query (async I/O — httpfs
 // and friends) adds at most one `Executor::WAIT_TIME` (20 ms) per poll, since
 // `WaitForTask()` waits with that timeout rather than indefinitely.
@@ -3209,8 +3212,10 @@ static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
     QueryResultState state =
         result->IsOpen() ? QueryResultState::NOT_READY : QueryResultState::FINISHED;
     while (!IsTerminal(state)) {
-        if (!forwarded && sv_compat::is_interrupted(outer)) {
-            // Sets the inner context's flag; the inner executor picks it up at
+        if (!forwarded && sv_compat::is_cancelled(outer)) {
+            // A cancelled caller (an interrupt, or 2.0's max_execution_time
+            // deadline, which is the caller's alone) sets the inner context's
+            // flag; the inner executor picks it up at
             // its own next poll (2.0's ExecuteTask also checks it before running
             // a task) and unwinds into an INTERRUPT error, which ends this loop
             // via EXECUTION_ERROR.
@@ -3223,11 +3228,10 @@ static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
         }
     }
 
-    if (sv_compat::is_interrupted(outer)) {
-        // The caller cancelled — authoritative however the inner query ended.
-        // It may have raced to completion, or stopped on the forwarded flag.
-        throw InterruptException();
-    }
+    // The caller cancelled (interrupted, or past its deadline) — authoritative
+    // however the inner query ended. It may have raced to completion, or
+    // stopped on the forwarded flag.
+    sv_compat::throw_if_cancelled(outer);
     if (result->HasError()) {
         return make_uniq<QueryResult>(result->GetErrorObject());
     }
@@ -3246,7 +3250,7 @@ static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
     bool forwarded = false;
     PendingExecutionResult exec_result = PendingExecutionResult::RESULT_NOT_READY;
     while (!PendingQueryResult::IsResultReady(exec_result)) {
-        if (!forwarded && sv_compat::is_interrupted(outer)) {
+        if (!forwarded && sv_compat::is_cancelled(outer)) {
             // Sets the inner context's flag; the inner executor picks it up at
             // its own next poll and unwinds into an INTERRUPT error, which ends
             // this loop via EXECUTION_ERROR.
@@ -3259,11 +3263,10 @@ static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
         }
     }
 
-    if (sv_compat::is_interrupted(outer)) {
-        // The caller cancelled — authoritative however the inner query ended.
-        // It may have raced to completion, or stopped on the forwarded flag.
-        throw InterruptException();
-    }
+    // The caller cancelled (interrupted, or past its deadline) — authoritative
+    // however the inner query ended. It may have raced to completion, or
+    // stopped on the forwarded flag.
+    sv_compat::throw_if_cancelled(outer);
     if (pending->HasError()) {
         return make_uniq<MaterializedQueryResult>(pending->GetErrorObject());
     }
