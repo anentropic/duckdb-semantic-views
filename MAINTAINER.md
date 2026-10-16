@@ -760,8 +760,9 @@ Key fields:
 > v0.14.1 runs both failed with `Permission to anentropic/community-extensions.git denied` after
 > tagging, when the push still used the PAT, so the workflow now checks this first: a
 > **preflight** step runs `git push --dry-run` to the fork with the app token before anything is
-> committed or tagged, in dry runs too, and fails with that remedy. It also fails if neither PAT
-> secret is set, since one is needed to open the upstream PR. If a run tagged the release but
+> committed or tagged, in dry runs too, and fails with that remedy. It also checks the PAT that
+> opens the upstream PR: it must be set, accepted by GitHub (not expired), and, for a classic PAT,
+> carry `public_repo` or `repo`. If a run tagged the release but
 > did not open the registry PR, fix the cause and re-run with `-f registry_pr_only=true`. That
 > publishes the version already on `main` from its existing tag, checking that `description.yml`
 > points at it, and bumps, rolls and tags nothing. Never re-run a normal publish after its

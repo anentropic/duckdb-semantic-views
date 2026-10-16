@@ -131,7 +131,9 @@ jobs:
       #    access to answer it, so it is refused exactly as the real push would be.
       #    It runs from a scratch repo: this checkout's git config carries the
       #    GITHUB_TOKEN auth header for github.com, which would replace the token.
-      #    The PAT that opens the upstream PR can only be checked for presence.
+      #    The PAT that opens the upstream PR is checked for being live and, for a
+      #    classic PAT, for the public_repo scope. `--no-maintainer-edit` below
+      #    matters too: GitHub refuses maintainer edits on an org-owned fork.
       - name: Get app token for the fork
         id: fork-token
         uses: actions/create-github-app-token@v3
@@ -153,6 +155,19 @@ jobs:
         run: |
           if [ -z "$GH_TOKEN" ]; then
             echo "::error::neither CE_PUBLISH_PAT nor VERSION_MONITOR_PAT is set; one is needed to open the PR on ${CE_UPSTREAM}"
+            exit 1
+          fi
+          # The PAT must be live (an expired one fails with 401 even on a public
+          # repo) and, if it is a classic PAT, carry public_repo or repo.
+          if ! HDRS=$(gh api -i "repos/${CE_UPSTREAM}" 2>&1); then
+            echo "::error::the PAT that opens the PR on ${CE_UPSTREAM} was rejected (expired or revoked?). Replace CE_PUBLISH_PAT with a classic PAT with the public_repo scope."
+            exit 1
+          fi
+          # Only classic PATs send X-OAuth-Scopes; a fine-grained one sends none.
+          SCOPE_LINE=$(printf '%s\n' "$HDRS" | tr -d '\r' | grep -i '^x-oauth-scopes:' || true)
+          SCOPES=${SCOPE_LINE#*:}
+          if [ -n "$SCOPE_LINE" ] && ! printf '%s\n' "$SCOPES" | grep -qwE 'public_repo|repo'; then
+            echo "::error::the PAT that opens the PR on ${CE_UPSTREAM} has scopes '${SCOPES}' but needs public_repo."
             exit 1
           fi
           PROBE="$RUNNER_TEMP/ce-preflight"
@@ -256,13 +271,16 @@ jobs:
             --jq "[.[] | select(.headRepositoryOwner.login == \"${CE_FORK_OWNER}\")][0].url // empty")
           if [ -n "$OPEN" ]; then
             # It may have been opened for an earlier version: retitle it to match.
-            gh pr edit "$OPEN" --title "$TITLE" --body "$BODY"
+            # Cosmetic, and only the PR's author can do it, so don't fail on it.
+            gh pr edit "$OPEN" --title "$TITLE" --body "$BODY" \
+              || echo "::warning::could not retitle $OPEN"
             echo "CE_PR=updated the open community-extensions PR $OPEN" >> "$GITHUB_ENV"
           else
             URL=$(gh pr create \
               --repo "$CE_UPSTREAM" \
               --head "${CE_FORK_OWNER}:$CE_BRANCH" \
               --base main \
+              --no-maintainer-edit \
               --title "$TITLE" \
               --body "$BODY")
             echo "CE_PR=opened community-extensions PR $URL" >> "$GITHUB_ENV"
