@@ -1290,6 +1290,8 @@ static bool sv_register_scalar_function_set(
         // overload's signature (no-op on v1.5, which takes them from the
         // description).
         sv_compat::name_positional_parameters(set, doc->positional_names);
+        // Every scalar this extension registers reports errors by throwing.
+        sv_compat::mark_fallible(set);
 
         CreateScalarFunctionInfo info(std::move(set));
         info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;

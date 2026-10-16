@@ -637,4 +637,20 @@ inline void name_positional_parameters(duckdb::ScalarFunctionSet &set, const duc
 #endif
 }
 
+// Mark every overload of a scalar function as able to raise a runtime error.
+//
+// 2.0: a scalar function that throws must say so (`SetFallible()`), because
+// the optimizer folds and reorders calls it believes cannot fail. One that
+// throws without the mark is reported as an INTERNAL error ("threw an
+// execution error, but the function is not marked as fallible") in place of
+// its own message. Both of ours raise ordinary errors for an unknown or
+// ambiguous view. v1.5 has no such marking, so this is a no-op there.
+inline void mark_fallible(duckdb::ScalarFunctionSet &set) {
+#ifdef SV_DUCKDB_2
+	set.SetFallible();
+#else
+	(void)set;
+#endif
+}
+
 } // namespace sv_compat
