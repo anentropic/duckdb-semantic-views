@@ -74,8 +74,8 @@ TEST_RUNNER=$(PYTHON_VENV_BIN) scripts/run_sqllogictest.py --required-extension 
 #   it into ./duckdb (Haybarn's fork of _extension_distribution.yml does this
 #   from `override_duckdb_repository`); when it is there, that IS the engine the
 #   extension will be loaded into, so the amalgamation is generated from it.
-#   Upstream community-extensions hands a C-API extension no such tree, so that
-#   build keeps using the release below.
+#   Upstream community-extensions clones one there too; a tree past an upstream
+#   release tag (its DuckDB development-branch default) is refused, not built.
 # AMALGAMATION_URL: the pinned upstream release, used when no tree is present
 #   (local development, upstream CI). Gitignored, ~25 MB, cached under
 #   .amalgamation/<id>/ so it survives branch switches.

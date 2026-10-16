@@ -69,6 +69,8 @@ STAMP_NAME = ".amalgamation_id"
 VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 # The `-<commits>-g<sha>` suffix `git describe` adds when a tree is past its tag.
 DISTANCE_RE = re.compile(r"-(\d+)-g[0-9a-f]+$")
+# An upstream release tag, as opposed to a fork's (`haybarn-v1.5.5-rc1`).
+UPSTREAM_TAG_RE = re.compile(r"v\d+\.\d+\.\d+(-\d+-g[0-9a-f]+)?$")
 # Stamp written when an install cannot be identified (an engine tree that is not
 # a git checkout). It never matches a computed identity, so such a tree is
 # regenerated on every build; what it does is mark the install as "known to be
@@ -159,11 +161,15 @@ def core_version(label: str) -> str | None:
 
 
 def commits_past_tag(label: str) -> int:
-    """How many commits a `git describe` label is past its tag; 0 at the tag.
+    """How many commits a label is past an upstream `vX.Y.Z` tag; 0 at the tag.
 
     `v1.5.6-15774-gb15358c371d` -> 15774 (DuckDB's development branch);
-    `v1.5.5-0-g105edd31b5` and `v1.5.5` -> 0.
+    `v1.5.5-0-g105edd31b5` and `v1.5.5` -> 0. A fork's tag is never counted:
+    its nightly (`haybarn-v1.5.5-rc1-42-g<sha>`) is past its own tag without
+    leaving the upstream release it is based on.
     """
+    if not UPSTREAM_TAG_RE.match(label):
+        return 0
     m = DISTANCE_RE.search(label)
     return int(m.group(1)) if m else 0
 
