@@ -79,7 +79,16 @@ UNSTABLE_C_API_FLAG=--abi-type C_STRUCT
 # OFFLINE_EXTENSION_TESTS never reach the wrapper, because prepare_test_list
 # below leaves them out of the list and prints their SKIPPED lines. (The
 # wrapper's own --offline-excused flag is for running it directly.)
-TEST_RUNNER=$(PYTHON_VENV_BIN) scripts/run_sqllogictest.py --required-extension semantic_views
+TEST_RUNNER=$(SV_CRASH_REPORT) $(PYTHON_VENV_BIN) scripts/run_sqllogictest.py --required-extension semantic_views
+
+# On Windows a crash of the runner (an access violation) is re-run under cdb so
+# the log shows the native stack and the faulting module; the exit status stays
+# the crash's. See scripts/windows_crash_report.py. Empty elsewhere.
+ifeq ($(OS),Windows_NT)
+SV_CRASH_REPORT=$(PYTHON_VENV_BIN) scripts/windows_crash_report.py --
+else
+SV_CRASH_REPORT=
+endif
 
 # The DuckDB engine the C++ shim is compiled and linked against. build.rs links a
 # static build of it INTO the extension binary (the parser hook the shim

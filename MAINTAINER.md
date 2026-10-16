@@ -129,7 +129,8 @@ examples/                      # Runnable Python demos — every one runs in CI 
 
 scripts/                       # Build/test helpers, among them:
 ├── run_examples.py            #   `just test-examples` runner (PASS/FAIL/SKIPPED/XFAIL per example)
-└── run_sqllogictest.py        #   strict sqllogictest wrapper — the Makefile's TEST_RUNNER
+├── run_sqllogictest.py        #   strict sqllogictest wrapper — the Makefile's TEST_RUNNER
+└── windows_crash_report.py    #   Windows only: re-runs a runner that crashed under cdb for the native stack
 
 test/
 ├── sql/                       # sqllogictest files (run via test/sql/TEST_LIST — drift is a CI error)
@@ -282,7 +283,9 @@ The engine is built for the target the extension is: on macOS with DuckDB's 11.0
 deployment target, and for the architecture in `OSX_BUILD_ARCH` when extension-ci-tools
 cross-compiles (osx_amd64 on an arm64 runner). On Windows, DuckDB's CMake forces the
 static MSVC runtime (`/MT`), so `.cargo/config.toml` links the extension with
-`+crt-static` to match; the `cc`-compiled shim follows that.
+`+crt-static` to match; the `cc`-compiled shim follows that. A `RUSTFLAGS` in the
+environment replaces that config's flags rather than adding to them, so `build.rs`
+refuses an MSVC build without `crt-static` instead of failing at the link.
 
 Builds are cached under `.engine/<id>/` (the static libraries, plus the extracted source
 for the pinned release's headers), keyed on the pin or on the tree's label and commit, so
@@ -1057,7 +1060,7 @@ Two consequences worth keeping in mind:
 1. **`BuildQuick` builds only `linux_amd64`, so it never tests.** Its `make test_release` step prints `Skipping tests..` and exits 0, which reads as a green build. Before #223 that meant **no** sqllogictest ran on pull requests at all — long enough for an incorrect assertion to reach `main` in #217 (an `IDENT-6` case asserting a quoted name is reported unquoted, corrected in #219). The `sqllogictest` job in `IntegrationChecks` is the authoritative PR gate; do **not** "simplify" it away on the assumption that BuildQuick covers it.
 2. **Cross-platform sqllogictest is real, but only on `main`,** via BuildAll's Windows and macOS-arm64 legs. A PR therefore gets Linux-only SQL coverage by design (the suite carries no platform-conditional directives — every file is a plain `require semantic_views`), and platform-specific breakage surfaces on the `main` push instead.
 
-You can tell the two apart in a job log without reading it all: a real run prints `Running RELEASE tests..`, then one `[n/N] test/sql/….test` line per file, then `sqllogictest: N file(s) ran, M statements/queries executed` (from `scripts/run_sqllogictest.py`, which fails the run rather than print it if any listed file skipped `require semantic_views`, never ran, or executed nothing) and `N test files passed (single process)`; a skipped one prints `Skipping tests..` and nothing else. The `ignoring old recipe for target 'test_extension_*_internal'` warnings are **not** a symptom of skipping — they appear in runs that do execute the suite, and simply record this project's Makefile overriding upstream's recipe.
+You can tell the two apart in a job log without reading it all: a real run prints `Running RELEASE tests..`, then one `[n/N] test/sql/….test` line per file, then `sqllogictest: N file(s) ran, M statements/queries executed` (from `scripts/run_sqllogictest.py`, which fails the run rather than print it if any listed file skipped `require semantic_views`, never ran, or executed nothing) and `N test files passed (single process)`; a skipped one prints `Skipping tests..` and nothing else. On Windows, a runner that dies of an access violation is run a second time under `cdb` (`scripts/windows_crash_report.py`, which the Makefile puts in front of `TEST_RUNNER` there): the log then holds the registers, native stack and loaded modules between `===== SV CRASH REPORT =====` markers, and the job still fails with the first run's status. The `ignoring old recipe for target 'test_extension_*_internal'` warnings are **not** a symptom of skipping — they appear in runs that do execute the suite, and simply record this project's Makefile overriding upstream's recipe.
 
 **Documentation-only skip.** `BuildAll`, `BuildQuick`, `CodeQuality`, and `IntegrationChecks` carry a shared `paths-ignore` (`**/*.md`, `_notes/**`, `docs/**`, `LICENSE`), so a change that touches only documentation/text does not run the extension build, sqllogictest, Rust lint/coverage, or the integration suites. `Fuzz` achieves the same via its `paths` allowlist. `DocsCheck` is intentionally exempt so prose changes still get the `-W` docs build. A change that also touches any non-doc file runs everything as normal. When editing these triggers, keep the four `paths-ignore` lists in sync.
 

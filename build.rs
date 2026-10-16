@@ -180,6 +180,26 @@ fn write_compile_commands_json(spec: &CppBuildSpec) {
     }
 }
 
+// DuckDB's CMake builds the engine against the static MSVC runtime (/MT), and
+// .cargo/config.toml turns on `crt-static` to match. A RUSTFLAGS set in the
+// environment replaces that config's rustflags instead of adding to them, and
+// the link then mixes runtimes, so say so here rather than as an LNK2038 at the
+// end of the build.
+#[cfg(feature = "extension")]
+fn check_msvc_static_runtime(is_windows: bool) {
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let target_features = std::env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    assert!(
+        !is_windows
+            || target_env != "msvc"
+            || target_features.split(',').any(|f| f == "crt-static"),
+        "the DuckDB engine is built against the static MSVC runtime (/MT), but this \
+         build does not link it statically (no `crt-static` target feature). A \
+         RUSTFLAGS in the environment replaces the `+crt-static` that \
+         .cargo/config.toml sets: add `-C target-feature=+crt-static` to it."
+    );
+}
+
 fn main() {
     // Always emit compile_commands.json so clangd works without `--features extension`.
     // Single source of truth: the same CppBuildSpec drives the cc-crate compile below.
@@ -265,6 +285,7 @@ fn main() {
              `just build`), which removes it, or delete it.",
             stale.display()
         );
+        check_msvc_static_runtime(is_windows);
         let spec = cpp_build_spec(is_windows, Some(engine));
         let mut build = cc::Build::new();
         build.cpp(true).std(spec.std).warnings(false); // DuckDB headers are not warning-clean
