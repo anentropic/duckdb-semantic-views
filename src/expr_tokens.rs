@@ -1322,6 +1322,17 @@ mod tests {
             Just("::TIMESTAMP WITH TIME ZONE".to_string()),
             Just("::STRUCT(blob BLOB)[]".to_string()),
             "CAST\\(x AS [a-zA-Z]{1,5}\\)",
+            // COR-3: the other keyword positions — an EXTRACT field and an
+            // INTERVAL unit (offsets recorded ahead of the walk), AT TIME ZONE,
+            // and a multi-word typed literal's type. The unit word is random,
+            // so it is sometimes a real unit and sometimes an ordinary name.
+            "EXTRACT\\([a-z]{1,4} FROM ",
+            "INTERVAL [0-9] [a-zA-Z]{1,4}",
+            "INTERVAL \\([a-z]{1,3}\\) [a-zA-Z]{1,4}",
+            "INTERVAL ?'[0-9]' [a-zA-Z]{1,4}",
+            Just(" AT TIME ZONE ".to_string()),
+            "[a-zA-Z]{1,5} (WITH|WITHOUT) TIME ZONE ?'[0-9 :-]{0,8}'",
+            "[a-zA-Z]{1,5} (PRECISION|VARYING) '[0-9.]{0,4}'",
             // dollar-quoted strings
             Just("$$a.b revenue$$".to_string()),
             // operators / punctuation / whitespace
@@ -1422,6 +1433,38 @@ mod tests {
                 prop_assert!(!references_ref(&expr, &ty, None), "expr={expr:?}");
                 prop_assert_eq!(inline_references(&expr, &m), expr.clone());
                 // Anti-vacuity: the cast's operand is still found.
+                prop_assert!(references_ref(&expr, "lhs col", None), "expr={expr:?}");
+            }
+        }
+
+        /// COR-3: a word in an EXTRACT field, an INTERVAL unit, or any word of
+        /// a multi-word typed literal's type is never found as a reference nor
+        /// substituted, while the references around it still are.
+        #[test]
+        fn a_keyword_position_word_is_never_a_reference(
+            word in "[a-zA-Z_][a-zA-Z0-9_]{0,4}",
+            unit in prop::sample::select(INTERVAL_UNITS.to_vec()),
+            tail in prop::sample::select(vec!["WITH TIME ZONE", "WITHOUT TIME ZONE", "PRECISION", "VARYING"]),
+            gap in prop::sample::select(vec!["", " ", "\n  "]),
+        ) {
+            let cases = [
+                (format!("EXTRACT({word} FROM \"lhs col\")"), word.clone()),
+                (format!("\"lhs col\" + INTERVAL{gap}'1' {unit}"), unit.to_string()),
+                (format!("\"lhs col\" + INTERVAL 1 {unit}"), unit.to_string()),
+                (format!("\"lhs col\" + INTERVAL (\"lhs col\") {unit}"), unit.to_string()),
+                (format!("\"lhs col\" = {word} {tail}{gap}'1'"), word.clone()),
+                (
+                    format!("\"lhs col\" = {word} {tail}{gap}'1'"),
+                    tail.split(' ').next().unwrap_or_default().to_string(),
+                ),
+            ];
+            for (expr, name) in cases {
+                let key = crate::ident::normalize_ident_part(&name);
+                let mut m: HashMap<String, &str> = HashMap::new();
+                m.insert(key, "<R>");
+                prop_assert!(!references_ref(&expr, &name, None), "expr={expr:?} name={name:?}");
+                prop_assert_eq!(inline_references(&expr, &m), expr.clone());
+                // Anti-vacuity: the reference beside the keyword is still found.
                 prop_assert!(references_ref(&expr, "lhs col", None), "expr={expr:?}");
             }
         }
