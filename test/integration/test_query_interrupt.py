@@ -30,6 +30,13 @@ Two properties are asserted, because the pre-fix build satisfies one of them:
      `InterruptException::INTERRUPT_MESSAGE`; a wrapped message would surface a
      cancelled query as ADBC_STATUS_INTERNAL.
 
+DuckDB 2.0 adds a second way to cancel a query: `SET max_execution_time`, a
+per-query deadline the engine enforces apart from the interrupt flag. It is the
+caller's setting, so the probe connections never had it, and `semantic_view()`
+and the metadata binds below ran to completion past it. Every check here runs
+once per cancellation (CANCELLATIONS), and a deadline must surface as the
+engine's own "Query exceeded maximum execution time", bare, the same way.
+
 A plain-SQL control runs first through the identical harness. It aborts early on
 *every* build (DuckDB's own executor polls the flag correctly), so if the control
 fails, the harness is wrong rather than the feature — the failure message says so.
@@ -207,6 +214,38 @@ def run_interrupted(con, sql, fire_at=FIRE_AT_S):
     return elapsed, err
 
 
+# DuckDB 2.0's per-query deadline (`SET max_execution_time`, in milliseconds)
+# stops a query the same way an interrupt does, from inside the engine, with
+# its own message. The caller's deadline is the caller's ClientContext state,
+# so it has to be carried to the probe connections exactly like the flag.
+DEADLINE_MESSAGE = "Query exceeded maximum execution time"
+
+
+def run_deadlined(con, sql, deadline_s=FIRE_AT_S):
+    """
+    Run `sql` under `SET max_execution_time` of `deadline_s` seconds.
+
+    Returns (elapsed_seconds, exception_or_None), like run_interrupted().
+    """
+    con.execute(f"SET max_execution_time = {int(deadline_s * 1000)}")
+    start = time.perf_counter()
+    try:
+        con.execute(sql).fetchall()
+        err = None
+    except Exception as exc:  # noqa: BLE001 - the exception IS the observation
+        err = exc
+    elapsed = time.perf_counter() - start
+    con.execute("RESET max_execution_time")
+    return elapsed, err
+
+
+# How each kind of cancellation is fired, and the message it must surface as.
+CANCELLATIONS = (
+    ("interrupt", run_interrupted, "Interrupted!"),
+    ("deadline", run_deadlined, DEADLINE_MESSAGE),
+)
+
+
 def calibrate(con):
     """Grow the md5 chain until one uninterrupted semantic_view() run is slow enough."""
     depth = START_DEPTH
@@ -325,7 +364,7 @@ def _run_metadata_probe_tests(con, csv_dir) -> bool:
 
 
 def check_interrupted_statement(con, label, sql) -> bool:
-    """Time `sql` uninterrupted, then assert an interrupt stops it early and bare."""
+    """Time `sql` uncancelled, then assert each cancellation stops it early and bare."""
     baseline = time_query(con, sql)
     limit = max(FIRE_AT_S + MIN_ABORT_SLACK_S, ABORT_FRACTION * baseline)
     print(f"\n{label}: cancellation must stop the member-type probes")
@@ -334,27 +373,28 @@ def check_interrupted_statement(con, label, sql) -> bool:
         limit <= VACUITY_MARGIN * baseline,
         f"limit {limit:.2f}s <= {VACUITY_MARGIN:.0%} of baseline {baseline:.2f}s",
     )
-    elapsed, err = run_interrupted(con, sql)
-    message = "" if err is None else str(err)
-    ok &= check(
-        "the statement raises rather than completing",
-        err is not None,
-        f"error={type(err).__name__ if err else 'None'} after {elapsed:.2f}s",
-    )
-    ok &= check(
-        "the statement stops early instead of probing to completion",
-        err is not None and elapsed < limit,
-        f"stopped after {elapsed:.2f}s (baseline {baseline:.2f}s, limit {limit:.2f}s)",
-    )
-    # Bare means an INTERRUPT carrying "Interrupted!", not wrapped in the
-    # "<function> failed: ..." BinderException every other bind failure gets.
-    # Raised from a bind, it carries the call's query location, as DuckDB's own
-    # table functions' bind-time interrupts do.
-    ok &= check(
-        "the error is a bare interrupt",
-        message.startswith("INTERRUPT Error: Interrupted!") and "failed:" not in message,
-        f"message={message!r}",
-    )
+    for kind, run, expected in CANCELLATIONS:
+        elapsed, err = run(con, sql)
+        message = "" if err is None else str(err)
+        ok &= check(
+            f"{kind}: the statement raises rather than completing",
+            err is not None,
+            f"error={type(err).__name__ if err else 'None'} after {elapsed:.2f}s",
+        )
+        ok &= check(
+            f"{kind}: the statement stops early instead of probing to completion",
+            err is not None and elapsed < limit,
+            f"stopped after {elapsed:.2f}s (baseline {baseline:.2f}s, limit {limit:.2f}s)",
+        )
+        # Bare means an INTERRUPT carrying the engine's own message, not wrapped
+        # in the "<function> failed: ..." BinderException every other bind
+        # failure gets. Raised from a bind, it carries the call's query
+        # location, as DuckDB's own table functions' bind-time interrupts do.
+        ok &= check(
+            f"{kind}: the error is a bare interrupt",
+            message.startswith(f"INTERRUPT Error: {expected}") and "failed:" not in message,
+            f"message={message!r}",
+        )
     return ok
 
 
@@ -431,47 +471,48 @@ def run_tests() -> int:
         )
         return 1
 
-    print("\nControl: plain SQL through the identical harness")
-    elapsed, err = run_interrupted(con, control_sql)
-    limit = deadline(plain_baseline)
-    control_ok = check(
-        "plain SQL aborts early",
-        err is not None and elapsed < limit,
-        f"stopped after {elapsed:.2f}s (baseline {plain_baseline:.2f}s, limit {limit:.2f}s), "
-        f"error={type(err).__name__ if err else 'None'}",
-    )
-    if not control_ok:
-        print(
-            "  NOTE: the control failing means the HARNESS is broken (interrupt "
-            "never reached DuckDB at all), not that semantic_view() regressed."
+    for kind, run, expected in CANCELLATIONS:
+        print(f"\nControl ({kind}): plain SQL through the identical harness")
+        elapsed, err = run(con, control_sql)
+        limit = deadline(plain_baseline)
+        control_ok = check(
+            "plain SQL aborts early",
+            err is not None and elapsed < limit and expected in str(err),
+            f"stopped after {elapsed:.2f}s (baseline {plain_baseline:.2f}s, limit {limit:.2f}s), "
+            f"error={err!r}",
         )
-    ok &= control_ok
+        if not control_ok:
+            print(
+                f"  NOTE: the control failing means the HARNESS is broken (the {kind} "
+                "never reached DuckDB at all), not that semantic_view() regressed."
+            )
+        ok &= control_ok
 
-    print("\nsemantic_view(): cancellation must reach the inner query")
-    elapsed, err = run_interrupted(con, SV_SQL)
-    limit = deadline(sv_baseline)
-    message = "" if err is None else str(err)
+        print(f"\nsemantic_view() ({kind}): cancellation must reach the inner query")
+        elapsed, err = run(con, SV_SQL)
+        limit = deadline(sv_baseline)
+        message = "" if err is None else str(err)
 
-    ok &= check(
-        "the query raises rather than completing",
-        err is not None,
-        f"error={type(err).__name__ if err else 'None'} after {elapsed:.2f}s",
-    )
-    ok &= check(
-        "the query stops early instead of running to completion",
-        err is not None and elapsed < limit,
-        f"stopped after {elapsed:.2f}s (baseline {sv_baseline:.2f}s, limit {limit:.2f}s)",
-    )
-    ok &= check(
-        "the error is a bare interrupt",
-        "Interrupted!" in message,
-        f"message={message!r}",
-    )
-    ok &= check(
-        "the interrupt is not wrapped as an execution failure",
-        "SQL execution failed" not in message,
-        f"message={message!r}",
-    )
+        ok &= check(
+            "the query raises rather than completing",
+            err is not None,
+            f"error={type(err).__name__ if err else 'None'} after {elapsed:.2f}s",
+        )
+        ok &= check(
+            "the query stops early instead of running to completion",
+            err is not None and elapsed < limit,
+            f"stopped after {elapsed:.2f}s (baseline {sv_baseline:.2f}s, limit {limit:.2f}s)",
+        )
+        ok &= check(
+            f"the error is a bare interrupt ({expected!r})",
+            expected in message,
+            f"message={message!r}",
+        )
+        ok &= check(
+            "the interrupt is not wrapped as an execution failure",
+            "SQL execution failed" not in message,
+            f"message={message!r}",
+        )
 
     ok &= run_metadata_probe_tests(con)
 
