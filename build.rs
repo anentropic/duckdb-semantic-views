@@ -200,6 +200,14 @@ fn main() {
     if std::path::Path::new(ENGINE_MANIFEST).exists() {
         println!("cargo:rerun-if-changed={ENGINE_MANIFEST}");
     }
+    // Cargo does not fingerprint `rustc-link-lib` inputs, so an engine rebuilt in
+    // place would otherwise keep the previous link. Only the libraries that exist
+    // are listed, for the same reason as the manifest.
+    for lib in engine.iter().flat_map(|e| &e.libs) {
+        if std::path::Path::new(lib).exists() {
+            println!("cargo:rerun-if-changed={lib}");
+        }
+    }
     // Toggling SV_SKIP_CPP_BUILD flips whether the C++ shim is compiled and the
     // engine linked below, so it must invalidate the build-script cache. Without
     // this, a `cargo build --features extension` right after a

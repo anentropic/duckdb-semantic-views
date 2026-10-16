@@ -19,8 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **The extension now runs on DuckDB 2.0, and only there.** This release is built
-  against DuckDB 2.0 and loads only in that exact DuckDB release. If you stay on DuckDB
-  1.5, keep v0.14.0, the last release for 1.5.
+  against DuckDB 2.0 and loads only in that exact DuckDB release. Until DuckDB 2.0.0 is
+  released it is built against the `v2.0.0-alpha47600` pre-release (the `duckdb`
+  `2.0.0.dev2610151406` Python wheel) and loads only there. If you stay on DuckDB 1.5, keep
+  v0.14.0, the last release for 1.5.
 - **Two identifier errors now come from DuckDB.** In semantic-view DDL, an unterminated
   quoted identifier and an empty one (`""`) are now rejected by DuckDB 2.0 before the
   extension sees the statement. The errors read `unterminated quoted identifier` and
@@ -31,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other stops with `semantic_views was built for DuckDB X and cannot run in DuckDB Y`. For a released
   DuckDB it also names the `FORCE INSTALL semantic_views FROM community;` command that fetches
   the matching build, once one has been published for that DuckDB.
+
+### Known limitations
+
+- **ADBC needs `import duckdb` first.** With the DuckDB 2.0 Python wheel, a connection from
+  `adbc_driver_duckdb` cannot `INSTALL` or `LOAD` any extension, this one included, unless
+  the `duckdb` Python module has been imported in the same process first. Add
+  `import duckdb` before you import the ADBC driver.
 
 ## [0.14.0] - 2026-10-15
 

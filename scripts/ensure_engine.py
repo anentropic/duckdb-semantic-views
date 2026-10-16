@@ -61,6 +61,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 from typing import NoReturn
 
@@ -68,9 +69,14 @@ DEFAULT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MANIFEST = os.path.join("cpp", "engine.manifest")
 # Engine builds that predate this layout or a change to how it is built would
 # be reused from the cache without this in the id.
-LAYOUT = "1"
+LAYOUT = "2"
 # A DuckDB release label, as DuckDB's CMake parses one.
 RELEASE_LABEL_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|dev)[0-9]+)?$")
+# A commit, as extension-ci-tools passes `duckdb_version` when it is a SHA.
+COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+# The variables a harness labels its engine build with, in the order DuckDB's
+# CMake reads them.
+HARNESS_LABEL_VARS = ("DUCKDB_VERSION", "OVERRIDE_GIT_DESCRIBE")
 # The CMake configure line logs the label the build stamps into the library.
 CMAKE_VERSION_RE = re.compile(r"git hash \S+, version (\S+),")
 # Static libraries of the `duckdb_static` target that a link needs. jemalloc is
@@ -151,32 +157,79 @@ def git_exact_tag(tree: str) -> str | None:
     return tag if RELEASE_LABEL_RE.match(tag) else None
 
 
+def git_ref_names(tree: str) -> set[str]:
+    """Every branch and tag name in `tree`, short and remote-relative.
+
+    `origin/main` is listed as `main` too: a harness checks out a branch
+    detached, so its name survives only as the remote-tracking ref.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-c", "safe.directory=*", "-C", tree, "for-each-ref",
+             "--format=%(refname)"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return set()
+    names = set()
+    for ref in out.split():
+        for prefix in ("refs/heads/", "refs/tags/"):
+            if ref.startswith(prefix):
+                names.add(ref[len(prefix):])
+        if ref.startswith("refs/remotes/"):
+            remote_ref = ref[len("refs/remotes/"):]
+            names.add(remote_ref)
+            names.add(remote_ref.split("/", 1)[-1])
+    return names
+
+
 def tree_label(tree: str) -> tuple[str | None, str]:
     """The version label to build `tree` with, and where it came from.
 
     The library reports this label as its version, and the extension refuses
-    any host reporting another, so it has to be what the release build of the
-    same source says. DuckDB's CMake takes it from `DUCKDB_VERSION` or
-    `OVERRIDE_GIT_DESCRIBE`, and otherwise makes up a `-devN` label from
-    `release_version.txt` and the commit count -- even for a checkout of a
-    release tag. So:
+    any host reporting another, so it has to be what the host's own build of
+    the same source says. DuckDB's CMake stamps `DUCKDB_VERSION` (else
+    `OVERRIDE_GIT_DESCRIBE`) verbatim, and otherwise makes up a `-devN` label
+    from `release_version.txt` and the commit count -- even for a checkout of
+    a release tag. So:
 
     1. a harness label that is a release label (`v2.0.0`, `v2.0.0-alpha47600`)
        is used as is;
-    2. otherwise a release tag the tree is checked out at (community-extensions
-       sets `DUCKDB_VERSION` to a commit SHA, which CMake would stamp verbatim);
-    3. otherwise CMake's own `-devN` label (None): a development tree is no
-       release, and its build loads in no released DuckDB, only in one built
-       from the same commit.
+    2. a harness value that is a git reference rather than a label -- a commit
+       (community-extensions and extension-ci-tools pass `duckdb_version` as
+       one) or a branch or tag name of the tree (`main`) -- names *which*
+       source, not what it is called, so it is skipped;
+    3. any other harness label (a fork's `haybarn-v1.5.5-rc1-42-g<sha>`, a
+       nightly's `git describe`) is used verbatim, as the harness's own engine
+       build does with the same variable: it is never cut down to a release
+       label it is not;
+    4. otherwise a release tag the tree is checked out at;
+    5. otherwise CMake's own `-devN` label (None). That is a guess: N is the
+       commit count of the clone, so a shallow clone gets a different label
+       than the full one upstream builds from.
     """
-    for name in ("DUCKDB_VERSION", "OVERRIDE_GIT_DESCRIBE"):
+    refs = None
+    for name in HARNESS_LABEL_VARS:
         value = os.environ.get(name, "").strip()
+        if not value:
+            continue
         if RELEASE_LABEL_RE.match(value):
             return value, f"{name}={value}"
+        if refs is None:
+            refs = git_ref_names(tree)
+        if COMMIT_RE.match(value) or value in refs:
+            continue
+        return value, f"{name}={value}, the harness's own label, used verbatim"
     tag = git_exact_tag(tree)
     if tag:
         return tag, f"the tree is checked out at {tag}"
-    return None, "not a release: CMake labels it from release_version.txt"
+    return None, (
+        "not a release, and the harness gave no label: CMake labels it from "
+        "release_version.txt and the clone's commit count, which matches the "
+        "host only if the host was built from a clone of the same depth"
+    )
 
 
 def download_sdist(pypi: str, archive: str) -> None:
@@ -198,6 +251,29 @@ def download_sdist(pypi: str, archive: str) -> None:
         fail(f"could not download {sdists[0]['url']} ({exc})")
 
 
+def check_sdist_version(tar: tarfile.TarFile, pypi: str) -> None:
+    """Fail unless the archive is the sdist of `duckdb` release `pypi`.
+
+    The engine source carries no commit or label of its own -- the build
+    takes its label from us -- so the archive's own metadata is the only
+    evidence that it is the release the wheel pin names.
+    """
+    info = [m for m in tar.getmembers() if m.name.count("/") == 1 and m.name.endswith("/PKG-INFO")]
+    if not info:
+        fail("the sdist has no PKG-INFO, so its release cannot be checked")
+    fh = tar.extractfile(info[0])
+    text = fh.read().decode("utf-8", "replace") if fh else ""
+    found = next(
+        (line.split(":", 1)[1].strip() for line in text.splitlines() if line.startswith("Version:")),
+        None,
+    )
+    if found != pypi:
+        fail(
+            f"the sdist is duckdb {found}, not duckdb {pypi}: its engine would be built "
+            f"under a label it does not carry. Use the sdist of duckdb {pypi}."
+        )
+
+
 def extract_engine(pypi: str, dest: str, sdist: str | None) -> None:
     """Extract the engine source (`external/duckdb`) of the sdist into `dest`.
 
@@ -208,6 +284,7 @@ def extract_engine(pypi: str, dest: str, sdist: str | None) -> None:
         if not sdist:
             download_sdist(pypi, archive)
         with tarfile.open(archive) as tar:
+            check_sdist_version(tar, pypi)
             prefix = None
             members = []
             for member in tar.getmembers():
@@ -220,9 +297,30 @@ def extract_engine(pypi: str, dest: str, sdist: str | None) -> None:
             for member in members:
                 member.name = member.name[len(prefix) :]
             members = [m for m in members if m.name]
-            tar.extractall(tmp + "/src", members=members, filter="data")
+            try:
+                tar.extractall(tmp + "/src", members=members, filter="data")
+            except TypeError:  # Python without extraction filters (< 3.12, unpatched)
+                tar.extractall(tmp + "/src", members=members)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.move(os.path.join(tmp, "src"), dest)
+
+
+def platform_flags() -> list[str]:
+    """CMake flags that make the engine match the target the extension is built for.
+
+    extension-ci-tools cross-compiles osx_amd64 on an arm64 runner and says so
+    in the `OSX_BUILD_ARCH` environment variable; DuckDB's CMake reads it only
+    as a CMake variable, where it also sets the macOS 11.0 deployment target
+    DuckDB's own builds use. A native macOS build gets that target too, so the
+    extension needs no newer macOS than DuckDB does.
+    """
+    arch = os.environ.get("OSX_BUILD_ARCH", "").strip()
+    if arch:
+        return [f"-DOSX_BUILD_ARCH={arch}"]
+    if sys.platform == "darwin":
+        target = os.environ.get("MACOSX_DEPLOYMENT_TARGET", "").strip() or "11.0"
+        return [f"-DCMAKE_OSX_DEPLOYMENT_TARGET={target}"]
+    return []
 
 
 def configure_engine(src: str, build: str, env: dict[str, str]) -> str:
@@ -240,6 +338,7 @@ def configure_engine(src: str, build: str, env: dict[str, str]) -> str:
         "-DBUILD_UNITTESTS=0",
         "-DENABLE_UNITTEST_CPP_TESTS=0",
         "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+        *platform_flags(),
     ]
     log("configuring: " + " ".join(configure))
     try:
@@ -304,8 +403,12 @@ def include_dirs(src: str) -> list[str]:
     return dirs
 
 
-def render_manifest(engine_id: str, label: str, includes: list[str], libs: list[str]) -> str:
-    lines = [f"id {engine_id}", f"version {label}"]
+def render_manifest(
+    engine_id: str, label: str, built: str, includes: list[str], libs: list[str]
+) -> str:
+    # `built` changes with every build of the libraries, so a rebuild (`--force`,
+    # or a cache entry rebuilt in place) changes the manifest `build.rs` watches.
+    lines = [f"id {engine_id}", f"version {label}", f"built {built}"]
     lines += [f"include {path}" for path in includes]
     lines += [f"lib {path}" for path in libs]
     return "\n".join(lines) + "\n"
@@ -345,7 +448,11 @@ def main(argv: list[str] | None = None) -> int:
 
     tree = engine_source_tree(root, args.src_dir)
     env = dict(os.environ)
-    env.pop("OVERRIDE_GIT_DESCRIBE", None)
+    for name in HARNESS_LABEL_VARS:
+        env.pop(name, None)
+    # A cross-compile builds a different engine from the same source.
+    arch = os.environ.get("OSX_BUILD_ARCH", "").strip()
+    target = f"-{arch}" if arch else ""
     # A tree with no commit has no identity to cache under, so it is rebuilt
     # every time rather than served a build of whatever was there before.
     cacheable = True
@@ -355,13 +462,15 @@ def main(argv: list[str] | None = None) -> int:
         label, evidence = tree_label(tree)
         if label:
             env["DUCKDB_VERSION"] = label
-        else:
-            env.pop("DUCKDB_VERSION", None)
-        engine_id = f"src-{label or 'dev'}-{commit or 'unidentified'}-{LAYOUT}"
+        engine_id = f"src-{label or 'dev'}-{commit or 'unidentified'}{target}-{LAYOUT}"
         log(f"engine source tree: {tree} (commit {commit or 'unknown'}; {evidence})")
     else:
         env["DUCKDB_VERSION"] = version
-        engine_id = f"{version}-{LAYOUT}"
+        # The wheel pin is part of the id: correcting it must not be served the
+        # engine built from the old one.
+        pypi = pypi_version(root, version)
+        wheel = "" if pypi == version.removeprefix("v") else f"-py{pypi}"
+        engine_id = f"{version}{wheel}{target}-{LAYOUT}"
     cache = os.path.join(root, ".engine", engine_id)
     src = tree or os.path.join(cache, "src")
     stamp = os.path.join(cache, "manifest")
@@ -377,6 +486,11 @@ def main(argv: list[str] | None = None) -> int:
         build = os.path.join(cache, "build")
         label = configure_engine(src, build, env)
         # Checked before the (long) build: the label is settled at configure.
+        # DuckDB's CMake stamps the DUCKDB_VERSION we set, so this only catches
+        # a CMake that labels differently; it says nothing about whether the
+        # sdist is the engine the pin names. That is check_sdist_version's job
+        # for the archive, and the wheel pin's own test
+        # (test/integration/test_engine_pins.py) for the pin pair.
         if not tree and label != version:
             fail(
                 f"the engine in the duckdb {pypi_version(root, version)} sdist "
@@ -392,7 +506,7 @@ def main(argv: list[str] | None = None) -> int:
             dest = os.path.join(lib_dir, os.path.basename(lib))
             shutil.copyfile(lib, dest)
             libs.append(dest)
-        manifest = render_manifest(engine_id, label, include_dirs(src), libs)
+        manifest = render_manifest(engine_id, label, str(time.time_ns()), include_dirs(src), libs)
         # The libraries are copied out, so the object files can go; the cache
         # keeps only what a link needs.
         shutil.rmtree(build, ignore_errors=True)
@@ -401,7 +515,9 @@ def main(argv: list[str] | None = None) -> int:
         log(f"cached {cache}")
 
     changed = install_manifest(root, manifest)
-    label = manifest.splitlines()[1].removeprefix("version ")
+    label = next(
+        line.removeprefix("version ") for line in manifest.splitlines() if line.startswith("version ")
+    )
     log(f"{'installed' if changed else 'already current'}: {MANIFEST} ({label}, {engine_id})")
     if label != version:
         log(

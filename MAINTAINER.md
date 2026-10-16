@@ -253,26 +253,45 @@ present) and writes `cpp/engine.manifest`, the include directories and static li
 1. **An engine source tree** — `ENGINE_SRC_DIR`, default `./duckdb`. A harness that builds
    the extension against a specific engine clones it there (extension-ci-tools and
    community-extensions do, as does Haybarn's fork). That tree *is* the engine the
-   extension will be loaded into, so it is built under the label its own release build
-   carries, never our pin: a release label the harness exports (`DUCKDB_VERSION` /
-   `OVERRIDE_GIT_DESCRIBE`), else the release tag the tree is checked out at, else
-   CMake's own `vX.Y.0-devN`. (community-extensions exports the engine's commit as
-   `DUCKDB_VERSION`; CMake would stamp that verbatim, and no host reports a commit as
-   its version.) A tree that is not the pinned release is reported, not refused: the
-   result loads only in a DuckDB built from that tree.
+   extension will be loaded into, so it is built under the label the host's own build of
+   it carries, never our pin. The label is, in this order:
+   - a release label the harness exports (`DUCKDB_VERSION`, else `OVERRIDE_GIT_DESCRIBE`),
+     used as given;
+   - any other harness label, used verbatim, as DuckDB's CMake does with the same
+     variable (a fork's `haybarn-v1.5.5-rc1-42-g<sha>`, a `git describe`). A harness value
+     that is a git reference rather than a label is skipped: a commit (extension-ci-tools
+     passes `duckdb_version` as one, and no host reports a commit as its version) or a
+     branch or tag name of the tree (`main`);
+   - the release tag the tree is checked out at;
+   - CMake's own `vX.Y.0-devN`. That is a guess, and the build says so: N is the clone's
+     commit count, so it matches only a host built from a clone of the same depth.
+
+   A tree that is not the pinned release is reported, not refused: the result loads only
+   in a DuckDB built from that tree.
 2. **The pinned release** — `.duckdb-version`, from the PyPI sdist of the matching
    `duckdb` package (`.duckdb-pypi-version` while the pin is a pre-release). The sdist
    carries the exact engine source the wheel was built from, `third_party/` included, and
-   PyPI is reachable from sandboxes that block GitHub. It is built with `DUCKDB_VERSION`
-   set to the pin, and a build that labels itself anything else fails at configure time.
-   This is the local-developer path and the one our own CI jobs take.
+   PyPI is reachable from sandboxes that block GitHub. The archive must be that release
+   (its `PKG-INFO`), and it is built with `DUCKDB_VERSION` set to the pin. The engine
+   source carries no label or commit of its own, so nothing in the build could notice a
+   wheel pin that names some other engine: `just test-engine-pins` checks the pair by
+   asking the wheel which engine and commit it is. This is the local-developer path and
+   the one our own CI jobs take.
+
+The engine is built for the target the extension is: on macOS with DuckDB's 11.0
+deployment target, and for the architecture in `OSX_BUILD_ARCH` when extension-ci-tools
+cross-compiles (osx_amd64 on an arm64 runner). On Windows, DuckDB's CMake forces the
+static MSVC runtime (`/MT`), so `.cargo/config.toml` links the extension with
+`+crt-static` to match; the `cc`-compiled shim follows that.
 
 Builds are cached under `.engine/<id>/` (the static libraries, plus the extracted source
 for the pinned release's headers), keyed on the pin or on the tree's label and commit, so
-switching branches or engines is a cache hit; a tree with no git commit is rebuilt every
-time. The first build of an engine takes a while (~20 minutes on four cores); after that
+switching branches or engines is a cache hit; the wheel pin and a cross-compile
+architecture are part of the key, and a tree with no git commit is rebuilt every time. The first build of an engine takes a while (~20 minutes on four cores); after that
 `make` only checks the cache. `cpp/engine.manifest` is rewritten only when it changes, so
-an unchanged engine keeps `cargo build` incremental. `tests/build_config.rs` covers the
+an unchanged engine keeps `cargo build` incremental; every rebuild of the libraries
+changes it (its `built` line), and `build.rs` also watches the libraries themselves, so a
+rebuilt engine is always relinked. `tests/build_config.rs` covers the
 selection rules; `just update-engine` rebuilds the cached engine from scratch.
 
 ### Common Build Errors
@@ -306,6 +325,7 @@ Fix: `rustup update stable`
 | `just test-multi-statement-error` | The multi-statement DDL error (TECH-DEBT #85) | Semantic-view DDL inside a multi-statement `execute()` string must fail with the "one statement per call" message, not the misleading "parser_override is not active" one, while the real override-off case keeps its message. Part of `test-integration`. |
 | `just test-interrupt` | Query cancellation (TECH-DEBT #42) | Builds the extension and fires `con.interrupt()` from a second thread mid-query; asserts `semantic_view()` aborts early (not just eventually) and reports a bare `Interrupted!`, then the same for the SHOW / DESCRIBE member-type probes (single-view, DIMENSIONS FOR METRIC and cross-view) over a source whose bind expands thousands of globs. Every check runs a second time under DuckDB 2.0's `SET max_execution_time` deadline, which must surface as the engine's bare "Query exceeded maximum execution time". Part of `test-integration`. |
 | `just test-load-version-guard` | The load-time DuckDB version check | Builds the extension and `LOAD`s it, in a child process, into a DuckDB other than `.duckdb-version` (DuckDB 1.5.6, the last 1.5 release, whose C API is the one we declare; pinned in the `test-load-version-guard` recipe via `uv run --with`). Asserts the load fails with the check's message from `src/load_guard.rs` rather than loading or crashing; without the check a v1.5.6 build segfaulted a 2.0 host. When the build moves to a new DuckDB, repin the recipe to a different release. Part of `test-integration`. |
+| `just test-engine-pins` | The wheel pin against the engine pin | Runs under the wheel `.duckdb-pypi-version` names and checks it is that release, that its engine reports `.duckdb-version`, and, while BuildAll / BuildQuick pin the engine by commit, that it was built from that commit. The engine is built from this wheel's sdist under `.duckdb-version`'s label, and nothing in the source could contradict a wrong pair. No build needed. Part of `test-integration`. |
 | `just test-legacy-schema-spelling` | Legacy-catalog migration (TECH-DEBT #44) | Builds a real pre-scoping database file (`_definitions` keyed on `name` alone), opens it through a real `LOAD`, and asserts the migration records the **catalog's** spelling of a schema rather than the row's — then that `CREATE OR REPLACE` replaces the migrated row instead of duplicating it. Part of `test-integration`. |
 | `just test-all` | Rust + SQL logic + DuckLake CI + integration | Runs `test-rust`, `test-sql`, `test-ducklake-ci`, and `test-integration` sequentially |
 

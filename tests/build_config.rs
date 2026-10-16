@@ -285,6 +285,32 @@ fn set_duckdb_tag_tags_the_engine_clone() {
         String::from_utf8_lossy(&tags.stdout).trim(),
         "v2.0.0-alpha1"
     );
+
+    // A re-run in the same clone is a no-op...
+    let again = make_command(
+        &dir,
+        &["set_duckdb_tag"],
+        &[("DUCKDB_TAG", "v2.0.0-alpha1")],
+    );
+    assert!(
+        again.status.success(),
+        "a re-run must succeed: {}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    // ...but a tag of that name somewhere else is never moved.
+    git(
+        &engine,
+        &["commit", "-q", "--allow-empty", "-m", "past the tag"],
+    );
+    let moved = make_command(
+        &dir,
+        &["set_duckdb_tag"],
+        &[("DUCKDB_TAG", "v2.0.0-alpha1")],
+    );
+    assert!(
+        !moved.status.success(),
+        "a tag that is not at HEAD must fail the run, not move"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +328,8 @@ fn set_duckdb_tag_tags_the_engine_clone() {
 ///   `duckdb_static` target leaves behind, each holding the source tree's
 ///   `MARKER` and the label, plus a jemalloc library that must not be linked.
 ///
-/// Every call is appended to `$STUB_LOG`.
+/// Every call is appended to `$STUB_LOG`, and each configure's `-D` flags to
+/// `$STUB_LOG.args`.
 const STUB_CMAKE: &str = r#"#!/usr/bin/env python3
 import os, pathlib, sys
 args = sys.argv[1:]
@@ -316,6 +343,8 @@ with open(os.environ["STUB_LOG"], "a") as log:
         (build / "stub-src").write_text(src)
         (build / "stub-label").write_text(label)
         log.write(f"configure {label}\n")
+        with open(os.environ["STUB_LOG"] + ".args", "a") as args_log:
+            args_log.write(" ".join(a for a in args if a.startswith("-D")) + "\n")
         print(f"-- git hash 0123456789, version {label}, extension folder {label}")
     elif args[:1] == ["--build"]:
         build = pathlib.Path(args[1])
@@ -372,14 +401,23 @@ fn write_engine_source(dir: &Path, marker: &str) {
 /// `duckdb-<pypi>/external/duckdb/`, next to the Python package's own files —
 /// and returns its path, for `--sdist`.
 fn plant_sdist(root: &Path, marker: &str) -> PathBuf {
+    plant_sdist_of(root, marker, &target_pypi_version())
+}
+
+/// The same, for the `duckdb` release `pypi` (its `PKG-INFO` says so).
+fn plant_sdist_of(root: &Path, marker: &str, pypi: &str) -> PathBuf {
     let staging = root.join("sdist-staging");
-    let top = staging.join(format!("duckdb-{}", target_pypi_version()));
+    let top = staging.join(format!("duckdb-{pypi}"));
     write(
         &top.join("pyproject.toml"),
         "# the Python package, not the engine\n",
     );
+    write(
+        &top.join("PKG-INFO"),
+        &format!("Metadata-Version: 2.1\nName: duckdb\nVersion: {pypi}\n"),
+    );
     write_engine_source(&top.join("external/duckdb"), marker);
-    let archive = root.join("duckdb-sdist.tar.gz");
+    let archive = root.join(format!("duckdb-{pypi}.tar.gz"));
     const MAKE_TAR: &str = "import sys, tarfile\n\
          with tarfile.open(sys.argv[1], 'w:gz') as t:\n    \
              t.add(sys.argv[2], arcname=sys.argv[3])\n";
@@ -430,7 +468,12 @@ fn run_script(root: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process:
         .args(args)
         .env("PATH", path)
         .env("STUB_LOG", root.join("cmake.log"));
-    for key in ["DUCKDB_VERSION", "OVERRIDE_GIT_DESCRIBE", "STUB_LABEL"] {
+    for key in [
+        "DUCKDB_VERSION",
+        "OVERRIDE_GIT_DESCRIBE",
+        "STUB_LABEL",
+        "OSX_BUILD_ARCH",
+    ] {
         cmd.env_remove(key);
     }
     for (key, value) in env {
@@ -458,6 +501,31 @@ fn cmake_calls(root: &Path) -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
+
+/// The `-D` flags of each configure call, one string per call.
+fn configure_args(root: &Path) -> Vec<String> {
+    std::fs::read_to_string(root.join("cmake.log.args"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The `.engine/` entry the pinned release is cached under, as the script
+/// names it: the wheel pin joins the id when it is not the plain version.
+fn sdist_engine_id() -> String {
+    let version = target_version();
+    let pypi = target_pypi_version();
+    let wheel = if pypi == version.trim_start_matches('v') {
+        String::new()
+    } else {
+        format!("-py{pypi}")
+    };
+    format!("{version}{wheel}-{LAYOUT}")
+}
+
+/// `LAYOUT` in `scripts/ensure_engine.py`.
+const LAYOUT: &str = "2";
 
 /// The installed manifest as (version, include dirs, libraries).
 fn manifest(root: &Path) -> (String, Vec<String>, Vec<String>) {
@@ -527,16 +595,22 @@ fn pinned_release_is_built_from_the_sdist_under_the_pin() {
     );
     // The Python package around the engine is not part of it.
     assert!(!root
-        .join(format!(".engine/{}-1/src/pyproject.toml", target_version()))
+        .join(format!(".engine/{}/src/pyproject.toml", sdist_engine_id()))
         .exists());
 }
 
-/// An sdist whose engine labels itself as some other release would give the
+/// A configure that stamps a label other than the pin would give the
 /// extension a version check that refuses the very host it was built for (or
 /// accepts the wrong one). That must stop the build, and leave nothing behind
 /// that a later run would mistake for a good build.
+///
+/// This is a backstop, not proof the sdist is the pinned engine: DuckDB's real
+/// CMake stamps the `DUCKDB_VERSION` the script sets, so only a CMake that
+/// labels differently reaches it (here, the stub's `STUB_LABEL`). The archive
+/// is checked by `an_sdist_of_another_release_is_refused`, and the wheel pin
+/// against the engine pin by `test/integration/test_engine_pins.py`.
 #[test]
-fn a_mislabelled_sdist_is_fatal_and_poisons_nothing() {
+fn a_configure_label_other_than_the_pin_is_fatal_and_poisons_nothing() {
     let root = script_project("release-mislabelled");
     let sdist = plant_sdist(&root, "SDIST");
 
@@ -558,7 +632,7 @@ fn a_mislabelled_sdist_is_fatal_and_poisons_nothing() {
         !root.join("cpp/engine.manifest").exists(),
         "nothing may be installed"
     );
-    let stamp = root.join(format!(".engine/{}-1/manifest", target_version()));
+    let stamp = root.join(format!(".engine/{}/manifest", sdist_engine_id()));
     assert!(
         !stamp.exists(),
         "a failed build must not be recorded in the cache"
@@ -610,21 +684,24 @@ fn a_commit_label_from_the_harness_gives_way_to_the_trees_release_tag() {
     assert_eq!(manifest(&root).0, "v2.0.0");
 }
 
-/// A development tree is no release: it keeps CMake's own `-devN` label rather
-/// than borrowing a harness's commit or `git describe` label — or our pin — and
-/// the build says plainly that it will load only in that engine.
+/// A development tree is no release. Given only a commit by the harness, it
+/// keeps CMake's own `-devN` label rather than borrowing our pin or the
+/// release tag it has moved past, and the build says plainly that it will
+/// load only in that engine. (`v1.5.6-15774-g<sha>` read as `v1.5.6` is how
+/// a development tree once passed for the release: #261.)
 #[test]
-fn a_development_tree_keeps_cmakes_own_label() {
+fn a_development_tree_past_its_release_tag_keeps_cmakes_own_label() {
     let root = script_project("tree-dev");
-    plant_git_engine_tree(&root, "TREE", None);
+    let tree = plant_git_engine_tree(&root, "TREE", Some("v2.0.0"));
+    git(
+        &tree,
+        &["commit", "-q", "--allow-empty", "-m", "past the release"],
+    );
 
     let out = run_script_ok(
         &root,
         &[],
-        &[
-            ("DUCKDB_VERSION", "d4355d01c59362d57036ad377735dd5340276a5b"),
-            ("OVERRIDE_GIT_DESCRIBE", "v1.5.6-15774-gb15358c371d"),
-        ],
+        &[("DUCKDB_VERSION", "d4355d01c59362d57036ad377735dd5340276a5b")],
     );
 
     assert_eq!(cmake_calls(&root)[0], "configure v2.0.0-dev7");
@@ -633,6 +710,50 @@ fn a_development_tree_keeps_cmakes_own_label() {
         out.contains("will load only in DuckDB v2.0.0-dev7"),
         "a build for another engine must say so: {out}"
     );
+    assert!(
+        out.contains("commit count"),
+        "the fallback label must be reported as the guess it is: {out}"
+    );
+}
+
+/// A branch name is which source to build, not what it is called: a harness
+/// that builds `main` gets no `main` label.
+#[test]
+fn a_branch_name_from_the_harness_is_not_a_label() {
+    let root = script_project("tree-branch");
+    let tree = plant_git_engine_tree(&root, "TREE", None);
+    git(&tree, &["branch", "-M", "main"]);
+
+    run_script_ok(&root, &[], &[("DUCKDB_VERSION", "main")]);
+
+    assert_eq!(cmake_calls(&root)[0], "configure v2.0.0-dev7");
+}
+
+/// A harness label that is not a release label -- a fork's nightly, a
+/// `git describe` -- is what the harness's own engine build is stamped with,
+/// so the extension is built under it verbatim. In particular it is never cut
+/// down to the release label it starts with.
+#[test]
+fn a_fork_or_describe_label_from_the_harness_is_used_verbatim() {
+    for (name, label) in [
+        ("tree-fork", "haybarn-v1.5.5-rc1-42-g0123456789"),
+        ("tree-describe", "v1.5.6-15774-gb15358c371d"),
+    ] {
+        let root = script_project(name);
+        plant_git_engine_tree(&root, "TREE", Some("v1.5.6"));
+
+        run_script_ok(
+            &root,
+            &[],
+            &[
+                ("DUCKDB_VERSION", "d4355d01c59362d57036ad377735dd5340276a5b"),
+                ("OVERRIDE_GIT_DESCRIBE", label),
+            ],
+        );
+
+        assert_eq!(cmake_calls(&root)[0], format!("configure {label}"));
+        assert_eq!(manifest(&root).0, label);
+    }
 }
 
 /// A harness label that *is* a release label is the harness telling us which
@@ -767,4 +888,97 @@ fn a_current_manifest_is_left_untouched() {
         "expected a no-op, got: {out}"
     );
     assert_eq!(cmake_calls(&root).len(), 2);
+}
+
+/// The archive must be the release the wheel pin names: its engine is built
+/// under our label, and nothing in the engine source could contradict it.
+#[test]
+fn an_sdist_of_another_release_is_refused() {
+    let root = script_project("sdist-wrong-release");
+    let sdist = plant_sdist_of(&root, "OTHER", "2.0.0.dev1");
+
+    let out = run_script(&root, &["--sdist", sdist.to_str().expect("utf-8")], &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "another release's sdist must fail");
+    assert!(
+        stderr.contains("2.0.0.dev1") && stderr.contains(&target_pypi_version()),
+        "the error must name both releases, got: {stderr}"
+    );
+    assert!(cmake_calls(&root).is_empty(), "nothing may be built");
+    assert!(!root.join("cpp/engine.manifest").exists());
+}
+
+/// Correcting the wheel pin must build that wheel's engine, not keep serving
+/// the one built from the old pin under the same engine version.
+#[test]
+fn a_wheel_pin_change_is_a_new_engine() {
+    let root = script_project("wheel-pin");
+    let first = plant_sdist_of(&root, "FIRST", "2.0.0.dev1");
+    write(&root.join(".duckdb-pypi-version"), "2.0.0.dev1\n");
+    run_script_ok(&root, &["--sdist", first.to_str().expect("utf-8")], &[]);
+
+    let second = plant_sdist_of(&root, "SECOND", "2.0.0.dev2");
+    write(&root.join(".duckdb-pypi-version"), "2.0.0.dev2\n");
+    run_script_ok(&root, &["--sdist", second.to_str().expect("utf-8")], &[]);
+
+    assert_eq!(
+        cmake_calls(&root).len(),
+        4,
+        "the new wheel pin must rebuild"
+    );
+    assert!(linked_engine(&root).starts_with("SECOND "));
+}
+
+/// extension-ci-tools cross-compiles osx_amd64 on an arm64 runner and says so
+/// in `OSX_BUILD_ARCH`. DuckDB's CMake reads that only as a CMake variable, so
+/// it must be passed through, and the cross build cached apart from the
+/// native one.
+#[test]
+fn a_cross_compile_architecture_reaches_cmake_and_the_cache_id() {
+    let root = script_project("osx-arch");
+    let sdist = plant_sdist(&root, "SDIST");
+    let sdist = sdist.to_str().expect("utf-8");
+
+    run_script_ok(&root, &["--sdist", sdist], &[("OSX_BUILD_ARCH", "x86_64")]);
+    run_script_ok(&root, &["--sdist", sdist], &[]);
+
+    let args = configure_args(&root);
+    assert_eq!(
+        args.len(),
+        2,
+        "the native build must not reuse the cross build"
+    );
+    assert!(
+        args[0].split(' ').any(|a| a == "-DOSX_BUILD_ARCH=x86_64"),
+        "the cross-compile arch must reach CMake: {args:?}"
+    );
+    assert!(
+        !args[1].contains("OSX_BUILD_ARCH"),
+        "a native build must not be told to cross-compile: {args:?}"
+    );
+}
+
+/// `--force` (`just update-engine`) exists to replace an engine nobody trusts
+/// any more; the manifest `build.rs` watches must change with it, or cargo
+/// keeps the previous link.
+#[test]
+fn a_forced_rebuild_changes_the_manifest() {
+    let root = script_project("force");
+    let sdist = plant_sdist(&root, "SDIST");
+    let sdist = sdist.to_str().expect("utf-8");
+    run_script_ok(&root, &["--sdist", sdist], &[]);
+    let before = read(&root.join("cpp/engine.manifest"));
+
+    let out = run_script_ok(&root, &["--sdist", sdist, "--force"], &[]);
+
+    assert_eq!(cmake_calls(&root).len(), 4, "--force must rebuild");
+    assert_ne!(
+        before,
+        read(&root.join("cpp/engine.manifest")),
+        "a rebuilt engine must change the manifest"
+    );
+    assert!(
+        out.contains("installed"),
+        "expected a reinstall, got: {out}"
+    );
 }

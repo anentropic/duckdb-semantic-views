@@ -108,8 +108,13 @@ ensure_engine:
 # pre-release with no release tag upstream: `duckdb_version` names its commit,
 # and this tag gives the clone the release label (.duckdb-version), which
 # scripts/ensure_engine.py then builds it under, as the wheel was.
+# A re-run in the same clone finds the tag already there; it is left alone if
+# it is at HEAD, and the run fails rather than move a tag that is not.
 set_duckdb_tag:
-	cd duckdb && git tag $(DUCKDB_TAG)
+	cd duckdb && if git rev-parse -q --verify "refs/tags/$(DUCKDB_TAG)" >/dev/null; then \
+	  test "$$(git rev-parse "$(DUCKDB_TAG)^{commit}")" = "$$(git rev-parse HEAD)" \
+	    || { echo "set_duckdb_tag: $(DUCKDB_TAG) exists and is not HEAD" >&2; exit 1; }; \
+	else git tag $(DUCKDB_TAG); fi
 
 configure: venv platform extension_version
 
