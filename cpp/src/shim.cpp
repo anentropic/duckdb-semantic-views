@@ -135,6 +135,19 @@ extern "C" {
         char *error_buf, size_t error_buf_len,
         uint32_t *position_out);
 
+    // Grammar bridge (src/grammar/ffi.rs). The changes to register, as text
+    // released with sv_free_buffer: 0 = ok, 1 = failed.
+    uint8_t sv_grammar_changes_rust(char **out_ptr, size_t *out_len);
+    // Lower one matched statement rule (its serialised parse subtree) to SQL:
+    // 0 = ok (SQL in *sql_out_*, release with sv_free_buffer), 1 = invalid
+    // statement (message in error_out, byte offset in *position_out or
+    // UINT32_MAX), 2 = bridge failure (message in error_out).
+    uint8_t sv_grammar_transform_rust(
+        const uint8_t *tree_ptr, size_t tree_len,
+        char **sql_out_ptr, size_t *sql_out_len,
+        char *error_out, size_t error_out_len,
+        uint32_t *position_out);
+
     // Releases a buffer previously produced by sv_parser_override_rust.
     // Safe to call with a null pointer (no-op). ptr/len must be the exact
     // pair the Rust side returned.
@@ -3640,7 +3653,7 @@ extern "C" {
 
 #ifdef SV_DUCKDB_2
 // ---------------------------------------------------------------------------
-// Grammar productions (DuckDB 2.0 PEG parser) -- Phase 3 prototype
+// Grammar productions (DuckDB 2.0 PEG parser)
 // ---------------------------------------------------------------------------
 // The parser override above sees a whole statement's text, so it can only
 // rewrite statements that *start* with our syntax. A grammar extension adds
@@ -3648,80 +3661,175 @@ extern "C" {
 // the grammar allows: `SELECT ... FROM (SHOW SEMANTIC VIEWS)`, a CTE, a view
 // body (TECH-DEBT #77).
 //
-// Prototype scope: `SHOW [TERSE] SEMANTIC VIEWS` as a DescribeStatement
-// alternative, lowered through the same Rust rewrite the override uses. The
-// override still owns every top-level statement, so the production is only
-// reached where the override cannot go.
+// The rules and their transforms live in Rust (src/grammar/). This side only
+// bridges: it registers the rules Rust lists, and when a statement rule
+// matches it serialises the matched subtree with the statement's tokens
+// (wire format in src/grammar/tree.rs), has Rust lower it to SQL, and parses
+// that SQL with the builtin parser. The override still runs first and owns
+// every statement that starts with our syntax; with overrides off
+// (allow_parser_override_extension = 'DEFAULT') every statement comes here.
 
 static const char *SV_GRAMMAR_NAME = "semantic_views";
 
-// The source text a parse result spans. A transform has no query string, only
-// the tokens (text and offset), so the gaps between tokens are refilled with
-// spaces of the original width. Comments inside the span are lost (spike
-// finding D4).
-static string sv_grammar_source_text(PEGTransformer &transformer, ParseResult &pr) {
-    auto loc = pr.GetLocation();
+static void sv_wire_u32(string &out, uint32_t v) {
+    char b[4] = {char(v & 0xff), char((v >> 8) & 0xff), char((v >> 16) & 0xff), char((v >> 24) & 0xff)};
+    out.append(b, 4);
+}
+
+static void sv_wire_str(string &out, const string &s) {
+    sv_wire_u32(out, static_cast<uint32_t>(s.size()));
+    out += s;
+}
+
+static void sv_wire_node(string &out, ParseResult &pr) {
+    out.push_back(static_cast<char>(pr.type));
+    sv_wire_str(out, pr.Name());
+    sv_wire_u32(out, pr.offset.IsValid() ? static_cast<uint32_t>(pr.offset.GetIndex()) : UINT32_MAX);
+    sv_wire_u32(out, pr.length.IsValid() ? static_cast<uint32_t>(pr.length.GetIndex()) : UINT32_MAX);
+    string value;
+    vector<reference<ParseResult>> children;
+    switch (pr.type) {
+    case ParseResultType::LIST:
+        for (auto &c : pr.Cast<ListParseResult>().GetChildren()) {
+            children.push_back(c);
+        }
+        break;
+    case ParseResultType::REPEAT:
+        for (auto &c : pr.Cast<RepeatParseResult>().GetChildren()) {
+            children.push_back(c);
+        }
+        break;
+    case ParseResultType::OPTIONAL: {
+        auto &opt = pr.Cast<OptionalParseResult>();
+        if (opt.HasResult()) {
+            children.push_back(opt.GetResult());
+        }
+        break;
+    }
+    case ParseResultType::CHOICE:
+        children.push_back(pr.Cast<ChoiceParseResult>().GetResult());
+        break;
+    case ParseResultType::IDENTIFIER:
+        value = pr.Cast<IdentifierParseResult>().identifier.GetIdentifierName();
+        break;
+    case ParseResultType::KEYWORD:
+        value = pr.Cast<KeywordParseResult>().keyword;
+        break;
+    case ParseResultType::OPERATOR:
+        value = pr.Cast<OperatorParseResult>().operator_token;
+        break;
+    case ParseResultType::NUMBER:
+        value = pr.Cast<NumberParseResult>().number;
+        break;
+    case ParseResultType::STRING:
+        value = pr.Cast<StringLiteralParseResult>().result;
+        break;
+    case ParseResultType::TOKEN:
+        value = pr.Cast<TokenParseResult>().text;
+        break;
+    default:
+        break;
+    }
+    sv_wire_str(out, value);
+    sv_wire_u32(out, static_cast<uint32_t>(children.size()));
+    for (auto &c : children) {
+        sv_wire_node(out, c.get());
+    }
+}
+
+static string sv_grammar_serialise(PEGTransformer &transformer, ParseResult &pr) {
     string out;
-    idx_t prev_end = loc.offset;
-    bool first = true;
+    sv_wire_node(out, pr);
     auto &tokens = transformer.token_iterator;
+    sv_wire_u32(out, static_cast<uint32_t>(tokens.Size()));
     for (idx_t i = 0; i < tokens.Size(); i++) {
         auto &tok = tokens.GetToken(i);
-        if (tok.offset < loc.offset || tok.offset >= loc.offset + loc.length) {
-            continue;
-        }
-        if (!first) {
-            out.append(tok.offset - prev_end, ' ');
-        }
-        first = false;
-        out += tok.text;
-        prev_end = tok.offset + tok.length;
+        sv_wire_u32(out, static_cast<uint32_t>(tok.offset));
+        sv_wire_u32(out, static_cast<uint32_t>(tok.length));
+        sv_wire_str(out, tok.text);
     }
     return out;
 }
 
-// Lower a recognised statement through the Rust rewrite and parse the result
-// with DuckDB's builtin parser. The rewrite of a read statement is one SELECT.
-static unique_ptr<QueryNode> sv_grammar_lower_query(const string &statement) {
+// Have Rust lower a matched statement rule to SQL, and parse the SQL.
+static vector<unique_ptr<SQLStatement>> sv_grammar_lower(PEGTransformer &transformer, ParseResult &pr) {
+    auto wire = sv_grammar_serialise(transformer, pr);
     SvOwnedBuffer sql_buf;
     char error_buf[1024];
     memset(error_buf, 0, sizeof(error_buf));
-    uint8_t rc = sv_parser_override_rust(statement.c_str(), statement.size(),
-                                         &sql_buf.ptr, &sql_buf.len, error_buf, sizeof(error_buf));
+    uint32_t position = UINT32_MAX;
+    uint8_t rc = sv_grammar_transform_rust(reinterpret_cast<const uint8_t *>(wire.data()), wire.size(),
+                                           &sql_buf.ptr, &sql_buf.len, error_buf, sizeof(error_buf), &position);
+    if (rc == 1) {
+        if (position != UINT32_MAX) {
+            throw ParserException(QueryLocation(position, 0), "%s", string(error_buf));
+        }
+        throw ParserException("%s", string(error_buf));
+    }
     if (rc != 0) {
-        throw ParserException("semantic_views: cannot lower '%s'%s%s", statement,
-                              error_buf[0] ? ": " : "", string(error_buf));
+        throw InternalException("semantic_views grammar bridge: %s", string(error_buf));
     }
     Parser parser = sv_compat::builtin_parser();
     parser.ParseQuery(sql_buf.to_string());
-    if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
-        throw ParserException("semantic_views: '%s' does not lower to a single query", statement);
-    }
-    return std::move(parser.statements[0]->Cast<SelectStatement>().node);
+    return std::move(parser.statements);
 }
 
-static arena_ptr<TransformResultValue> sv_grammar_finalize_show(PEGTransformer &transformer, ParseResult &pr) {
-    auto node = sv_grammar_lower_query(sv_grammar_source_text(transformer, pr));
+static arena_ptr<TransformResultValue> sv_grammar_finalize_query(PEGTransformer &transformer, ParseResult &pr) {
+    auto statements = sv_grammar_lower(transformer, pr);
+    if (statements.size() != 1 || statements[0]->type != StatementType::SELECT_STATEMENT) {
+        throw InternalException("semantic_views grammar: rule %s did not lower to one query", pr.Name());
+    }
+    auto node = std::move(statements[0]->Cast<SelectStatement>().node);
     return transformer.MakeResult<unique_ptr<QueryNode>>(std::move(node));
 }
 
-static arena_ptr<TransformProcess> sv_grammar_start_show(PEGTransformer &transformer, ParseResult &pr) {
-    return transformer.MakeProcess<FinalizeTransformProcess>(transformer, pr, sv_grammar_finalize_show);
+static arena_ptr<TransformProcess> sv_grammar_start_query(PEGTransformer &transformer, ParseResult &pr) {
+    return transformer.MakeProcess<FinalizeTransformProcess>(transformer, pr, sv_grammar_finalize_query);
 }
 
 class SemanticViewsGrammar final : public GrammarExtension {
 public:
-    SemanticViewsGrammar() : GrammarExtension(SV_GRAMMAR_NAME, "CREATE / SHOW / DESCRIBE SEMANTIC VIEW syntax") {
+    explicit SemanticViewsGrammar(vector<GrammarChange> changes_p)
+        : GrammarExtension(SV_GRAMMAR_NAME, "CREATE / ALTER / DROP / SHOW / DESCRIBE SEMANTIC VIEW syntax"),
+          changes(std::move(changes_p)) {
     }
     vector<GrammarChange> GetChanges() const override {
-        vector<GrammarChange> c;
-        c.push_back(GrammarChange::AddChoice("UnreservedKeyword", "'SEMANTIC'"));
-        c.push_back(GrammarChange::AddChoice("UnreservedKeyword", "'TERSE'"));
-        c.push_back(GrammarChange::AddRule("SvShowViews <- 'SHOW' 'TERSE'? 'SEMANTIC' 'VIEWS'", sv_grammar_start_show));
-        c.push_back(GrammarChange::PrependChoice("DescribeStatement", "SvShowViews"));
-        return c;
+        return changes;
     }
+
+private:
+    vector<GrammarChange> changes;
 };
+
+// The grammar changes Rust lists (src/grammar/mod.rs, `changes`), one per line.
+static vector<GrammarChange> sv_grammar_changes() {
+    SvOwnedBuffer buf;
+    if (sv_grammar_changes_rust(&buf.ptr, &buf.len) != 0) {
+        throw InternalException("semantic_views grammar: listing the grammar rules failed");
+    }
+    vector<GrammarChange> changes;
+    for (auto &line : StringUtil::Split(buf.to_string(), '\n')) {
+        if (line.empty()) {
+            continue;
+        }
+        auto fields = StringUtil::Split(line, '\t');
+        if (fields.size() >= 2 && fields[0] == "RULE") {
+            auto shape = line.substr(line.rfind('\t') + 1);
+            if (shape == "query") {
+                changes.push_back(GrammarChange::AddRule(fields[1], sv_grammar_start_query));
+            } else if (shape.empty()) {
+                changes.push_back(GrammarChange::AddRule(fields[1]));
+            } else {
+                throw InternalException("semantic_views grammar: unknown rule shape '%s'", shape);
+            }
+        } else if (fields.size() == 3 && fields[0] == "PREPEND") {
+            changes.push_back(GrammarChange::PrependChoice(fields[1], fields[2]));
+        } else {
+            throw InternalException("semantic_views grammar: malformed change '%s'", line);
+        }
+    }
+    return changes;
+}
 
 // Turn the grammar on for one connection. `active_grammar_extensions` is a
 // per-connection setting, so a LOAD reaches the connections that exist now
@@ -3751,7 +3859,7 @@ public:
 static void sv_register_grammar(DatabaseInstance &db) {
     auto &config = DBConfig::GetConfig(db);
     if (!config.GetCallbackManager().FindGrammarExtension(SV_GRAMMAR_NAME)) {
-        GrammarExtension::Register(db, make_shared_ptr<SemanticViewsGrammar>());
+        GrammarExtension::Register(db, make_shared_ptr<SemanticViewsGrammar>(sv_grammar_changes()));
         ExtensionCallback::Register(config, make_shared_ptr<SemanticViewsGrammarActivation>());
     }
     for (auto &context : db.GetConnectionManager().GetConnectionList()) {

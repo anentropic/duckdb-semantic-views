@@ -41,6 +41,14 @@ runner would have reported success without actually testing anything:
    path. Upstream lists "INTERNAL" in ``always_fail_error_messages`` but never
    consults it.
 
+With ``SV_ROUTE_TO_GRAMMAR=1`` the wrapper also runs every statement the
+extension's grammar productions cover (``GRAMMAR_OWNED`` below) with parser
+overrides off on its connection, so it is parsed by DuckDB's grammar and our
+productions instead of the parser override; everything else runs as usual.
+That runs the same files against both implementations while they coexist
+(``just test-sql-grammar``). The summary reports how many statements were
+routed, and a run that routed none fails.
+
 The required extensions default to ``semantic_views``; pass
 ``--required-extension NAME`` (repeatable) to change that. ``--offline-excused
 FILE`` (repeatable) is described in 5. Every other argument is forwarded to the
@@ -61,6 +69,7 @@ import argparse
 import faulthandler
 import io
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 
@@ -78,6 +87,15 @@ class FileOutcome:
     requires: set[str] = field(default_factory=set)
     network_errors: list[str] = field(default_factory=list)
     internal_errors: list[str] = field(default_factory=list)
+
+
+# Statements the grammar productions in src/grammar/ cover. Extend it as each
+# statement moves onto the grammar.
+GRAMMAR_OWNED = re.compile(
+    r"^\s*(?:(?:--[^\n]*(?:\n|$)|/\*.*?\*/)\s*)*"
+    r"(?:show\s+(?:terse\s+)?semantic\b|show\s+columns\s+in\s+semantic\b|desc(?:ribe)?\s+semantic\b)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class _InternalErrorWatch:
@@ -200,20 +218,31 @@ def main() -> int:
 
     result.SQLLogicRunner.skip_error_message = skip_error_message
 
-    # 3. Count executed statements/queries (loop bodies included).
+    # 3. Count executed statements/queries (loop bodies included), and with
+    # SV_ROUTE_TO_GRAMMAR=1 run the grammar-owned ones with overrides off.
+    route = os.environ.get("SV_ROUTE_TO_GRAMMAR") == "1"
+    routed = [0]
+    orig_get_connection = _hook(result.SQLLogicContext, "get_connection")
     for method in ("execute_statement", "execute_query"):
         orig = _hook(result.SQLLogicContext, method)
 
         def counted(self, statement, _orig=orig):
             if current:
                 current[-1].executed += 1
-            return _orig(self, statement)
+            if not route or not GRAMMAR_OWNED.match("\n".join(statement.lines)):
+                return _orig(self, statement)
+            routed[0] += 1
+            conn = orig_get_connection(self, statement.connection_name)
+            before = conn.execute("SELECT current_setting('allow_parser_override_extension')").fetchone()[0]
+            conn.execute("SET allow_parser_override_extension = 'DEFAULT'")
+            try:
+                return _orig(self, statement)
+            finally:
+                conn.execute(f"SET allow_parser_override_extension = '{before}'")
 
         setattr(result.SQLLogicContext, method, counted)
 
     # 6. Record every INTERNAL error, whether or not an expected error matched it.
-    orig_get_connection = _hook(result.SQLLogicContext, "get_connection")
-
     def get_connection(self, name=None):
         return _InternalErrorWatch(orig_get_connection(self, name), current)
 
@@ -259,6 +288,8 @@ def main() -> int:
                 )
     if not outcomes:
         problems.append("no test files ran at all")
+    if route and not routed[0]:
+        problems.append("SV_ROUTE_TO_GRAMMAR=1, but no statement was routed to the grammar")
 
     for outcome in outcomes.values():
         needs_required = bool(outcome.requires & required)
@@ -322,6 +353,7 @@ def main() -> int:
     print(
         f"sqllogictest: {ran} file(s) ran, {statements} statements/queries executed"
         + (f", {len(allowed_skips)} skipped (listed above)" if allowed_skips else "")
+        + (f", {routed[0]} routed to the grammar" if route else "")
     )
     return 0
 

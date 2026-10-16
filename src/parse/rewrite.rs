@@ -17,6 +17,7 @@ use super::{
     skip_leading_whitespace, validate_create_body, DdlKind,
 };
 
+use super::show_clauses::ShowClauses;
 // Only the emitted-SQL unit tests name this type directly; production code
 // passes it through as `clauses.in_schema.as_ref()`.
 #[cfg(test)]
@@ -348,10 +349,8 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, ParseError> {
         // SQL text on the read side.
         DdlKind::Describe | DdlKind::ShowColumns => {
             let name = extract_raw_name_only(trimmed, plen, trim_base)?;
-            let safe_name = SqlLit::escape(&name);
-            let fn_name = read_function_name(kind);
-            Ok(RewriteAction::Passthrough(format!(
-                "SELECT * FROM {fn_name}('{safe_name}')"
+            Ok(RewriteAction::Passthrough(lower_name_only_read(
+                kind, &name,
             )))
         }
         // SHOW SEMANTIC VIEWS/DIMENSIONS/METRICS/FACTS: optional LIKE/IN/FOR METRIC/STARTS WITH/LIMIT
@@ -364,53 +363,77 @@ fn plan_ddl(query: &str) -> Result<RewriteAction, ParseError> {
             let after_prefix = trimmed[plen..].trim();
             let after_prefix_base = trim_base + byte_offset_within(trimmed, after_prefix);
             let clauses = parse_show_filter_clauses(after_prefix, kind, after_prefix_base)?;
-
-            // Validate FOR METRIC requires IN
-            if clauses.for_metric.is_some() && clauses.in_view.is_none() {
-                return Err(ParseError {
-                    message: "FOR METRIC requires IN view_name".to_string(),
-                    position: Some(after_prefix_base),
-                });
-            }
-
-            // Build base SELECT
-            let base = if let Some(view_name) = clauses.in_view {
-                let safe_name = SqlLit::escape(view_name);
-                if let Some(metric_name) = clauses.for_metric {
-                    let safe_metric = SqlLit::escape(metric_name);
-                    format!(
-                        "SELECT * FROM show_semantic_dimensions_for_metric('{safe_name}', '{safe_metric}')"
-                    )
-                } else {
-                    let fn_name = read_function_name(kind);
-                    format!("SELECT * FROM {fn_name}('{safe_name}')")
-                }
-            } else {
-                let all_fn = match kind {
-                    DdlKind::Show => "list_semantic_views",
-                    DdlKind::ShowTerse => "list_terse_semantic_views",
-                    DdlKind::ShowDimensions => "show_semantic_dimensions_all",
-                    DdlKind::ShowMetrics => "show_semantic_metrics_all",
-                    DdlKind::ShowFacts => "show_semantic_facts_all",
-                    DdlKind::ShowMaterializations => "show_semantic_materializations_all",
-                    _ => unreachable!(),
-                };
-                format!("SELECT * FROM {all_fn}()")
-            };
-
-            // Append filter suffix
-            let suffix = build_filter_suffix(
-                clauses.like_pattern.as_deref(),
-                clauses.starts_with.as_deref(),
-                clauses.limit,
-                clauses.in_schema.as_ref(),
-                clauses.in_database.as_ref(),
-            );
-            Ok(RewriteAction::Passthrough(format!("{base}{suffix}")))
+            Ok(RewriteAction::Passthrough(lower_show(
+                kind,
+                &clauses,
+                after_prefix_base,
+            )?))
         }
         // ALTER: sub-operation dispatch (RENAME TO, SET COMMENT, UNSET COMMENT)
         DdlKind::Alter | DdlKind::AlterIfExists => rewrite_alter(trimmed, plen, kind, trim_base),
     }
+}
+
+/// Lower a name-only read statement (DESCRIBE, SHOW COLUMNS) to its read table
+/// function. The name is passed raw: the table function folds and resolves it
+/// at the catalog-read boundary (FF-4).
+pub(crate) fn lower_name_only_read(kind: DdlKind, raw_name: &str) -> String {
+    let safe_name = SqlLit::escape(raw_name);
+    let fn_name = read_function_name(kind);
+    format!("SELECT * FROM {fn_name}('{safe_name}')")
+}
+
+/// Lower a `SHOW SEMANTIC ...` statement, already split into its clauses, to a
+/// query over the read table functions. Shared by the parser override and the
+/// grammar production, so both emit the same SQL. `position` is where the
+/// clauses start, for the one error found here.
+pub(crate) fn lower_show(
+    kind: DdlKind,
+    clauses: &ShowClauses<'_>,
+    position: usize,
+) -> Result<String, ParseError> {
+    // Validate FOR METRIC requires IN
+    if clauses.for_metric.is_some() && clauses.in_view.is_none() {
+        return Err(ParseError {
+            message: "FOR METRIC requires IN view_name".to_string(),
+            position: Some(position),
+        });
+    }
+
+    // Build base SELECT
+    let base = if let Some(view_name) = clauses.in_view {
+        let safe_name = SqlLit::escape(view_name);
+        if let Some(metric_name) = clauses.for_metric {
+            let safe_metric = SqlLit::escape(metric_name);
+            format!(
+                "SELECT * FROM show_semantic_dimensions_for_metric('{safe_name}', '{safe_metric}')"
+            )
+        } else {
+            let fn_name = read_function_name(kind);
+            format!("SELECT * FROM {fn_name}('{safe_name}')")
+        }
+    } else {
+        let all_fn = match kind {
+            DdlKind::Show => "list_semantic_views",
+            DdlKind::ShowTerse => "list_terse_semantic_views",
+            DdlKind::ShowDimensions => "show_semantic_dimensions_all",
+            DdlKind::ShowMetrics => "show_semantic_metrics_all",
+            DdlKind::ShowFacts => "show_semantic_facts_all",
+            DdlKind::ShowMaterializations => "show_semantic_materializations_all",
+            _ => unreachable!(),
+        };
+        format!("SELECT * FROM {all_fn}()")
+    };
+
+    // Append filter suffix
+    let suffix = build_filter_suffix(
+        clauses.like_pattern.as_deref(),
+        clauses.starts_with.as_deref(),
+        clauses.limit,
+        clauses.in_schema.as_ref(),
+        clauses.in_database.as_ref(),
+    );
+    Ok(format!("{base}{suffix}"))
 }
 
 // ---------------------------------------------------------------------------

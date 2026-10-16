@@ -1,4 +1,5 @@
-# SHOW SEMANTIC VIEWS is a query wherever DuckDB accepts one (TECH-DEBT #77).
+# SHOW and DESCRIBE SEMANTIC statements are queries wherever DuckDB accepts one
+# (TECH-DEBT #77).
 #
 # The parser override rewrites a statement only when the statement *starts*
 # with our syntax, so SHOW nested in a subquery, a CTE or a view body failed
@@ -55,6 +56,117 @@ query T
 SELECT name FROM gq_listing;
 ----
 gq_a
+
+# --- every SHOW / DESCRIBE form as a subquery ----------------------------------
+
+statement ok
+CREATE TABLE gq_o (id INTEGER, cust_id INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+CREATE TABLE gq_c (id INTEGER, name VARCHAR);
+
+statement ok
+CREATE TABLE gq_agg (region VARCHAR, revenue BIGINT);
+
+statement ok
+CREATE SEMANTIC VIEW gq_m AS
+TABLES (o AS gq_o PRIMARY KEY (id), c AS gq_c PRIMARY KEY (id))
+RELATIONSHIPS (o_c AS o(cust_id) REFERENCES c)
+FACTS (o.net AS o.amount)
+DIMENSIONS (o.region AS o.region, c.name AS c.name)
+METRICS (o.revenue AS SUM(o.net), o.orders AS COUNT(*))
+MATERIALIZATIONS (by_region AS (TABLE gq_agg, DIMENSIONS (region), METRICS (revenue)));
+
+# DESCRIBE, filtered and aggregated by object_kind
+query TI
+SELECT object_kind, count(DISTINCT object_name) FROM (DESCRIBE SEMANTIC VIEW gq_m) GROUP BY 1 ORDER BY 1;
+----
+DIMENSION	2
+FACT	1
+MATERIALIZATION	1
+METRIC	2
+RELATIONSHIP	1
+TABLE	2
+
+query T
+SELECT DISTINCT object_name FROM (DESC SEMANTIC VIEW gq_m) WHERE object_kind = 'RELATIONSHIP';
+----
+o_c
+
+query TT
+SELECT name, table_name FROM (SHOW SEMANTIC DIMENSIONS IN gq_m) ORDER BY name;
+----
+name	gq_c
+region	gq_o
+
+query TT
+SELECT name, data_type FROM (SHOW SEMANTIC METRICS IN gq_m) WHERE name = 'orders';
+----
+orders	BIGINT
+
+query T
+SELECT name FROM (SHOW SEMANTIC FACTS IN gq_m);
+----
+net
+
+query TT
+SELECT name, "table" FROM (SHOW SEMANTIC MATERIALIZATIONS IN gq_m);
+----
+by_region	gq_agg
+
+query T
+SELECT name FROM (SHOW SEMANTIC DIMENSIONS IN gq_m FOR METRIC revenue) ORDER BY name;
+----
+name
+region
+
+query TT
+SELECT kind, count(*) FROM (SHOW COLUMNS IN SEMANTIC VIEW gq_m) GROUP BY kind ORDER BY kind;
+----
+DIMENSION	2
+FACT	1
+METRIC	2
+
+# The account-wide form, joined back to the view listing
+query TT
+SELECT v.name, d.name FROM (SHOW SEMANTIC VIEWS) v JOIN (SHOW SEMANTIC DIMENSIONS) d ON d.semantic_view_name = v.name WHERE v.name = 'gq_m' ORDER BY d.name;
+----
+gq_m	name
+gq_m	region
+
+query T
+WITH d AS (SHOW SEMANTIC METRICS IN gq_m) SELECT name FROM d ORDER BY name;
+----
+orders
+revenue
+
+# All the SHOW SEMANTIC VIEWS clauses together
+query T
+SELECT name FROM (SHOW SEMANTIC VIEWS LIKE 'gq%' IN SCHEMA main STARTS WITH 'gq_m' LIMIT 1);
+----
+gq_m
+
+# --- the extension's own errors, raised from inside a subquery -------------------
+
+statement error
+SELECT * FROM (SHOW SEMANTIC METRICS IN gq_m FOR METRIC revenue);
+----
+FOR METRIC is only valid for SHOW SEMANTIC DIMENSIONS, not SHOW SEMANTIC METRICS
+
+statement error
+SELECT * FROM (SHOW SEMANTIC VIEWS LIMIT -1);
+----
+LIMIT must be a non-negative integer, got: '-1'
+
+statement error
+SELECT * FROM (SHOW SEMANTIC VIEWS IN gq_m);
+----
+SHOW SEMANTIC VIEWS requires a scope
+
+statement error
+SELECT * FROM (DESCRIBE SEMANTIC VIEW gq_nope);
+----
+semantic view 'gq_nope' does not exist
 
 # --- the top-level statement is unchanged ----------------------------------------
 

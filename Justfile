@@ -132,6 +132,13 @@ test-sql: build test-sql-prebuilt
 test-sql-prebuilt: _ensure-test-deps
     make test_debug
 
+# Run the SQL logic tests with every statement the grammar productions cover
+# (src/grammar/) parsed by the grammar instead of the parser override. Both
+# implementations coexist during Phase 3 of the DuckDB 2.0 epic; this holds the
+# grammar to the same tests, the DDL corpus included.
+test-sql-grammar: build
+    SV_ROUTE_TO_GRAMMAR=1 make test_debug
+
 # Download jaffle-shop data and create DuckLake/Iceberg catalog for integration tests.
 # Idempotent — safe to run multiple times. Data files are gitignored.
 # Uses uv to run the script with its declared dependencies (PEP 723).

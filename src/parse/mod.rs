@@ -39,10 +39,12 @@ mod native_sql;
 pub(crate) use native_sql::rewrite_to_native_sql;
 
 mod show_clauses;
-pub(crate) use show_clauses::{build_filter_suffix, parse_show_filter_clauses};
+pub(crate) use show_clauses::{
+    build_filter_suffix, parse_show_filter_clauses, ScopeName, ShowClauses,
+};
 
 mod rewrite;
-pub(crate) use rewrite::extract_quoted_string;
+pub(crate) use rewrite::{extract_quoted_string, lower_name_only_read, lower_show};
 pub use rewrite::{plan_rewrite, CreateMode, RewriteAction};
 
 /// Not our statement -- return `DISPLAY_ORIGINAL_ERROR`.

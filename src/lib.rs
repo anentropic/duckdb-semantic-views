@@ -4,6 +4,7 @@ pub mod errors;
 pub mod expand;
 pub(crate) mod expr_tokens;
 pub mod ffi_util;
+pub(crate) mod grammar;
 pub mod graph;
 pub mod ident;
 pub mod load_guard;

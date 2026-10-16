@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`SHOW` and `DESCRIBE` statements work as subqueries.** `DESCRIBE SEMANTIC VIEW`,
+  `SHOW [TERSE] SEMANTIC VIEWS`, `SHOW SEMANTIC DIMENSIONS / METRICS / FACTS /
+  MATERIALIZATIONS` (with `FOR METRIC` too) and `SHOW COLUMNS IN SEMANTIC VIEW` can now be
+  used wherever DuckDB accepts a query: in `FROM`, in a CTE or in a view body, so you can
+  filter, join and aggregate their output, as in
+  `SELECT * FROM (DESCRIBE SEMANTIC VIEW v) WHERE object_kind = 'METRIC'`.
+
 - **`SET max_execution_time` stops semantic-view queries.** DuckDB 2.0's per-query time
   limit now applies to `semantic_view()` and to the `SHOW` / `DESCRIBE` commands that look
   up member types, which fail with DuckDB's own `Query exceeded maximum execution time`
