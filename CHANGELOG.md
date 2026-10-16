@@ -22,25 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against DuckDB 2.0 and loads only in that exact DuckDB release. Until DuckDB 2.0.0 is
   released it is built against the `v2.0.0-alpha47600` pre-release (the `duckdb`
   `2.0.0.dev2610151406` Python wheel) and loads only there. If you stay on DuckDB 1.5, keep
-  v0.14.0, the last release for 1.5.
+  v0.14.1, the last release for 1.5.
 - **Two identifier errors now come from DuckDB.** In semantic-view DDL, an unterminated
   quoted identifier and an empty one (`""`) are now rejected by DuckDB 2.0 before the
   extension sees the statement. The errors read `unterminated quoted identifier` and
   `zero-length delimited identifier` instead of the extension's own wording.
-- **Loading the extension into the wrong DuckDB release now fails with a clear message
-  instead of crashing.** The extension now uses DuckDB's stable C extension API and checks
-  the DuckDB version itself when it loads. A build for one DuckDB release loaded into any
-  other stops with `semantic_views was built for DuckDB X and cannot run in DuckDB Y`. For a released
-  DuckDB it also names the `FORCE INSTALL semantic_views FROM community;` command that fetches
-  the matching build, once one has been published for that DuckDB.
-
-### Fixed
-
-- **Windows: a failed `SHOW` / `DESCRIBE` or semantic-view table function no longer
-  crashes DuckDB later.** On Windows, an error raised by one of these calls (for example,
-  a view that does not exist) skipped the extension's cleanup. Since v0.14.0 that left a
-  background thread running against freed memory, which crashed the process with an
-  access violation soon afterwards. Errors now clean up as they do on Linux and macOS.
 
 ### Known limitations
 
@@ -48,6 +34,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `adbc_driver_duckdb` cannot `INSTALL` or `LOAD` any extension, this one included, unless
   the `duckdb` Python module has been imported in the same process first. Add
   `import duckdb` before you import the ADBC driver.
+
+## [0.14.1] - 2026-10-16
+
+### Changed
+
+- **Loading the extension into the wrong DuckDB release now fails with a clear message
+  instead of crashing.** The extension now uses DuckDB's stable C extension API and checks
+  the DuckDB version itself when it loads. A build for one DuckDB release loaded into a newer
+  one stops with `semantic_views was built for DuckDB X and cannot run in DuckDB Y`. When the
+  running DuckDB is a tagged release, the message also suggests
+  `FORCE INSTALL semantic_views FROM community;`, which fetches the matching build if one has
+  been published. See *Error messages* in the docs.
+
+### Fixed
+
+- **Windows: an error from a `SHOW` or `DESCRIBE` command, or from `list_semantic_views()`,
+  no longer crashes DuckDB later.** On Windows these commands skipped the extension's
+  cleanup when they raised an error (for example, naming a view that does not exist). In
+  v0.14.0 that left a background thread running against freed memory, which crashed the
+  process with an access violation soon afterwards. Errors now clean up as they do on Linux
+  and macOS.
+- **A member named like a SQL type or keyword no longer breaks expressions that use that
+  word.** With a fact named `blob`, a `where_clause` such as `blob = '\x41'::BLOB` failed
+  with a parser error, because the `BLOB` type was replaced with the fact's expression. The
+  same happened to the type in `CAST(… AS type)`, the type of a literal written as
+  `DATE '2020-01-01'`, the field in `EXTRACT(year FROM …)`, the unit in `INTERVAL 1 DAY`, and
+  `AT TIME ZONE`, whenever a dimension, fact or metric had that name. This affected
+  `where_clause` predicates and member expressions in a view definition, such as a
+  `ts::DATE` dimension in a view with a fact named `date`. These words are now left alone.
 
 ## [0.14.0] - 2026-10-15
 
@@ -798,7 +813,8 @@ Connection-lifecycle and ADBC fixes. Two downstream regressions reported against
 - `list_semantic_views()` and `describe_semantic_view()` introspection functions
 - Fuzz targets for FFI boundary testing
 
-[Unreleased]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/s-layer/duckdb-semantic-views/compare/v0.12.0...v0.12.1

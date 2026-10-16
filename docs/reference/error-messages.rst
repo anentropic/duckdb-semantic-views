@@ -12,41 +12,43 @@ This page documents the error messages produced by DuckDB Semantic Views, their 
 
 .. _ref-err-load:
 
-Loading Errors
-==============
+Load Errors
+===========
 
 These errors occur when ``LOAD semantic_views`` runs.
 
 
 .. _ref-err-load-version:
 
-Extension built for a different DuckDB
---------------------------------------
+Built for a different DuckDB release
+------------------------------------
 
 .. versionchanged:: 0.15.0
 
    This release is built for DuckDB 2.0. Earlier releases were built for
-   DuckDB 1.5, and v0.14.0 is the last of them.
+   DuckDB 1.5, and v0.14.1 is the last of them.
 
 .. code-block:: text
 
    semantic_views was built for DuckDB <built> and cannot run in DuckDB <host>,
    because it depends on that exact DuckDB release. If a semantic_views build
-   for this DuckDB has been published, install it with:
-   FORCE INSTALL semantic_views FROM community;
+   for this DuckDB has been published, install it with: FORCE INSTALL
+   semantic_views FROM community;
 
-DuckDB prefixes the message with ``An error was thrown during initialization of the extension '<path>':``. When ``<host>`` is a development build of DuckDB (its version contains a ``-``), the last sentence reads ``Load a semantic_views build compiled against this DuckDB.`` instead, because the community repository publishes builds only for released versions of DuckDB.
+DuckDB prefixes the message with ``An error was thrown during initialization of the extension '<path>':``.
 
-**Cause:** Each build of the extension is compiled against one exact DuckDB release and refuses to load into any other. A common source is an extension file installed before a DuckDB upgrade or downgrade.
+**Cause:** Each build of the extension is compiled against one exact DuckDB release. The file being loaded was built for ``<built>``, but the running DuckDB is ``<host>``. The extension checks this before it starts, so the ``LOAD`` fails instead of crashing DuckDB. A common source is an extension file installed before a DuckDB upgrade or downgrade.
 
-**Fix:** Run ``SELECT version();`` to see which DuckDB you are running, then install the build that matches it. ``FORCE INSTALL`` replaces the installed file even when one is already present:
+**Fix:** Run ``SELECT version();`` to see which DuckDB you are running, then install the build that matches it and load it. ``FORCE INSTALL`` replaces the installed file even when one is already present:
 
 .. code-block:: sql
 
    FORCE INSTALL semantic_views FROM community;
    LOAD semantic_views;
 
-This works once a build for your DuckDB release has been published to the community repository. DuckDB 1.5 gets no release newer than v0.14.0.
+If no build for ``<host>`` has been published yet, the install fails. Until one is, run DuckDB ``<built>``. DuckDB 1.5 gets no release newer than v0.14.1.
+
+When ``<host>`` is a development or nightly DuckDB build (its version contains a ``-``, such as ``v2.0.1-dev42``), the message ends with ``Load a semantic_views build compiled against this DuckDB.`` instead. The community repository only has builds for tagged releases, so build the extension from source against that DuckDB.
 
 
 .. _ref-err-ddl:

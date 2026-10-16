@@ -791,15 +791,32 @@ Key fields:
 > the tag, and the registry-pin gate. `just release` does **none** of those: it publishes
 > whatever version `Cargo.toml` already says, so running it before bumping (and tagging)
 > reopens the registry PR for the previous release rather than publishing a new one. The workflow pushes the release commits and tag to this
-> repo with the job's own `GITHUB_TOKEN`, and uses `CE_PUBLISH_PAT` (falling back to
-> `VERSION_MONITOR_PAT`) only to push to the `anentropic/community-extensions` fork and open the
-> registry PR. A personal token is refused for this repo since it moved to the s-layer org (the
-> first v0.14.0 run failed its push with a 403 that way). Pushes made with `GITHUB_TOKEN` don't
+> repo with the job's own `GITHUB_TOKEN`, pushes the release branch to the
+> `s-layer/community-extensions` fork with a GitHub App token (`BOT_APP_ID` / `BOT_APP_PRIVATE_KEY`;
+> the app must be installed on the fork), and uses `CE_PUBLISH_PAT` (falling back to
+> `VERSION_MONITOR_PAT`) only to open the registry PR on `duckdb/community-extensions`. The s-layer
+> org refuses personal tokens, for this repo and the fork alike (the first v0.14.0 run failed its
+> push with a 403 that way). Pushes made with `GITHUB_TOKEN` don't
 > start other workflows, so the release commits get no CI run of their own; they change only
-> versions, the changelog and `description.yml`. When the PAT expires, this workflow fails at the
-> community-extensions step, and the DuckDB Version Monitor, which still checks out and opens its
-> PR with `VERSION_MONITOR_PAT`, fails at `actions/checkout` with
-> `could not read Username for 'https://github.com'`.
+> versions, the changelog and `description.yml`. When the PAT expires, the DuckDB Version
+> Monitor, which still checks out and opens its PR with `VERSION_MONITOR_PAT`, fails at
+> `actions/checkout` with `could not read Username for 'https://github.com'`.
+>
+> The app must be installed on the fork with Contents and Workflows set to read and write
+> (Workflows because the branch is cut from upstream `main` and can carry workflow-file changes
+> the fork lacks). `CE_PUBLISH_PAT` should be a classic PAT with `public_repo`. The v0.14.0 and
+> v0.14.1 runs both failed with `Permission to anentropic/community-extensions.git denied` after
+> tagging, when the push still used the PAT, so the workflow now checks this first: a
+> **preflight** step runs `git push --dry-run` to the fork with the app token before anything is
+> committed or tagged, in dry runs too, and fails with that remedy. It also checks the PAT that
+> opens the upstream PR: it must be set, accepted by GitHub (not expired), and, for a classic PAT,
+> carry `public_repo` or `repo`. If a run tagged the release but
+> did not open the registry PR, fix the cause and re-run with `-f registry_pr_only=true`. That
+> publishes the version already on `main` from its existing tag, checking that `description.yml`
+> points at it, and bumps, rolls and tags nothing. Never re-run a normal publish after its
+> "Commit, tag, and push" step succeeded: it would cut another version. If an open PR from the
+> fork's `semantic-views` branch already exists, the force-push updates it, the workflow retitles
+> it for the new version, and no second PR is opened.
 >
 > The registry-pin gate and the descriptor update use `scripts/registry_target.py`, guarded by
 > `tests/registry_target_script.rs`. The registry builds its default DuckDB (`DUCKDB_LATEST_STABLE`
@@ -1042,7 +1059,7 @@ Do **not** set a directory-level nightly override (`rustup override set nightly`
 | **Docs** | Push to `main` | Same `-W` Sphinx build, then deploys the site to GitHub Pages. |
 | **Fuzz** | Push touching `src/**`, `fuzz/**`, or the Cargo manifests | Runs all nine fuzz targets for 10 minutes each. Detects crashes via artifact files (not exit codes), uploads them, opens a `bug`/`fuzzing` issue, and fails the job on any crash. A `changes` guard job re-checks the push's **net** diff and skips the matrix when the trigger fired only because of the push-range quirk below. |
 | **DuckDBVersionMonitor** | Weekly (Monday 09:00 UTC) + manual | Queries the DuckDB GitHub API for the latest / LTS release. If newer than the pin (a release counts as newer than a pre-release of the same version), updates the engine pin and its derived locations (never the C API pin), builds, and tests, then opens a version-bump PR on success or a breakage PR (tagging `@copilot`) on failure. |
-| **PublishExtension** | Manual (`workflow_dispatch`) only | Release automation for the Community Extension registry. |
+| **PublishExtension** | Manual (`workflow_dispatch`) only | Release automation for the Community Extension registry. Inputs: `version`, `dry_run`, and `registry_pr_only` (open the registry PR for the release already tagged on `main`). A preflight checks that the app token can push to the fork before anything is tagged. |
 
 Most workflows also accept a manual `workflow_dispatch` trigger for debugging.
 
