@@ -172,3 +172,90 @@ fn setting_an_existing_key_rewrites_it_in_place() {
     let twice = set("again-2", &once, "variegata", "def");
     assert_eq!(twice, once.replace("variegata: abc", "variegata: def"));
 }
+
+/// `registry_target.py release-sha <version>` run inside `repo`: the SHA on
+/// success, the error message on failure.
+fn release_sha(repo: &std::path::Path, version: &str) -> Result<String, String> {
+    let out = Command::new("python3")
+        .arg(repo_root().join("scripts/registry_target.py"))
+        .args(["release-sha", version])
+        .current_dir(repo)
+        .output()
+        .expect("run python3 (is it on PATH?)");
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).to_string())
+    }
+}
+
+fn git(repo: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(["-c", "tag.gpgsign=false"])
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A repo whose `v1.2.3` tag is one commit behind HEAD, as `main` was when
+/// `just release` ran for v0.14.0: it pinned HEAD (the Phase 2 merge and a
+/// docs fix) instead of the tagged release.
+fn repo_with_tag_behind_head(name: &str, annotated: bool) -> (PathBuf, String, String) {
+    let dir = scratch(name);
+    git(&dir, &["init", "-q"]);
+    git(&dir, &["commit", "-q", "--allow-empty", "-m", "release"]);
+    let tagged = git(&dir, &["rev-parse", "HEAD"]);
+    if annotated {
+        git(&dir, &["tag", "-a", "v1.2.3", "-m", "v1.2.3"]);
+    } else {
+        git(&dir, &["tag", "v1.2.3"]);
+    }
+    git(&dir, &["commit", "-q", "--allow-empty", "-m", "later work"]);
+    let head = git(&dir, &["rev-parse", "HEAD"]);
+    (dir, tagged, head)
+}
+
+#[test]
+fn the_release_sha_is_the_tagged_commit_not_head() {
+    for annotated in [false, true] {
+        let (dir, tagged, head) = repo_with_tag_behind_head(&format!("sha-{annotated}"), annotated);
+        let got = release_sha(&dir, "1.2.3");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(tagged, head);
+        assert_eq!(got, Ok(tagged), "annotated={annotated}");
+    }
+}
+
+#[test]
+fn a_release_with_no_tag_is_refused() {
+    let (dir, _, _) = repo_with_tag_behind_head("sha-missing", false);
+    let got = release_sha(&dir, "9.9.9");
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = got.expect_err("a missing tag must fail");
+    assert!(err.contains("v9.9.9"), "{err}");
+}
+
+#[test]
+fn a_branch_named_like_the_tag_does_not_count_as_the_release() {
+    let (dir, _, _) = repo_with_tag_behind_head("sha-branch", false);
+    git(&dir, &["branch", "v9.9.9"]);
+    let got = release_sha(&dir, "9.9.9");
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = got.expect_err("a branch is not a release tag");
+    assert!(err.contains("v9.9.9"), "{err}");
+}

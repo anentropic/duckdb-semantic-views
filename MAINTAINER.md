@@ -741,8 +741,8 @@ Key fields:
 > ideally with `-f dry_run=true` first). It does everything `just release` does *plus* the
 > version bump, the `[Unreleased]` → `[X.Y.Z]` changelog roll (`scripts/changelog_release.py`),
 > the tag, and the registry-pin gate. `just release` does **none** of those: it publishes
-> whatever version `Cargo.toml` already says, so running it before bumping resubmits the
-> previous release under a new `ref`. The workflow pushes the release commits and tag to this
+> whatever version `Cargo.toml` already says, so running it before bumping (and tagging)
+> reopens the registry PR for the previous release rather than publishing a new one. The workflow pushes the release commits and tag to this
 > repo with the job's own `GITHUB_TOKEN`, and uses `CE_PUBLISH_PAT` (falling back to
 > `VERSION_MONITOR_PAT`) only to push to the `anentropic/community-extensions` fork and open the
 > registry PR. A personal token is refused for this repo since it moved to the s-layer org (the
@@ -773,8 +773,8 @@ The `just release` recipe automates steps 3-7 below:
 
 This will:
 - Verify you're on `main` with a clean working tree and `gh` CLI installed
-- Extract the version from `Cargo.toml` and the current commit SHA
-- Update `description.yml` with the new `ref` and `version`, and commit
+- Extract the version from `Cargo.toml` and the commit its `v<version>` tag points at (`scripts/registry_target.py release-sha`; it refuses when the tag is missing). Not `HEAD`: `main` may have moved past the release, as it had when v0.14.0's registry PR was first opened
+- Update `description.yml` with the new `ref` and `version`, and commit (a re-run for the same release finds it unchanged and goes straight to the registry PR)
 - In the CE fork (default: `~/Documents/Dev/Sources/community-extensions`, override with `CE_REPO` env var): ensure an `upstream` remote, `git fetch upstream main`, and **rebranch `semantic-views` off `upstream/main`** so the PR is a clean one-file change, then copy in `description.yml`, commit, and **force-push**
 - Open a PR to `duckdb/community-extensions` (or report the existing open one, which the force-push updates in place)
 

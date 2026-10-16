@@ -20,11 +20,17 @@ Usage:
         on stderr, when the registry does not build <our-pin>.
     registry_target.py set <description.yml> <key> <sha>
         Point `repo.<key>` at <sha>, adding the key after `ref:` if it is missing.
+    registry_target.py release-sha <version>
+        Print the commit the `v<version>` tag points at, run inside our checkout.
+        Exit 1 when there is no such tag. The registry must build the tagged
+        release, not whatever `main` has moved on to since (v0.14.0 was first
+        published pinned to a later `main`).
 """
 
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 
 # `DUCKDB_LATEST_STABLE: 'b15358c…'` (current layout), else the default in
@@ -87,6 +93,18 @@ def set_key(text: str, key: str, sha: str) -> str:
     return "".join(lines)
 
 
+def release_sha(version: str) -> str:
+    tag = f"v{version}"
+    out = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0:
+        raise SystemExit(f"no {tag} tag in this checkout: tag the release (or fetch tags) first")
+    return out.stdout.strip()
+
+
 def main(argv: list[str]) -> None:
     if len(argv) == 5 and argv[1] == "key":
         pin = argv[2].strip()
@@ -101,6 +119,8 @@ def main(argv: list[str]) -> None:
             text = f.read()
         with open(path, "w") as f:
             f.write(set_key(text, key, sha))
+    elif len(argv) == 3 and argv[1] == "release-sha":
+        print(release_sha(argv[2].strip()))
     else:
         raise SystemExit(__doc__)
 

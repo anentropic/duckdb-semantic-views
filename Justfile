@@ -476,12 +476,13 @@ release:
       exit 1
     fi
     # --- Extract values ---
-    SHA=$(git rev-parse HEAD)
     VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
     if [ -z "$VERSION" ]; then
       echo "ERROR: could not extract version from Cargo.toml" >&2
       exit 1
     fi
+    # The tagged release, not HEAD: main may have moved on since the tag.
+    SHA=$(python3 scripts/registry_target.py release-sha "$VERSION")
     # --- Which description.yml key the registry builds our DuckDB pin from ---
     TMP=$(mktemp -d)
     gh api repos/duckdb/community-extensions/contents/.github/workflows/build.yml --jq '.content' | base64 -d > "$TMP/build.yml"
@@ -493,9 +494,17 @@ release:
     python3 scripts/registry_target.py set description.yml "$KEY" "$SHA"
     sed -i '' "s/^  version: .*/  version: $VERSION/" description.yml
     git add description.yml
-    git commit -m "chore: update description.yml for v$VERSION release"
+    # A re-run for the same release (e.g. to reopen the registry PR) finds
+    # description.yml already up to date; go straight to the registry step.
+    if git diff --cached --quiet; then
+      echo "description.yml already pins v$VERSION; nothing to commit"
+    else
+      git commit -m "chore: update description.yml for v$VERSION release"
+    fi
+    # Outside the if: a re-run after a failed push still has that commit to push
+    # (a no-op when main is already up to date).
     git push origin main
-    echo "Committed and pushed description.yml update to main"
+    echo "description.yml for v$VERSION is on origin/main"
     DESC_SRC="$PWD/description.yml"
     # --- Copy to CE fork and open PR ---
     CE_REPO="${CE_REPO:-$HOME/Documents/Dev/Sources/community-extensions}"
