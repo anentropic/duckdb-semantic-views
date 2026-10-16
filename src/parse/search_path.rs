@@ -9,7 +9,7 @@
 //! its current schema, and neither is reachable from the bind callback — the
 //! caller's `ClientContext` cannot be queried re-entrantly (its `context_lock`
 //! is not recursive) and `ClientData::catalog_search_path` is not exposed by
-//! the amalgamation. Entry #19 records both walls.
+//! the headers the shim compiles against. Entry #19 records both walls.
 //!
 //! What *is* available is the caller's connection at **bind time**: `DuckDB`
 //! constant-folds table-function arguments there, on the caller's connection,

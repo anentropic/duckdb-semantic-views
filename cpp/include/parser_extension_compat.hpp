@@ -20,6 +20,10 @@
 // expressed through one helper. The v1.5 branches are the pre-existing code,
 // unchanged.
 //
+// Since v0.15.0 build.rs always defines SV_DUCKDB_2 (it links a 2.0 engine
+// built by scripts/ensure_engine.py), so the v1.5 branches are no longer
+// compiled. They stay until the switch is removed (TECH-DEBT #91).
+//
 // ---------------------------------------------------------------------------
 // v1.5 amalgamation notes
 // ---------------------------------------------------------------------------
@@ -70,6 +74,7 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
+#include "duckdb/parser/query_error_context.hpp"
 
 #else // v1.5 amalgamation
 
@@ -436,11 +441,28 @@ inline const duckdb::vector<duckdb::LogicalType> &result_types(const duckdb::Que
 #endif
 }
 
-inline duckdb::QueryResultType result_type(const duckdb::QueryResult &result) {
+// Whether `result` holds its rows in memory. v1.5 reports a
+// MATERIALIZED_RESULT type. 2.0 has a single QueryResult kind and no result
+// type; the shim's 2.0 query path (`sv_query_interruptible`) calls
+// `Complete()`, which collects the rows, before handing a result back.
+inline bool is_materialized(const duckdb::QueryResult &result) {
 #ifdef SV_DUCKDB_2
-	return result.GetResultType();
+	(void)result;
+	return true;
 #else
-	return result.type;
+	return result.type == duckdb::QueryResultType::MATERIALIZED_RESULT;
+#endif
+}
+
+// A parser with the built-in grammar and no parser extensions, so re-parsing
+// the SQL our parser_override produced cannot re-enter parser_override. v1.5:
+// default-constructed ParserOptions; 2.0 dropped the default constructor for
+// `Parser::GetBuiltinParser()`.
+inline duckdb::Parser builtin_parser() {
+#ifdef SV_DUCKDB_2
+	return duckdb::Parser::GetBuiltinParser();
+#else
+	return duckdb::Parser();
 #endif
 }
 

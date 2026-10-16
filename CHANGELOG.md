@@ -11,10 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The extension now runs on DuckDB 2.0, and only there.** This release is built
+  against DuckDB 2.0 and loads only in that exact DuckDB release. If you stay on DuckDB
+  1.5, keep v0.14.0, the last release for 1.5.
+- **Two identifier errors now come from DuckDB.** In semantic-view DDL, an unterminated
+  quoted identifier and an empty one (`""`) are now rejected by DuckDB 2.0 before the
+  extension sees the statement. The errors read `unterminated quoted identifier` and
+  `zero-length delimited identifier` instead of the extension's own wording.
 - **Loading the extension into the wrong DuckDB release now fails with a clear message
   instead of crashing.** The extension now uses DuckDB's stable C extension API and checks
-  the DuckDB version itself when it loads. A build for one DuckDB release loaded into a newer
-  one stops with `semantic_views was built for DuckDB X and cannot run in DuckDB Y`. For a released
+  the DuckDB version itself when it loads. A build for one DuckDB release loaded into any
+  other stops with `semantic_views was built for DuckDB X and cannot run in DuckDB Y`. For a released
   DuckDB it also names the `FORCE INSTALL semantic_views FROM community;` command that fetches
   the matching build, once one has been published for that DuckDB.
 

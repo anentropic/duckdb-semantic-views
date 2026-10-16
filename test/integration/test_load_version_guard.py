@@ -12,8 +12,9 @@ release and reads host objects by layout, so running inside any other release
 is undefined behaviour. The extension therefore checks the host's version at
 load time and refuses with an actionable message.
 
-This test runs under a DuckDB that differs from `.duckdb-version` (a 2.0
-development build from PyPI) and asserts that `LOAD` fails with our message and
+This test runs under a DuckDB that differs from `.duckdb-version` (the last 1.5
+release, whose C API is the one we declare, so only our own check stands
+between it and the shim) and asserts that `LOAD` fails with our message and
 does not crash. The LOAD runs in a child process so that a crash, which is what
 the unguarded extension may do, reports as a failure with its exit status
 instead of killing the test.

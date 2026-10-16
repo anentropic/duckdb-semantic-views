@@ -66,7 +66,14 @@ static_assert(sizeof(duckdb_connection) == sizeof(void*),
 // other function here, and refuses to load on a mismatch: the C_STRUCT ABI
 // (see the Makefile) no longer has DuckDB make that check for us.
 extern "C" const char *sv_compiled_duckdb_version() {
+#ifdef SV_DUCKDB_2
+    // The engine's header tree does not define DUCKDB_VERSION (its CMake build
+    // passes it to the engine's own sources only). The statically linked
+    // engine reports the version it was built as.
+    return DuckDB::LibraryVersion();
+#else
     return DUCKDB_VERSION;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +424,15 @@ struct SvOwnedBuffer {
 // marker.)
 struct SemanticViewsParserInfo : public ParserExtensionInfo {};
 
+#ifdef SV_DUCKDB_2
+// The query the last parser_override call on this thread saw. DuckDB 2.0's
+// parse_function gets tokens without source offsets; when it runs, it is inside
+// the same Parser::ParseQuery as the override call that recorded this, so the
+// tokens can be located in it (sv_locate_tail). Only ever a hint: a stale value
+// fails that match and the stub falls back to rebuilding the text.
+static thread_local std::string sv_override_query;
+#endif
+
 // ---------------------------------------------------------------------------
 // Parser-override hook: sv_parser_override
 // ---------------------------------------------------------------------------
@@ -439,6 +455,9 @@ static ParserOverrideResult sv_parser_override(
     if (!sv_info) {
         return ParserOverrideResult();
     }
+#ifdef SV_DUCKDB_2
+    sv_override_query = query;
+#endif
 
     SvOwnedBuffer sql_buf;
     char error_buf[1024];
@@ -469,7 +488,7 @@ static ParserOverrideResult sv_parser_override(
     // rewritten SQL is read by exact length, so size is unbounded.
     string native_sql = sql_buf.to_string();
     try {
-        Parser parser;
+        Parser parser = sv_compat::builtin_parser();
         parser.ParseQuery(native_sql);
         return ParserOverrideResult(std::move(parser.statements));
     } catch (std::exception &e) {
@@ -572,25 +591,95 @@ static ParserExtensionParseResult sv_parse_statement(const string &query) {
 //   > 0  claimed (v1.5's PARSE_SUCCESSFUL), which sv_parse_statement never
 //        returns.
 //
-// So the statement text v1.5 passed is rebuilt from the tokens up to the first
-// TERMINATOR (re-appending `;` as v1.5's statement splitter did) and the result
-// mapped onto consumed_tokens.
+// So the stub recovers the statement text v1.5 passed (from the first token up
+// to and including the TERMINATOR, as v1.5's statement splitter did) and maps
+// the result onto consumed_tokens.
 //
-// TODO(duckdb-2.0, TECH-DEBT #88): SimpleToken carries no source offsets or whitespace, so the
-// rebuilt text is a normalised spelling of the statement (one space between
-// tokens, none around `.` or inside brackets, no comments, newlines folded).
-// Three things can differ from v1.5 and must be checked against a 2.0 build:
-// (1) the caret: sv_parse_function_rust reports a byte offset into the rebuilt
-//     text, which DuckDB renders against the original query, so it is exact
-//     only while the statement starts at byte 0 and the original spacing up to
-//     the error matches the normalised one;
-// (2) the Rust validator sees the normalised text, so a check sensitive to
-//     spacing or comments could word its error differently;
-// (3) the Rust multi-statement hint (TECH-DEBT #85) looks the statement up as
-//     a substring of the query the override recorded, which fails when the
-//     original spacing differs, falling back to the override-inactive hint.
-// A lossless fix needs the source offsets (e.g. the original query text) in
-// the 2.0 parse_function API, or the Rust side taking tokens.
+// SimpleToken carries the raw source text of each token but no offset, so the
+// statement is found in the query the override recorded (sv_locate_tail): the
+// tokens run to the end of the query, which pins where they start. With the
+// statement's own text, the Rust validator sees exactly what the user wrote,
+// error positions are offsets into the real query, and the #85 multi-statement
+// lookup finds the statement as a substring.
+//
+// The caret is rendered into the message here rather than left to
+// `error_location`: 2.0 only renders a parser error's location on the
+// ClientContext query path, so the Python client (and the sqllogictest runner
+// built on it) would show none, for DuckDB's own syntax errors as for ours.
+//
+// When the tokens cannot be located (parser_override switched off, so nothing
+// was recorded) the text is rebuilt from the tokens instead: one space between
+// tokens, none around `.` or inside brackets, no comments. A position in that
+// text is not one in the query, so no caret is shown then.
+static bool sv_skip_trivia(const std::string &q, idx_t &pos) {
+    while (pos < q.size()) {
+        char c = q[pos];
+        if (StringUtil::CharacterIsSpace(c)) {
+            pos++;
+        } else if (c == '-' && pos + 1 < q.size() && q[pos + 1] == '-') {
+            while (pos < q.size() && q[pos] != '\n') {
+                pos++;
+            }
+        } else if (c == '/' && pos + 1 < q.size() && q[pos + 1] == '*') {
+            auto close = q.find("*/", pos + 2);
+            if (close == std::string::npos) {
+                return false;
+            }
+            pos = close + 2;
+        } else {
+            break;
+        }
+    }
+    return true;
+}
+
+static bool sv_is_end_token(const SimpleToken &token) {
+    return token.type == TokenType::END_OF_INPUT ||
+           token.type == TokenType::END_OF_INPUT_AUTOCOMPLETE;
+}
+
+// Where `tokens` -- the tail of `query` from the failed statement to its end --
+// starts in `query`, with the offset just past the statement's TERMINATOR (or
+// the end of its last token when there is none). False when they do not match
+// the query's suffix token for token.
+static bool sv_locate_tail(const std::string &query, const vector<SimpleToken> &tokens,
+                           idx_t &start, idx_t &statement_end) {
+    if (tokens.empty() || sv_is_end_token(tokens[0]) || tokens[0].text.empty()) {
+        return false;
+    }
+    const std::string &first = tokens[0].text;
+    for (auto candidate = query.rfind(first); candidate != std::string::npos;
+         candidate = candidate == 0 ? std::string::npos : query.rfind(first, candidate - 1)) {
+        idx_t pos = candidate;
+        idx_t end = std::string::npos;
+        bool matched = true;
+        for (idx_t i = 0; i < tokens.size(); i++) {
+            const auto &token = tokens[i];
+            if (sv_is_end_token(token) || token.text.empty()) {
+                continue;
+            }
+            if (i > 0 && !sv_skip_trivia(query, pos)) {
+                matched = false;
+                break;
+            }
+            if (query.compare(pos, token.text.size(), token.text) != 0) {
+                matched = false;
+                break;
+            }
+            pos += token.text.size();
+            if (end == std::string::npos && token.type == TokenType::TERMINATOR) {
+                end = pos;
+            }
+        }
+        if (matched && sv_skip_trivia(query, pos) && pos == query.size()) {
+            start = candidate;
+            statement_end = end == std::string::npos ? pos : end;
+            return true;
+        }
+    }
+    return false;
+}
+
 static std::string sv_statement_from_tokens(const vector<SimpleToken> &tokens) {
     auto glue_left = [](const std::string &t) {  // no space before these
         return t == "." || t == "," || t == ")" || t == "]";
@@ -601,8 +690,7 @@ static std::string sv_statement_from_tokens(const vector<SimpleToken> &tokens) {
     std::string text;
     const std::string *prev = nullptr;
     for (const auto &token : tokens) {
-        if (token.type == TokenType::END_OF_INPUT ||
-            token.type == TokenType::END_OF_INPUT_AUTOCOMPLETE) {
+        if (sv_is_end_token(token)) {
             break;
         }
         if (token.type == TokenType::TERMINATOR) {
@@ -623,11 +711,21 @@ static std::string sv_statement_from_tokens(const vector<SimpleToken> &tokens) {
 
 static ParserExtensionParseResult sv_parse_stub(
     ParserExtensionInfo * /*info*/, const vector<SimpleToken> &tokens) {
-    auto result = sv_parse_statement(sv_statement_from_tokens(tokens));
+    idx_t start = 0;
+    idx_t statement_end = 0;
+    const std::string &query = sv_override_query;
+    bool located = sv_locate_tail(query, tokens, start, statement_end);
+    auto result = sv_parse_statement(located ? query.substr(start, statement_end - start)
+                                             : sv_statement_from_tokens(tokens));
     // DISPLAY_EXTENSION_ERROR -> throw; DISPLAY_ORIGINAL_ERROR keeps the
     // default 0 (not claimed). PARSE_SUCCESSFUL is never produced.
     if (result.type == ParserExtensionResultType::DISPLAY_EXTENSION_ERROR) {
         result.consumed_tokens = -1;
+        if (located && result.error_location.IsValid()) {
+            result.error = QueryErrorContext::Format(query, result.error,
+                                                     start + result.error_location.GetIndex());
+        }
+        result.error_location = optional_idx();
     }
     return result;
 }
@@ -3087,21 +3185,22 @@ struct SemanticViewGlobalState : public GlobalTableFunctionState {
 // handle is detached from `probe` and serves `Fetch()` from its own collection —
 // the role `pending->Execute()` and MaterializedQueryResult had. The loop below
 // is the one `Connection::Query` runs internally in 2.0
-// (`QueryResult::CompleteInternal`): ResultEagerness::FORCED settles retention
+// (`QueryResult::CompleteInternal`): `Materialize()` settles retention
 // at submission exactly as `Connection::Query` does, so READY is waited on like
 // BLOCKED and only a terminal state (FINISHED / EXECUTION_ERROR) ends it.
 static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
                                                       ClientContext &outer,
                                                       const std::string &sql) {
 #ifdef SV_DUCKDB_2
-    QueryParameters parameters;
-    parameters.result_eagerness = ResultEagerness::FORCED;
-    auto result = probe.Submit(sql, parameters);
+    auto result = probe.Submit(sql, QueryParameters());
     if (result->HasError()) {
         // Parse/bind failure — nothing has executed. Same shape
         // Connection::Query hands back for the identical failure.
         return make_uniq<QueryResult>(result->GetErrorObject());
     }
+    // Settle retention up front, as Connection::Query does: without it the
+    // engine parks on READY waiting for the caller to pick stream vs retain.
+    result->Materialize();
 
     bool forwarded = false;
     // A query whose custom result collector builds its own result is run to
@@ -3135,10 +3234,6 @@ static unique_ptr<QueryResult> sv_query_interruptible(Connection &probe,
     // Collect the rows and end the query on `probe`; a commit failure lands on
     // the result as an error, as it did from pending->Execute().
     result->Complete();
-    // TODO(duckdb-2.0, TECH-DEBT #88): this loop is read from the dev-build sources
-    // (QueryResult::CompleteInternal); run the semantic_view cancellation tests
-    // against a 2.0 build to confirm interrupt latency and that a cancelled
-    // query still surfaces as a bare "Interrupted!".
     return result;
 #else
     auto pending = probe.PendingQuery(sql);
@@ -3386,7 +3481,7 @@ static unique_ptr<GlobalTableFunctionState> sv_semantic_view_init_global(
             "semantic_view: SQL execution failed: " + qresult->GetError() +
             "  (expanded SQL: " + bd.expanded_sql_for_error + ")");
     }
-    if (sv_compat::result_type(*qresult) != QueryResultType::MATERIALIZED_RESULT) {
+    if (!sv_compat::is_materialized(*qresult)) {
         throw InternalException(
             "semantic_view: expected MaterializedQueryResult from Connection::Query");
     }

@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Build the DuckDB engine the C++ shim links against, and point build.rs at it.
+
+`build.rs` links a static DuckDB engine *into* the extension binary alongside
+`cpp/src/shim.cpp`, because the parser-extension hook the shim registers is C++
+internals with no C-API equivalent. That makes the engine an ABI contract, not
+a convenience: the C++ reads host objects by layout, so the host that loads the
+extension must be the exact DuckDB release the shim was compiled against
+(`src/load_guard.rs` refuses any other at load time).
+
+DuckDB 2.0 ships no amalgamation (`scripts/amalgamation.py` is a remnant) and
+its release archives carry no C++ headers, so the engine is built here from
+source with its own CMake build, and only the `duckdb_static` target.
+
+Two sources, in priority order:
+
+1. **An engine source tree** (`--src-dir`, default `./duckdb`). A harness that
+   builds the extension against a specific engine clones it there (upstream
+   community-extensions and extension-ci-tools do, as does Haybarn's fork).
+   That tree *is* the engine the extension will be loaded into, so it is built
+   under the version label its release build carries (see `tree_label`), never
+   the one this repo pins: stamping our pin onto some other engine is the one
+   way to build an extension that loads where its shim does not fit. Whatever
+   the tree is, the extension then loads only in a DuckDB built from it (the
+   load-time check compares the labels), so a tree other than the pinned
+   release is reported but not refused.
+2. **The pinned release** (`.duckdb-version`), from the PyPI sdist of the
+   matching `duckdb` Python package (`.duckdb-pypi-version` while 2.0 is a
+   pre-release, otherwise the version without its `v`). The sdist carries the
+   exact engine source the wheel was built from, including `third_party/`, and
+   PyPI is reachable from sandboxes that block GitHub. It is built with
+   `DUCKDB_VERSION` set to the pin, so the library reports the same version
+   string as the wheel. This is the local-developer and CI path.
+
+The result is cached under `.engine/<id>/` (the static libraries plus, for the
+pinned release, the extracted source for its headers), so switching branches
+or engines is a cache hit. `cpp/engine.manifest` records which entry the build
+uses: `build.rs` reads the include directories and libraries from it, and
+reruns when it changes. It is rewritten only when its content changes, so an
+unchanged engine keeps `cargo build` incremental.
+
+Usage (normally invoked by `make ensure_engine`):
+
+    python3 scripts/ensure_engine.py                    # auto-detect
+    python3 scripts/ensure_engine.py --force            # rebuild the engine
+    python3 scripts/ensure_engine.py --src-dir ''       # pinned release only
+
+Requires cmake (and uses ninja when it is on PATH). Only the Python standard
+library is needed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.request
+from typing import NoReturn
+
+DEFAULT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MANIFEST = os.path.join("cpp", "engine.manifest")
+# Engine builds that predate this layout or a change to how it is built would
+# be reused from the cache without this in the id.
+LAYOUT = "1"
+# A DuckDB release label, as DuckDB's CMake parses one.
+RELEASE_LABEL_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|rc|dev)[0-9]+)?$")
+# The CMake configure line logs the label the build stamps into the library.
+CMAKE_VERSION_RE = re.compile(r"git hash \S+, version (\S+),")
+# Static libraries of the `duckdb_static` target that a link needs. jemalloc is
+# left out: the extension must use the host's allocator, not install its own.
+THIRD_PARTY_SKIP = ("jemalloc",)
+
+
+def log(msg: str) -> None:
+    print(f"[ensure-engine] {msg}", flush=True)
+
+
+def fail(msg: str) -> NoReturn:
+    raise SystemExit(f"[ensure-engine] ERROR: {msg}")
+
+
+def read_pin(root: str, name: str) -> str | None:
+    path = os.path.join(root, name)
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        return fh.read().strip() or None
+
+
+def pypi_version(root: str, version: str) -> str:
+    """The `duckdb` PyPI release whose wheel reports `version`."""
+    return read_pin(root, ".duckdb-pypi-version") or version.removeprefix("v")
+
+
+def engine_source_tree(root: str, src_dir: str) -> str | None:
+    """Absolute path of a usable engine source tree, or None.
+
+    "Usable" means it carries a CMake build and the headers the shim compiles
+    against. A bare `duckdb/` directory that is something else -- an empty
+    submodule mount point, a stray checkout of the Python package -- is not
+    mistaken for an engine.
+    """
+    if not src_dir:
+        return None
+    path = src_dir if os.path.isabs(src_dir) else os.path.join(root, src_dir)
+    if os.path.exists(os.path.join(path, "CMakeLists.txt")) and os.path.isdir(
+        os.path.join(path, "src", "include", "duckdb")
+    ):
+        return os.path.abspath(path)
+    return None
+
+
+def git_commit(tree: str) -> str | None:
+    """Short commit hash of `tree`, or None when it is not a git checkout.
+
+    `safe.directory=*` because CI hands the tree to the build across an
+    ownership boundary (the community-extensions Linux leg clones on the host
+    and builds inside a container), where git otherwise refuses it outright.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-c", "safe.directory=*", "-C", tree, "rev-parse", "--short=10", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return out.stdout.strip() or None
+
+
+def git_exact_tag(tree: str) -> str | None:
+    """The release tag `tree` is checked out at, or None."""
+    try:
+        out = subprocess.run(
+            ["git", "-c", "safe.directory=*", "-C", tree, "describe", "--tags", "--exact-match"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    tag = out.stdout.strip()
+    return tag if RELEASE_LABEL_RE.match(tag) else None
+
+
+def tree_label(tree: str) -> tuple[str | None, str]:
+    """The version label to build `tree` with, and where it came from.
+
+    The library reports this label as its version, and the extension refuses
+    any host reporting another, so it has to be what the release build of the
+    same source says. DuckDB's CMake takes it from `DUCKDB_VERSION` or
+    `OVERRIDE_GIT_DESCRIBE`, and otherwise makes up a `-devN` label from
+    `release_version.txt` and the commit count -- even for a checkout of a
+    release tag. So:
+
+    1. a harness label that is a release label (`v2.0.0`, `v2.0.0-alpha47600`)
+       is used as is;
+    2. otherwise a release tag the tree is checked out at (community-extensions
+       sets `DUCKDB_VERSION` to a commit SHA, which CMake would stamp verbatim);
+    3. otherwise CMake's own `-devN` label (None): a development tree is no
+       release, and its build loads in no released DuckDB, only in one built
+       from the same commit.
+    """
+    for name in ("DUCKDB_VERSION", "OVERRIDE_GIT_DESCRIBE"):
+        value = os.environ.get(name, "").strip()
+        if RELEASE_LABEL_RE.match(value):
+            return value, f"{name}={value}"
+    tag = git_exact_tag(tree)
+    if tag:
+        return tag, f"the tree is checked out at {tag}"
+    return None, "not a release: CMake labels it from release_version.txt"
+
+
+def download_sdist(pypi: str, archive: str) -> None:
+    """Download the sdist of the `duckdb` release `pypi` from PyPI to `archive`."""
+    url = f"https://pypi.org/pypi/duckdb/{pypi}/json"
+    log(f"looking up the duckdb {pypi} sdist ({url})")
+    try:
+        with urllib.request.urlopen(url) as resp:
+            meta = json.load(resp)
+    except OSError as exc:
+        fail(f"could not read {url} ({exc})")
+    sdists = [u for u in meta.get("urls", []) if u.get("packagetype") == "sdist"]
+    if not sdists:
+        fail(f"duckdb {pypi} has no sdist on PyPI")
+    log(f"downloading {sdists[0]['url']}")
+    try:
+        urllib.request.urlretrieve(sdists[0]["url"], archive)
+    except OSError as exc:
+        fail(f"could not download {sdists[0]['url']} ({exc})")
+
+
+def extract_engine(pypi: str, dest: str, sdist: str | None) -> None:
+    """Extract the engine source (`external/duckdb`) of the sdist into `dest`.
+
+    `sdist` is a local copy of the archive; without one it comes from PyPI.
+    """
+    with tempfile.TemporaryDirectory(prefix="dd-engine-") as tmp:
+        archive = sdist or os.path.join(tmp, "sdist.tar.gz")
+        if not sdist:
+            download_sdist(pypi, archive)
+        with tarfile.open(archive) as tar:
+            prefix = None
+            members = []
+            for member in tar.getmembers():
+                parts = member.name.split("/")
+                if len(parts) > 2 and parts[1:3] == ["external", "duckdb"]:
+                    prefix = "/".join(parts[:3]) + "/"
+                    members.append(member)
+            if not prefix:
+                fail(f"the duckdb {pypi} sdist has no external/duckdb engine source")
+            for member in members:
+                member.name = member.name[len(prefix) :]
+            members = [m for m in members if m.name]
+            tar.extractall(tmp + "/src", members=members, filter="data")
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.move(os.path.join(tmp, "src"), dest)
+
+
+def configure_engine(src: str, build: str, env: dict[str, str]) -> str:
+    """Configure the engine build; return the label CMake stamps into it."""
+    generator = ["-G", "Ninja"] if shutil.which("ninja") else []
+    configure = [
+        "cmake",
+        "-S",
+        src,
+        "-B",
+        build,
+        *generator,
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DBUILD_SHELL=0",
+        "-DBUILD_UNITTESTS=0",
+        "-DENABLE_UNITTEST_CPP_TESTS=0",
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+    ]
+    log("configuring: " + " ".join(configure))
+    try:
+        out = subprocess.run(
+            configure, env=env, check=True, capture_output=True, text=True
+        ).stdout
+    except FileNotFoundError:
+        fail("cmake is not on PATH; it is needed to build the DuckDB engine")
+    except subprocess.CalledProcessError as exc:
+        fail(f"cmake configure failed:\n{exc.stdout}\n{exc.stderr}")
+    m = CMAKE_VERSION_RE.search(out)
+    if not m:
+        fail("could not find the engine version in the cmake configure output")
+    return m.group(1)
+
+
+def build_engine(build: str, env: dict[str, str]) -> None:
+    """Build the configured engine's `duckdb_static` target."""
+    jobs = str(os.cpu_count() or 2)
+    command = [
+        "cmake", "--build", build, "--target", "duckdb_static",
+        "--config", "Release", "--parallel", jobs,
+    ]
+    log("building (the first build takes a while): " + " ".join(command))
+    try:
+        subprocess.run(command, env=env, check=True)
+    except subprocess.CalledProcessError as exc:
+        fail(f"the engine build failed ({exc})")
+
+
+def static_libraries(build: str) -> list[str]:
+    """`duckdb_static` first, then the third-party libraries it depends on."""
+
+    def find(pattern: str) -> list[str]:
+        hits = []
+        for ext in ("a", "lib"):
+            hits += glob.glob(os.path.join(build, "**", f"{pattern}.{ext}"), recursive=True)
+        return sorted(hits)
+
+    core = find("libduckdb_static") + find("duckdb_static")
+    if len(core) != 1:
+        fail(f"expected one duckdb_static library under {build}, found {core}")
+    third_party = [
+        lib
+        for lib in find(os.path.join("third_party", "**", "*duckdb_*"))
+        if not any(skip in os.path.basename(lib) for skip in THIRD_PARTY_SKIP)
+    ]
+    return core + third_party
+
+
+def include_dirs(src: str) -> list[str]:
+    """The engine's headers plus every third-party include directory."""
+    dirs = [os.path.join(src, "src", "include")]
+    third_party = os.path.join(src, "third_party")
+    for name in sorted(os.listdir(third_party)):
+        path = os.path.join(third_party, name)
+        if not os.path.isdir(path):
+            continue
+        dirs.append(path)
+        if os.path.isdir(os.path.join(path, "include")):
+            dirs.append(os.path.join(path, "include"))
+    return dirs
+
+
+def render_manifest(engine_id: str, label: str, includes: list[str], libs: list[str]) -> str:
+    lines = [f"id {engine_id}", f"version {label}"]
+    lines += [f"include {path}" for path in includes]
+    lines += [f"lib {path}" for path in libs]
+    return "\n".join(lines) + "\n"
+
+
+def install_manifest(root: str, text: str) -> bool:
+    path = os.path.join(root, MANIFEST)
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as fh:
+            if fh.read() == text:
+                return False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    partial = path + ".partial"
+    with open(partial, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(partial, path)
+    return True
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--repo-root", default=DEFAULT_ROOT, help="repository root")
+    ap.add_argument("--version", help="target DuckDB version (default: .duckdb-version)")
+    ap.add_argument(
+        "--src-dir",
+        default="duckdb",
+        help="engine source tree to build; '' disables the source-tree path",
+    )
+    ap.add_argument("--force", action="store_true", help="rebuild even when cached")
+    ap.add_argument("--sdist", help="a local duckdb sdist to build instead of PyPI's")
+    args = ap.parse_args(argv)
+
+    root = os.path.abspath(args.repo_root)
+    version = args.version or read_pin(root, ".duckdb-version")
+    if not version:
+        fail("no target version: pass --version or create .duckdb-version")
+
+    tree = engine_source_tree(root, args.src_dir)
+    env = dict(os.environ)
+    env.pop("OVERRIDE_GIT_DESCRIBE", None)
+    # A tree with no commit has no identity to cache under, so it is rebuilt
+    # every time rather than served a build of whatever was there before.
+    cacheable = True
+    if tree:
+        commit = git_commit(tree)
+        cacheable = commit is not None
+        label, evidence = tree_label(tree)
+        if label:
+            env["DUCKDB_VERSION"] = label
+        else:
+            env.pop("DUCKDB_VERSION", None)
+        engine_id = f"src-{label or 'dev'}-{commit or 'unidentified'}-{LAYOUT}"
+        log(f"engine source tree: {tree} (commit {commit or 'unknown'}; {evidence})")
+    else:
+        env["DUCKDB_VERSION"] = version
+        engine_id = f"{version}-{LAYOUT}"
+    cache = os.path.join(root, ".engine", engine_id)
+    src = tree or os.path.join(cache, "src")
+    stamp = os.path.join(cache, "manifest")
+
+    if os.path.exists(stamp) and cacheable and not args.force:
+        with open(stamp, encoding="utf-8") as fh:
+            manifest = fh.read()
+    else:
+        if not tree:
+            if args.force or not os.path.isdir(src):
+                shutil.rmtree(src, ignore_errors=True)
+                extract_engine(pypi_version(root, version), src, args.sdist)
+        build = os.path.join(cache, "build")
+        label = configure_engine(src, build, env)
+        # Checked before the (long) build: the label is settled at configure.
+        if not tree and label != version:
+            fail(
+                f"the engine in the duckdb {pypi_version(root, version)} sdist "
+                f"labels itself {label}, but this extension targets {version} "
+                "(.duckdb-version). Fix .duckdb-pypi-version or .duckdb-version."
+            )
+        build_engine(build, env)
+        lib_dir = os.path.join(cache, "lib")
+        shutil.rmtree(lib_dir, ignore_errors=True)
+        os.makedirs(lib_dir)
+        libs = []
+        for lib in static_libraries(build):
+            dest = os.path.join(lib_dir, os.path.basename(lib))
+            shutil.copyfile(lib, dest)
+            libs.append(dest)
+        manifest = render_manifest(engine_id, label, include_dirs(src), libs)
+        # The libraries are copied out, so the object files can go; the cache
+        # keeps only what a link needs.
+        shutil.rmtree(build, ignore_errors=True)
+        with open(stamp, "w", encoding="utf-8") as fh:
+            fh.write(manifest)
+        log(f"cached {cache}")
+
+    changed = install_manifest(root, manifest)
+    label = manifest.splitlines()[1].removeprefix("version ")
+    log(f"{'installed' if changed else 'already current'}: {MANIFEST} ({label}, {engine_id})")
+    if label != version:
+        log(
+            f"NOTE: this engine is {label}, not {version} (.duckdb-version); the "
+            f"extension will load only in DuckDB {label}"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
