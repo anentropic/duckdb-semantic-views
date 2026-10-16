@@ -244,6 +244,14 @@ fn main() {
             .include(spec.include)
             .warnings(false); // Suppress warnings from DuckDB amalgamation
 
+        // cl (and clang-cl) compile C++ without exception unwinding unless told,
+        // so a DuckDB exception thrown through a frame would skip its destructors;
+        // DuckDB's own CMake build gets /EHsc from CMake's defaults. shim.cpp
+        // refuses to compile without it.
+        if std::env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|env| env == "msvc") {
+            build.flag("/EHsc");
+        }
+
         // Substitute the patched duckdb.cpp path on Windows; other files come from spec.
         for file in &spec.files {
             if *file == "cpp/include/duckdb.cpp" {
