@@ -771,7 +771,7 @@ The `just release` recipe automates steps 3-7 below:
 
 This will:
 - Verify you're on `main` with a clean working tree and `gh` CLI installed
-- Extract the version from `Cargo.toml` and the current commit SHA
+- Extract the version from `Cargo.toml` and the commit its `v<version>` tag points at (`scripts/registry_target.py release-sha`; it refuses when the tag is missing). Not `HEAD`: `main` may have moved past the release, as it had when v0.14.0's registry PR was first opened
 - Update `description.yml` with the new `ref` and `version`, and commit
 - In the CE fork (default: `~/Documents/Dev/Sources/community-extensions`, override with `CE_REPO` env var): ensure an `upstream` remote, `git fetch upstream main`, and **rebranch `semantic-views` off `upstream/main`** so the PR is a clean one-file change, then copy in `description.yml`, commit, and **force-push**
 - Open a PR to `duckdb/community-extensions` (or report the existing open one, which the force-push updates in place)

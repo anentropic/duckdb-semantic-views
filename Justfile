@@ -476,12 +476,13 @@ release:
       exit 1
     fi
     # --- Extract values ---
-    SHA=$(git rev-parse HEAD)
     VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
     if [ -z "$VERSION" ]; then
       echo "ERROR: could not extract version from Cargo.toml" >&2
       exit 1
     fi
+    # The tagged release, not HEAD: main may have moved on since the tag.
+    SHA=$(python3 scripts/registry_target.py release-sha "$VERSION")
     # --- Which description.yml key the registry builds our DuckDB pin from ---
     TMP=$(mktemp -d)
     gh api repos/duckdb/community-extensions/contents/.github/workflows/build.yml --jq '.content' | base64 -d > "$TMP/build.yml"
