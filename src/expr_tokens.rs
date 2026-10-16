@@ -125,8 +125,10 @@ impl IdentRef<'_> {
 /// whitespace; a part is either a bare run of identifier bytes
 /// ([`crate::util::is_ident_byte`] — ASCII alphanumerics, `_`, and every
 /// non-ASCII byte, so Unicode identifiers scan intact) or a `"…"` quoted part
-/// (with `""` escape). The returned spans are non-overlapping and tile the
-/// non-literal identifier text.
+/// (with `""` escape). The returned spans are non-overlapping. Together with
+/// [`scan_function_heads`] they tile the non-literal identifier text, except
+/// for the words in a keyword position, which neither returns (COR-3: see
+/// [`scan_chains`]).
 ///
 /// A chain immediately followed by `(` (skipping whitespace) is a **function
 /// call**, not a name reference (`SUM(x)`, `date_trunc (...)`), and is not
@@ -139,7 +141,8 @@ pub(crate) fn scan_references(expr: &str) -> Vec<IdentRef<'_>> {
 
 /// Which class of identifier chain a scan collects: [`scan_references`] keeps
 /// the chains that are *not* function-call heads; [`scan_function_heads`] keeps
-/// the ones that *are*. Every chain is exactly one of the two.
+/// the ones that *are*. Every chain is at most one of the two; a chain in a
+/// keyword position (a cast's type, an `INTERVAL` unit, …) is neither.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ChainKind {
     /// A name reference — a chain not immediately followed by `(`.
@@ -200,6 +203,17 @@ fn scan_chains(expr: &str, kind: ChainKind) -> Vec<IdentRef<'_>> {
             }
             _ if b == b'"' || crate::util::is_ident_byte(b) => {
                 let end = scan_chain(bytes, i);
+                let raw = &expr[i..end];
+                // COR-3: an INTERVAL literal's unit (`INTERVAL '1' DAY`, and
+                // `INTERVAL'1' DAY` with no space) is marked before the
+                // typed-literal rules below swallow the `INTERVAL` keyword itself.
+                if raw.eq_ignore_ascii_case("interval") {
+                    if let Some(unit) = interval_unit_start(bytes, end) {
+                        keyword_at.push(unit);
+                        i = end;
+                        continue;
+                    }
+                }
                 // PARSE-12 (code-review 2026-08-08): a chain IMMEDIATELY
                 // followed by `'` is a literal's introducer, not a name — the
                 // escape-string forms `e'…'` / `E'…'` (PARSE-7 made them
@@ -219,26 +233,20 @@ fn scan_chains(expr: &str, kind: ChainKind) -> Vec<IdentRef<'_>> {
                     i = skip_single_quoted(bytes, end);
                     continue;
                 }
-                let raw = &expr[i..end];
-                // COR-3: an INTERVAL literal's unit (`INTERVAL '1' DAY`) is
-                // marked before the typed-literal rule below swallows the
-                // `INTERVAL` keyword itself.
-                if raw.eq_ignore_ascii_case("interval") {
-                    if let Some(unit) = interval_unit_start(bytes, end) {
-                        keyword_at.push(unit);
-                        i = end;
-                        continue;
-                    }
-                }
                 // COR-3: PARSE-12's rule holds with whitespace between too —
-                // `DATE '…'` is the usual spelling of a typed literal. In a valid
-                // expression a NAME is never followed directly by a string
-                // literal, so the chain is a type or a keyword (`LIKE '…'`)
-                // either way, never a reference. The string itself is left to
-                // the walk: it is not an escape string, and the skipper's
-                // adjacency test agrees.
-                if bytes.get(skip_whitespace(bytes, end)) == Some(&b'\'') || keyword_at.contains(&i)
-                {
+                // `DATE '…'` is the usual spelling of a typed literal — and for
+                // every word of a multi-word type (`TIMESTAMP WITH TIME ZONE '…'`,
+                // `DOUBLE PRECISION '…'`). In a valid expression a NAME is never
+                // followed directly by a string literal, so the chain is a type
+                // or a keyword (`LIKE '…'`) either way, never a reference. The
+                // string itself is left to the walk: it is not an escape string,
+                // and the skipper's adjacency test agrees.
+                let type_end = skip_type_name_words(bytes, end);
+                if bytes.get(skip_whitespace(bytes, type_end)) == Some(&b'\'') {
+                    i = type_end;
+                    continue;
+                }
+                if keyword_at.contains(&i) {
                     i = end;
                     continue;
                 }
@@ -281,9 +289,11 @@ fn scan_chains(expr: &str, kind: ChainKind) -> Vec<IdentRef<'_>> {
 /// source order, skipping single-quoted and `$tag$…$tag$` literal content
 /// exactly as [`scan_references`] does.
 ///
-/// This is the exact complement of [`scan_references`]: every identifier chain
-/// in an expression is classified as *either* a name reference (returned there)
-/// *or* a call head (returned here), never both and never neither. It is the
+/// This is the complement of [`scan_references`] over the chains outside
+/// keyword positions: such a chain is *either* a name reference (returned
+/// there) *or* a call head (returned here), never both. A chain in a keyword
+/// position (COR-3: a cast's type, a typed literal's type, an `EXTRACT` field,
+/// an `INTERVAL` unit, `AT TIME ZONE`) is in neither result. It is the
 /// engine primitive behind aggregate-function detection — matching the last
 /// part of each head against a known-aggregate set — so that detection shares
 /// the tokenizer's literal handling (a `sum(` inside `'…'` is not a call) and
@@ -346,6 +356,19 @@ const TYPE_NAME_CONTINUATIONS: &[&[&str]] = &[
     &["without", "time", "zone"],
     &["array"],
 ];
+
+/// COR-3: for a chain ending at `end`, the offset just past the words that
+/// continue it as a multi-word type name (`end` itself when none do).
+fn skip_type_name_words(bytes: &[u8], end: usize) -> usize {
+    let mut end = end;
+    while let Some(next) = TYPE_NAME_CONTINUATIONS
+        .iter()
+        .find_map(|words| match_words(bytes, skip_whitespace(bytes, end), words))
+    {
+        end = next;
+    }
+    end
+}
 
 /// COR-3: skip a type name starting at `start` — a cast's target type — and
 /// return the offset just past it. A type is a chain (bare, quoted or
@@ -1051,6 +1074,40 @@ mod tests {
         assert_eq!(inline_references(expr, &m), expr);
         assert_eq!(keys("x > TIMESTAMP\n  '2020-01-01 00:00'"), vec!["x"]);
         assert_eq!(keys("ts + INTERVAL '1 day'"), vec!["ts"]);
+    }
+
+    #[test]
+    fn a_multi_word_typed_literal_type_is_not_a_reference() {
+        // Review of #267: every word of a multi-word type is the literal's
+        // type, not just the one before the quote.
+        assert_eq!(
+            keys("ts > TIMESTAMP WITH TIME ZONE '2020-01-01 00:00:00+00'"),
+            vec!["ts"]
+        );
+        assert_eq!(keys("x = DOUBLE PRECISION '1.5'"), vec!["x"]);
+        assert_eq!(keys("x = CHARACTER VARYING 'x'"), vec!["x"]);
+        assert_eq!(keys("t = TIME WITHOUT TIME ZONE '10:00'"), vec!["t"]);
+        assert_eq!(
+            keys("ts > TIMESTAMP WITH TIME ZONE'2020-01-01'"),
+            vec!["ts"]
+        );
+        let expr = "ts > TIMESTAMP WITH TIME ZONE '2020-01-01 00:00:00+00'";
+        let mut m: HashMap<String, &str> = HashMap::new();
+        m.insert("time".to_string(), "(o.t)");
+        assert_eq!(inline_references(expr, &m), expr);
+    }
+
+    #[test]
+    fn the_unit_of_an_abutting_interval_literal_is_not_a_reference() {
+        // Review of #267: `INTERVAL'1' DAY` (no space before the quote) is the
+        // same literal as `INTERVAL '1' DAY`.
+        assert_eq!(keys("ts + INTERVAL'1' DAY"), vec!["ts"]);
+        let mut m: HashMap<String, &str> = HashMap::new();
+        m.insert("day".to_string(), "(o.ts::DATE)");
+        assert_eq!(
+            inline_references("ts < INTERVAL'1' DAY", &m),
+            "ts < INTERVAL'1' DAY"
+        );
     }
 
     #[test]

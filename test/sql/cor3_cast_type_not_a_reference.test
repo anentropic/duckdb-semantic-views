@@ -37,12 +37,13 @@ INSERT INTO cor3_sales VALUES
     (2, 'b', '\x42'::BLOB, TIMESTAMP '2021-06-01 12:30:00', 20);
 
 # Facts named `blob` and `date`, like the type names the predicates and the
-# `day` dimension cast to; dimensions named `day` and `year`, like an INTERVAL
-# unit and an EXTRACT field.
+# `day` dimension cast to, and `double`, like the first word of a multi-word
+# type; dimensions named `day` and `year`, like an INTERVAL unit and an EXTRACT
+# field.
 statement ok
 CREATE SEMANTIC VIEW cor3_v AS
 TABLES (s AS cor3_sales PRIMARY KEY (id))
-FACTS (s.blob AS s.payload, s.date AS s.ts)
+FACTS (s.blob AS s.payload, s.date AS s.ts, s.double AS s.qty)
 DIMENSIONS (s.name AS s.name, s.day AS s.ts::DATE, s.year AS EXTRACT(year FROM s.ts))
 METRICS (s.total AS SUM(s.qty))
 
@@ -103,6 +104,20 @@ SELECT * FROM semantic_view('cor3_v', dimensions := ['name'], metrics := ['total
     where_clause := $$ts < TIMESTAMP '2020-01-01' + INTERVAL 1 DAY$$)
 ----
 a	10
+
+# The same unit with no space between INTERVAL and its string.
+query TI
+SELECT * FROM semantic_view('cor3_v', dimensions := ['name'], metrics := ['total'],
+    where_clause := $$ts < TIMESTAMP '2020-01-01' + INTERVAL'1' DAY$$)
+----
+a	10
+
+# Every word of a multi-word typed literal's type, next to a fact named `double`.
+query TI
+SELECT * FROM semantic_view('cor3_v', dimensions := ['name'], metrics := ['total'],
+    where_clause := $$qty > DOUBLE PRECISION '15'$$)
+----
+b	20
 
 # Control: the member as the cast's OPERAND still resolves.
 query TI
