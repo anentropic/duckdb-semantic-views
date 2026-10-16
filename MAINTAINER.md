@@ -754,7 +754,9 @@ Key fields:
 > Monitor, which still checks out and opens its PR with `VERSION_MONITOR_PAT`, fails at
 > `actions/checkout` with `could not read Username for 'https://github.com'`.
 >
-> The app must be installed on the fork with Contents set to read and write. The v0.14.0 and
+> The app must be installed on the fork with Contents and Workflows set to read and write
+> (Workflows because the branch is cut from upstream `main` and can carry workflow-file changes
+> the fork lacks). `CE_PUBLISH_PAT` should be a classic PAT with `public_repo`. The v0.14.0 and
 > v0.14.1 runs both failed with `Permission to anentropic/community-extensions.git denied` after
 > tagging, when the push still used the PAT, so the workflow now checks this first: a
 > **preflight** step runs `git push --dry-run` to the fork with the app token before anything is
@@ -764,8 +766,8 @@ Key fields:
 > publishes the version already on `main` from its existing tag, checking that `description.yml`
 > points at it, and bumps, rolls and tags nothing. Never re-run a normal publish after its
 > "Commit, tag, and push" step succeeded: it would cut another version. If an open PR from the
-> fork's `semantic-views` branch already exists, the force-push updates it and no second PR is
-> opened.
+> fork's `semantic-views` branch already exists, the force-push updates it, the workflow retitles
+> it for the new version, and no second PR is opened.
 >
 > The registry-pin gate and the descriptor update use `scripts/registry_target.py`, guarded by
 > `tests/registry_target_script.rs`. The registry builds its default DuckDB (`DUCKDB_LATEST_STABLE`
