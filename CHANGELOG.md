@@ -27,6 +27,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   v0.14.0 that left a background thread running against freed memory, which crashed the
   process with an access violation soon afterwards. Errors now clean up as they do on Linux
   and macOS.
+- **A member named like a SQL type or keyword no longer breaks expressions that use that
+  word.** With a fact named `blob`, a `where_clause` such as `blob = '\x41'::BLOB` failed
+  with a parser error, because the `BLOB` type was replaced with the fact's expression. The
+  same happened to the type in `CAST(… AS type)`, the type of a literal written as
+  `DATE '2020-01-01'`, the field in `EXTRACT(year FROM …)`, the unit in `INTERVAL 1 DAY`, and
+  `AT TIME ZONE`, whenever a dimension, fact or metric had that name. This affected
+  `where_clause` predicates and member expressions in a view definition, such as a
+  `ts::DATE` dimension in a view with a fact named `date`. These words are now left alone.
 
 ## [0.14.0] - 2026-10-15
 

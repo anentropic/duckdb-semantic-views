@@ -583,6 +583,18 @@ mod tests {
     }
 
     #[test]
+    fn a_member_named_like_a_cast_type_does_not_replace_the_type() {
+        // COR-3 (semolina review 2026-10-16): a `bytes` filter renders as
+        // `blob = '\x41'::BLOB`; with a fact named `blob` the type was spliced
+        // too, giving `(o.payload) = '\x41'::(o.payload)` — a parser error.
+        let def = def().with_fact("blob", "o.payload", "o");
+        let r = resolve_where_clause("v", &def, "blob = '\\x41'::BLOB").unwrap();
+        assert_eq!(r.sql, "(o.payload) = '\\x41'::BLOB");
+        let r = resolve_where_clause("v", &def, "blob = CAST('A' AS blob)").unwrap();
+        assert_eq!(r.sql, "(o.payload) = CAST('A' AS blob)");
+    }
+
+    #[test]
     fn a_metric_name_inside_a_string_literal_does_not_trigger_rejection() {
         let r = resolve_where_clause("v", &def(), "region = 'revenue'").unwrap();
         assert_eq!(r.sql, "(c.region) = 'revenue'");
