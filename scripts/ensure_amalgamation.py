@@ -18,8 +18,10 @@ Two sources, in priority order:
    `scripts/amalgamation.py`. This is what makes an alternative distribution
    build correctly: Haybarn's fork diverges from upstream in headers the shim
    compiles against, so an upstream amalgamation would silently bake the wrong
-   layouts into the binary. Upstream community-extensions supplies no tree for a
-   C-API extension, so its builds take path 2.
+   layouts into the binary. Upstream community-extensions checks an engine tree
+   out at `./duckdb` too, and since its default moved to DuckDB's development
+   branch that tree is past the release this extension targets. Such a tree is
+   refused below, rather than trusted as the release its last tag names.
 2. **The pinned upstream release** (`--url`), downloaded and cached. This is
    the local-developer and upstream-CI path, unchanged from before.
 
@@ -65,6 +67,10 @@ DEFAULT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FILES = ("duckdb.hpp", "duckdb.cpp")
 STAMP_NAME = ".amalgamation_id"
 VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+# The `-<commits>-g<sha>` suffix `git describe` adds when a tree is past its tag.
+DISTANCE_RE = re.compile(r"-(\d+)-g[0-9a-f]+$")
+# An upstream release tag, as opposed to a fork's (`haybarn-v1.5.5-rc1`).
+UPSTREAM_TAG_RE = re.compile(r"v\d+\.\d+\.\d+(-\d+-g[0-9a-f]+)?$")
 # Stamp written when an install cannot be identified (an engine tree that is not
 # a git checkout). It never matches a computed identity, so such a tree is
 # regenerated on every build; what it does is mark the install as "known to be
@@ -154,8 +160,22 @@ def core_version(label: str) -> str | None:
     return f"v{m.group(1)}.{m.group(2)}.{m.group(3)}" if m else None
 
 
-def engine_tree_release(tree: str) -> tuple[str | None, str]:
-    """Which DuckDB release `tree` is based on, and the evidence for it.
+def commits_past_tag(label: str) -> int:
+    """How many commits a label is past an upstream `vX.Y.Z` tag; 0 at the tag.
+
+    `v1.5.6-15774-gb15358c371d` -> 15774 (DuckDB's development branch);
+    `v1.5.5-0-g105edd31b5` and `v1.5.5` -> 0. A fork's tag is never counted:
+    its nightly (`haybarn-v1.5.5-rc1-42-g<sha>`) is past its own tag without
+    leaving the upstream release it is based on.
+    """
+    if not UPSTREAM_TAG_RE.match(label):
+        return 0
+    m = DISTANCE_RE.search(label)
+    return int(m.group(1)) if m else 0
+
+
+def engine_tree_release(tree: str) -> tuple[str | None, int, str]:
+    """Which DuckDB release `tree` is based on, how far past it, and the evidence.
 
     This has to come from the tree itself, and never from the amalgamation it
     produces: the generator takes the label it stamps into `DUCKDB_VERSION` from
@@ -165,11 +185,19 @@ def engine_tree_release(tree: str) -> tuple[str | None, str]:
     """
     override = os.environ.get("OVERRIDE_GIT_DESCRIBE", "").strip()
     if override:
-        return core_version(override), f"OVERRIDE_GIT_DESCRIBE={override}"
+        return (
+            core_version(override),
+            commits_past_tag(override),
+            f"OVERRIDE_GIT_DESCRIBE={override}",
+        )
     described = git_output(tree, "describe", "--tags")
     if described:
-        return core_version(described), f"`git describe --tags` = {described}"
-    return None, "no OVERRIDE_GIT_DESCRIBE, and not a tagged git checkout"
+        return (
+            core_version(described),
+            commits_past_tag(described),
+            f"`git describe --tags` = {described}",
+        )
+    return None, 0, "no OVERRIDE_GIT_DESCRIBE, and not a tagged git checkout"
 
 
 def read_stamp(include_dir: str) -> str | None:
@@ -324,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
 
     tree = engine_source_tree(root, args.src_dir)
     if tree:
-        claimed, evidence = engine_tree_release(tree)
+        claimed, past, evidence = engine_tree_release(tree)
         if claimed is None:
             fail(
                 f"cannot tell which DuckDB release the engine tree {tree} is based on "
@@ -341,6 +369,17 @@ def main(argv: list[str] | None = None) -> int:
                 "will load it is not supported.\n"
                 "  Point --src-dir at a matching engine checkout, or update "
                 ".duckdb-version."
+            )
+        if past:
+            # A development tree names its last tag but is not that release:
+            # DuckDB's main branch describes itself as v1.5.6-15774-g<sha>.
+            fail(
+                f"the engine tree {tree} is {past} commit{'s' if past != 1 else ''} past "
+                f"{claimed} ({evidence}), so it is a development tree, not the {version} "
+                "release this extension targets (.duckdb-version).\n"
+                "  Building the C++ shim against a different DuckDB than the one that "
+                "will load it is not supported.\n"
+                f"  Point --src-dir at a checkout of the {version} tag."
             )
         commit = git_commit(tree)
         # Keyed on the target version as well as the commit: the version is an

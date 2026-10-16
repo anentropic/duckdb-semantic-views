@@ -430,6 +430,115 @@ fn a_mismatched_engine_tree_is_fatal() {
     );
 }
 
+/// Adds a commit on top of the planted engine tree's tag, so `git describe` reads
+/// `<tag>-1-g<sha>`: a tree that is *past* the release, as DuckDB's main branch is.
+fn commit_past_the_tag(root: &Path) {
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "past the release",
+        ])
+        .current_dir(root.join("duckdb"))
+        .output()
+        .expect("run git (is it on PATH?)");
+    assert!(
+        status.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+}
+
+/// A development tree past the release tag is not the release. DuckDB's main
+/// branch describes itself as `v1.5.6-15774-gb15358c371d`; reading only the
+/// `v1.5.6` out of that let the 2.0 dev tree through as v1.5.6, and the build then
+/// failed later on a missing amalgamation instead of saying which engine it got.
+#[test]
+fn an_engine_tree_past_the_release_tag_is_refused() {
+    let root = script_project("engine-past-tag");
+    plant_git_engine_tree(&root, &target_version(), None);
+    commit_past_the_tag(&root);
+
+    let out = run_script(&root, &["--url", "file:///nonexistent.zip"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a tree past the release tag must fail"
+    );
+    assert!(
+        stderr.contains("1 commit") && stderr.contains(&target_version()),
+        "the error must say the tree is past the release, got: {stderr}"
+    );
+    assert!(!root.join("cpp/include/duckdb.hpp").exists());
+}
+
+/// The same refusal when the distance comes from the harness's own label.
+#[test]
+fn a_harness_label_past_the_release_tag_is_refused() {
+    let root = script_project("engine-label-past-tag");
+    plant_engine_tree(&root, None);
+    let label = format!("{}-15774-gb15358c371d", target_version());
+
+    let out = run_script_env(
+        &root,
+        &["--url", "file:///nonexistent.zip"],
+        &[("OVERRIDE_GIT_DESCRIBE", &label)],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a label past the release tag must fail"
+    );
+    assert!(
+        stderr.contains("15774 commits"),
+        "the error must say how far past the release the tree is, got: {stderr}"
+    );
+    assert!(!root.join("cpp/include/duckdb.hpp").exists());
+}
+
+/// A fork's nightly is past its own tag (`haybarn-v1.5.5-rc1-42-g<sha>`) without
+/// leaving the upstream release it is based on, and the Makefile documents fork
+/// nightlies as supported. Only a bare upstream `vX.Y.Z` tag is held to the
+/// exact-tag rule.
+#[test]
+fn a_fork_label_past_its_own_tag_is_accepted() {
+    let root = script_project("engine-fork-nightly");
+    // A fork's own build labels its headers with the upstream release it is based on.
+    plant_engine_tree(&root, Some(&target_version()));
+    let label = format!("haybarn-{}-rc1-42-g0123456789", target_version());
+
+    run_script_env_ok(
+        &root,
+        &["--url", "file:///nonexistent.zip"],
+        &[("OVERRIDE_GIT_DESCRIBE", &label)],
+    );
+
+    assert!(read(&root.join("cpp/include/duckdb.hpp")).contains(ENGINE_MARKER));
+}
+
+/// `git describe --long` spells a tree exactly at its tag `<tag>-0-g<sha>`; that
+/// is the release, and must still be accepted.
+#[test]
+fn a_long_form_label_at_the_release_tag_is_accepted() {
+    let root = script_project("engine-label-long-form");
+    plant_engine_tree(&root, None);
+    let label = format!("{}-0-g105edd31b5", target_version());
+
+    run_script_env_ok(
+        &root,
+        &["--url", "file:///nonexistent.zip"],
+        &[("OVERRIDE_GIT_DESCRIBE", &label)],
+    );
+
+    assert!(read(&root.join("cpp/include/duckdb.hpp")).contains(ENGINE_MARKER));
+}
+
 /// An engine tree we cannot independently date — not a git checkout, and no
 /// `OVERRIDE_GIT_DESCRIBE` from the harness — must be refused rather than
 /// relabelled as the release we target. Silently stamping our own version onto

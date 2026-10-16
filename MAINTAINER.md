@@ -251,8 +251,9 @@ contract with whatever engine loads the result, so `make ensure_amalgamation`
    couple of seconds). This is what keeps an alternative distribution — e.g.
    [Haybarn](https://github.com/Query-farm-haybarn), whose fork adds fields to structs in
    the headers the shim compiles against — building against the engine that will actually
-   load the result. Upstream community-extensions supplies
-   no tree for a C-API extension, so our own builds never take this path.
+   load the result. Upstream community-extensions checks a tree out at `./duckdb` as
+   well; since its default moved to DuckDB's development branch, that tree is past our
+   release and is refused (see below); those builds need the harness pinned to the release.
 2. **The pinned upstream release** — `AMALGAMATION_URL`, the `libduckdb-src.zip` asset for
    `.duckdb-version`. This is the local-developer and upstream-CI path.
 
@@ -262,7 +263,8 @@ fails the build rather than compiling. That evidence has to come from the tree, 
 the amalgamation it produces: the generator takes the label it stamps into `DUCKDB_VERSION`
 from `OVERRIDE_GIT_DESCRIBE`, which this script sets, so checking the generated header
 would only ask the tree a question we had just answered for it. A tree with neither form of
-evidence is refused rather than relabelled. The download path is verified the same way,
+evidence is refused rather than relabelled, and so is one past its release tag
+(`v1.5.6-15774-g<sha>`, DuckDB's development branch): it names the release but is not it. The download path is verified the same way,
 against the header in the zip.
 
 Whatever the source, it is staged and validated in a temporary directory before being
