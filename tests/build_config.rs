@@ -502,6 +502,28 @@ fn a_harness_label_past_the_release_tag_is_refused() {
     assert!(!root.join("cpp/include/duckdb.hpp").exists());
 }
 
+/// A fork's nightly is past its own tag (`haybarn-v1.5.5-rc1-42-g<sha>`) without
+/// leaving the upstream release it is based on, and the Makefile documents fork
+/// nightlies as supported. Only a bare upstream `vX.Y.Z` tag is held to the
+/// exact-tag rule.
+#[test]
+fn a_fork_label_past_its_own_tag_is_accepted() {
+    let root = script_project("engine-fork-nightly");
+    plant_engine_tree(&root, None);
+    let label = format!("haybarn-{}-rc1-42-g0123456789", target_version());
+
+    let out = run_script_env(
+        &root,
+        &["--url", "file:///nonexistent.zip"],
+        &[("OVERRIDE_GIT_DESCRIBE", &label)],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("commits past"),
+        "a fork nightly must not be refused as past the release, got: {stderr}"
+    );
+}
+
 /// `git describe --long` spells a tree exactly at its tag `<tag>-0-g<sha>`; that
 /// is the release, and must still be accepted.
 #[test]
