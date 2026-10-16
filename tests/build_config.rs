@@ -509,19 +509,17 @@ fn a_harness_label_past_the_release_tag_is_refused() {
 #[test]
 fn a_fork_label_past_its_own_tag_is_accepted() {
     let root = script_project("engine-fork-nightly");
-    plant_engine_tree(&root, None);
+    // A fork's own build labels its headers with the upstream release it is based on.
+    plant_engine_tree(&root, Some(&target_version()));
     let label = format!("haybarn-{}-rc1-42-g0123456789", target_version());
 
-    let out = run_script_env(
+    run_script_env_ok(
         &root,
         &["--url", "file:///nonexistent.zip"],
         &[("OVERRIDE_GIT_DESCRIBE", &label)],
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !stderr.contains("commits past"),
-        "a fork nightly must not be refused as past the release, got: {stderr}"
-    );
+
+    assert!(read(&root.join("cpp/include/duckdb.hpp")).contains(ENGINE_MARKER));
 }
 
 /// `git describe --long` spells a tree exactly at its tag `<tag>-0-g<sha>`; that
