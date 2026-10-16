@@ -1,0 +1,118 @@
+# Resolution of an unqualified semantic-view name follows the caller's search
+# path in every read function, including the two scalars and a table function
+# that reaches DuckDB without passing through the parser override.
+#
+# The read functions now take the path from the caller's ClientContext at bind
+# (scalars: at execution), instead of a `search_path :=` argument the parser
+# override spliced into the statement text. TECH-DEBT #19 / #25.
+#
+# Setup: one view name, `v`, in two schemas, each over its own table, so which
+# definition a call resolved is visible in its output.
+
+require semantic_views
+
+statement ok
+CREATE SCHEMA sp1;
+
+statement ok
+CREATE SCHEMA sp2;
+
+statement ok
+CREATE TABLE sp1.t (id INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO sp1.t VALUES (1, 'one');
+
+statement ok
+CREATE TABLE sp2.t (id INTEGER, region VARCHAR);
+
+statement ok
+INSERT INTO sp2.t VALUES (2, 'two');
+
+statement ok
+CREATE SEMANTIC VIEW sp1.v AS TABLES (t AS sp1.t PRIMARY KEY (id)) DIMENSIONS (t.region AS region) METRICS (t.n AS COUNT(*)) COMMENT = 'from sp1';
+
+statement ok
+CREATE SEMANTIC VIEW sp2.v AS TABLES (t AS sp2.t PRIMARY KEY (id)) DIMENSIONS (t.region AS region) METRICS (t.n AS COUNT(*)) COMMENT = 'from sp2';
+
+# Neither schema is on the path: no read guesses, and the error names where
+# the view does live.
+statement error
+SELECT get_ddl('SEMANTIC_VIEW', 'v');
+----
+It exists in schemas sp1, sp2, none of which are on the current search path (main)
+
+statement ok
+SET search_path = 'sp2';
+
+# --- the two scalar functions --------------------------------------------------
+# Before: both used the no-path fallback, so with `v` in two schemas they raised
+# the ambiguity error whatever the search path said.
+
+query I
+SELECT get_ddl('SEMANTIC_VIEW', 'v') LIKE '%from sp2%';
+----
+true
+
+query I
+SELECT read_yaml_from_semantic_view('v') LIKE '%from sp2%';
+----
+true
+
+# The path is read per call, not once per connection.
+statement ok
+SET search_path = 'sp1';
+
+query I
+SELECT get_ddl('SEMANTIC_VIEW', 'v') LIKE '%from sp1%';
+----
+true
+
+query I
+SELECT read_yaml_from_semantic_view('v') LIKE '%from sp1%';
+----
+true
+
+# --- a table function the parser override never sees ----------------------------
+# With overrides off, the statement reaches DuckDB's own parser untouched, so no
+# `search_path :=` argument was ever spliced in and the call fell back to the
+# ambiguity error.
+
+statement ok
+SET allow_parser_override_extension = 'DEFAULT';
+
+query TI
+SELECT * FROM semantic_view('v', dimensions := ['region'], metrics := ['n']);
+----
+one	1
+
+query TT
+SELECT object_kind, property_value FROM describe_semantic_view('v') WHERE property = 'COMMENT';
+----
+(empty)	from sp1
+
+statement ok
+SET search_path = 'sp2';
+
+query TI
+SELECT * FROM semantic_view('v', dimensions := ['region'], metrics := ['n']);
+----
+two	1
+
+statement ok
+SET allow_parser_override_extension = 'FALLBACK';
+
+# --- an explicit path still wins -----------------------------------------------
+# Views created before this change were stored with the argument the parser
+# override spliced in, which evaluates to the same path the bind now reads. So an
+# explicit `search_path` is still accepted, and still decides.
+
+query TI
+SELECT * FROM semantic_view('v', dimensions := ['region'], metrics := ['n'], search_path := ['sp1']);
+----
+one	1
+
+query TI
+SELECT * FROM semantic_view('v', dimensions := ['region'], metrics := ['n'], search_path := list_concat(current_schemas(false), [current_schema()]));
+----
+two	1

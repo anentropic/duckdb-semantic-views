@@ -952,11 +952,11 @@ static const SvFunctionDoc *sv_function_doc(const std::string &name) {
 
 // Sentence appended to every table function that declares the `search_path`
 // named parameter, so a caller reading duckdb_functions() leaves it alone.
-// Worded to hold for the listing functions too: they declare the parameter
-// but the parser never injects it into them (`src/parse/search_path.rs`).
+// The binds read the caller's search path themselves; the parameter remains
+// because views stored by releases before 0.16 carry it in their SQL text.
 static const char *const SV_SEARCH_PATH_NOTE =
-    " The search_path parameter is reserved for the extension, which fills it "
-    "in where needed; do not pass it.";
+    " The search_path parameter is reserved (kept so views stored by earlier "
+    "releases still bind); do not pass it.";
 
 static FunctionDescription sv_base_description(const SvFunctionDoc &doc) {
     FunctionDescription desc;
@@ -2042,23 +2042,50 @@ static void sv_run_varchar_bind(ClientContext &context,
     sv_parse_varchar_payload(payload.ptr, payload.len, bd, fn_name);
 }
 
-// Serialise the caller's schema resolution order from the `search_path` named
-// parameter into the shared varchar-list wire format.
-//
-// Absent or NULL yields an empty buffer, which the Rust side reads as "no path
-// supplied" and falls back to its pre-injection rule. That matters: a table
-// function invoked directly, rather than through the parser override that
-// injects the path, must keep working.
 // Defined further down, next to the other named-parameter marshalling it
-// shares its wire format with; forward-declared here because the single-name
-// bind helper below is the first caller.
+// shares its wire format with; forward-declared here because the search-path
+// helpers below are the first callers.
 static std::vector<uint8_t> sv_serialise_string_list(const Value &list_val,
                                                      const char *param_name);
 
-static std::vector<uint8_t> sv_search_path_payload(TableFunctionBindInput &input) {
+// The caller's schema resolution order, most significant first, in the shared
+// varchar-list wire format: the schemas `SET search_path` / `USE` put on the
+// path, then the current schema. That is what
+// `list_concat(current_schemas(false), [current_schema()])` evaluates to, the
+// expression the parser override used to splice into every read call (#19 /
+// #25). It is read off the caller's `ClientContext`, a plain field read that
+// takes no lock, so it works from a bind or a scalar's execution alike, and
+// for calls that never pass through the parser override.
+//
+// `current_schemas(true)` is deliberately not mirrored: it prepends the temp
+// schema, itself named `main`, which would shadow a real schema of that name.
+static std::vector<uint8_t> sv_caller_search_path(ClientContext &context) {
+#ifdef SV_DUCKDB_2
+    auto &search_path = ClientData::Get(context).catalog_search_path;
+    vector<Value> schemas;
+    for (const auto &entry : search_path->GetSetPaths()) {
+        schemas.emplace_back(entry.GetSchema());
+    }
+    schemas.emplace_back(search_path->GetDefault().GetSchema());
+    return sv_serialise_string_list(Value::LIST(LogicalType::VARCHAR, std::move(schemas)),
+                                    "search_path");
+#else
+    // v1.5's amalgamation only forward-declares ClientData; the Rust side reads
+    // an empty buffer as "no path" and falls back to the unique match.
+    (void)context;
+    return {};
+#endif
+}
+
+// A table function's resolution order: an explicit `search_path` argument if
+// the call carries one (a view stored by an earlier release has the spliced-in
+// expression in its text, which evaluates to the same order), else the
+// caller's search path.
+static std::vector<uint8_t> sv_search_path_payload(ClientContext &context,
+                                                   TableFunctionBindInput &input) {
     auto it = input.named_parameters.find("search_path");
     if (it == input.named_parameters.end() || it->second.IsNull()) {
-        return {};
+        return sv_caller_search_path(context);
     }
     return sv_serialise_string_list(it->second, "search_path");
 }
@@ -2083,7 +2110,7 @@ static void sv_run_varchar_bind_with_name(ClientContext &context,
                               ": view name is required (positional arg 0)");
     }
     std::string name = input.inputs[0].GetValue<std::string>();
-    std::vector<uint8_t> sp = sv_search_path_payload(input);
+    std::vector<uint8_t> sp = sv_search_path_payload(context, input);
     Connection probe(*context.db);
     SvBindCancellationScope cancellation(context, probe);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
@@ -2123,7 +2150,7 @@ static void sv_run_varchar_bool_bind_with_two_names(
     }
     std::string name1 = input.inputs[0].GetValue<std::string>();
     std::string name2 = input.inputs[1].GetValue<std::string>();
-    std::vector<uint8_t> sp = sv_search_path_payload(input);
+    std::vector<uint8_t> sp = sv_search_path_payload(context, input);
     Connection probe(*context.db);
     SvBindCancellationScope cancellation(context, probe);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
@@ -2760,6 +2787,8 @@ static void sv_get_ddl_exec(DataChunk &args, ExpressionState &state,
 
     Connection probe(*state.GetContext().db);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
+    // Read once per chunk: the path cannot change while a statement runs.
+    const std::vector<uint8_t> sp = sv_caller_search_path(state.GetContext());
 
     for (idx_t i = 0; i < args.size(); ++i) {
         // A NULL in any argument yields a NULL row, the third included: asked
@@ -2781,15 +2810,7 @@ static void sv_get_ddl_exec(DataChunk &args, ExpressionState &state,
                     borrowed,
                     reinterpret_cast<const uint8_t *>(t.GetData()), t.GetSize(),
                     reinterpret_cast<const uint8_t *>(n.GetData()), n.GetSize(),
-                    // No search path: GET_DDL / READ_YAML are SCALAR
-                    // functions, so the path cannot arrive as a named
-                    // parameter. Passing (nullptr, 0) selects the Rust side's
-                    // no-path fallback — the unique match, or an actionable
-                    // ambiguity error. Conservative rather than wrong: it never
-                    // returns another schema's definition. Tracked in
-                    // TECH-DEBT #25. (The overload below adds an *arity*, not a
-                    // named parameter, so it does not carry a path either.)
-                    nullptr, 0,
+                    sp.empty() ? nullptr : sp.data(), sp.size(),
                     qualify,
                     op, ol, eb, ebl);
             });
@@ -2811,6 +2832,7 @@ static void sv_read_yaml_from_semantic_view_exec(DataChunk &args,
 
     Connection probe(*state.GetContext().db);
     duckdb_connection borrowed = reinterpret_cast<duckdb_connection>(&probe);
+    const std::vector<uint8_t> sp = sv_caller_search_path(state.GetContext());
 
     for (idx_t i = 0; i < args.size(); ++i) {
         if (!name_validity.RowIsValid(i)) {
@@ -2824,15 +2846,7 @@ static void sv_read_yaml_from_semantic_view_exec(DataChunk &args,
                 return sv_read_yaml_from_semantic_view_exec_rust(
                     borrowed,
                     reinterpret_cast<const uint8_t *>(n.GetData()), n.GetSize(),
-                    // No search path: GET_DDL / READ_YAML are SCALAR
-                    // functions, so the path cannot arrive as a named
-                    // parameter and would need a second registered arity
-                    // (a ScalarFunctionSet overload). Passing (nullptr, 0)
-                    // selects the Rust side's no-path fallback — the unique
-                    // match, or an actionable ambiguity error. Conservative
-                    // rather than wrong: it never returns another schema's
-                    // definition. Tracked in TECH-DEBT #25.
-                    nullptr, 0,
+                    sp.empty() ? nullptr : sp.data(), sp.size(),
                     op, ol, eb, ebl);
             });
     }
@@ -2985,7 +2999,7 @@ static unique_ptr<FunctionData> sv_explain_semantic_view_bind(
     if (it_w != input.named_parameters.end() && !it_w->second.IsNull()) {
         where_clause = it_w->second.GetValue<std::string>();
     }
-    std::vector<uint8_t> sp_buf = sv_search_path_payload(input);
+    std::vector<uint8_t> sp_buf = sv_search_path_payload(context, input);
 
     Connection probe(*context.db);
     // The EXPLAIN of the expanded query binds the view's tables on `probe`, so
@@ -3427,7 +3441,7 @@ static unique_ptr<FunctionData> sv_semantic_view_bind(
     if (it_w != input.named_parameters.end() && !it_w->second.IsNull()) {
         where_clause = it_w->second.GetValue<std::string>();
     }
-    std::vector<uint8_t> sp_buf = sv_search_path_payload(input);
+    std::vector<uint8_t> sp_buf = sv_search_path_payload(context, input);
 
     Connection probe(*context.db);
     // The Rust bind types the requested members on `probe`, and a DECIMAL or

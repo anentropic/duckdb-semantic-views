@@ -964,8 +964,9 @@ pub(crate) fn foreign_database_error(
 /// connection — the reader does the I/O, this decides.
 ///
 /// `rows` is every `(schema_name, definition)` the name matched, and
-/// `search_path` the caller's resolution order (see
-/// [`crate::parse::search_path::SEARCH_PATH_SQL`] for how it reaches the read side).
+/// `search_path` the caller's resolution order, which the shim reads off the
+/// caller's context (`sv_caller_search_path`) and the write side evaluates as
+/// [`crate::catalog::writes::SEARCH_PATH_SQL`].
 ///
 /// Two cases are not a plain first-match:
 ///
