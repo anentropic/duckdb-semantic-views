@@ -343,6 +343,32 @@ def _run_metadata_probe_tests(con, csv_dir) -> bool:
     for label, sql in single:
         ok &= check_interrupted_statement(con, label, sql)
 
+    # semantic_view()'s own bind runs on a probe connection too: the Rust bind
+    # types the requested members, and a DECIMAL or LIST output adds a LIMIT 0
+    # probe of the expanded query. Both read the slow source.
+    con.execute("DROP SEMANTIC VIEW IF EXISTS mp_dec")
+    con.execute(
+        """
+        CREATE SEMANTIC VIEW mp_dec AS
+          TABLES (s AS mp_src PRIMARY KEY (id))
+          DIMENSIONS (s.x AS s.x)
+          METRICS (s.dtotal AS sum(s.x::DECIMAL(18, 2)))
+        """
+    )
+    binds = [
+        (
+            "semantic_view(<view>) bind",
+            "SELECT * FROM semantic_view('mp_one', metrics := ['total'])",
+        ),
+        (
+            "semantic_view(<view>) bind with a DECIMAL output",
+            "SELECT * FROM semantic_view('mp_dec', metrics := ['dtotal'])",
+        ),
+    ]
+    for label, sql in binds:
+        ok &= check_interrupted_statement(con, label, sql)
+    con.execute("DROP SEMANTIC VIEW mp_dec")
+
     # Cross-view: many views, each probe a fraction of the whole. The fix must
     # stop between views, not type all of them first.
     con.execute("DROP SEMANTIC VIEW mp_one")
