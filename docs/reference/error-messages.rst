@@ -196,27 +196,6 @@ Malformed quoted identifier
 **Fix:** Close the quote, or give the identifier a name. Quote only names that need it (spaces, special characters, reserved words): DuckDB matches identifiers case-insensitively whether they are quoted or not, so quoting does not change which name matches.
 
 
-.. _ref-err-one-statement:
-
-Semantic-view DDL in a multi-statement string
----------------------------------------------
-
-.. versionchanged:: 0.14.0
-
-   This case used to fail with ``parser_override is not active for this
-   connection``, which pointed at a setting that was not the problem.
-
-.. code-block:: text
-
-   semantic_views: semantic-view DDL must be sent as its own statement, one
-   statement per call. This query string also contains other statements; send
-   each statement in a separate call (a single trailing ';' is fine).
-
-**Cause:** One query string holds a semantic-view statement and at least one other statement, separated by semicolons. A typical source is a Python ``execute()`` call that runs a whole setup script at once.
-
-**Fix:** Send each statement in its own call. See :ref:`explanation-txn-ddl-one-statement` for an example.
-
-
 .. _ref-err-name-uniqueness:
 
 Duplicate or colliding names

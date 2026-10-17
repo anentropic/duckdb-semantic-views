@@ -15,6 +15,7 @@
 //! corpus is run against both while they coexist (`.planning/PEG-PARSER-EPIC.md`,
 //! Phase 3).
 
+mod create;
 mod show;
 pub(crate) mod tree;
 mod write;
@@ -60,6 +61,8 @@ impl Shape {
 ///
 /// - `RULE\t<definition>\t<shape>`: add a rule. `<shape>` is empty for a
 ///   helper rule, or names the transform's result for a statement rule.
+/// - `ANY_TOKEN\t<rule>`: match `<rule>` with `DuckDB`'s matcher for any one
+///   token short of the statement's end, instead of its body.
 /// - `PREPEND\t<rule>\t<choice>`: make `<choice>` the first alternative of
 ///   an existing `DuckDB` rule.
 pub(crate) fn changes() -> String {
@@ -70,10 +73,14 @@ pub(crate) fn changes() -> String {
         .chain(
             write::STATEMENTS
                 .iter()
+                .chain(create::STATEMENTS)
                 .map(|rule| (*rule, Shape::Statement)),
         )
         .collect();
-    let definitions = show::RULES.lines().chain(write::RULES.lines());
+    let definitions = show::RULES
+        .lines()
+        .chain(write::RULES.lines())
+        .chain(create::RULES.lines());
     for definition in definitions.map(str::trim).filter(|l| !l.is_empty()) {
         let name = definition.split_whitespace().next().unwrap_or_default();
         let shape = statements
@@ -81,6 +88,9 @@ pub(crate) fn changes() -> String {
             .find(|(rule, _)| *rule == name)
             .map_or("", |(_, shape)| shape.wire_name());
         let _ = writeln!(out, "RULE\t{definition}\t{shape}");
+    }
+    for rule in create::ANY_TOKEN {
+        let _ = writeln!(out, "ANY_TOKEN\t{rule}");
     }
     for (rule, shape) in &statements {
         let _ = writeln!(out, "PREPEND\t{}\t{rule}", shape.target());
@@ -100,6 +110,9 @@ pub(crate) fn transform(tree: &Tree) -> Result<RewriteAction, ParseError> {
     }
     if is(write::STATEMENTS) {
         return write::transform(rule, tree);
+    }
+    if is(create::STATEMENTS) {
+        return create::transform(tree);
     }
     Err(ParseError {
         message: format!("semantic_views grammar: no transform for rule '{rule}'"),
@@ -144,7 +157,15 @@ mod tests {
             );
             assert!(text.contains(&format!("PREPEND\tDescribeStatement\t{rule}\n")));
         }
-        for rule in super::write::STATEMENTS {
+        for rule in super::create::ANY_TOKEN {
+            let at = text.find(&format!("ANY_TOKEN\t{rule}\n")).unwrap();
+            let defined = text.find(&format!("RULE\t{rule} <-")).unwrap();
+            assert!(defined < at, "{rule} must be defined before its override");
+        }
+        for rule in super::write::STATEMENTS
+            .iter()
+            .chain(super::create::STATEMENTS)
+        {
             assert!(
                 text.lines()
                     .any(|l| l.starts_with(&format!("RULE\t{rule} <-"))

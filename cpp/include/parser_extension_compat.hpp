@@ -82,6 +82,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/peg/transformer/parse_result.hpp"
+#include "duckdb/parser/peg/passthrough_dialect.hpp"
 #include "duckdb/parser/peg/transformer/peg_transformer.hpp"
 #include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/parser/statement/multi_statement.hpp"

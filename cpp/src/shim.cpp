@@ -3737,7 +3737,30 @@ static void sv_wire_node(string &out, ParseResult &pr) {
     }
 }
 
-static string sv_grammar_serialise(PEGTransformer &transformer, ParseResult &pr) {
+// Whether the query the parser override recorded on this thread
+// (sv_override_query) is the one being parsed: every token is that query's
+// text at the token's offset. A transform gets only the tokens, so this is how
+// it learns the source text. With the override on, the override saw this query
+// and declined it just before the grammar ran. With it off nothing was
+// recorded, and an earlier query on this thread does not match.
+static bool sv_grammar_has_source(TokenIterator &tokens) {
+    const std::string &query = sv_override_query;
+    if (query.empty()) {
+        return false;
+    }
+    for (idx_t i = 0; i < tokens.Size(); i++) {
+        auto &tok = tokens.GetToken(i);
+        if (tok.text.empty()) {
+            continue;
+        }
+        if (tok.offset > query.size() || query.compare(tok.offset, tok.text.size(), tok.text) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static string sv_grammar_serialise(PEGTransformer &transformer, ParseResult &pr, bool has_source) {
     string out;
     sv_wire_node(out, pr);
     auto &tokens = transformer.token_iterator;
@@ -3746,14 +3769,20 @@ static string sv_grammar_serialise(PEGTransformer &transformer, ParseResult &pr)
         auto &tok = tokens.GetToken(i);
         sv_wire_u32(out, static_cast<uint32_t>(tok.offset));
         sv_wire_u32(out, static_cast<uint32_t>(tok.length));
+        out.push_back(tok.preceded_by_newline ? 1 : 0);
         sv_wire_str(out, tok.text);
     }
+    sv_wire_str(out, has_source ? sv_override_query : string());
     return out;
 }
 
-// Have Rust lower a matched statement rule to SQL, and parse the SQL.
+// Have Rust lower a matched statement rule to SQL, and parse the SQL. With the
+// source text, an error's caret is rendered into its message, as the parse stub
+// renders it, since 2.0 shows a parser error's location only on the
+// ClientContext path (TECH-DEBT #99).
 static vector<unique_ptr<SQLStatement>> sv_grammar_lower(PEGTransformer &transformer, ParseResult &pr) {
-    auto wire = sv_grammar_serialise(transformer, pr);
+    bool has_source = sv_grammar_has_source(transformer.token_iterator);
+    auto wire = sv_grammar_serialise(transformer, pr, has_source);
     SvOwnedBuffer sql_buf;
     char error_buf[1024];
     memset(error_buf, 0, sizeof(error_buf));
@@ -3761,6 +3790,9 @@ static vector<unique_ptr<SQLStatement>> sv_grammar_lower(PEGTransformer &transfo
     uint8_t rc = sv_grammar_transform_rust(reinterpret_cast<const uint8_t *>(wire.data()), wire.size(),
                                            &sql_buf.ptr, &sql_buf.len, error_buf, sizeof(error_buf), &position);
     if (rc == 1) {
+        if (position != UINT32_MAX && has_source) {
+            throw ParserException("%s", QueryErrorContext::Format(sv_override_query, string(error_buf), position));
+        }
         if (position != UINT32_MAX) {
             throw ParserException(QueryLocation(position, 0), "%s", string(error_buf));
         }
@@ -3849,6 +3881,13 @@ static vector<GrammarChange> sv_grammar_changes() {
             }
         } else if (fields.size() == 3 && fields[0] == "PREPEND") {
             changes.push_back(GrammarChange::PrependChoice(fields[1], fields[2]));
+        } else if (fields.size() == 2 && fields[0] == "ANY_TOKEN") {
+            // DuckDB's own matcher for a token it does not interpret (the
+            // passthrough dialect's): any one token short of the statement's end.
+            changes.push_back(GrammarChange::AddTerminalRuleOverride(
+                fields[1], [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
+                    return make_uniq<PassthroughTokenMatcher>();
+                }));
         } else {
             throw InternalException("semantic_views grammar: malformed change '%s'", line);
         }

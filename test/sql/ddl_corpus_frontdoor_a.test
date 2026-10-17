@@ -327,16 +327,17 @@ SELECT count(*) FROM list_semantic_views();
 ----
 0
 
-# F-013b: PRE-EXISTING (TECH-DEBT #98): a CREATE ending `; ;` is still refused with a misleading "parser_override is not active" message (the override is active) and is not run, until CREATE moves onto the grammar
-statement error
+# F-013b: a CREATE ending `; ;` runs too, through the grammar (it was refused with a misleading "parser_override is not active" until CREATE moved onto the grammar)
+statement ok
 CREATE SEMANTIC VIEW dcf_semi3 AS TABLES (t AS dcf_orders PRIMARY KEY (id)) DIMENSIONS (t.region AS region); ;
-----
-parser_override is not active
 
 query I
 SELECT count(*) FROM list_semantic_views();
 ----
-0
+1
+
+statement ok
+DROP SEMANTIC VIEW dcf_semi3;
 
 # --- DDL prefix detection: whitespace between the prefix keywords ---
 # (parse_proptest's generator also draws `\r`; the runner strips CR from the
