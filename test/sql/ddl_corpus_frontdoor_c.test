@@ -457,10 +457,11 @@ SHOW SEMANTIC METRICS IN dcf_sw LIMIT -1;
 ----
 LIMIT must be a non-negative integer, got: '-1'
 
-# F-098: show_clauses.rs::limit_rejects_negative_with_non_negative_message — a non-numeric LIMIT token is refused (near miss of F-096) [syntax]
+# F-098: show_clauses.rs::limit_rejects_negative_with_non_negative_message — a non-numeric LIMIT token is refused (near miss of F-096) [text]
 statement error
 SHOW SEMANTIC METRICS IN dcf_sw LIMIT abc;
 ----
+LIMIT must be a non-negative integer
 
 # F-099: show_clauses.rs::filter_suffix_plain_values_and_limit_unchanged — LIKE with a `%` pattern plus LIMIT 10 / LIMIT 1, and a listing with no clauses at all
 query TTTTTT nosort
@@ -493,6 +494,7 @@ SHOW SEMANTIC VIEWS STARTS WITH 'dcf_o''br';
 <REGEX>:.+	dcf_o'brien	SEMANTIC_VIEW	memory	main	(empty)
 <REGEX>:.+	dcf_o'bryan	SEMANTIC_VIEW	memory	main	(empty)
 
+# PRE-EXISTING (TECH-DEBT #96): `table_name` in SHOW SEMANTIC DIMENSIONS keeps the qualifier as written (`main.dcf_orders`)
 # F-101: show_clauses.rs::filter_suffix_escapes_single_quotes (IN SCHEMA, IN DATABASE) — a quote inside a quoted scope name reaches the predicate as data: the schema matches by its real name, a database of that shape matches nothing (no error), and the qualified <db>.<schema> form applies both halves
 query TTTTTT nosort
 SHOW SEMANTIC VIEWS IN SCHEMA "dcf_sch'ema";

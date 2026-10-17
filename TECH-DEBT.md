@@ -580,7 +580,7 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **What is wrong:**
   - A DDL statement ending in `; ;` (`DROP SEMANTIC VIEW x; ;`) is refused with "parser_override is not active", which is untrue, and is not run. DuckDB accepts `SELECT 1; ;`. (`ddl_corpus_frontdoor_a.test`, F-013.)
   - An unquoted view name containing an apostrophe (`it's_a_view`) is accepted and stored raw, though DuckDB's tokenizer reads `'s_a_view …` as a string literal. (`ddl_corpus_statements_a.test`, S-014.)
-  - An error message from the hook is cut at 1022 bytes (the C++ error buffer), so a long one loses its tail. (`ddl_corpus_create_forms.test`, S-391.)
+  - An error message from the hook is cut at 1023 bytes (the 1024-byte C++ error buffer, truncated at a UTF-8 boundary), so a long one loses its tail. S-391's name is two-byte `é`s, so it stops at 1022. (`ddl_corpus_create_forms.test`, S-391.)
   - The per-thread record of the last query outlives a query that parsed cleanly, so after `SELECT 1; /* ; DROP SEMANTIC VIEW x; */ SELECT 2`, a DDL on another connection with the override off reports "one statement per call" instead of "not active". Not pinnable in a `.test` (the runner's settings query masks it).
 - **What would finish it:** Phase 3 of the PEG epic replaces the hook with grammar productions, which take statement boundaries, identifiers and errors from DuckDB's own parser. Turn the corpus rows into the grammar's behaviour as each is retired.
 
@@ -592,7 +592,7 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 ### 96. ❌ DESCRIBE reports the wrong base table schema and name — OPEN
 
-- **Origin:** 2026-10-16, the Phase 3 DDL corpus (rows C-175, C-176 and C-184 in `ddl_corpus_body_b2.test`, F-090 in `ddl_corpus_frontdoor_c.test`).
+- **Origin:** 2026-10-16, the Phase 3 DDL corpus (rows C-175, C-176 and C-184 in `ddl_corpus_body_b2.test`, F-090 and F-101 in `ddl_corpus_frontdoor_c.test`).
 - **What is wrong:** `BASE_TABLE_SCHEMA_NAME` is the view's schema, not the table's (`src/ddl/describe.rs`, `collect_table_rows` uses `def.schema_name`), and `BASE_TABLE_NAME` keeps the qualifier and quotes as written (`main.orders`, `"Orders"`). `SHOW SEMANTIC DIMENSIONS` repeats the qualified spelling in `table_name`.
 - **What would finish it:** split the stored table reference into its parts and report each unquoted, test-first from those rows.
 
@@ -604,9 +604,9 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 ### 94. ❌ CREATE accepts a view with no tables, or with neither dimensions nor metrics — OPEN
 
-- **Origin:** 2026-10-16, the Phase 3 DDL corpus (rows B-049, B-050 and B-056 in `ddl_corpus_body_a1.test`, S-358 in `ddl_corpus_create_forms.test`).
-- **What is wrong:** three shapes create a view: `TABLES () DIMENSIONS ()` (B-056), an AS body with `DIMENSIONS () METRICS ()` (B-049), and an empty YAML definition (S-358). None of them round-trips. GET_DDL of B-056 and S-358 fails ("Legacy definition format"), and GET_DDL of B-049 renders a TABLES-only body that CREATE rejects (B-050). A TABLES-only AS body is already rejected at CREATE (S-359), which is what the decision below wants for all three.
-- **Decision:** reject both shapes at CREATE, for the AS body and the YAML forms alike: TABLES is required, and at least one of DIMENSIONS or METRICS (Paul, 2026-10-16, Snowflake parity).
+- **Origin:** 2026-10-16, the Phase 3 DDL corpus (rows B-049, B-050, B-052 and B-056 in `ddl_corpus_body_a1.test`, S-358 in `ddl_corpus_create_forms.test`).
+- **What is wrong:** four shapes create a view: `TABLES () DIMENSIONS ()` (B-056), an AS body with `DIMENSIONS () METRICS ()` (B-049) or with `METRICS ()` alone (B-052), and an empty YAML definition (S-358). None of them round-trips. GET_DDL of B-056 and S-358 fails ("Legacy definition format"), and GET_DDL of B-049 and B-052 renders a TABLES-only body that CREATE rejects (B-050). A TABLES-only AS body is already rejected at CREATE (S-359), which is what the decision below wants for all four.
+- **Decision:** reject both kinds at CREATE (no tables; neither dimensions nor metrics), for the AS body and the YAML forms alike: TABLES is required, and at least one of DIMENSIONS or METRICS (Paul, 2026-10-16, Snowflake parity).
 - **What would finish it:** the Phase 3 grammar transform enforces it, and the pinned rows become rejection tests.
 
 ### 93. ❌ The reference scanner is keyword-blind: a member named like a keyword in a position not yet taught is still spliced over it (COR-3) — OPEN
