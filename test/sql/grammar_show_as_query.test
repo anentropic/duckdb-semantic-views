@@ -146,6 +146,71 @@ SELECT name FROM (SHOW SEMANTIC VIEWS LIKE 'gq%' IN SCHEMA main STARTS WITH 'gq_
 ----
 gq_m
 
+# --- IN <schema>.<view> where the schema is named like a scope keyword ---------
+# ACCOUNT, SCHEMA and DATABASE are not reserved, so each can name a schema.
+# `IN account.v` is that schema's view, as it is for the parser override; the
+# grammar used to take the keyword as the scope and fail on `.v`.
+
+statement ok
+CREATE SCHEMA account;
+
+statement ok
+CREATE SCHEMA schema;
+
+statement ok
+CREATE SCHEMA database;
+
+statement ok
+CREATE SEMANTIC VIEW account.v AS TABLES (t AS gq_t PRIMARY KEY (id)) DIMENSIONS (t.acct_region AS t.region);
+
+statement ok
+CREATE SEMANTIC VIEW schema.v AS TABLES (t AS gq_t PRIMARY KEY (id)) DIMENSIONS (t.sch_region AS t.region);
+
+statement ok
+CREATE SEMANTIC VIEW database.v AS TABLES (t AS gq_t PRIMARY KEY (id)) DIMENSIONS (t.db_region AS t.region);
+
+query T
+SELECT name FROM (SHOW SEMANTIC DIMENSIONS IN account.v);
+----
+acct_region
+
+query T
+SELECT name FROM (SHOW SEMANTIC DIMENSIONS IN schema.v);
+----
+sch_region
+
+query T
+SELECT name FROM (SHOW SEMANTIC DIMENSIONS IN database.v);
+----
+db_region
+
+query T
+SELECT name FROM (SHOW SEMANTIC DIMENSIONS IN memory.account.v);
+----
+acct_region
+
+# The keywords followed by a space are still scopes.
+query T
+SELECT name FROM (SHOW SEMANTIC VIEWS IN SCHEMA account);
+----
+v
+
+query T rowsort
+SELECT schema_name FROM (SHOW SEMANTIC VIEWS IN ACCOUNT) WHERE name = 'v';
+----
+account
+database
+schema
+
+statement ok
+DROP SEMANTIC VIEW account.v;
+
+statement ok
+DROP SEMANTIC VIEW schema.v;
+
+statement ok
+DROP SEMANTIC VIEW database.v;
+
 # --- the extension's own errors, raised from inside a subquery -------------------
 
 statement error

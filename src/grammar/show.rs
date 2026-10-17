@@ -23,6 +23,11 @@ use crate::parse::{lower_name_only_read, lower_show, DdlKind, ScopeName, ShowCla
 ///   first; the transform finds the `STARTS WITH` clause wherever it sits.
 /// - `LIMIT` takes any single value, so a non-integer is our error with our
 ///   wording rather than a `LIMIT` modifier on the query `DuckDB` would bind.
+/// - `ACCOUNT`, `SCHEMA` and `DATABASE` are not reserved, so each can be a
+///   schema's name: `IN account.v` names a view, as it does for the override
+///   (`in_clause_is_scope` wants a space after the keyword). An ordered choice
+///   commits to the first alternative that matches, and the scope keyword alone
+///   would match, leaving `.v` unparsed, so a dotted view name is tried first.
 pub(super) const RULES: &str = r"
 SvShowStatement <- 'SHOW' SvShowWhat SvShowLike? SvShowIn? SvShowForMetric? SvShowStartsWith? SvShowLimit?
 SvShowWhat <- SvShowTerse / SvShowViews / SvShowDimensions / SvShowMetrics / SvShowFacts / SvShowMaterializations
@@ -34,7 +39,8 @@ SvShowFacts <- 'SEMANTIC' 'FACTS'
 SvShowMaterializations <- 'SEMANTIC' 'MATERIALIZATIONS'
 SvShowLike <- 'LIKE' StringLiteral
 SvShowIn <- 'IN' SvShowScope
-SvShowScope <- SvShowInAccount / SvShowInSchema / SvShowInDatabase / SvShowInView
+SvShowScope <- SvShowInDottedView / SvShowInAccount / SvShowInSchema / SvShowInDatabase / SvShowInView
+SvShowInDottedView <- SvNamePart '.' SvViewName
 SvShowInAccount <- 'ACCOUNT'
 SvShowInSchema <- 'SCHEMA' SvShowStartsWith / 'SCHEMA' SvScopeName?
 SvShowInDatabase <- 'DATABASE' SvShowStartsWith / 'DATABASE' SvScopeName?
@@ -139,7 +145,10 @@ fn transform_show(tree: &Tree) -> Result<String, ParseError> {
 type Scope = (Option<String>, Option<ScopeName>, Option<ScopeName>);
 
 fn show_scope(tree: &Tree, scope: &Node, kind: DdlKind) -> Result<Scope, ParseError> {
-    if let Some(view) = scope.find("SvShowInView") {
+    if let Some(view) = scope
+        .find("SvShowInDottedView")
+        .or_else(|| scope.find("SvShowInView"))
+    {
         // VIEWS has no view-name slot: there `IN` is always a scope.
         if matches!(kind, DdlKind::Show | DdlKind::ShowTerse) {
             return Err(ParseError {
