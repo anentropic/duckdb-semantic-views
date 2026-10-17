@@ -226,7 +226,7 @@ impl Reader<'_> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{Kind, Node, Tree};
+    use super::{Kind, Node, Token, Tree};
 
     /// Encode a tree in the bridge's wire format, for tests.
     pub(crate) fn encode(root: &Node, tokens: &[(usize, &str)]) -> Vec<u8> {
@@ -359,5 +359,59 @@ pub(crate) mod tests {
         let root = list("R", 0, 5, vec![outer]);
         assert_eq!(root.find_all("X").len(), 1);
         assert_eq!(root.find("x").unwrap().span, Some((0, 5)));
+    }
+
+    /// A node spanning the first occurrence of `text` in `sql`.
+    pub(crate) fn n(
+        sql: &str,
+        rule: &str,
+        text: &str,
+        kind: Kind,
+        value: &str,
+        children: Vec<Node>,
+    ) -> Node {
+        let offset = sql
+            .find(text)
+            .unwrap_or_else(|| panic!("{text} not in {sql}"));
+        Node {
+            rule: rule.to_string(),
+            kind,
+            span: Some((offset, text.len())),
+            value: value.to_string(),
+            children,
+        }
+    }
+
+    /// The statement's tokens: words split on whitespace, with `.` split off
+    /// as its own token.
+    pub(crate) fn tree(sql: &str, root: Node) -> Tree {
+        let mut tokens = Vec::new();
+        let mut start = None;
+        for (i, c) in sql.char_indices().chain(std::iter::once((sql.len(), ' '))) {
+            let boundary = c.is_whitespace() || c == '.';
+            if boundary {
+                if let Some(s) = start.take() {
+                    tokens.push(Token {
+                        offset: s,
+                        len: i - s,
+                        text: sql[s..i].to_string(),
+                    });
+                }
+                if c == '.' {
+                    tokens.push(Token {
+                        offset: i,
+                        len: 1,
+                        text: ".".to_string(),
+                    });
+                }
+            } else if start.is_none() {
+                start = Some(i);
+            }
+        }
+        Tree { root, tokens }
+    }
+
+    pub(crate) fn root(sql: &str, rule: &str, children: Vec<Node>) -> Node {
+        n(sql, rule, sql, Kind::List, "", children)
     }
 }

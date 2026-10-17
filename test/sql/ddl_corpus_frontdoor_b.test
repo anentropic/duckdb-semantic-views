@@ -485,14 +485,14 @@ SELECT count(*) FROM list_semantic_views() WHERE name = 'dcf_off';
 statement ok
 CREATE SEMANTIC VIEW dcf_off AS TABLES (t AS dcf_orders PRIMARY KEY (id)) DIMENSIONS (t.region AS region);
 
-# F-064: ffi.rs::record_is_consumed_when_read (first half) — a DROP after a plain SELECT in one query string is refused with the one-statement message and drops nothing
+# F-064: ffi.rs::record_is_consumed_when_read (first half) — a CREATE after a plain SELECT in one query string is refused with the one-statement message and creates nothing (a DROP or ALTER there now runs through the grammar: `grammar_write_statements.test`)
 statement error
-SELECT 1; DROP SEMANTIC VIEW dcf_off;
+SELECT 1; CREATE SEMANTIC VIEW dcf_off2 AS TABLES (t AS dcf_orders PRIMARY KEY (id)) DIMENSIONS (t.region AS region);
 ----
 one statement per call
 
 query I
-SELECT count(*) FROM list_semantic_views() WHERE name = 'dcf_off';
+SELECT count(*) FROM list_semantic_views() WHERE name IN ('dcf_off', 'dcf_off2');
 ----
 1
 

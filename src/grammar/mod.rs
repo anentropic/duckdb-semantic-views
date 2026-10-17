@@ -17,13 +17,15 @@
 
 mod show;
 pub(crate) mod tree;
+mod write;
 
 #[cfg(feature = "extension")]
 pub(crate) mod ffi;
 
 use crate::errors::ParseError;
+use crate::parse::RewriteAction;
 use std::fmt::Write;
-use tree::Tree;
+use tree::{Kind, Node, Tree};
 
 /// What a statement rule's transform returns, which decides where `DuckDB`
 /// may use it.
@@ -32,12 +34,24 @@ pub(crate) enum Shape {
     /// One query (a `QueryNode`): an alternative of `DescribeStatement`, so it
     /// also stands as a subquery.
     Query,
+    /// A statement (a `SQLStatement`, several as one `MultiStatement`): an
+    /// alternative of `Statement`, so it stands only at the top level.
+    Statement,
 }
 
 impl Shape {
     fn wire_name(self) -> &'static str {
         match self {
             Self::Query => "query",
+            Self::Statement => "statement",
+        }
+    }
+
+    /// The `DuckDB` rule a statement rule of this shape is an alternative of.
+    fn target(self) -> &'static str {
+        match self {
+            Self::Query => "DescribeStatement",
+            Self::Statement => "Statement",
         }
     }
 }
@@ -53,8 +67,14 @@ pub(crate) fn changes() -> String {
     let statements: Vec<(&str, Shape)> = show::QUERY_STATEMENTS
         .iter()
         .map(|rule| (*rule, Shape::Query))
+        .chain(
+            write::STATEMENTS
+                .iter()
+                .map(|rule| (*rule, Shape::Statement)),
+        )
         .collect();
-    for definition in show::RULES.lines().map(str::trim).filter(|l| !l.is_empty()) {
+    let definitions = show::RULES.lines().chain(write::RULES.lines());
+    for definition in definitions.map(str::trim).filter(|l| !l.is_empty()) {
         let name = definition.split_whitespace().next().unwrap_or_default();
         let shape = statements
             .iter()
@@ -63,27 +83,50 @@ pub(crate) fn changes() -> String {
         let _ = writeln!(out, "RULE\t{definition}\t{shape}");
     }
     for (rule, shape) in &statements {
-        let target = match shape {
-            Shape::Query => "DescribeStatement",
-        };
-        let _ = writeln!(out, "PREPEND\t{target}\t{rule}");
+        let _ = writeln!(out, "PREPEND\t{}\t{rule}", shape.target());
     }
     out
 }
 
-/// Lower one matched statement rule to SQL.
-pub(crate) fn transform(tree: &Tree) -> Result<String, ParseError> {
+/// Plan one matched statement rule: the same [`RewriteAction`] the parser
+/// override plans for the statement, which `crate::parse::lower_action` turns
+/// into SQL.
+#[cfg_attr(not(feature = "extension"), allow(dead_code))]
+pub(crate) fn transform(tree: &Tree) -> Result<RewriteAction, ParseError> {
     let rule = tree.root.rule.as_str();
-    if show::QUERY_STATEMENTS
-        .iter()
-        .any(|r| r.eq_ignore_ascii_case(rule))
-    {
-        return show::transform(rule, tree);
+    let is = |rules: &[&str]| rules.iter().any(|r| r.eq_ignore_ascii_case(rule));
+    if is(show::QUERY_STATEMENTS) {
+        return show::transform(rule, tree).map(RewriteAction::Passthrough);
+    }
+    if is(write::STATEMENTS) {
+        return write::transform(rule, tree);
     }
     Err(ParseError {
         message: format!("semantic_views grammar: no transform for rule '{rule}'"),
         position: tree.root.offset(),
     })
+}
+
+// --- helpers the statement modules share ---
+
+/// A string literal's decoded contents.
+fn string_value(node: &Node) -> String {
+    node.first_leaf(Kind::String)
+        .map(|n| n.value.clone())
+        .unwrap_or_default()
+}
+
+/// A name exactly as written, quotes and qualifiers included, with no
+/// whitespace: the read table functions fold and resolve it themselves (FF-4).
+fn name_text(tree: &Tree, node: &Node) -> String {
+    tree.tokens_in(node).map(|t| t.text.as_str()).collect()
+}
+
+fn internal(node: &Node, what: &str) -> ParseError {
+    ParseError {
+        message: format!("semantic_views grammar: {what} in {}", node.rule),
+        position: node.offset(),
+    }
 }
 
 #[cfg(test)]
@@ -101,6 +144,29 @@ mod tests {
             );
             assert!(text.contains(&format!("PREPEND\tDescribeStatement\t{rule}\n")));
         }
+        for rule in super::write::STATEMENTS {
+            assert!(
+                text.lines()
+                    .any(|l| l.starts_with(&format!("RULE\t{rule} <-"))
+                        && l.ends_with("\tstatement")),
+                "{rule} is not defined as a statement rule"
+            );
+            assert!(text.contains(&format!("PREPEND\tStatement\t{rule}\n")));
+        }
+    }
+
+    #[test]
+    fn no_rule_is_defined_twice() {
+        let text = changes();
+        let mut names: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("RULE\t"))
+            .map(|l| l.split_whitespace().next().unwrap())
+            .collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total);
     }
 
     #[test]

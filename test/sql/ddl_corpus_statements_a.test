@@ -143,7 +143,7 @@ DROP SEMANTIC VIEW
 ----
 
 # S-014: rewrite.rs::test_rewrite_name_with_single_quote — an unquoted name containing `'` is captured raw, created and dropped intact [text]
-# PRE-EXISTING (TECH-DEBT #98): `it's_a_view` is not a legal unquoted DuckDB identifier (DuckDB's own tokenizer reads `'s_a_view ...` as a string literal), yet both CREATE and DROP accept it as a view name.
+# PRE-EXISTING (TECH-DEBT #98): `it's_a_view` is not a legal unquoted DuckDB identifier (DuckDB's own tokenizer reads `'s_a_view ...` as a string literal), yet the parser override's CREATE and DROP accept it as a view name. The grammar's DROP refuses it as DuckDB does (below), so the view is removed from the catalog table directly, which `test-sql-grammar` does not route.
 statement ok
 CREATE SEMANTIC VIEW it's_a_view AS TABLES (o AS dcs_orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) METRICS (o.total AS SUM(o.amount));
 
@@ -153,7 +153,18 @@ SELECT * FROM dcs_views();
 main	it's_a_view	(empty)
 
 statement ok
+SET allow_parser_override_extension = 'DEFAULT';
+
+statement error
 DROP SEMANTIC VIEW it's_a_view;
+----
+unterminated string literal
+
+statement ok
+SET allow_parser_override_extension = 'FALLBACK';
+
+statement ok
+DELETE FROM semantic_layer._definitions WHERE name = 'it''s_a_view';
 
 query TTT nosort
 SELECT * FROM dcs_views();

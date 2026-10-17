@@ -23,7 +23,8 @@ pub unsafe extern "C" fn sv_grammar_changes_rust(out_ptr: *mut *mut u8, out_len:
     }
 }
 
-/// FFI export: lower one matched statement rule to SQL.
+/// FFI export: lower one matched statement rule to SQL ([`super::transform`],
+/// then `crate::parse::lower_action`).
 ///
 /// `tree_ptr` / `tree_len` hold the serialised parse subtree ([`Tree::decode`]).
 ///
@@ -64,7 +65,7 @@ pub unsafe extern "C" fn sv_grammar_transform_rust(
                 return 2;
             }
         };
-        match super::transform(&tree) {
+        match super::transform(&tree).and_then(crate::parse::lower_action) {
             Ok(sql) => {
                 publish_owned_string(sql, sql_out_ptr, sql_out_len);
                 0

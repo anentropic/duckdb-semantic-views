@@ -7,6 +7,7 @@
 //! grammar accepts one: a subquery, a CTE, a view body (TECH-DEBT #77).
 
 use super::tree::{Kind, Node, Tree};
+use super::{internal, name_text, string_value};
 use crate::errors::ParseError;
 use crate::parse::{lower_name_only_read, lower_show, DdlKind, ScopeName, ShowClauses};
 
@@ -205,19 +206,6 @@ fn show_kind(root: &Node) -> Result<DdlKind, ParseError> {
         .ok_or_else(|| internal(root, "SHOW statement without an object kind"))
 }
 
-/// A string literal's decoded contents.
-fn string_value(node: &Node) -> String {
-    node.first_leaf(Kind::String)
-        .map(|n| n.value.clone())
-        .unwrap_or_default()
-}
-
-/// A name exactly as written, quotes and qualifiers included, with no
-/// whitespace: the read table functions fold and resolve it themselves (FF-4).
-fn name_text(tree: &Tree, node: &Node) -> String {
-    tree.tokens_in(node).map(|t| t.text.as_str()).collect()
-}
-
 /// The parts of a dotted name, each unquoted.
 fn name_parts(node: &Node) -> Vec<String> {
     node.find_all("SvNamePart")
@@ -237,31 +225,11 @@ fn required(tree: &Tree, root: &Node, rule: &str) -> Result<String, ParseError> 
         .ok_or_else(|| internal(root, &format!("missing {rule}")))
 }
 
-fn internal(node: &Node, what: &str) -> ParseError {
-    ParseError {
-        message: format!("semantic_views grammar: {what} in {}", node.rule),
-        position: node.offset(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::transform;
-    use crate::grammar::tree::{Kind, Node, Token, Tree};
-
-    /// A node spanning the first occurrence of `text` in `sql`.
-    fn n(sql: &str, rule: &str, text: &str, kind: Kind, value: &str, children: Vec<Node>) -> Node {
-        let offset = sql
-            .find(text)
-            .unwrap_or_else(|| panic!("{text} not in {sql}"));
-        Node {
-            rule: rule.to_string(),
-            kind,
-            span: Some((offset, text.len())),
-            value: value.to_string(),
-            children,
-        }
-    }
+    use crate::grammar::tree::tests::{n, root, tree};
+    use crate::grammar::tree::{Kind, Node};
 
     fn at(rule: &str, offset: usize, len: usize, kind: Kind, value: &str) -> Node {
         Node {
@@ -271,39 +239,6 @@ mod tests {
             value: value.to_string(),
             children: Vec::new(),
         }
-    }
-
-    /// The statement's tokens: words split on whitespace, with `.` split off
-    /// as its own token.
-    fn tree(sql: &str, root: Node) -> Tree {
-        let mut tokens = Vec::new();
-        let mut start = None;
-        for (i, c) in sql.char_indices().chain(std::iter::once((sql.len(), ' '))) {
-            let boundary = c.is_whitespace() || c == '.';
-            if boundary {
-                if let Some(s) = start.take() {
-                    tokens.push(Token {
-                        offset: s,
-                        len: i - s,
-                        text: sql[s..i].to_string(),
-                    });
-                }
-                if c == '.' {
-                    tokens.push(Token {
-                        offset: i,
-                        len: 1,
-                        text: ".".to_string(),
-                    });
-                }
-            } else if start.is_none() {
-                start = Some(i);
-            }
-        }
-        Tree { root, tokens }
-    }
-
-    fn root(sql: &str, rule: &str, children: Vec<Node>) -> Node {
-        n(sql, rule, sql, Kind::List, "", children)
     }
 
     const L: Kind = Kind::List;

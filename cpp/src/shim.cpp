@@ -3787,6 +3787,29 @@ static arena_ptr<TransformProcess> sv_grammar_start_query(PEGTransformer &transf
     return transformer.MakeProcess<FinalizeTransformProcess>(transformer, pr, sv_grammar_finalize_query);
 }
 
+// A write statement lowers to several statements (the guards, then the DML).
+// They go back as one MultiStatement, which the client unpacks and runs in
+// order, as it does for a PIVOT's generated statements.
+static arena_ptr<TransformResultValue> sv_grammar_finalize_statement(PEGTransformer &transformer,
+                                                                     ParseResult &pr) {
+    auto statements = sv_grammar_lower(transformer, pr);
+    if (statements.empty()) {
+        throw InternalException("semantic_views grammar: rule %s lowered to no statement", pr.Name());
+    }
+    if (statements.size() == 1) {
+        return transformer.MakeResult<unique_ptr<SQLStatement>>(std::move(statements[0]));
+    }
+    auto multi = make_uniq<MultiStatement>();
+    for (auto &statement : statements) {
+        multi->statements.push_back(std::move(statement));
+    }
+    return transformer.MakeResult<unique_ptr<SQLStatement>>(std::move(multi));
+}
+
+static arena_ptr<TransformProcess> sv_grammar_start_statement(PEGTransformer &transformer, ParseResult &pr) {
+    return transformer.MakeProcess<FinalizeTransformProcess>(transformer, pr, sv_grammar_finalize_statement);
+}
+
 class SemanticViewsGrammar final : public GrammarExtension {
 public:
     explicit SemanticViewsGrammar(vector<GrammarChange> changes_p)
@@ -3817,6 +3840,8 @@ static vector<GrammarChange> sv_grammar_changes() {
             auto shape = line.substr(line.rfind('\t') + 1);
             if (shape == "query") {
                 changes.push_back(GrammarChange::AddRule(fields[1], sv_grammar_start_query));
+            } else if (shape == "statement") {
+                changes.push_back(GrammarChange::AddRule(fields[1], sv_grammar_start_statement));
             } else if (shape.empty()) {
                 changes.push_back(GrammarChange::AddRule(fields[1]));
             } else {

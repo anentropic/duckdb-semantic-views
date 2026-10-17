@@ -46,8 +46,9 @@ extension's grammar productions cover (``GRAMMAR_OWNED`` below) with parser
 overrides off on its connection, so it is parsed by DuckDB's grammar and our
 productions instead of the parser override; everything else runs as usual.
 That runs the same files against both implementations while they coexist
-(``just test-sql-grammar``). The summary reports how many statements were
-routed, and a run that routed none fails.
+(``just test-sql-grammar``). A statement whose expected error pins a caret
+(``LINE 1:``) is not routed (``CARET_EXPECTED`` below). The summary reports how
+many statements were routed, and a run that routed none fails.
 
 The required extensions default to ``semantic_views``; pass
 ``--required-extension NAME`` (repeatable) to change that. ``--offline-excused
@@ -93,9 +94,25 @@ class FileOutcome:
 # statement moves onto the grammar.
 GRAMMAR_OWNED = re.compile(
     r"^\s*(?:(?:--[^\n]*(?:\n|$)|/\*.*?\*/)\s*)*"
-    r"(?:show\s+(?:terse\s+)?semantic\b|show\s+columns\s+in\s+semantic\b|desc(?:ribe)?\s+semantic\b)",
+    r"(?:show\s+(?:terse\s+)?semantic\b|show\s+columns\s+in\s+semantic\b|desc(?:ribe)?\s+semantic\b"
+    r"|drop\s+semantic\b|alter\s+semantic\b)",
     re.IGNORECASE | re.DOTALL,
 )
+
+# An expected error that pins a caret (`LINE 1: ... ^`) stays on the parser
+# override. The grammar raises a parser error with its location, and DuckDB
+# renders that only on the ClientContext path, which the Python client the
+# runner uses does not take (DuckDB's own syntax errors show none either). See
+# TECH-DEBT #99.
+CARET_EXPECTED = re.compile(r"\bLINE \d+:")
+
+
+def _routed(statement) -> bool:
+    if not GRAMMAR_OWNED.match("\n".join(statement.lines)):
+        return False
+    expected = getattr(statement, "expected_result", None)
+    lines = getattr(expected, "lines", None) or []
+    return not CARET_EXPECTED.search("\n".join(lines))
 
 
 class _InternalErrorWatch:
@@ -229,7 +246,7 @@ def main() -> int:
         def counted(self, statement, _orig=orig):
             if current:
                 current[-1].executed += 1
-            if not route or not GRAMMAR_OWNED.match("\n".join(statement.lines)):
+            if not route or not _routed(statement):
                 return _orig(self, statement)
             routed[0] += 1
             conn = orig_get_connection(self, statement.connection_name)
