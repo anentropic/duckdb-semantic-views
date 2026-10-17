@@ -72,7 +72,7 @@ also carry an accepted control), 19 syntax-reject rows. 99 source tests/properti
 | search_path.rs::nested_resolving_calls_do_not_panic_and_both_get_injected | F-088 | partial: a resolving call nested in another's arguments can only be a subquery, which DuckDB refuses in a table-function argument ("cannot contain subqueries") whatever the injection did; the row pins that the shape fails cleanly, the injection itself is not SQL-observable |
 | search_path.rs::injection_is_idempotent_for_the_nested_shape | F-077 | partial: idempotence ported on the flat shape; the nested shape cannot execute (see F-088) |
 | search_path.rs::a_leading_line_comment_ended_by_a_bare_carriage_return_does_not_defeat_injection | F-084 | CR built with `chr(13)` and parsed via `query()` (see "harness limits"); LF control alongside |
-| search_path.rs (module contract: `RESOLVING_READ_FUNCTIONS`, "What is deliberately NOT rewritten") | F-089, F-090, F-091, F-095 | not a test: rows added so the grammar's structural replacement of the injection is held to the same set of functions; F-090 and F-095 are PRE-EXISTING; F-091 pins the scalars following the path (since 0.16.0) |
+| search_path.rs (module contract: `RESOLVING_READ_FUNCTIONS`, "What is deliberately NOT rewritten") | F-089, F-090, F-091, F-095 | not a test: rows added so the grammar's structural replacement of the injection is held to the same set of functions; F-090 and F-095 are PRE-EXISTING (#96, #97); F-091 pins the scalars following the path (since 0.16.0) |
 
 ## src/parse/show_clauses.rs
 
@@ -96,7 +96,7 @@ also carry an accepted control), 19 syntax-reject rows. 99 source tests/properti
 | ffi.rs::unrelated_or_single_declined_query_keeps_override_inactive | N/A | the record's lifetime across statements is not observable: the runner's own settings query before each statement overwrites it (see "harness limits") |
 | ffi.rs::record_is_consumed_when_read | F-064 | partial: the multi-statement refusal is ported; the consumption is not observable (as above) |
 | ffi.rs::record_is_consumed_by_a_statement_that_is_not_ours | F-065 | partial: `SELEC 1; <DDL>` ends with DuckDB's syntax error; the consumption is not observable (as above) |
-| ffi.rs::statement_must_match_a_whole_recorded_statement | N/A | not observable (as above). A related PRE-EXISTING mis-diagnosis was reproduced outside the runner; see the report |
+| ffi.rs::statement_must_match_a_whole_recorded_statement | N/A | not observable (as above). A related PRE-EXISTING mis-diagnosis was reproduced outside the runner; it is the fourth bullet of TECH-DEBT #98 |
 | ffi.rs::strings_without_semantic_are_not_kept | N/A | not observable (as above); the buffer-capacity half is internal |
 | ffi.rs::panic_surfaces_as_an_extension_error_not_as_not_ours | N/A | no SQL input reaches the panic arm (no injectable fault) |
 | ffi.rs::panic_arm_tolerates_null_out_parameters | N/A | FFI out-parameter contract; no SQL path passes null |

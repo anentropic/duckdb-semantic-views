@@ -17,7 +17,7 @@ Totals: 104 accept rows, 3 semantic rejects, 77 syntax rejects.
 | body_parser/mod.rs::split_dollar_quoted_comma_not_split | B-004 |  |
 | body_parser/mod.rs::split_tagged_dollar_quoted_comma_not_split | B-005 |  |
 | body_parser/mod.rs::split_dollar_paren_does_not_change_depth | B-006 |  |
-| body_parser/mod.rs::split_lone_dollar_is_live_not_a_tag | B-007 |  |
+| body_parser/mod.rs::split_lone_dollar_is_live_not_a_tag | B-007 | PRE-EXISTING (TECH-DEBT #95): a `$1` dimension expression is stored |
 | body_parser/mod.rs::dollar_quoted_dimension_expr_is_one_entry | B-015 |  |
 | body_parser/mod.rs::dollar_quoted_metric_keyword_is_inert | B-016 |  |
 | body_parser/mod.rs::dollar_quoted_dimension_close_paren_is_inert | B-017 |  |

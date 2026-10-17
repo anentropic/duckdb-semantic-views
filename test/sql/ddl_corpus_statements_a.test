@@ -591,10 +591,11 @@ ALTER SEMANTIC VIEW nope UNSET COMMENT
 ----
 semantic view 'nope' does not exist
 
-# S-087: rewrite.rs::test_validate_rewrite_alter_unsupported_operation, parse_error_position_points_at_offending_token — an unsupported ALTER sub-operation [syntax]
+# S-087: rewrite.rs::test_validate_rewrite_alter_unsupported_operation, parse_error_position_points_at_offending_token — an unsupported ALTER sub-operation [text]
 statement error
 ALTER SEMANTIC VIEW v TRUNCATE
 ----
+Unsupported ALTER operation
 
 # S-088: rewrite.rs::test_validate_rewrite_alter_missing_operation — ALTER with a name but no sub-operation [syntax]
 statement error

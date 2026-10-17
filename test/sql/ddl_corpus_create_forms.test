@@ -298,14 +298,17 @@ statement error
 CREATE SEMANTIC VIEW sales (tables := [...], dimensions := [...])
 ----
 
+# `s316_paren` is not in the catalog, so the only reason for this to fail is the
+# retired body form (`x` exists by now, which would fail it either way).
 statement error
-CREATE SEMANTIC VIEW x (tables := [])
+CREATE SEMANTIC VIEW s316_paren (tables := [])
 ----
 
-# S-317: rewrite.rs::test_error_message_mentions_from_yaml, test_error_message_mentions_from_yaml_file — neither AS nor FROM YAML after the name [syntax]
+# S-317: rewrite.rs::test_error_message_mentions_from_yaml, test_error_message_mentions_from_yaml_file — neither AS nor FROM YAML after the name [text]
 statement error
 CREATE SEMANTIC VIEW v2 SOMETHING_ELSE
 ----
+Expected 'AS' or 'FROM YAML' after view name
 
 # S-318: rewrite.rs::test_trailing_semicolon — a name and `;` but no body [syntax]
 statement error
@@ -481,10 +484,11 @@ statement error
 CREATE SEMANTIC VIEW "foo AS TABLES (o AS dcs_orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) METRICS (o.total AS SUM(o.amount))
 ----
 
-# S-338: rewrite.rs::phase64_quoted_ident_tests::create_with_four_part_name_errors — a four-part name is not truncated to its last part [syntax]
+# S-338: rewrite.rs::phase64_quoted_ident_tests::create_with_four_part_name_errors — a four-part name is not truncated to its last part [text]
 statement error
 CREATE SEMANTIC VIEW memory.dcs_sch.orders_sv.d AS TABLES (o AS dcs_orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region) METRICS (o.total AS SUM(o.amount))
 ----
+too many identifier parts
 
 query TTT nosort
 SELECT * FROM dcs_views() WHERE name LIKE 'orders%' OR name = 'd';
@@ -904,18 +908,20 @@ statement error
 CREATE SEMANTIC VIEW y_body FROM YAML $$no closing
 ----
 
-# S-356: rewrite.rs::test_extract_dollar_quoted_rejects_invalid_tag — a digit-led tag (`$1$`) and a tag with a space (`$ta g$`) [syntax]
+# S-356: rewrite.rs::test_extract_dollar_quoted_rejects_invalid_tag — a digit-led tag (`$1$`) and a tag with a space (`$ta g$`) [text]
 statement error
 CREATE SEMANTIC VIEW y_tag1 FROM YAML $1$
 tables: []
 $1$
 ----
+Invalid dollar-quote tag
 
 statement error
 CREATE SEMANTIC VIEW y_tag2 FROM YAML $ta g$
 tables: []
 $ta g$
 ----
+Invalid dollar-quote tag
 
 # S-357: the rejected FROM YAML statements created nothing
 query TTT nosort
@@ -923,7 +929,7 @@ SELECT * FROM dcs_views() WHERE name IN ('bad_view', 'y_empty_body', 'y_trail', 
 ----
 
 # S-358: rewrite.rs::test_yaml_rewrite_create_or_replace, test_yaml_rewrite_create_if_not_exists — the Rust tests' YAML body declares no tables, dimensions or metrics, and is accepted
-# PRE-EXISTING (TECH-DEBT #94): an empty YAML definition (`tables: []`, `dimensions: []`, `metrics: []`) creates a view, while the AS-body equivalent below is rejected ("At least one of 'DIMENSIONS' or 'METRICS' is required"). The stored view has no members; GET_DDL on it fails ("Legacy definition format"), so it is not called here.
+# PRE-EXISTING (TECH-DEBT #94): an empty YAML definition (`tables: []`, `dimensions: []`, `metrics: []`) creates a view. Its AS-body equivalent, `DIMENSIONS () METRICS ()` (B-049), is accepted too; only a TABLES-only body (S-359 below) is rejected. The stored view has no members; GET_DDL on it fails ("Legacy definition format"), so it is not called here.
 statement ok
 CREATE SEMANTIC VIEW y_empty FROM YAML $$
 base_table: t
@@ -941,7 +947,7 @@ query TTTTT nosort
 DESCRIBE SEMANTIC VIEW y_empty;
 ----
 
-# S-359: rewrite.rs::test_yaml_rewrite_create_or_replace — the AS-body counterpart of S-358 (TABLES only, no DIMENSIONS or METRICS) is rejected [syntax]
+# S-359: rewrite.rs::test_yaml_rewrite_create_or_replace — a near miss of S-358 in AS-body form (TABLES only, no DIMENSIONS or METRICS) is rejected, as TECH-DEBT #94's decision wants for every empty view [syntax]
 statement error
 CREATE SEMANTIC VIEW as_empty AS TABLES (o AS dcs_orders PRIMARY KEY (id))
 ----
@@ -1279,16 +1285,16 @@ SELECT * FROM dcs_views() WHERE name IN ('rel_nopk', 'rel_count', 'v_dup');
 
 # --- error-message rendering through the parser hook ---
 
-# S-390: rewrite.rs::write_error_to_buffer_handles_short_string — a short validation error reaches the user whole
+# S-390: rewrite.rs::write_error_to_buffer_handles_short_string — a short validation error reaches the user whole (the row pins the message's tail) [text]
 statement ok
 CREATE SEMANTIC VIEW dup_ok AS TABLES (o AS dcs_orders PRIMARY KEY (id)) DIMENSIONS (o.r AS o.region, o.r2 AS o.id)
 
 statement error
 CREATE SEMANTIC VIEW dup_short AS TABLES (o AS dcs_orders PRIMARY KEY (id)) DIMENSIONS (o.r AS o.region, o.r AS o.id)
 ----
-duplicate name 'r': dimension 'r' collides with dimension 'r'
+duplicate name 'r': dimension 'r' collides with dimension 'r' -- dimension, metric, and fact names share one namespace and are case-insensitive (quoting does not make a name distinct)
 
-# S-391: rewrite.rs::write_error_to_buffer_truncates_at_char_boundary — an error message longer than the 1024-byte hook buffer is cut at a UTF-8 character boundary, so it still decodes (the dimension name is 600 two-byte `é`; today the message stops after 1022 bytes, mid-name, before "collides ...") (TECH-DEBT #98) [text]
+# S-391: rewrite.rs::write_error_to_buffer_truncates_at_char_boundary — an error message longer than the 1024-byte hook buffer is cut at a UTF-8 character boundary, so it still decodes (the dimension name is 600 two-byte `é`; today the message stops after 1022 bytes, mid-name, before "collides ...": the regex pins exactly that, 503 `é` and nothing after them) PRE-EXISTING (TECH-DEBT #98) [text]
 statement ok
 CREATE SEMANTIC VIEW long_ok AS TABLES (o AS dcs_orders PRIMARY KEY (id)) DIMENSIONS (o.éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé AS o.region)
 
@@ -1300,7 +1306,7 @@ SELECT strlen(line) FROM dcs_ddl('long_ok') WHERE line LIKE '%AS o.region';
 statement error
 CREATE SEMANTIC VIEW long_dup AS TABLES (o AS dcs_orders PRIMARY KEY (id)) DIMENSIONS (o.éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé AS o.region, o.éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé AS o.id)
 ----
-duplicate name 'éééééééééééééééééééé
+<REGEX>:^Parser Error: duplicate name 'é{503}$
 
 query TTT nosort
 SELECT * FROM dcs_views() WHERE name IN ('dup_short', 'long_dup');
