@@ -11,10 +11,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`SHOW` and `DESCRIBE` statements work as subqueries.** `DESCRIBE SEMANTIC VIEW`,
+  `SHOW [TERSE] SEMANTIC VIEWS`, `SHOW SEMANTIC DIMENSIONS / METRICS / FACTS /
+  MATERIALIZATIONS` (with `FOR METRIC` too) and `SHOW COLUMNS IN SEMANTIC VIEW` can now be
+  used wherever DuckDB accepts a query: in `FROM`, in a CTE or in a view body, so you can
+  filter, join and aggregate their output, as in
+  `SELECT * FROM (DESCRIBE SEMANTIC VIEW v) WHERE object_kind = 'METRIC'`.
+
 - **`SET max_execution_time` stops semantic-view queries.** DuckDB 2.0's per-query time
   limit now applies to `semantic_view()` and to the `SHOW` / `DESCRIBE` commands that look
   up member types, which fail with DuckDB's own `Query exceeded maximum execution time`
   like any other query instead of running past the limit.
+
+- **Semantic-view DDL can share a query string with other statements.** One `execute()`
+  call can now hold, say, `CREATE TABLE …; INSERT …; CREATE SEMANTIC VIEW …`: DuckDB
+  splits the string and runs each statement in order. Before, any `CREATE`, `DROP` or
+  `ALTER SEMANTIC VIEW` in such a string was refused with "semantic-view DDL must be sent
+  as its own statement, one statement per call".
+
+- **Semantic-view DDL runs with `allow_parser_override_extension` set to `DEFAULT`.**
+  Before, every `CREATE`, `DROP`, `ALTER`, `SHOW` and `DESCRIBE` failed there with
+  "parser_override is not active". Two differences remain with that setting: in the
+  Python client a syntax error in the DDL shows no `LINE 1: … ^` caret, and `GET_DDL`
+  shows a tab inside an expression as a space and a run of blank lines as one line
+  break. The query a view expands to is the same.
 
 ### Changed
 
@@ -34,6 +54,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quoted identifier and an empty one (`""`) are now rejected by DuckDB 2.0 before the
   extension sees the statement. The errors read `unterminated quoted identifier` and
   `zero-length delimited identifier` instead of the extension's own wording.
+
+- **CREATE rejects an empty view.** A view with no tables (`TABLES ()`, or a YAML
+  definition with `tables: []` or no `tables`), or whose `DIMENSIONS` and `METRICS`
+  clauses are all empty (`DIMENSIONS () METRICS ()`, a lone `METRICS ()`), is now refused at
+  `CREATE SEMANTIC VIEW`, as Snowflake does. Before, such a view was created but could not
+  be queried, and `GET_DDL` either failed on it or returned DDL that `CREATE` refused. A
+  YAML export of a view stored in the legacy format, which lists no tables, can no longer be
+  imported either; re-create that view with `CREATE OR REPLACE SEMANTIC VIEW`.
 
 ### Known limitations
 
