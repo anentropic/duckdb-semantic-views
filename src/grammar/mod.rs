@@ -142,6 +142,93 @@ fn internal(node: &Node, what: &str) -> ParseError {
     }
 }
 
+/// Run `body` under `catch_unwind` and convert a panic into the
+/// return-code contract of `sv_grammar_transform_rust` (`ffi.rs`).
+///
+/// Split out so the panic arm is reachable from a unit test with a real
+/// unwinding panic (the production body has no injectable fault), as
+/// `crate::parse::ffi`'s `parse_function_panic_guard` is.
+///
+/// # Safety
+///
+/// `error_out` must point to `error_out_len` writable bytes; `position_out`
+/// must be null or point to a writable `u32`.
+#[cfg_attr(not(feature = "extension"), allow(dead_code))]
+pub(super) unsafe fn transform_panic_guard<F>(
+    error_out: *mut u8,
+    error_out_len: usize,
+    position_out: *mut u32,
+    body: F,
+) -> u8
+where
+    F: FnOnce() -> u8,
+{
+    if let Ok(rc) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        rc
+    } else {
+        if !position_out.is_null() {
+            *position_out = u32::MAX;
+        }
+        crate::ffi_util::write_error_to_buffer(
+            error_out,
+            error_out_len,
+            "semantic_views: internal error: panic inside sv_grammar_transform_rust \
+             (please report this bug)",
+        );
+        // rc=1, an ordinary parser error, as the parse stub reports its own
+        // panics. rc=2 is thrown as an InternalException, which can leave the
+        // database invalidated for every later query.
+        1
+    }
+}
+
+#[cfg(test)]
+mod panic_guard_tests {
+    use super::transform_panic_guard;
+
+    /// Drive the guard with `body`, returning `(rc, message, position)`.
+    fn guarded(body: impl FnOnce() -> u8) -> (u8, String, u32) {
+        let mut error_buf = vec![0_u8; 256];
+        let mut position: u32 = 7;
+        let rc = unsafe {
+            transform_panic_guard(
+                error_buf.as_mut_ptr(),
+                error_buf.len(),
+                &raw mut position,
+                body,
+            )
+        };
+        let nul = error_buf.iter().position(|&b| b == 0).unwrap_or(0);
+        (
+            rc,
+            String::from_utf8_lossy(&error_buf[..nul]).into_owned(),
+            position,
+        )
+    }
+
+    /// A panic in a transform (a latent body-parser bug a fuzzer could find)
+    /// must reach the user as an ordinary parser error (rc=1), not as rc=2,
+    /// which the bridge throws as an `InternalException` that can invalidate
+    /// the database.
+    #[test]
+    fn a_panic_is_reported_as_a_parse_error() {
+        let (rc, msg, position) = guarded(|| panic!("injected"));
+        assert_eq!(rc, 1, "msg={msg}");
+        assert!(
+            msg.contains("panic inside sv_grammar_transform_rust"),
+            "got: {msg}"
+        );
+        assert_eq!(position, u32::MAX, "an internal failure has no caret");
+    }
+
+    /// Control: a body that returns passes its code through.
+    #[test]
+    fn a_returned_code_passes_through() {
+        assert_eq!(guarded(|| 0).0, 0);
+        assert_eq!(guarded(|| 2).0, 2);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::changes;

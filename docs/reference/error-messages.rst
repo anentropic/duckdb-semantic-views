@@ -243,7 +243,7 @@ A reserved-word view name outside a statement of its own
    (allow_parser_override_extension is 'DEFAULT' or 'STRICT'). Re-enable with:
    SET allow_parser_override_extension='FALLBACK';
 
-**Cause:** The statement names a view with an unquoted reserved word, such as ``select``. DuckDB does not accept an unquoted reserved word as a name, so only the extension's parser hook can read the statement, and it reads only a query string that holds the one statement. The first message appears when the string holds other statements too; the second when ``allow_parser_override_extension`` is ``'DEFAULT'`` or ``'STRICT'``.
+**Cause:** A ``DROP``, ``ALTER``, ``DESCRIBE`` or ``SHOW`` statement names a view with an unquoted reserved word, such as ``select``. DuckDB does not accept an unquoted reserved word as a name, so only the extension's parser hook can read the statement, and it reads only a query string that holds the one statement. The first message appears when the string holds other statements too; the second when ``allow_parser_override_extension`` is ``'DEFAULT'`` or ``'STRICT'``.
 
 **Fix:** Quote the name (``DESCRIBE SEMANTIC VIEW "select"``). See :ref:`explanation-txn-ddl-one-statement`.
 

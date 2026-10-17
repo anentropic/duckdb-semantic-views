@@ -1,5 +1,6 @@
 //! C-ABI entry points the C++ grammar bridge calls (`cpp/src/shim.cpp`).
 
+use super::transform_panic_guard;
 use super::tree::Tree;
 use crate::ffi_util::{publish_owned_string, write_error_to_buffer};
 
@@ -33,8 +34,9 @@ pub unsafe extern "C" fn sv_grammar_changes_rust(out_ptr: *mut *mut u8, out_len:
 ///       (release with `sv_free_buffer`).
 ///   1 = the statement is ours but invalid: the message is in `error_out`,
 ///       and `*position_out` is its byte offset in the query, or `u32::MAX`.
-///   2 = the bridge failed (a malformed tree, or a panic): the message is in
-///       `error_out`.
+///   2 = the bridge failed (a tree that does not decode): the message is in
+///       `error_out`. A panic is rc=1 with an internal-error message, so the
+///       user sees a parser error rather than an `InternalException`.
 ///
 /// # Safety
 ///
@@ -52,7 +54,7 @@ pub unsafe extern "C" fn sv_grammar_transform_rust(
     error_out_len: usize,
     position_out: *mut u32,
 ) -> u8 {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    transform_panic_guard(error_out, error_out_len, position_out, || {
         if tree_ptr.is_null() {
             write_error_to_buffer(error_out, error_out_len, "empty parse tree");
             return 2;
@@ -81,13 +83,5 @@ pub unsafe extern "C" fn sv_grammar_transform_rust(
                 1
             }
         }
-    }));
-    result.unwrap_or_else(|_| {
-        write_error_to_buffer(
-            error_out,
-            error_out_len,
-            "internal error: panic inside sv_grammar_transform_rust",
-        );
-        2
     })
 }

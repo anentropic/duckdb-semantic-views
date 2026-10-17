@@ -202,6 +202,15 @@ account
 database
 schema
 
+# A scope name spelled like the start of a clause is a name (TECH-DEBT #102).
+query I
+SELECT count(*) FROM (SHOW SEMANTIC VIEWS IN SCHEMA starts);
+----
+0
+
+statement ok
+SHOW SEMANTIC VIEWS IN SCHEMA starts;
+
 statement ok
 DROP SEMANTIC VIEW account.v;
 
