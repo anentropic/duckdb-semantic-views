@@ -846,9 +846,16 @@ DIMENSIONS (
     dcf_t.a AS dcf_t.a
 )
 
+# The rejected name is not in the catalog: if the name were cut at `;`, `dcf_x2`
+# would be created (and `dcf_x` would fail with "already exists" either way).
 statement error
-CREATE SEMANTIC VIEW dcf_x;injection AS TABLES (dcf_t) DIMENSIONS (dcf_t.a AS dcf_t.a);
+CREATE SEMANTIC VIEW dcf_x2;injection AS TABLES (dcf_t) DIMENSIONS (dcf_t.a AS dcf_t.a);
 ----
+
+query I
+SELECT count(*) FROM list_semantic_views() WHERE name = 'dcf_x2';
+----
+0
 
 # F-034: parse_proptest.rs::test_semicolon_in_name (DESCRIBE pair) [syntax]
 query I

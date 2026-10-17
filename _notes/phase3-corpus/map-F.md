@@ -96,7 +96,7 @@ also carry an accepted control), 19 syntax-reject rows. 99 source tests/properti
 | ffi.rs::unrelated_or_single_declined_query_keeps_override_inactive | N/A | the record's lifetime across statements is not observable: the runner's own settings query before each statement overwrites it (see "harness limits") |
 | ffi.rs::record_is_consumed_when_read | F-064 | partial: the multi-statement refusal is ported; the consumption is not observable (as above) |
 | ffi.rs::record_is_consumed_by_a_statement_that_is_not_ours | F-065 | partial: `SELEC 1; <DDL>` ends with DuckDB's syntax error; the consumption is not observable (as above) |
-| ffi.rs::statement_must_match_a_whole_recorded_statement | N/A | not observable (as above). A related PRE-EXISTING mis-diagnosis was reproduced outside the runner; see the report |
+| ffi.rs::statement_must_match_a_whole_recorded_statement | N/A | not observable (as above). A related PRE-EXISTING mis-diagnosis was reproduced outside the runner; it is the fourth bullet of TECH-DEBT #98 |
 | ffi.rs::strings_without_semantic_are_not_kept | N/A | not observable (as above); the buffer-capacity half is internal |
 | ffi.rs::panic_surfaces_as_an_extension_error_not_as_not_ours | N/A | no SQL input reaches the panic arm (no injectable fault) |
 | ffi.rs::panic_arm_tolerates_null_out_parameters | N/A | FFI out-parameter contract; no SQL path passes null |

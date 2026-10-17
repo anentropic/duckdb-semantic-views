@@ -592,20 +592,20 @@ Areas where test coverage is reduced compared to ideal, with justification.
 
 ### 96. ❌ DESCRIBE reports the wrong base table schema and name — OPEN
 
-- **Origin:** 2026-10-16, the Phase 3 DDL corpus (rows C-175 and C-176 in `ddl_corpus_body_b2.test`, F-090 in `ddl_corpus_frontdoor_c.test`).
+- **Origin:** 2026-10-16, the Phase 3 DDL corpus (rows C-175, C-176 and C-184 in `ddl_corpus_body_b2.test`, F-090 in `ddl_corpus_frontdoor_c.test`).
 - **What is wrong:** `BASE_TABLE_SCHEMA_NAME` is the view's schema, not the table's (`src/ddl/describe.rs`, `collect_table_rows` uses `def.schema_name`), and `BASE_TABLE_NAME` keeps the qualifier and quotes as written (`main.orders`, `"Orders"`). `SHOW SEMANTIC DIMENSIONS` repeats the qualified spelling in `table_name`.
 - **What would finish it:** split the stored table reference into its parts and report each unquoted, test-first from those rows.
 
 ### 95. ❌ CREATE accepts an aggregate or a positional parameter as a dimension expression — OPEN
 
-- **Origin:** 2026-10-16, the Phase 3 DDL corpus (rows C-012 in `ddl_corpus_body_b1.test` and C-185 in `ddl_corpus_body_b2.test`).
+- **Origin:** 2026-10-16, the Phase 3 DDL corpus (rows B-007 in `ddl_corpus_body_a1.test`, C-012 in `ddl_corpus_body_b1.test` and C-185 in `ddl_corpus_body_b2.test`).
 - **What is wrong:** `DIMENSIONS (o.d AS SUM(o.amount))` and `DIMENSIONS (o.p AS $1)` are both stored. Snowflake rejects an aggregate dimension; a parameter has no value at query time.
-- **What would finish it:** reject both at CREATE in the Phase 3 grammar transform, and turn the two rows into rejection tests.
+- **What would finish it:** reject both at CREATE in the Phase 3 grammar transform, and turn those rows into rejection tests (B-007 keeps its split check with a `$1` the grammar still accepts).
 
 ### 94. ❌ CREATE accepts a view with no tables, or with neither dimensions nor metrics — OPEN
 
-- **Origin:** 2026-10-16, the Phase 3 DDL corpus (rows B-056 and the empty-clause rows in `ddl_corpus_body_a1.test`, S-358/S-359 in `ddl_corpus_create_forms.test`).
-- **What is wrong:** `TABLES () DIMENSIONS ()`, an AS body with `DIMENSIONS () METRICS ()`, and an empty YAML definition all create a view. GET_DDL of the first fails ("Legacy definition format"); GET_DDL of the others renders a body CREATE rejects, so they do not round-trip.
+- **Origin:** 2026-10-16, the Phase 3 DDL corpus (rows B-049, B-050 and B-056 in `ddl_corpus_body_a1.test`, S-358 in `ddl_corpus_create_forms.test`).
+- **What is wrong:** three shapes create a view: `TABLES () DIMENSIONS ()` (B-056), an AS body with `DIMENSIONS () METRICS ()` (B-049), and an empty YAML definition (S-358). None of them round-trips. GET_DDL of B-056 and S-358 fails ("Legacy definition format"), and GET_DDL of B-049 renders a TABLES-only body that CREATE rejects (B-050). A TABLES-only AS body is already rejected at CREATE (S-359), which is what the decision below wants for all three.
 - **Decision:** reject both shapes at CREATE, for the AS body and the YAML forms alike: TABLES is required, and at least one of DIMENSIONS or METRICS (Paul, 2026-10-16, Snowflake parity).
 - **What would finish it:** the Phase 3 grammar transform enforces it, and the pinned rows become rejection tests.
 

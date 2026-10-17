@@ -232,6 +232,7 @@ DIMENSIONS (
 )
 
 # B-007: body_parser/mod.rs::split_lone_dollar_is_live_not_a_tag — a positional `$1` is not a dollar-quote opener; the following comma still splits
+# PRE-EXISTING (TECH-DEBT #95): a `$1` dimension expression is stored; when #95 rejects it, move this split check to a `$1` the grammar still accepts.
 statement ok
 CREATE SEMANTIC VIEW dcb_split_param AS
 TABLES (o AS dcb_orders PRIMARY KEY (id))
@@ -515,13 +516,14 @@ METRICS (
     o.m AS sum(CASE WHEN o.id IN (SELECT a.id FROM dcb_x a JOIN dcb_y b USING (id)) THEN o.v ELSE 0 END)
 )
 
-# B-027: body_parser/mod.rs::a_missing_metric_name_is_reported_before_a_misplaced_clause — a metric with no name and a misplaced NON ADDITIVE BY is rejected (as a missing name today; near miss of B-019) [syntax]
+# B-027: body_parser/mod.rs::a_missing_metric_name_is_reported_before_a_misplaced_clause — a metric with no name and a misplaced NON ADDITIVE BY is rejected (as a missing name today; near miss of B-019) [text]
 statement error
 CREATE SEMANTIC VIEW dcb_noname_nab AS
 TABLES (o AS dcb_orders PRIMARY KEY (id))
 DIMENSIONS (o.d AS o.d)
 METRICS (AS sum(o.v) NON ADDITIVE BY (d));
 ----
+Missing metric name
 
 # --- a metric name eaten by a peeled USING / NON ADDITIVE BY clause ---
 
@@ -653,19 +655,21 @@ METRICS (
     o.revenue AS sum(o.amount)
 )
 
-# B-037: body_parser/mod.rs::labels_is_rejected_on_a_metric — LABELS on a metric is rejected, not silently dropped (near miss of B-036) [syntax]
+# B-037: body_parser/mod.rs::labels_is_rejected_on_a_metric — LABELS on a metric is rejected, not silently dropped (near miss of B-036) [text]
 statement error
 CREATE SEMANTIC VIEW dcb_labels_metric AS
 TABLES (o AS dcb_orders PRIMARY KEY (id))
 METRICS (o.revenue AS sum(o.amount) LABELS = (FILTER));
 ----
+LABELS is not valid on a metric
 
-# B-038: body_parser/mod.rs::labels_is_rejected_on_a_table — LABELS on a table entry is rejected (near miss of B-036) [syntax]
+# B-038: body_parser/mod.rs::labels_is_rejected_on_a_table — LABELS on a table entry is rejected (near miss of B-036) [text]
 statement error
 CREATE SEMANTIC VIEW dcb_labels_table AS
 TABLES (o AS dcb_orders PRIMARY KEY (id) LABELS = (FILTER))
 METRICS (o.revenue AS sum(o.amount));
 ----
+LABELS is not valid on a table
 
 # B-039: body_parser/mod.rs::labels_is_rejected_at_the_view_level — LABELS after the view-level COMMENT is rejected (near miss of B-036) [syntax]
 statement error
@@ -749,15 +753,17 @@ statement error
 CREATE SEMANTIC VIEW dcb_bounds_notables AS DIMENSIONS (o.region AS region) METRICS (o.rev AS SUM(amount));
 ----
 
-# B-046: body_parser/mod.rs::find_clause_bounds_rejects_duplicate_dimensions — a second DIMENSIONS clause is rejected (near miss of B-040) [syntax]
+# B-046: body_parser/mod.rs::find_clause_bounds_rejects_duplicate_dimensions — a second DIMENSIONS clause is rejected (near miss of B-040) [text]
 statement error
 CREATE SEMANTIC VIEW dcb_bounds_dup_dims AS TABLES (o AS dcb_orders PRIMARY KEY (id)) DIMENSIONS (o.region AS region) DIMENSIONS (o.b AS o.b) METRICS (o.rev AS SUM(amount));
 ----
+Duplicate clause keyword 'DIMENSIONS'
 
-# B-047: body_parser/mod.rs::find_clause_bounds_rejects_duplicate_tables — a second TABLES clause is rejected (near miss of B-040) [syntax]
+# B-047: body_parser/mod.rs::find_clause_bounds_rejects_duplicate_tables — a second TABLES clause is rejected (near miss of B-040) [text]
 statement error
 CREATE SEMANTIC VIEW dcb_bounds_dup_tables AS TABLES (o AS dcb_orders PRIMARY KEY (id)) TABLES (c AS dcb_customers PRIMARY KEY (id)) DIMENSIONS (o.region AS region) METRICS (o.rev AS SUM(amount));
 ----
+Duplicate clause keyword 'TABLES'
 
 # B-048: body_parser/mod.rs::find_clause_bounds_nested_pk_not_confused — the `)` closing a composite PRIMARY KEY (...) does not end TABLES early
 statement ok
@@ -969,10 +975,11 @@ DIMENSIONS (
     l.l_orderkey AS l.l_orderkey
 )
 
-# B-064: body_parser/mod.rs::parse_tables_two_words_before_constraint_rejected — `o dcb_orders PRIMARY KEY` (missing AS) is rejected, not silently taken (near miss of B-061) [syntax]
+# B-064: body_parser/mod.rs::parse_tables_two_words_before_constraint_rejected — `o dcb_orders PRIMARY KEY` (missing AS) is rejected, not silently taken (near miss of B-061) [text]
 statement error
 CREATE SEMANTIC VIEW dcb_t_two_words AS TABLES (o dcb_orders PRIMARY KEY (o_orderkey)) DIMENSIONS (o.id AS o.id);
 ----
+between source table name and PRIMARY KEY
 
 # B-065: body_parser/mod.rs::parse_tables_without_primary_key_is_valid — PRIMARY KEY is optional
 statement ok
