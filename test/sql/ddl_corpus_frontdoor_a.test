@@ -477,31 +477,37 @@ SELECT one FROM dcf_plain_v;
 
 # --- Near-miss prefixes ---
 
-# F-020: parse_proptest.rs::near_miss_detects_transposition — transposed prefix keywords (cretae / craete / dreop / descrbe / shwo) are rejected, as near misses of F-001 / F-010 / F-005 / F-008 [syntax]
+# F-020: parse_proptest.rs::near_miss_detects_transposition — transposed prefix keywords (cretae / craete / dreop / descrbe / shwo) are rejected with a suggestion of the statement meant, as near misses of F-001 / F-010 / F-005 / F-008 [text]
 statement error
 cretae semantic view dcf_nm AS TABLES (t AS dcf_orders PRIMARY KEY (id)) DIMENSIONS (t.region AS region);
 ----
+Did you mean 'CREATE SEMANTIC VIEW'?
 
 statement error
 craete semantic view dcf_nm AS TABLES (t AS dcf_orders PRIMARY KEY (id)) DIMENSIONS (t.region AS region);
 ----
+Did you mean 'CREATE SEMANTIC VIEW'?
 
 statement error
 dreop semantic view dcf_nm;
 ----
+Did you mean 'DROP SEMANTIC VIEW'?
 
 statement error
 descrbe semantic view dcf_nm;
 ----
+Did you mean 'DESCRIBE SEMANTIC VIEW'?
 
 statement error
 shwo semantic views;
 ----
+Did you mean 'SHOW SEMANTIC VIEWS'?
 
-# F-021: parse_proptest.rs::near_miss_position_at_start — a near miss after leading spaces is still rejected (caret position not asserted) [syntax]
+# F-021: parse_proptest.rs::near_miss_position_at_start — a near miss after leading spaces is still rejected with the suggestion (caret position not asserted) [text]
 statement error
           cretae semantic view dcf_nm AS TABLES (t AS dcf_orders PRIMARY KEY (id)) DIMENSIONS (t.region AS region);
 ----
+Did you mean 'CREATE SEMANTIC VIEW'?
 
 # F-022: parse_proptest.rs::test_unicode_homoglyph — a Cyrillic С (U+0421) in place of the Latin C is not the CREATE SEMANTIC VIEW prefix; near miss of F-001 [syntax]
 statement error

@@ -918,10 +918,11 @@ statement error
 CREATE SEMANTIC VIEW dcc_c042 AS TABLES (o AS dcc_orders PRIMARY KEY (id)) FACTS (net_price AS o.price * (1 - o.discount)) DIMENSIONS (o.region AS region) METRICS (o.rev AS SUM(amount));
 ----
 
-# C-043: body_parser/mod.rs::parse_keyword_body_facts_after_dimensions_rejected — near miss of C-038: FACTS written after DIMENSIONS is rejected as out of order [syntax]
+# C-043: body_parser/mod.rs::parse_keyword_body_facts_after_dimensions_rejected — near miss of C-038: FACTS written after DIMENSIONS is rejected as out of order [text]
 statement error
 CREATE SEMANTIC VIEW dcc_c043 AS TABLES (o AS dcc_orders PRIMARY KEY (id)) DIMENSIONS (o.region AS region) FACTS (o.net_price AS o.price * (1 - o.discount)) METRICS (o.rev AS SUM(amount));
 ----
+Clause 'FACTS' appears out of order
 
 # --- METRICS clause: qualified and derived entries ---
 

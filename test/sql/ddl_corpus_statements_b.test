@@ -95,12 +95,17 @@ memory	main	v	dcs_orders	total_amount	BIGINT	[]	(empty)
 memory	main	v	dcs_orders	total_orders	BIGINT	[]	(empty)
 memory	main	w	dcs_orders	total_units	BIGINT	[]	(empty)
 
-# S-203: rewrite.rs::phase34_1_1_show_filter_tests::test_rewrite_show_facts_limit, test_build_filter_suffix_limit_only — LIMIT alone
+# S-203: rewrite.rs::phase34_1_1_show_filter_tests::test_rewrite_show_facts_limit, test_build_filter_suffix_limit_only — LIMIT alone; LIMIT 1 below the two facts shows it takes effect
 query TTTTTTTT rowsort
 SHOW SEMANTIC FACTS LIMIT 10
 ----
 memory	main	v	dcs_orders	raw_amount	INTEGER	[]	(empty)
 memory	main	w	dcs_orders	unit	INTEGER	[]	(empty)
+
+query TTTTTTTT nosort
+SHOW SEMANTIC FACTS LIMIT 1
+----
+memory	main	v	dcs_orders	raw_amount	INTEGER	[]	(empty)
 
 # S-204: rewrite.rs::phase34_1_1_show_filter_tests::test_rewrite_show_dims_for_metric_with_all_clauses — LIKE, IN, FOR METRIC, STARTS WITH, LIMIT all together
 query TTTT nosort
@@ -465,6 +470,24 @@ query TTTTTT nosort
 SHOW SEMANTIC VIEWS LIKE '%s%' IN SCHEMA "dcs my schema" LIMIT 3
 ----
 <REGEX>:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z	spaced_sv	SEMANTIC_VIEW	memory	dcs my schema	(empty)
+
+# With two more views in the schema, LIKE drops plain_v (no `s`) and LIMIT 1 drops spaced_sv2, so both clauses are shown to take effect
+statement ok
+CREATE SEMANTIC VIEW "dcs my schema".plain_v AS TABLES (o AS main.dcs_orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region);
+
+statement ok
+CREATE SEMANTIC VIEW "dcs my schema".spaced_sv2 AS TABLES (o AS main.dcs_orders PRIMARY KEY (id)) DIMENSIONS (o.region AS o.region);
+
+query TTTTTT nosort
+SHOW SEMANTIC VIEWS LIKE '%s%' IN SCHEMA "dcs my schema" LIMIT 1
+----
+<REGEX>:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z	spaced_sv	SEMANTIC_VIEW	memory	dcs my schema	(empty)
+
+statement ok
+DROP SEMANTIC VIEW "dcs my schema".plain_v;
+
+statement ok
+DROP SEMANTIC VIEW "dcs my schema".spaced_sv2;
 
 # S-243: rewrite.rs::show_name_slot_quoted_ident_tests::an_unterminated_quote_in_a_schema_name_still_errors — IN SCHEMA "<unterminated> [syntax]
 statement error

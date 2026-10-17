@@ -395,7 +395,7 @@ What changed from the plan:
 **PR sequence.** Each PR is stacked on the previous one until Phase 2 (#262) merges.
 
 1. **DDL corpus.** The parser's unit tests and proptests ported to sqllogictest rows
-   (`test/sql/ddl_corpus_*.test`, about 650 rows) with a case map per source file under
+   (`test/sql/ddl_corpus_*.test`, 708 rows) with a case map per source file under
    `_notes/phase3-corpus/`. Green against today's parser override. This is the
    coverage the later PRs are measured against.
 2. **Search path from the bind.** The read functions take the caller's search path
