@@ -1027,6 +1027,16 @@ mod tests {
                 if_exists: false,
             }
         );
+        // The same raw name is accepted at CREATE (TECH-DEBT #98: DuckDB's
+        // tokenizer, and so the grammar, refuses it; corpus row S-014).
+        let created = plan(
+            "CREATE SEMANTIC VIEW it's_a_view AS TABLES (o AS orders PRIMARY KEY (id)) \
+             DIMENSIONS (o.region AS o.region)",
+        );
+        assert!(
+            matches!(&created, RewriteAction::Create { name, .. } if *name == vref("it's_a_view")),
+            "got {created:?}"
+        );
     }
 
     // ===================================================================
