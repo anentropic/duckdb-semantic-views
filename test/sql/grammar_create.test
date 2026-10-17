@@ -87,6 +87,35 @@ CREATE SEMANTIC VIEW gc_e AS TABLES (t AS gc_t PRIMARY KEY (id)) DIMENSIONS (t.r
 ----
 Duplicate clause keyword 'DIMENSIONS'
 
+# --- DuckDB's own statements are not shadowed -----------------------------------
+
+# The productions are prepended choices; a statement they do not match falls to
+# DuckDB's own alternative, even on a table named `semantic`.
+statement ok
+CREATE TABLE semantic (view INTEGER);
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE semantic);
+----
+view	INTEGER
+
+query TT
+SELECT column_name, column_type FROM (SHOW semantic);
+----
+view	INTEGER
+
+statement ok
+CREATE OR REPLACE VIEW semantic_v AS SELECT 1 AS one;
+
+statement ok
+ALTER TABLE semantic RENAME TO semantic2;
+
+statement ok
+DROP VIEW semantic_v;
+
+statement ok
+DROP TABLE semantic2;
+
 # --- inside a multi-statement string (TECH-DEBT #85) ---------------------------
 
 # Back to the override as the extension loads it. It declines a string holding
