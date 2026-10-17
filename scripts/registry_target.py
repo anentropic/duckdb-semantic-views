@@ -20,11 +20,13 @@ Usage:
         on stderr, when the registry does not build <our-pin>.
     registry_target.py set <description.yml> <key> <sha>
         Point `repo.<key>` at <sha>, adding the key after `ref:` if it is missing.
-    registry_target.py release-sha <version>
+    registry_target.py release-sha <version> [<branch>]
         Print the commit the `v<version>` tag points at, run inside our checkout.
         Exit 1 when there is no such tag. The registry must build the tagged
         release, not whatever `main` has moved on to since (v0.14.0 was first
-        published pinned to a later `main`).
+        published pinned to a later `main`). With <branch> (`just release` passes
+        `origin/main`), also exit 1 unless <branch> contains that commit, so a tag
+        made on a feature branch or an unpushed commit is never published.
 """
 
 from __future__ import annotations
@@ -93,7 +95,7 @@ def set_key(text: str, key: str, sha: str) -> str:
     return "".join(lines)
 
 
-def release_sha(version: str) -> str:
+def release_sha(version: str, branch: str | None = None) -> str:
     tag = f"v{version}"
     out = subprocess.run(
         ["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}"],
@@ -102,7 +104,23 @@ def release_sha(version: str) -> str:
     )
     if out.returncode != 0:
         raise SystemExit(f"no {tag} tag in this checkout: tag the release (or fetch tags) first")
-    return out.stdout.strip()
+    sha = out.stdout.strip()
+    if branch is not None:
+        on_branch = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", sha, branch], capture_output=True, text=True
+        )
+        # 1 is "not an ancestor"; anything else means git could not check.
+        if on_branch.returncode == 1:
+            raise SystemExit(
+                f"{tag} ({sha[:12]}) is not on {branch}: merge the release to {branch} "
+                f"and tag it there"
+            )
+        if on_branch.returncode != 0:
+            raise SystemExit(
+                f"could not check {tag} against {branch!r} (is it a ref in this checkout?): "
+                f"{on_branch.stderr.strip()}"
+            )
+    return sha
 
 
 def main(argv: list[str]) -> None:
@@ -119,8 +137,8 @@ def main(argv: list[str]) -> None:
             text = f.read()
         with open(path, "w") as f:
             f.write(set_key(text, key, sha))
-    elif len(argv) == 3 and argv[1] == "release-sha":
-        print(release_sha(argv[2].strip()))
+    elif len(argv) in (3, 4) and argv[1] == "release-sha":
+        print(release_sha(argv[2].strip(), argv[3].strip() if len(argv) == 4 else None))
     else:
         raise SystemExit(__doc__)
 
