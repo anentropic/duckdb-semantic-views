@@ -239,23 +239,45 @@ def main() -> int:
     # SV_ROUTE_TO_GRAMMAR=1 run the grammar-owned ones with overrides off.
     route = os.environ.get("SV_ROUTE_TO_GRAMMAR") == "1"
     routed = [0]
+    # A routed statement that fails inside a transaction aborts it, and no SET
+    # runs until the file's own ROLLBACK. The setting it had is restored then,
+    # before the connection's next statement (keyed by connection identity).
+    pending_restore = {}
     orig_get_connection = _hook(result.SQLLogicContext, "get_connection")
+
+    def restore(conn, setting):
+        try:
+            conn.execute(f"SET allow_parser_override_extension = '{setting}'")
+            pending_restore.pop(id(conn), None)
+        except duckdb.TransactionException:
+            pending_restore[id(conn)] = setting
+
     for method in ("execute_statement", "execute_query"):
         orig = _hook(result.SQLLogicContext, method)
 
         def counted(self, statement, _orig=orig):
             if current:
                 current[-1].executed += 1
-            if not route or not _routed(statement):
+            if not route:
+                return _orig(self, statement)
+            conn = orig_get_connection(self, statement.connection_name)
+            if id(conn) in pending_restore:
+                restore(conn, pending_restore[id(conn)])
+            if not _routed(statement):
                 return _orig(self, statement)
             routed[0] += 1
-            conn = orig_get_connection(self, statement.connection_name)
-            before = conn.execute("SELECT current_setting('allow_parser_override_extension')").fetchone()[0]
-            conn.execute("SET allow_parser_override_extension = 'DEFAULT'")
+            before = pending_restore.get(id(conn)) or conn.execute(
+                "SELECT current_setting('allow_parser_override_extension')"
+            ).fetchone()[0]
+            try:
+                conn.execute("SET allow_parser_override_extension = 'DEFAULT'")
+            except duckdb.TransactionException:
+                # Still aborted: the statement fails whichever parser runs it.
+                return _orig(self, statement)
             try:
                 return _orig(self, statement)
             finally:
-                conn.execute(f"SET allow_parser_override_extension = '{before}'")
+                restore(conn, before)
 
         setattr(result.SQLLogicContext, method, counted)
 
