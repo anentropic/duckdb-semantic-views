@@ -1043,11 +1043,11 @@ static std::vector<std::pair<std::string, LogicalType>> sv_semantic_named_params
         // DuckDB's parser reserves that keyword in named-parameter position:
         // `where := '…'` is a syntax error before the binder ever sees it.
         {"where_clause", LogicalType::VARCHAR},
-        // The caller's schema resolution order, injected by the parser
-        // override (see `crate::parse::search_path::SEARCH_PATH_SQL`). The read side binds
-        // on a fresh connection that cannot see the caller's search path or
-        // current schema, so the only way it can resolve an unqualified view
-        // name the way DuckDB would is to be handed the path — TECH-DEBT #19.
+        // An explicit schema resolution order. Without it the bind reads the
+        // caller's search path off its ClientContext (`sv_caller_search_path`).
+        // Kept, reserved, because views stored by earlier releases carry the
+        // `search_path := …` argument the parser override used to splice in
+        // (TECH-DEBT #19); an explicit value still decides.
         {"search_path", list_varchar},
     };
 }
@@ -1228,11 +1228,12 @@ extern "C" {
         spec.exec_cb = exec_cb;
         spec.init_local_cb = init_cb;
         spec.init_global_cb = nullptr;
-        // Every read TF registered through this wrapper accepts the caller's
-        // schema resolution order. Declared uniformly rather than per-TF: the
-        // parser override injects it into any read-TF call it rewrites, and a
-        // TF that takes no view name simply ignores it. `semantic_view` and
-        // `explain_semantic_view` declare it via `sv_semantic_named_params`.
+        // Every read TF registered through this wrapper accepts an explicit
+        // schema resolution order (see `sv_search_path_payload`). Declared
+        // uniformly rather than per-TF: views stored by earlier releases carry
+        // it on any read-TF call, and a TF that takes no view name simply
+        // ignores it. `semantic_view` and `explain_semantic_view` declare it
+        // via `sv_semantic_named_params`.
         spec.named_params.emplace_back("search_path",
                                        LogicalType::LIST(LogicalType::VARCHAR));
         return sv_register_table_function_core(
