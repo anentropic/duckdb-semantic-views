@@ -220,6 +220,34 @@ Malformed quoted identifier
 **Fix:** Close the quote, or give the identifier a name. Quote only names that need it (spaces, special characters, reserved words): DuckDB matches identifiers case-insensitively whether they are quoted or not, so quoting does not change which name matches.
 
 
+.. _ref-err-one-statement:
+
+A reserved-word view name outside a statement of its own
+--------------------------------------------------------
+
+.. versionchanged:: 0.16.0
+
+   Semantic-view DDL can now share a query string with other statements, and
+   runs with ``allow_parser_override_extension`` set to ``'DEFAULT'``. These
+   messages remain only for the case below.
+
+.. code-block:: text
+
+   semantic_views: semantic-view DDL must be sent as its own statement, one
+   statement per call. This query string also contains other statements; send
+   each statement in a separate call (a single trailing ';' is fine).
+
+.. code-block:: text
+
+   semantic_views: parser_override is not active for this connection
+   (allow_parser_override_extension is 'DEFAULT' or 'STRICT'). Re-enable with:
+   SET allow_parser_override_extension='FALLBACK';
+
+**Cause:** The statement names a view with an unquoted reserved word, such as ``select``. DuckDB does not accept an unquoted reserved word as a name, so only the extension's parser hook can read the statement, and it reads only a query string that holds the one statement. The first message appears when the string holds other statements too; the second when ``allow_parser_override_extension`` is ``'DEFAULT'`` or ``'STRICT'``.
+
+**Fix:** Quote the name (``DESCRIBE SEMANTIC VIEW "select"``). See :ref:`explanation-txn-ddl-one-statement`.
+
+
 .. _ref-err-name-uniqueness:
 
 Duplicate or colliding names

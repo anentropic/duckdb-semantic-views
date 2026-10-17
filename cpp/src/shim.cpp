@@ -643,10 +643,20 @@ static ParserExtensionParseResult sv_parse_statement(const string &query) {
 // was recorded) the text is rebuilt from the tokens instead: one space between
 // tokens, none around `.` or inside brackets, no comments. A position in that
 // text is not one in the query, so no caret is shown then.
-static bool sv_skip_trivia(const std::string &q, idx_t &pos) {
+// `newline`, when given, is set if the skipped trivia held a line break, as
+// DuckDB's tokenizer reports on the token after it (preceded_by_newline).
+static bool sv_skip_trivia(const std::string &q, idx_t &pos, bool *newline = nullptr) {
+    auto note_newlines = [&](idx_t from, idx_t to) {
+        for (idx_t i = from; newline != nullptr && i < to; i++) {
+            if (StringUtil::CharacterIsNewline(q[i])) {
+                *newline = true;
+            }
+        }
+    };
     while (pos < q.size()) {
         char c = q[pos];
         if (StringUtil::CharacterIsSpace(c)) {
+            note_newlines(pos, pos + 1);
             pos++;
         } else if (c == '-' && pos + 1 < q.size() && q[pos + 1] == '-') {
             while (pos < q.size() && q[pos] != '\n') {
@@ -657,6 +667,7 @@ static bool sv_skip_trivia(const std::string &q, idx_t &pos) {
             if (close == std::string::npos) {
                 return false;
             }
+            note_newlines(pos, close);
             pos = close + 2;
         } else {
             break;
@@ -3743,27 +3754,39 @@ static void sv_wire_node(string &out, ParseResult &pr) {
 // text at the token's offset, and everything else in it (before the first
 // token, between tokens, after the last) is whitespace or comments. The
 // iterator holds the whole query's tokens, so together that is the query, up
-// to the trivia the tokenizer drops. A transform gets only the tokens, so this
-// is how it learns the source text. With the override on, the override saw
-// this query and declined it just before the grammar ran. With it off nothing
-// was recorded, and an earlier query on this thread is left over: matching
-// tokens alone would take its text where the offsets line up, so a body with
-// spaces where the earlier one had `+o.b` would store the earlier body.
+// to the trivia the tokenizer drops. Each gap must also hold a line break
+// exactly when the tokenizer says this query's gap did (preceded_by_newline),
+// so a record never lends its line structure to an error's caret or to the
+// stored body. A transform gets only the tokens, so
+// this is how it learns the source text. With the override on, the override
+// saw this query and declined it just before the grammar ran. With it off
+// nothing was recorded, and an earlier query on this thread is left over:
+// matching tokens alone would take its text where the offsets line up, so a
+// body with spaces where the earlier one had `+o.b` would store the earlier
+// body. What still passes is a gap of the same length with the same line
+// breaks, such as a tab for a space (TECH-DEBT #100).
 static bool sv_grammar_has_source(TokenIterator &tokens) {
     const std::string &query = sv_override_query;
     if (query.empty()) {
         return false;
     }
     idx_t pos = 0;
+    bool first = true;
     for (idx_t i = 0; i < tokens.Size(); i++) {
         auto &tok = tokens.GetToken(i);
         if (tok.text.empty()) {
             continue;
         }
-        if (!sv_skip_trivia(query, pos) || pos != tok.offset ||
+        bool newline = false;
+        if (!sv_skip_trivia(query, pos, &newline) || pos != tok.offset ||
             query.compare(tok.offset, tok.text.size(), tok.text) != 0) {
             return false;
         }
+        // The tokenizer leaves the flag unset on the first token.
+        if (!first && newline != tok.preceded_by_newline) {
+            return false;
+        }
+        first = false;
         pos = tok.offset + tok.text.size();
     }
     return sv_skip_trivia(query, pos) && pos == query.size();

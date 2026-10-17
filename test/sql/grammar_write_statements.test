@@ -139,3 +139,77 @@ query I
 SELECT count(*) FROM (SHOW SEMANTIC VIEWS) WHERE name LIKE 'gw_m%';
 ----
 0
+
+# --- wrapped in EXPLAIN or PREPARE ------------------------------------------------
+# A write statement lowers to several statements, which neither EXPLAIN nor
+# PREPARE takes: each is refused at parse, and the database stays usable. The
+# read statements are single queries, so both work on them.
+
+statement ok
+CREATE SEMANTIC VIEW gw_x AS TABLES (t AS gw_t PRIMARY KEY (id)) DIMENSIONS (t.region AS region);
+
+statement error
+EXPLAIN DROP SEMANTIC VIEW gw_x;
+----
+syntax error at or near "SEMANTIC"
+
+statement error
+EXPLAIN CREATE SEMANTIC VIEW gw_y AS TABLES (t AS gw_t PRIMARY KEY (id)) DIMENSIONS (t.region AS region);
+----
+syntax error at or near "SEMANTIC"
+
+statement error
+PREPARE gw_p1 AS ALTER SEMANTIC VIEW gw_x RENAME TO gw_z;
+----
+MULTI_STATEMENT is not a preparable statement
+
+statement error
+PREPARE gw_p2 AS DROP SEMANTIC VIEW gw_x;
+----
+MULTI_STATEMENT is not a preparable statement
+
+statement error
+PREPARE gw_p3 AS CREATE SEMANTIC VIEW gw_y AS TABLES (t AS gw_t PRIMARY KEY (id)) DIMENSIONS (t.region AS region);
+----
+MULTI_STATEMENT is not a preparable statement
+
+query T
+SELECT name FROM (SHOW SEMANTIC VIEWS) WHERE name IN ('gw_x', 'gw_y', 'gw_z');
+----
+gw_x
+
+statement ok
+PREPARE gw_p4 AS SHOW SEMANTIC DIMENSIONS IN gw_x;
+
+query TTTTTTTT
+EXECUTE gw_p4;
+----
+memory	main	gw_x	gw_t	region	VARCHAR	[]	(empty)
+
+statement ok
+EXPLAIN DESCRIBE SEMANTIC VIEW gw_x;
+
+# --- inside a transaction that has failed --------------------------------------
+# A semantic-view statement after a failed statement gets DuckDB's own
+# "transaction is aborted" error, whichever parser runs it.
+
+statement ok
+BEGIN;
+
+statement error
+SELECT * FROM gw_no_such_table;
+----
+gw_no_such_table
+
+statement error
+DROP SEMANTIC VIEW gw_x;
+----
+Current transaction is aborted
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT name FROM (SHOW SEMANTIC VIEWS) WHERE name = 'gw_x';
+----
+gw_x

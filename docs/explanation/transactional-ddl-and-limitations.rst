@@ -259,6 +259,8 @@ A query string can hold semantic-view statements alongside other SQL, separated 
 
 As with any multi-statement string in DuckDB, a syntax error in one statement means none of them runs, and an error while running one leaves the statements before it in place.
 
+One name still needs its own call: a view named with a reserved word such as ``select``, written without quotes. DuckDB does not accept an unquoted reserved word as a name, so in a multi-statement string such a statement fails with :ref:`one statement per call <ref-err-one-statement>`. Quote the name (``DROP SEMANTIC VIEW "select"; ...``) and it works there too.
+
 
 .. _explanation-txn-ddl-peg:
 
@@ -278,6 +280,8 @@ If a session sets ``allow_parser_override_extension`` back to ``'DEFAULT'``, sem
 
 - An error in a semantic-view statement shows no ``LINE 1: ... ^`` pointer in the Python client. The message is the same.
 - ``CREATE SEMANTIC VIEW`` stores each expression with its tabs turned into spaces and each run of blank lines into one line break, so ``GET_DDL`` and ``DESCRIBE`` show that spelling. The view behaves the same.
+
+A statement naming a view with an unquoted reserved word, such as ``DESCRIBE SEMANTIC VIEW select``, fails there with :ref:`parser_override is not active <ref-err-one-statement>`. Quote the name.
 
 To restore the default, run:
 

@@ -266,10 +266,10 @@ def main() -> int:
             if not _routed(statement):
                 return _orig(self, statement)
             routed[0] += 1
-            before = pending_restore.get(id(conn)) or conn.execute(
-                "SELECT current_setting('allow_parser_override_extension')"
-            ).fetchone()[0]
             try:
+                before = pending_restore.get(id(conn)) or conn.execute(
+                    "SELECT current_setting('allow_parser_override_extension')"
+                ).fetchone()[0]
                 conn.execute("SET allow_parser_override_extension = 'DEFAULT'")
             except duckdb.TransactionException:
                 # Still aborted: the statement fails whichever parser runs it.

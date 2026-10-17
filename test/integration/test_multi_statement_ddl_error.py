@@ -53,9 +53,20 @@ Each scenario runs on a fresh in-memory database and reports independently:
                                record's token at that offset (`ab`).
   control_stale_source_tail    the same, where the record runs on past the
                                last token: the error must quote its own query.
+  control_stale_source_newline  the same, where every gap has the same length
+                               but the record has a line break where the query
+                               has a space: it must store its own spacing.
   control_reserved_word_name   a view named `select`, unquoted: the override
                                takes it, the grammar refuses it as DuckDB does
                                (TECH-DEBT #98). Pins today's messages.
+  control_stale_other_database  that statement in a multi-statement string on
+                               one database ("one statement per call"), then
+                               alone on another whose override is off: it must
+                               keep "not active", not reuse the first record.
+  control_stale_after_success  the same after a one-statement string holding a
+                               `;` that succeeds.
+  control_stale_after_typo     the same after a string that fails to parse
+                               before its DDL.
 
 Run: uv run test/integration/test_multi_statement_ddl_error.py (or
 `just test-multi-statement-error`).
@@ -257,6 +268,13 @@ def scenario_control_stale_source_prefix():
     assert "o.ab" not in ddl and "o.r AS o.a\n" in ddl, f"must store its own body; got: {ddl}"
 
 
+def scenario_control_stale_source_newline():
+    record = STALE_DDL.replace("o.a+o.b", "o.a+\no.b")
+    msg, ddl = run_after_record(record, record.replace("o.a+\no.b", "o.a+ o.b"))
+    assert msg is None, f"the CREATE must run; got: {msg}"
+    assert "o.a+\no.b" not in ddl and "o.a+ o.b" in ddl, f"must store its own body; got: {ddl!r}"
+
+
 def scenario_control_stale_source_tail():
     record = STALE_DDL + " METRICS (o.m AS SUM(o.b))"
     msg, _ = run_after_record(record, record[: record.index(" (o.m")])
@@ -288,6 +306,49 @@ def scenario_control_reserved_word_name():
     assert quoted_multi is None and quoted_off is None, f"got: {quoted_multi} / {quoted_off}"
 
 
+# The parse stub still answers for a statement the grammar does not take, which
+# on 2.0 means an unquoted reserved-word view name (TECH-DEBT #98). Its
+# multi-statement diagnosis reads a per-thread record of the override's last
+# query; these check that a record left by another query never turns the
+# override-off message into "one statement per call".
+RW_SETUP = (
+    "CREATE TABLE t (id INTEGER, r VARCHAR); "
+    "CREATE SEMANTIC VIEW select AS TABLES (t AS t PRIMARY KEY (id)) DIMENSIONS (t.r AS t.r)"
+)
+RW_DDL = "DESCRIBE SEMANTIC VIEW select"
+MULTI_HINT = "one statement per call"
+OFF_HINT = "parser_override is not active"
+
+
+def check_not_blamed_after(first_sql, expect_first):
+    off, on = connect(), connect()
+    try:
+        on.execute(RW_SETUP)
+        off.execute("SET allow_parser_override_extension = 'DEFAULT'")
+        first = error_of(on, first_sql)
+        msg = error_of(off, RW_DDL)
+    finally:
+        off.close()
+        on.close()
+    assert expect_first(first), f"setup: unexpected first result: {first}"
+    assert msg is not None and OFF_HINT in msg, f"must keep its own message; got: {msg}"
+    assert MULTI_HINT not in msg, f"must not reuse another query's record; got: {msg}"
+
+
+def scenario_control_stale_other_database():
+    check_not_blamed_after(
+        "SELECT 1; " + RW_DDL, lambda first: first is not None and MULTI_HINT in first
+    )
+
+
+def scenario_control_stale_after_success():
+    check_not_blamed_after(RW_DDL + "; -- described", lambda first: first is None)
+
+
+def scenario_control_stale_after_typo():
+    check_not_blamed_after("SELEC 1; " + RW_DDL, lambda first: first is not None)
+
+
 SCENARIOS = [
     scenario_ddl_after_other_statements,
     scenario_ddl_before_other_statement,
@@ -301,8 +362,12 @@ SCENARIOS = [
     scenario_control_stale_caret_parse_error,
     scenario_control_stale_source_gap,
     scenario_control_stale_source_prefix,
+    scenario_control_stale_source_newline,
     scenario_control_stale_source_tail,
     scenario_control_reserved_word_name,
+    scenario_control_stale_other_database,
+    scenario_control_stale_after_success,
+    scenario_control_stale_after_typo,
 ]
 
 
