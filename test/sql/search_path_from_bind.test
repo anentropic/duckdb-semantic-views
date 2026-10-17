@@ -126,12 +126,17 @@ statement ok
 SET allow_parser_override_extension = 'FALLBACK';
 
 # --- a prepared statement (TECH-DEBT #101) ------------------------------------
-# DuckDB resolves its own tables on the path in effect at EXECUTE. These read
-# the path at PREPARE and keep it, as the injected argument did before. Pinned
-# so that a fix shows up here.
+# DuckDB resolves its own tables on the path in effect at EXECUTE. The table
+# function resolves at PREPARE (its bind), and a scalar with constant arguments
+# is folded at PREPARE, so both keep the PREPARE-time path, as the injected
+# argument did before. A scalar with a parameter is not folded and follows the
+# EXECUTE-time path. Pinned so that a fix shows up here.
 
 statement ok
 PREPARE sp_prep_ddl AS SELECT get_ddl('SEMANTIC_VIEW', 'v') LIKE '%from sp1%';
+
+statement ok
+PREPARE sp_prep_ddl_param AS SELECT get_ddl('SEMANTIC_VIEW', $1) LIKE '%from sp2%';
 
 statement ok
 PREPARE sp_prep_tf AS SELECT region FROM semantic_view('v', dimensions := ['region'], metrics := ['n']);
@@ -141,6 +146,11 @@ SET search_path = 'sp2';
 
 query I
 EXECUTE sp_prep_ddl;
+----
+true
+
+query I
+EXECUTE sp_prep_ddl_param('v');
 ----
 true
 
