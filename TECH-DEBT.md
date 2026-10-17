@@ -577,9 +577,11 @@ Areas where test coverage is reduced compared to ideal, with justification.
 ### 101. ❌ A prepared read keeps the search path it was prepared under — OPEN
 
 - **Origin:** 2026-10-17, review of PR #274 (search path at bind). Pre-existing: the injected `search_path := list_concat(current_schemas(false), [current_schema()])` argument was evaluated at PREPARE as well.
-- **What is wrong:** `PREPARE p AS SELECT * FROM semantic_view('v', …)` (or `get_ddl('SEMANTIC_VIEW', 'v')`), then `SET search_path = …`, then `EXECUTE p` still resolves `v` on the path in effect at PREPARE. DuckDB resolves its own tables on the path in effect at EXECUTE (checked on the 2.0 wheel: a prepared `SELECT * FROM t` follows a later `SET search_path`). The read functions look the view up on a fresh connection in their bind, so DuckDB records no catalog dependency that would make it rebind.
-- **Pinned by:** the prepared-statement section of `test/sql/search_path_from_bind.test`, which expects the PREPARE-time view.
-- **What would finish it:** make a prepared read rebind, or resolve, when the caller's search path has changed since PREPARE. For example, record the path in the bind data and check it at execution (rebinding or failing when it differs), or register the resolved view as a dependency DuckDB's rebind check sees. Then flip the pinned rows.
+- **What is wrong:** `PREPARE p AS SELECT * FROM semantic_view('v', …)` (or `get_ddl('SEMANTIC_VIEW', 'v')`), then `SET search_path = …`, then `EXECUTE p` still resolves `v` on the path in effect at PREPARE. DuckDB resolves its own tables on the path in effect at EXECUTE (checked on the 2.0 wheel: a prepared `SELECT * FROM t` follows a later `SET search_path`). Two mechanisms are behind it:
+  - **The table functions** look the view up in their bind, on a fresh connection, so DuckDB records no catalog dependency that would make it rebind.
+  - **The scalars** (`get_ddl`, `read_yaml_from_semantic_view`) read the path at execution, but are registered `CONSISTENT`, so with all-constant arguments the optimizer folds the call at PREPARE. With a parameter (`get_ddl('SEMANTIC_VIEW', $1)`) nothing is folded and the call follows the EXECUTE-time path.
+- **Pinned by:** the prepared-statement section of `test/sql/search_path_from_bind.test`: the table function and the constant scalar expect the PREPARE-time view, the parameterized scalar the EXECUTE-time one.
+- **What would finish it:** for the table functions, make a prepared read rebind, or resolve, when the caller's search path has changed since PREPARE: record the path in the bind data and check it at execution (rebinding or failing when it differs), or register the resolved view as a dependency DuckDB's rebind check sees. For the scalars, stop the constant folding (register them `VOLATILE`, which their dependence on session state warrants anyway). Then flip the pinned rows.
 
 ### 98. ❌ Four oddities at the parser hook's front door — OPEN
 
