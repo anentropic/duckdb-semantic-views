@@ -475,14 +475,22 @@ release:
       echo "ERROR: working tree is not clean. Commit or stash changes first." >&2
       exit 1
     fi
+    # Start from the latest main (and its tags). A stale local main would get
+    # its push rejected below, after description.yml was already committed.
+    git fetch origin main --tags
+    if ! git merge --ff-only origin/main; then
+      echo "ERROR: local main has diverged from origin/main. Reconcile them first." >&2
+      exit 1
+    fi
     # --- Extract values ---
     VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
     if [ -z "$VERSION" ]; then
       echo "ERROR: could not extract version from Cargo.toml" >&2
       exit 1
     fi
-    # The tagged release, not HEAD: main may have moved on since the tag.
-    SHA=$(python3 scripts/registry_target.py release-sha "$VERSION")
+    # The tagged release, not HEAD: main may have moved on since the tag. The
+    # tag must be on origin/main, or the registry would build an unmerged commit.
+    SHA=$(python3 scripts/registry_target.py release-sha "$VERSION" origin/main)
     # --- Which description.yml key the registry builds our DuckDB pin from ---
     TMP=$(mktemp -d)
     gh api repos/duckdb/community-extensions/contents/.github/workflows/build.yml --jq '.content' | base64 -d > "$TMP/build.yml"
@@ -501,9 +509,10 @@ release:
     else
       git commit -m "chore: update description.yml for v$VERSION release"
     fi
-    # Outside the if: a re-run after a failed push still has that commit to push
-    # (a no-op when main is already up to date).
-    git push origin main
+    # Outside the if: a re-run after a failed push still has that commit to push.
+    if [ -n "$(git rev-list origin/main..HEAD)" ]; then
+      git push origin main
+    fi
     echo "description.yml for v$VERSION is on origin/main"
     DESC_SRC="$PWD/description.yml"
     # --- Copy to CE fork and open PR ---
