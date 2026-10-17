@@ -106,11 +106,19 @@ def release_sha(version: str, branch: str | None = None) -> str:
         raise SystemExit(f"no {tag} tag in this checkout: tag the release (or fetch tags) first")
     sha = out.stdout.strip()
     if branch is not None:
-        on_branch = subprocess.run(["git", "merge-base", "--is-ancestor", sha, branch])
-        if on_branch.returncode != 0:
+        on_branch = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", sha, branch], capture_output=True, text=True
+        )
+        # 1 is "not an ancestor"; anything else means git could not check.
+        if on_branch.returncode == 1:
             raise SystemExit(
                 f"{tag} ({sha[:12]}) is not on {branch}: merge the release to {branch} "
                 f"and tag it there"
+            )
+        if on_branch.returncode != 0:
+            raise SystemExit(
+                f"could not check {tag} against {branch!r} (is it a ref in this checkout?): "
+                f"{on_branch.stderr.strip()}"
             )
     return sha
 

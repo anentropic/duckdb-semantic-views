@@ -475,9 +475,9 @@ release:
       echo "ERROR: working tree is not clean. Commit or stash changes first." >&2
       exit 1
     fi
-    # Start from the latest main (and its tags). A stale local main would get
-    # its push rejected below, after description.yml was already committed.
-    git fetch origin main --tags
+    # Start from the latest main. A stale local main would get its push
+    # rejected below, after description.yml was already committed.
+    git fetch origin main
     if ! git merge --ff-only origin/main; then
       echo "ERROR: local main has diverged from origin/main. Reconcile them first." >&2
       exit 1
@@ -487,6 +487,15 @@ release:
     if [ -z "$VERSION" ]; then
       echo "ERROR: could not extract version from Cargo.toml" >&2
       exit 1
+    fi
+    # Take the release tag from origin when it is there (it may still be local
+    # only). Just this tag: fetching all of them would stop on any unrelated
+    # local tag that differs from origin's.
+    if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+      if ! git fetch origin "refs/tags/v$VERSION:refs/tags/v$VERSION"; then
+        echo "ERROR: local tag v$VERSION differs from origin's. Delete it (git tag -d v$VERSION) and re-run." >&2
+        exit 1
+      fi
     fi
     # The tagged release, not HEAD: main may have moved on since the tag. The
     # tag must be on origin/main, or the registry would build an unmerged commit.

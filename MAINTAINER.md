@@ -789,8 +789,8 @@ The `just release` recipe automates steps 3-7 below:
 3. Run `just release`
 
 This will:
-- Verify you're on `main` with a clean working tree and `gh` CLI installed, then fetch `origin/main` and its tags and fast-forward to it (it stops if local `main` has diverged)
-- Extract the version from `Cargo.toml` and the commit its `v<version>` tag points at (`scripts/registry_target.py release-sha`; it refuses when the tag is missing or `origin/main` does not contain the tagged commit). Not `HEAD`: `main` may have moved past the release, as it had when v0.14.0's registry PR was first opened
+- Verify you're on `main` with a clean working tree and `gh` CLI installed, then fetch `origin/main` and fast-forward to it (it stops if local `main` has diverged)
+- Extract the version from `Cargo.toml`, fetch its `v<version>` tag from `origin` if it is there (it stops if the local tag differs), and take the commit the tag points at (`scripts/registry_target.py release-sha`; it refuses when the tag is missing or `origin/main` does not contain the tagged commit). Not `HEAD`: `main` may have moved past the release, as it had when v0.14.0's registry PR was first opened
 - Update `description.yml` with the tagged commit under the key the registry builds our DuckDB pin from (`ref`, or an older DuckDB line's key such as `variegata`; `scripts/registry_target.py key`) and the new `version`, commit, and push to `main` if that left it ahead of `origin/main` (a re-run for the same release finds it unchanged and goes straight to the registry PR)
 - In the CE fork (default: `~/Documents/Dev/Sources/community-extensions`, override with `CE_REPO` env var): ensure an `upstream` remote, `git fetch upstream main`, and **rebranch `semantic-views` off `upstream/main`** so the PR is a clean one-file change, then copy in `description.yml`, commit, and **force-push**
 - Open a PR to `duckdb/community-extensions` (or report the existing open one, which the force-push updates in place)

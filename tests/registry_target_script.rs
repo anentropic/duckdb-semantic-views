@@ -299,3 +299,18 @@ fn a_tag_off_the_release_branch_is_refused() {
     let err = got.expect_err("a tag that main does not contain must fail");
     assert!(err.contains("v2.0.0") && err.contains("main"), "{err}");
 }
+
+/// A branch that does not resolve is a bad argument, not a release that is
+/// off the branch.
+#[test]
+fn a_branch_that_does_not_resolve_is_reported_as_such() {
+    let (dir, _, _) = repo_with_tag_behind_head("sha-no-branch", false);
+    let got = release_sha_on(&dir, "1.2.3", "origin/nope");
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = got.expect_err("an unknown branch must fail");
+    assert!(
+        err.contains("could not check v1.2.3 against 'origin/nope'"),
+        "{err}"
+    );
+    assert!(!err.contains("is not on"), "{err}");
+}
