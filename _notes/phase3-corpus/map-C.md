@@ -200,7 +200,7 @@ SQL corpus rows that carry each case. Rows C-001..C-079 are in
 | `src/body_parser/lexer.rs::escape_string_with_escaped_final_quote_is_unterminated_and_in_bounds` | C-183 |  |
 | `src/body_parser/lexer.rs::escape_string_with_escaped_backslash_is_terminated` | C-177 |  |
 | `src/body_parser/lexer.rs::typed_literal_is_not_an_escape_string` | C-177 |  |
-| `src/body_parser/lexer.rs::non_ascii_is_one_bare_ident_no_midcodepoint_span` | C-184 |  |
+| `src/body_parser/lexer.rs::non_ascii_is_one_bare_ident_no_midcodepoint_span` | C-184 | PRE-EXISTING (TECH-DEBT #96): DESCRIBE keeps the quotes in BASE_TABLE_NAME |
 | `src/body_parser/lexer.rs::paren_group_tokens` | C-009 |  |
 | `src/body_parser/lexer.rs::well_formed_over_hostile_inputs` | C-175, C-176, C-177, C-178, C-184, C-185 | Each curated hostile input maps to the row that feeds the same shape through CREATE. |
 | `src/body_parser/lexer.rs::tiling_holds_over_hostile_alphabet` | C-176, C-178, C-181 | Representative rows per generator axis: doubled/unterminated quotes (C-176, C-178, C-181). |

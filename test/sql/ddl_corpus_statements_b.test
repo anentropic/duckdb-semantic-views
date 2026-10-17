@@ -550,15 +550,17 @@ SHOW SEMANTIC VIEWS IN SCHEMA "dcs_a.b"
 ----
 <REGEX>:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z	dot_sv	SEMANTIC_VIEW	memory	dcs_a.b	(empty)
 
-# S-263: rewrite.rs::show_scope_qualified_name_tests::a_three_part_schema_name_is_rejected — IN SCHEMA a.b.c [syntax]
+# S-263: rewrite.rs::show_scope_qualified_name_tests::a_three_part_schema_name_is_rejected — IN SCHEMA a.b.c [text]
 statement error
 SHOW SEMANTIC VIEWS IN SCHEMA memory.main.extra
 ----
+Invalid schema name 'memory.main.extra'
 
-# S-264: rewrite.rs::show_scope_qualified_name_tests::a_qualified_database_name_is_rejected — IN DATABASE a.b [syntax]
+# S-264: rewrite.rs::show_scope_qualified_name_tests::a_qualified_database_name_is_rejected — IN DATABASE a.b [text]
 statement error
 SHOW SEMANTIC VIEWS IN DATABASE memory.main
 ----
+Invalid database name 'memory.main'
 
 # --- SHOW scope on DIMENSIONS / METRICS / FACTS, IN ACCOUNT, bare IN SCHEMA / IN DATABASE ---
 

@@ -807,17 +807,22 @@ statement error
 CREATE SEMANTIC VIEW dcc_c131 AS TABLES (o AS dcc_orders PRIMARY KEY (id), c AS dcc_customers PRIMARY KEY (id)) RELATIONSHIPS (foo bar AS o(cust_id) REFERENCES c) DIMENSIONS (o."order date" AS o.created_at, o.d AS o.region) METRICS (o.revenue AS SUM(o.amount), total AS revenue + 1);
 ----
 
-# C-132: body_parser/mod.rs::f11_empty_quoted_table_alias_rejected — near miss of C-127: an empty quoted identifier `""` as a TABLES alias is rejected [syntax]
+# C-132: body_parser/mod.rs::f11_empty_quoted_table_alias_rejected — near miss of C-127: an empty quoted identifier `""` as a TABLES alias is rejected
 # Today the rejection comes from DuckDB's own tokenizer (zero-length delimited
-# identifier) before the extension's F-11 check is reached.
+# identifier) before the extension's F-11 check is reached. The empty alias is
+# the customers table's, and RELATIONSHIPS refers to it as `""`, so with `""`
+# accepted the statement would succeed: renaming that alias to `cc` does.
 statement error
-CREATE SEMANTIC VIEW dcc_c132 AS TABLES ("" AS dcc_orders PRIMARY KEY (id), c AS dcc_customers PRIMARY KEY (id)) RELATIONSHIPS (foo AS o(cust_id) REFERENCES c) DIMENSIONS (o."order date" AS o.created_at, o.d AS o.region) METRICS (o.revenue AS SUM(o.amount), total AS revenue + 1);
+CREATE SEMANTIC VIEW dcc_c132 AS TABLES (o AS dcc_orders PRIMARY KEY (id), "" AS dcc_customers PRIMARY KEY (id)) RELATIONSHIPS (foo AS o(cust_id) REFERENCES "") DIMENSIONS (o."order date" AS o.created_at, o.d AS o.region) METRICS (o.revenue AS SUM(o.amount), total AS revenue + 1);
 ----
+zero-length delimited identifier
 
-# C-133: body_parser/mod.rs::f11_empty_quoted_dimension_alias_rejected — near miss of C-127: an empty quoted identifier `""` as a dimension qualifier is rejected [syntax]
+# C-133: body_parser/mod.rs::f11_empty_quoted_dimension_alias_rejected — near miss of C-127: an empty quoted identifier `""` as a dimension qualifier is rejected
+# The message is pinned: an accepted `""` would fail too, as an unknown alias.
 statement error
 CREATE SEMANTIC VIEW dcc_c133 AS TABLES (o AS dcc_orders PRIMARY KEY (id), c AS dcc_customers PRIMARY KEY (id)) RELATIONSHIPS (foo AS o(cust_id) REFERENCES c) DIMENSIONS (o."order date" AS o.created_at, "".d AS o.region) METRICS (o.revenue AS SUM(o.amount), total AS revenue + 1);
 ----
+zero-length delimited identifier
 
 # --- F-12: PUBLIC on dimensions; `=` optional in WITH SYNONYMS ---
 
@@ -1520,6 +1525,7 @@ CREATE SEMANTIC VIEW dcc_c183 AS TABLES (o AS dcc_orders PRIMARY KEY (id)) DIMEN
 #   body_parser/lexer.rs::well_formed_over_hostile_inputs,
 #   body_parser/lexer.rs::tiling_holds_over_arbitrary_unicode
 #   — non-ASCII bare identifiers (alias café, member café東京) are single tokens; quoted "dcc 東京 table" kept whole [text]
+# PRE-EXISTING (TECH-DEBT #96): DESCRIBE reports BASE_TABLE_NAME and the dimension's TABLE with the quotes kept.
 statement ok
 CREATE SEMANTIC VIEW dcc_c184 AS TABLES (café AS "dcc 東京 table" PRIMARY KEY (id)) DIMENSIONS (café.café東京 AS café.region);
 
