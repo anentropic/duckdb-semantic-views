@@ -185,8 +185,8 @@ row's description. 6 of 276 tests are N/A.
 | rewrite.rs::test_extract_dollar_quoted_multiline | S-340 | CREATE ... FROM YAML $$ <multi-line YAML> $$ |
 | rewrite.rs::test_yaml_rewrite_basic_create | S-340 | CREATE ... FROM YAML $$ <multi-line YAML> $$ |
 | rewrite.rs::test_yaml_rewrite_create_or_replace | S-343, S-359 | CREATE OR REPLACE ... FROM YAML replaces ([syntax]) |
-| rewrite.rs::test_yaml_rewrite_create_if_not_exists | S-344 |
-| model.rs::yaml_with_no_tables_is_rejected | S-358 | CREATE IF NOT EXISTS ... FROM YAML is a no-op on an existing view and creates a missing one |
+| rewrite.rs::test_yaml_rewrite_create_if_not_exists | S-344 | CREATE IF NOT EXISTS ... FROM YAML is a no-op on an existing view and creates a missing one |
+| model.rs::yaml_with_no_tables_is_rejected | S-358 | an empty YAML definition (`tables: []`) is rejected like `TABLES ()` (TECH-DEBT #94) |
 | rewrite.rs::test_yaml_rewrite_trailing_content_rejected | S-351 | text after the closing `$$` ([syntax]) |
 | rewrite.rs::test_yaml_rewrite_invalid_yaml | S-349 | malformed YAML content names the view in the error |
 | rewrite.rs::test_yaml_rewrite_comment_override | S-346 | the DDL COMMENT wins over a `comment:` key in the YAML; without one the YAML comment is used |
