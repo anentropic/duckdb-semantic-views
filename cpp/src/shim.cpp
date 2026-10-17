@@ -3740,25 +3740,33 @@ static void sv_wire_node(string &out, ParseResult &pr) {
 
 // Whether the query the parser override recorded on this thread
 // (sv_override_query) is the one being parsed: every token is that query's
-// text at the token's offset. A transform gets only the tokens, so this is how
-// it learns the source text. With the override on, the override saw this query
-// and declined it just before the grammar ran. With it off nothing was
-// recorded, and an earlier query on this thread does not match.
+// text at the token's offset, and everything else in it (before the first
+// token, between tokens, after the last) is whitespace or comments. The
+// iterator holds the whole query's tokens, so together that is the query, up
+// to the trivia the tokenizer drops. A transform gets only the tokens, so this
+// is how it learns the source text. With the override on, the override saw
+// this query and declined it just before the grammar ran. With it off nothing
+// was recorded, and an earlier query on this thread is left over: matching
+// tokens alone would take its text where the offsets line up, so a body with
+// spaces where the earlier one had `+o.b` would store the earlier body.
 static bool sv_grammar_has_source(TokenIterator &tokens) {
     const std::string &query = sv_override_query;
     if (query.empty()) {
         return false;
     }
+    idx_t pos = 0;
     for (idx_t i = 0; i < tokens.Size(); i++) {
         auto &tok = tokens.GetToken(i);
         if (tok.text.empty()) {
             continue;
         }
-        if (tok.offset > query.size() || query.compare(tok.offset, tok.text.size(), tok.text) != 0) {
+        if (!sv_skip_trivia(query, pos) || pos != tok.offset ||
+            query.compare(tok.offset, tok.text.size(), tok.text) != 0) {
             return false;
         }
+        pos = tok.offset + tok.text.size();
     }
-    return true;
+    return sv_skip_trivia(query, pos) && pos == query.size();
 }
 
 static string sv_grammar_serialise(PEGTransformer &transformer, ParseResult &pr, bool has_source) {

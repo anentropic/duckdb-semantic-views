@@ -23,6 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   up member types, which fail with DuckDB's own `Query exceeded maximum execution time`
   like any other query instead of running past the limit.
 
+- **Semantic-view DDL can share a query string with other statements.** One `execute()`
+  call can now hold, say, `CREATE TABLE …; INSERT …; CREATE SEMANTIC VIEW …`: DuckDB
+  splits the string and runs each statement in order. Before, any `CREATE`, `DROP` or
+  `ALTER SEMANTIC VIEW` in such a string was refused with "semantic-view DDL must be sent
+  as its own statement, one statement per call".
+
+- **Semantic-view DDL runs with `allow_parser_override_extension` set to `DEFAULT`.**
+  Before, every `CREATE`, `DROP`, `ALTER`, `SHOW` and `DESCRIBE` failed there with
+  "parser_override is not active". Two differences remain with that setting: in the
+  Python client a syntax error in the DDL shows no `LINE 1: … ^` caret, and `GET_DDL`
+  shows a tab inside an expression as a space and a run of blank lines as one line
+  break. The query a view expands to is the same.
+
 ### Changed
 
 - **`GET_DDL` and `READ_YAML_FROM_SEMANTIC_VIEW` follow `search_path`.** An unqualified

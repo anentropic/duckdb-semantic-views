@@ -44,6 +44,18 @@ Each scenario runs on a fresh in-memory database and reports independently:
   control_stale_caret_parse_error  a query that fails to parse before reaching
                                its DDL on one database, then an invalid DDL on
                                another whose override is off: likewise.
+  control_stale_source_gap     a CREATE left as the record, then on another
+                               database whose override is off a CREATE whose
+                               tokens sit at the same offsets but with spaces
+                               where the record had `+o.b`: it must store its
+                               own body, not the record's.
+  control_stale_source_prefix  the same, where a token (`a`) is a prefix of the
+                               record's token at that offset (`ab`).
+  control_stale_source_tail    the same, where the record runs on past the
+                               last token: the error must quote its own query.
+  control_reserved_word_name   a view named `select`, unquoted: the override
+                               takes it, the grammar refuses it as DuckDB does
+                               (TECH-DEBT #98). Pins today's messages.
 
 Run: uv run test/integration/test_multi_statement_ddl_error.py (or
 `just test-multi-statement-error`).
@@ -204,6 +216,78 @@ def scenario_control_stale_caret_parse_error():
     check_not_quoted_after(lambda on: error_of(on, "SELEC 1;\n" + DDL))
 
 
+STALE_TABLE = "CREATE TABLE orders (id INTEGER, a INTEGER, b INTEGER, ab INTEGER)"
+STALE_DDL = (
+    "SELECT 1; CREATE SEMANTIC VIEW s AS TABLES (o AS orders PRIMARY KEY (id)) "
+    "DIMENSIONS (o.r AS o.a+o.b)"
+)
+
+
+def run_after_record(record, sql):
+    """Leave `record` as the recorded query (the override declines it, the
+    grammar runs it, nothing clears it), then run `sql` on another database
+    whose override is off. Returns that database's error (or None) and its
+    GET_DDL of `s` (or None)."""
+    off, on = connect(), connect()
+    try:
+        on.execute(STALE_TABLE)
+        off.execute(STALE_TABLE)
+        off.execute("SET allow_parser_override_extension = 'DEFAULT'")
+        on.execute(record)
+        msg = error_of(off, sql)
+        ddl = None if msg else off.execute("SELECT get_ddl('SEMANTIC_VIEW', 's')").fetchone()[0]
+    finally:
+        off.close()
+        on.close()
+    return msg, ddl
+
+
+def scenario_control_stale_source_gap():
+    # Every token of the second query, its `)` included, is at the same offset
+    # in the record; only the bytes between them differ.
+    msg, ddl = run_after_record(STALE_DDL, STALE_DDL.replace("+o.b", "    "))
+    assert msg is None, f"the CREATE must run; got: {msg}"
+    assert "o.a+o.b" not in ddl and "o.r AS o.a\n" in ddl, f"must store its own body; got: {ddl}"
+
+
+def scenario_control_stale_source_prefix():
+    record = STALE_DDL.replace("o.a+o.b", "o.ab")
+    msg, ddl = run_after_record(record, record.replace("o.ab)", "o.a )"))
+    assert msg is None, f"the CREATE must run; got: {msg}"
+    assert "o.ab" not in ddl and "o.r AS o.a\n" in ddl, f"must store its own body; got: {ddl}"
+
+
+def scenario_control_stale_source_tail():
+    record = STALE_DDL + " METRICS (o.m AS SUM(o.b))"
+    msg, _ = run_after_record(record, record[: record.index(" (o.m")])
+    assert msg is not None and "Expected '(' after clause keyword 'METRICS'" in msg, (
+        f"expected the METRICS error; got: {msg}"
+    )
+    assert "SUM(o.b)" not in msg, f"must not quote the record's tail; got: {msg}"
+
+
+def scenario_control_reserved_word_name():
+    # TECH-DEBT #98: the override accepts an unquoted reserved word as a view
+    # name; the grammar's ColId, like DuckDB, refuses it. Where the override
+    # declines the statement, the stub answers. Quoted, it works on both routes.
+    con = connect()
+    try:
+        con.execute("CREATE TABLE t (id INTEGER, r VARCHAR)")
+        con.execute(
+            "CREATE SEMANTIC VIEW select AS TABLES (t AS t PRIMARY KEY (id)) DIMENSIONS (t.r AS t.r)"
+        )
+        multi = error_of(con, "DESCRIBE SEMANTIC VIEW select; SELECT 1")
+        quoted_multi = error_of(con, 'DESCRIBE SEMANTIC VIEW "select"; SELECT 1')
+        con.execute("SET allow_parser_override_extension = 'DEFAULT'")
+        off = error_of(con, "DESCRIBE SEMANTIC VIEW select")
+        quoted_off = error_of(con, 'DESCRIBE SEMANTIC VIEW "select"')
+    finally:
+        con.close()
+    assert multi is not None and "one statement per call" in multi, f"got: {multi}"
+    assert off is not None and "parser_override is not active" in off, f"got: {off}"
+    assert quoted_multi is None and quoted_off is None, f"got: {quoted_multi} / {quoted_off}"
+
+
 SCENARIOS = [
     scenario_ddl_after_other_statements,
     scenario_ddl_before_other_statement,
@@ -215,6 +299,10 @@ SCENARIOS = [
     scenario_control_stale_caret_success,
     scenario_control_stale_caret_rewrite,
     scenario_control_stale_caret_parse_error,
+    scenario_control_stale_source_gap,
+    scenario_control_stale_source_prefix,
+    scenario_control_stale_source_tail,
+    scenario_control_reserved_word_name,
 ]
 
 
