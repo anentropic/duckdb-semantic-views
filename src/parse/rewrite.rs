@@ -2759,7 +2759,7 @@ $$"#;
 
     #[test]
     fn test_yaml_rewrite_create_or_replace() {
-        let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let yaml_text = "$$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\n$$";
         let action =
             rewrite_ddl_yaml_body(DdlKind::CreateOrReplace, &vref("v"), yaml_text, None).unwrap();
         assert!(matches!(
@@ -2773,7 +2773,7 @@ $$"#;
 
     #[test]
     fn test_yaml_rewrite_create_if_not_exists() {
-        let yaml_text = "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let yaml_text = "$$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\n$$";
         let result =
             rewrite_ddl_yaml_body(DdlKind::CreateIfNotExists, &vref("v"), yaml_text, None).unwrap();
         assert!(matches!(
@@ -2788,7 +2788,7 @@ $$"#;
     #[test]
     fn test_yaml_rewrite_trailing_content_rejected() {
         let yaml_text =
-            "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$ extra stuff";
+            "$$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\n$$ extra stuff";
         let err = rewrite_ddl_yaml_body(DdlKind::Create, &vref("v"), yaml_text, None).unwrap_err();
         assert!(err
             .message
@@ -2806,7 +2806,7 @@ $$"#;
     #[test]
     fn test_yaml_rewrite_comment_override() {
         let yaml_text =
-            "$$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\ncomment: yaml comment\n$$";
+            "$$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\ncomment: yaml comment\n$$";
         let result = rewrite_ddl_yaml_body(
             DdlKind::Create,
             &vref("v"),
@@ -2845,7 +2845,7 @@ $$"#;
 
     #[test]
     fn test_yaml_rewrite_tagged_dollar_quote() {
-        let yaml_text = "$yaml$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$yaml$";
+        let yaml_text = "$yaml$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\n$yaml$";
         let result = rewrite_ddl_yaml_body(DdlKind::Create, &vref("v"), yaml_text, None).unwrap();
         assert!(matches!(result, RewriteAction::Create { .. }));
     }
@@ -2858,8 +2858,14 @@ $$"#;
     fn test_from_yaml_detection_via_rewrite_ddl() {
         let query = r#"CREATE SEMANTIC VIEW yaml_test FROM YAML $$
 base_table: t
-tables: []
-dimensions: []
+tables:
+  - alias: t
+    table: t
+    pk_columns: [id]
+dimensions:
+  - name: d
+    expr: t.d
+    source_table: t
 metrics: []
 $$"#;
         let RewriteAction::Create { name, mode, .. } = plan(query) else {
@@ -2871,13 +2877,13 @@ $$"#;
 
     #[test]
     fn test_from_yaml_case_insensitive() {
-        let query = "CREATE SEMANTIC VIEW v from yaml $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let query = "CREATE SEMANTIC VIEW v from yaml $$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\n$$";
         assert!(matches!(plan(query), RewriteAction::Create { .. }));
     }
 
     #[test]
     fn test_from_yaml_mixed_case() {
-        let query = "CREATE SEMANTIC VIEW v From Yaml $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let query = "CREATE SEMANTIC VIEW v From Yaml $$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\n$$";
         assert!(matches!(plan(query), RewriteAction::Create { .. }));
     }
 
@@ -2888,16 +2894,16 @@ $$"#;
         // `FROM\tYAML`, and `FROM /* fmt */ YAML` (comments blank to a run
         // of spaces) all fell through to the generic error. Fixed PA-10
         // class; this site was missed by the Phase 25.1 sweep.
-        let two_spaces = "CREATE SEMANTIC VIEW v FROM  YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let two_spaces = "CREATE SEMANTIC VIEW v FROM  YAML $$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\n$$";
         assert!(matches!(plan(two_spaces), RewriteAction::Create { .. }));
 
-        let tab = "CREATE SEMANTIC VIEW v FROM\tYAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let tab = "CREATE SEMANTIC VIEW v FROM\tYAML $$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\n$$";
         assert!(matches!(plan(tab), RewriteAction::Create { .. }));
 
-        let comment = "CREATE SEMANTIC VIEW v FROM /* fmt */ YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let comment = "CREATE SEMANTIC VIEW v FROM /* fmt */ YAML $$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\n$$";
         assert!(matches!(plan(comment), RewriteAction::Create { .. }));
 
-        let newline = "CREATE SEMANTIC VIEW v FROM\nYAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let newline = "CREATE SEMANTIC VIEW v FROM\nYAML $$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\n$$";
         assert!(matches!(plan(newline), RewriteAction::Create { .. }));
     }
 
@@ -2914,7 +2920,7 @@ $$"#;
 
     #[test]
     fn test_create_or_replace_from_yaml() {
-        let query = "CREATE OR REPLACE SEMANTIC VIEW v FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let query = "CREATE OR REPLACE SEMANTIC VIEW v FROM YAML $$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\n$$";
         assert!(matches!(
             plan(query),
             RewriteAction::Create {
@@ -2926,7 +2932,7 @@ $$"#;
 
     #[test]
     fn test_create_if_not_exists_from_yaml() {
-        let query = "CREATE SEMANTIC VIEW IF NOT EXISTS v FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let query = "CREATE SEMANTIC VIEW IF NOT EXISTS v FROM YAML $$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\n$$";
         assert!(matches!(
             plan(query),
             RewriteAction::Create {
@@ -2938,7 +2944,7 @@ $$"#;
 
     #[test]
     fn test_comment_with_from_yaml() {
-        let query = "CREATE SEMANTIC VIEW v COMMENT = 'my comment' FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let query = "CREATE SEMANTIC VIEW v COMMENT = 'my comment' FROM YAML $$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\n$$";
         let RewriteAction::Create { def, .. } = plan(query) else {
             panic!("expected RewriteAction::Create");
         };
@@ -3158,7 +3164,7 @@ $$"#;
     #[test]
     fn test_validate_and_rewrite_yaml_inline_still_works() {
         // Regression: FROM YAML $$...$$ still works after FILE branch is added
-        let query = "CREATE SEMANTIC VIEW v FROM YAML $$\nbase_table: t\ntables: []\ndimensions: []\nmetrics: []\n$$";
+        let query = "CREATE SEMANTIC VIEW v FROM YAML $$\nbase_table: t\ntables:\n  - alias: t\n    table: t\n    pk_columns: [id]\ndimensions:\n  - name: d\n    expr: t.d\n    source_table: t\nmetrics: []\n$$";
         assert!(matches!(plan(query), RewriteAction::Create { .. }));
     }
 

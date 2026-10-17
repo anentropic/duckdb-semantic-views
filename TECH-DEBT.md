@@ -615,12 +615,13 @@ Areas where test coverage is reduced compared to ideal, with justification.
 - **What is wrong:** `DIMENSIONS (o.d AS SUM(o.amount))` and `DIMENSIONS (o.p AS $1)` are both stored. Snowflake rejects an aggregate dimension; a parameter has no value at query time.
 - **What would finish it:** reject both at CREATE in the Phase 3 grammar transform, and turn those rows into rejection tests (B-007 keeps its split check with a `$1` the grammar still accepts).
 
-### 94. ❌ CREATE accepts a view with no tables, or with neither dimensions nor metrics — OPEN
+### 94. ✅ CREATE accepts a view with no tables, or with neither dimensions nor metrics — RESOLVED 2026-10-17
 
 - **Origin:** 2026-10-16, the Phase 3 DDL corpus (rows B-049, B-050, B-052 and B-056 in `ddl_corpus_body_a1.test`, S-358 in `ddl_corpus_create_forms.test`).
-- **What is wrong:** four shapes create a view: `TABLES () DIMENSIONS ()` (B-056), an AS body with `DIMENSIONS () METRICS ()` (B-049) or with `METRICS ()` alone (B-052), and an empty YAML definition (S-358). None of them round-trips. GET_DDL of B-056 and S-358 fails ("Legacy definition format"), and GET_DDL of B-049 and B-052 renders a TABLES-only body that CREATE rejects (B-050). A TABLES-only AS body is already rejected at CREATE (S-359), which is what the decision below wants for all four.
-- **Decision:** reject both kinds at CREATE (no tables; neither dimensions nor metrics), for the AS body and the YAML forms alike: TABLES is required, and at least one of DIMENSIONS or METRICS (Paul, 2026-10-16, Snowflake parity).
-- **What would finish it:** the Phase 3 grammar transform enforces it, and the pinned rows become rejection tests.
+- **What was wrong:** four shapes created a view that did not round-trip: `TABLES () DIMENSIONS ()` (B-056), an AS body with `DIMENSIONS () METRICS ()` (B-049) or with `METRICS ()` alone (B-052), and an empty YAML definition (S-358). GET_DDL of B-056 and S-358 failed ("Legacy definition format"), and GET_DDL of B-049 and B-052 rendered a TABLES-only body that CREATE rejects (B-050).
+- **Decision:** reject both kinds at CREATE (no tables; neither dimensions nor metrics), for the AS body and the YAML forms alike (Paul, 2026-10-16, Snowflake parity).
+- **Resolved by:** `parse_keyword_body` refuses an empty `TABLES` ("A semantic view needs at least one table in TABLES.") and an all-empty DIMENSIONS / METRICS pair ("A semantic view needs at least one dimension or metric."), each at its keyword, so the parser override and the grammar production both refuse them. `validate_yaml_structure` no longer exempts an empty `tables` (it had, to keep legacy YAML importable), so `FROM YAML` and `FROM YAML FILE` refuse it. Covered by `body_parser::tests` (`an_empty_tables_clause_is_rejected`, `empty_dimensions_and_metrics_are_rejected`, `an_empty_metrics_clause_alone_is_rejected`, `facts_with_empty_dimensions_are_rejected`) and `model::tests::yaml_with_no_tables_is_rejected*`, each watched failing first, and by the corpus rows above, now rejection tests.
+- **Consequence:** a YAML export of a legacy-format view (no `tables`) can no longer be imported; the view must be re-created from DDL, which GET_DDL already told its owner to do.
 
 ### 93. ❌ The reference scanner is keyword-blind: a member named like a keyword in a position not yet taught is still spliced over it (COR-3) — OPEN
 

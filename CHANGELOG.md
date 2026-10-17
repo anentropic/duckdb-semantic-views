@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extension sees the statement. The errors read `unterminated quoted identifier` and
   `zero-length delimited identifier` instead of the extension's own wording.
 
+- **CREATE rejects an empty view.** A view with no tables (`TABLES ()`, or a YAML
+  definition with `tables: []` or no `tables`), or whose `DIMENSIONS` and `METRICS`
+  clauses are all empty (`DIMENSIONS () METRICS ()`, a lone `METRICS ()`), is now refused at
+  `CREATE SEMANTIC VIEW`, as Snowflake does. Before, such a view was created but could not
+  be queried, and `GET_DDL` either failed on it or returned DDL that `CREATE` refused. A
+  YAML export of a view stored in the legacy format, which lists no tables, can no longer be
+  imported either; re-create that view with `CREATE OR REPLACE SEMANTIC VIEW`.
+
 ### Known limitations
 
 - **ADBC needs `import duckdb` first.** With the DuckDB 2.0 Python wheel, a connection from

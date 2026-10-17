@@ -108,6 +108,30 @@ No DIMENSIONS or METRICS
 **Fix:** Add at least one ``DIMENSIONS`` or ``METRICS`` clause.
 
 
+No tables in TABLES
+-------------------
+
+.. code-block:: text
+
+   A semantic view needs at least one table in TABLES.
+
+**Cause:** The ``TABLES`` clause is empty: ``TABLES ()``.
+
+**Fix:** List the view's tables in ``TABLES``, for example ``TABLES (o AS orders PRIMARY KEY (id))``.
+
+
+No dimension or metric
+----------------------
+
+.. code-block:: text
+
+   A semantic view needs at least one dimension or metric.
+
+**Cause:** The ``DIMENSIONS`` and ``METRICS`` clauses that the body has are all empty, as in ``DIMENSIONS () METRICS ()`` or a lone ``METRICS ()``. Facts alone do not count: a view is queried through its dimensions and metrics.
+
+**Fix:** Declare at least one dimension or metric.
+
+
 Unknown clause keyword
 ----------------------
 
